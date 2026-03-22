@@ -206,32 +206,31 @@ class OnlineFlashMTPModel(nn.Module):
         self,
         anchor_positions: torch.Tensor,
         block_keep_mask: torch.Tensor,
-        seq_len: int,
+        target_hidden_len: int,
         device: torch.device,
     ):
         """
         创建DFlash风格的块掩码
 
-        KV: [Context (1 token per block) | Block_0 | Block_1 | ... | Block_{n-1}]
+        KV: [Context (target_hidden_len tokens) | Block_0 | Block_1 | ... | Block_{n-1}]
         Q:  [Block_0 | Block_1 | ... | Block_{n-1}]
 
         规则:
-        1. 每个块只能看到自己的context token（target_hidden）
+        1. 每个块只能看到自己的context token（target_hidden中对应位置的token）
         2. 块内双向注意力
         3. 不同块之间不可见
         """
         def mask_mod(b, h, q_idx, kv_idx):
             q_block_id = q_idx // self.block_size
-            anchor_pos = anchor_positions[b, q_block_id]
 
-            # Context部分（target_hidden）
-            is_context = kv_idx < seq_len
-            # 只允许看到本块的anchor位置
-            mask_context = is_context & (kv_idx == anchor_pos)
+            # Context部分（target_hidden）- 每个块对应一个独立的context token
+            is_context = kv_idx < target_hidden_len
+            # 只允许看到本块对应的context token
+            mask_context = is_context & (kv_idx == q_block_id)
 
             # Block部分
-            is_draft = kv_idx >= seq_len
-            kv_block_id = (kv_idx - seq_len) // self.block_size
+            is_draft = kv_idx >= target_hidden_len
+            kv_block_id = (kv_idx - target_hidden_len) // self.block_size
             mask_draft = is_draft & (q_block_id == kv_block_id)
 
             # 检查块是否有效
@@ -241,12 +240,12 @@ class OnlineFlashMTPModel(nn.Module):
 
         B, N = anchor_positions.shape
         Q_LEN = N * self.block_size
-        KV_LEN = seq_len + N * self.block_size
+        KV_LEN = target_hidden_len + N * self.block_size
 
         if not FLEX_ATTENTION_AVAILABLE:
             # 回退到标准attention mask
             return self._create_standard_block_mask(
-                anchor_positions, block_keep_mask, seq_len, device
+                anchor_positions, block_keep_mask, target_hidden_len, device
             )
 
         return create_block_mask(
@@ -257,7 +256,7 @@ class OnlineFlashMTPModel(nn.Module):
         self,
         anchor_positions: torch.Tensor,
         block_keep_mask: torch.Tensor,
-        seq_len: int,
+        target_hidden_len: int,
         device: torch.device,
     ) -> torch.Tensor:
         """
@@ -267,16 +266,11 @@ class OnlineFlashMTPModel(nn.Module):
         """
         B, N = anchor_positions.shape
         Q_LEN = N * self.block_size
-        KV_LEN = seq_len + N * self.block_size
+        KV_LEN = target_hidden_len + N * self.block_size
 
         # 创建query和key的块ID
         q_block_ids = torch.arange(Q_LEN, device=device) // self.block_size  # [Q_LEN]
         q_block_ids = q_block_ids.unsqueeze(0).expand(B, -1)  # [B, Q_LEN]
-
-        # KV的块ID
-        kv_context_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(B, -1)  # [B, seq_len]
-        kv_noise_ids = torch.arange(Q_LEN, device=device) // self.block_size  # [Q_LEN]
-        kv_noise_ids = kv_noise_ids.unsqueeze(0).expand(B, -1)  # [B, Q_LEN]
 
         # 创建mask
         mask = torch.zeros(B, 1, Q_LEN, KV_LEN, dtype=torch.bool, device=device)
@@ -284,14 +278,13 @@ class OnlineFlashMTPModel(nn.Module):
         for b in range(B):
             for q_idx in range(Q_LEN):
                 q_block = q_idx // self.block_size
-                anchor_pos = anchor_positions[b, q_block].item()
 
-                # 可以attend到自己的context token
-                if 0 <= anchor_pos < seq_len:
-                    mask[b, 0, q_idx, anchor_pos] = True
+                # 可以attend到对应的context token
+                if q_block < target_hidden_len:
+                    mask[b, 0, q_idx, q_block] = True
 
                 # 可以attend到同块的noise token（双向）
-                kv_start = seq_len + q_block * self.block_size
+                kv_start = target_hidden_len + q_block * self.block_size
                 kv_end = kv_start + self.block_size
                 mask[b, 0, q_idx, kv_start:kv_end] = True
 
@@ -366,13 +359,14 @@ class OnlineFlashMTPModel(nn.Module):
             target_hidden = torch.cat(target_hidden_list, dim=1)  # dim=1 序列维度
 
         # 创建attention mask
+        target_hidden_len = target_hidden.shape[1]  # n_blocks
         if self.attention_backend == "flex_attention" and FLEX_ATTENTION_AVAILABLE:
             attention_mask = self._create_dflash_block_mask(
-                anchor_positions, block_keep_mask, seq_len, device
+                anchor_positions, block_keep_mask, target_hidden_len, device
             )
         else:
             attention_mask = self._create_standard_block_mask(
-                anchor_positions, block_keep_mask, seq_len, device
+                anchor_positions, block_keep_mask, target_hidden_len, device
             )
 
         # 小模型前向
