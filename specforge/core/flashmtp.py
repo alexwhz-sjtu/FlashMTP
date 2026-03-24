@@ -341,8 +341,17 @@ class OnlineFlashMTPModel(nn.Module):
         )
 
         # 创建position ids
-        position_ids = self._create_position_ids(anchor_positions)
-
+        # if seq, we don't include ctx in position ids
+        if self.concat_mode == "seq":
+            position_ids = self._create_position_ids(anchor_positions)
+        # if feature, we count ctx as 1 position
+        else: 
+            # anchor_positions: [bsz, n_blocks]
+            bsz, n_blocks = anchor_positions.shape
+            ctx_positions = (anchor_positions - 1).unsqueeze(-1)  # [bsz, n_blocks, 1]
+            block_positions = self._create_position_ids(anchor_positions).view(bsz, n_blocks, self.block_size)  # [bsz, n_blocks, block_size]
+            position_ids = torch.cat([ctx_positions, block_positions], dim=-1).view(bsz, -1)  # [bsz, n_blocks*(block_size+1)]
+        
         # 提取target_hidden（每个anchor位置对应的hidden state）
         n_blocks = anchor_positions.shape[1]
 
@@ -372,14 +381,30 @@ class OnlineFlashMTPModel(nn.Module):
             for n in range(n_blocks):
                 if block_keep_mask[b, n]:
                     pos = anchor_positions[b, n].item()
+                    # 获取 anchor 前一个位置的 hidden state (hs_{t-1})
+                    ctx_pos = pos - 1
 
                     if self.concat_mode == "seq":
-                        layer_positions = (
-                            torch.arange(self.num_target_layers, device=device) * seq_len + pos
-                        )
-                        block_hidden_list.append(hidden_states[b, layer_positions, :])
+                        if ctx_pos >= 0:
+                            layer_positions = (
+                                torch.arange(self.num_target_layers, device=device) * seq_len + ctx_pos
+                            )
+                            block_hidden_list.append(hidden_states[b, layer_positions, :])
+                        else:
+                            # anchor 在位置 0，用零填充
+                            block_hidden_list.append(torch.zeros(
+                                self.num_target_layers, hidden_states.shape[-1],
+                                dtype=hidden_states.dtype, device=device
+                            ))
                     else:
-                        block_hidden_list.append(hidden_states[b, pos:pos+1, :])
+                        if ctx_pos >= 0:
+                            block_hidden_list.append(hidden_states[b, ctx_pos:ctx_pos+1, :])
+                        else:
+                            # anchor 在位置 0，用零填充
+                            block_hidden_list.append(torch.zeros(
+                                1, hidden_states.shape[-1],
+                                dtype=hidden_states.dtype, device=device
+                            ))
                 else:
                     # 无效块用零填充
                     if self.concat_mode == "seq":
@@ -415,6 +440,7 @@ class OnlineFlashMTPModel(nn.Module):
             noise_embedding=noise_embedding,
             target_hidden=target_hidden,
             attention_mask=attention_mask,
+            concat_mode=self.concat_mode
         )
 
         # 通过lm_head得到logits

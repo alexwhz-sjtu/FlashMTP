@@ -119,6 +119,7 @@ class FlashMTPAttention(nn.Module):
         target_hidden: torch.Tensor,      # [bsz, ctx_len, hidden_size] - 前缀，无位置编码
         position_embeddings: tuple[torch.Tensor, torch.Tensor],  # RoPE
         attention_mask: Optional[torch.Tensor] = None,
+        concat_mode: Optional[str] = "feature",
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -153,15 +154,20 @@ class FlashMTPAttention(nn.Module):
         k = self.k_norm(k).transpose(1, 2)  # [bsz, num_kv_heads, ctx_len + q_len, head_dim]
         v = v.transpose(1, 2)  # [bsz, num_kv_heads, ctx_len + q_len, head_dim]
 
-        # 应用RoPE到q和k_noise部分（k_ctx部分已经是处理过的，不需要RoPE）
+        # 应用RoPE到q和k部分
         cos, sin = position_embeddings
 
-        # 只对q和k的noise部分应用RoPE
-        # k[:, :, ctx_len:, :] 是noise部分
-        q, k_noise_rope = apply_rotary_pos_emb(q, k[:, :, ctx_len:, :], cos, sin)
-
-        # 重新组合k：ctx部分（无RoPE）+ noise部分（有RoPE）
-        k = torch.cat([k[:, :, :ctx_len, :], k_noise_rope], dim=2)
+        # print(f"FlashMTPAttention Layer {self.layer_idx}: q shape {q.shape}, k shape {k.shape}, ctx_len {ctx_len}, q_len {q_len}")
+        # print(f"ctx_len: {ctx_len}, q_len: {q_len}, position_embeddings cos shape: {cos.shape}, sin shape: {sin.shape}")
+        if concat_mode == "feature":
+            # ctx_len == 1：对整个k应用RoPE（ctx部分也有位置编码）
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        else:
+            # ctx_len > 1：只对q和k的noise部分应用RoPE
+            # k[:, :, ctx_len:, :] 是noise部分
+            q, k_noise_rope = apply_rotary_pos_emb(q, k[:, :, ctx_len:, :], cos, sin)
+            # 重新组合k：ctx部分（无RoPE）+ noise部分（有RoPE）
+            k = torch.cat([k[:, :, :ctx_len, :], k_noise_rope], dim=2)
 
         # Attention计算
         attn_fn: Callable = eager_attention_forward
@@ -203,6 +209,7 @@ class FlashMTPDecoderLayer(GradientCheckpointingLayer):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        concat_mode: Optional[str] = "feature",
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.FloatTensor:
         """
@@ -224,6 +231,7 @@ class FlashMTPDecoderLayer(GradientCheckpointingLayer):
             target_hidden=target_hidden,
             attention_mask=attention_mask,
             position_embeddings=position_embeddings,
+            concat_mode=concat_mode,
             **kwargs,
         )[0]
         hidden_states = residual + hidden_states
@@ -295,6 +303,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         noise_embedding: Optional[torch.Tensor] = None,
         target_hidden: Optional[torch.Tensor] = None,
+        concat_mode: Optional[str] = "feature",
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -315,7 +324,17 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         # target_hidden: [bsz, ctx_len, hidden_size]
 
         # 获取位置编码
-        position_embeddings = self.rotary_emb(noise_embedding, position_ids)
+        # ctx_len = target_hidden.shape[1]
+        ctx_len = target_hidden.shape[1] if target_hidden is not None else 0
+        if concat_mode == "feature":
+            # ctx 也加 RoPE，拼接到 noise_embedding 前面
+            # 需要 target_hidden 和 noise_embedding shape: [bsz, 1, hidden_size], [bsz, block_size, hidden_size]
+            full_embedding = torch.cat([target_hidden, noise_embedding], dim=1)  # [bsz, 1+block_size, hidden_size]
+            # position_ids 也拼接 ctx 的位置id（假设为 position_ids[:, :1]）
+            position_embeddings = self.rotary_emb(full_embedding, position_ids)
+        else:
+            # 只对 noise_embedding 加 RoPE
+            position_embeddings = self.rotary_emb(noise_embedding, position_ids)
 
         # 通过解码器层
         hidden_states = noise_embedding
@@ -326,6 +345,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 position_embeddings=position_embeddings,
+                concat_mode=concat_mode,
                 **kwargs,
             )
 
