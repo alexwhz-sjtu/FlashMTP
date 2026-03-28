@@ -523,7 +523,7 @@ def main():
                         attention_mask=attention_mask,
                         loss_mask=loss_mask,
                     )
-                    hidden_states = flashmtp_output.hidden_states
+                    hidden_states = flashmtp_output.hidden_states # all hidden states from target model, list of tensors
 
             loss, accuracy = flashmtp_model(
                 input_ids=input_ids,

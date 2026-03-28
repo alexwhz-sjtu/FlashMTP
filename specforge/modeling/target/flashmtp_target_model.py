@@ -96,7 +96,7 @@ class HFFlashMTPTargetModel(FlashMTPTargetModel):
             output_hidden_states=True,
             use_cache=False,
         )
-        hidden_states = outputs.hidden_states[-1]
+        hidden_states = outputs.hidden_states
         return FlashMTPTargetOutput(
             hidden_states=hidden_states,
             input_ids=input_ids,

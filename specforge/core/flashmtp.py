@@ -349,14 +349,10 @@ class OnlineFlashMTPModel(nn.Module):
                     ))
 
         # 拼接target_hidden
-        if self.concat_mode == "feature":
-            # 特征维度拼接（最后一个维度）：[bsz, 1, n_blocks * feature_dim]
-            # 适用于多个anchor位置的hidden states在特征维度拼接
-            target_hidden = torch.cat(target_hidden_list, dim=-1)  # dim=-1 特征维度
-        else:
-            # 序列维度拼接（默认）：[bsz, n_blocks, feature_dim]
-            # 每个块一个独立的context token
-            target_hidden = torch.cat(target_hidden_list, dim=1)  # dim=1 序列维度
+        # 注意：两种模式都在序列维度(dim=1)拼接，保持n_blocks个独立的ctx
+        # - feature模式: [bsz, n_blocks, feature_dim]，后续通过fc投影到hidden_size
+        # - seq模式: [bsz, n_blocks, hidden_size]，直接作为K/V输入
+        target_hidden = torch.cat(target_hidden_list, dim=1)  # [bsz, n_blocks, feature_dim]
 
         # 创建attention mask
         target_hidden_len = target_hidden.shape[1]  # n_blocks

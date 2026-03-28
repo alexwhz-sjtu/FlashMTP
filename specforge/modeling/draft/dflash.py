@@ -95,6 +95,7 @@ class Qwen3DFlashAttention(nn.Module):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden.shape[1]
+
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
@@ -102,16 +103,17 @@ class Qwen3DFlashAttention(nn.Module):
         k_noise = self.k_proj(hidden_states)
         v_ctx = self.v_proj(target_hidden)
         v_noise = self.v_proj(hidden_states)
-        k = torch.cat([k_ctx, k_noise], dim=1).view(
-            bsz, ctx_len + q_len, -1, self.head_dim
-        )
-        v = torch.cat([v_ctx, v_noise], dim=1).view(
-            bsz, ctx_len + q_len, -1, self.head_dim
-        )
+
+        k = torch.cat([k_ctx, k_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
+        v = torch.cat([v_ctx, v_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
+
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
+
         cos, sin = position_embeddings
+        
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)

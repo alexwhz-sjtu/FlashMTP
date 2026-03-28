@@ -153,15 +153,18 @@ class FlashMTPAttention(nn.Module):
         k = self.k_norm(k).transpose(1, 2)  # [bsz, num_kv_heads, ctx_len + q_len, head_dim]
         v = v.transpose(1, 2)  # [bsz, num_kv_heads, ctx_len + q_len, head_dim]
 
-        # 应用RoPE到q和k_noise部分（k_ctx部分已经是处理过的，不需要RoPE）
+        # 应用RoPE到q和k
         cos, sin = position_embeddings
 
-        # 只对q和k的noise部分应用RoPE
-        # k[:, :, ctx_len:, :] 是noise部分
-        q, k_noise_rope = apply_rotary_pos_emb(q, k[:, :, ctx_len:, :], cos, sin)
-
-        # 重新组合k：ctx部分（无RoPE）+ noise部分（有RoPE）
-        k = torch.cat([k[:, :, :ctx_len, :], k_noise_rope], dim=2)
+        if ctx_len == 1:
+            # 如果ctx_len==1，对全部k应用RoPE
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        else:
+            # 如果ctx_len>1，只对k的noise部分应用RoPE
+            # k[:, :, ctx_len:, :] 是noise部分
+            q, k_noise_rope = apply_rotary_pos_emb(q, k[:, :, ctx_len:, :], cos, sin)
+            # 重新组合k：ctx部分（无RoPE）+ noise部分（有RoPE）
+            k = torch.cat([k[:, :, :ctx_len, :], k_noise_rope], dim=2)
 
         # Attention计算
         attn_fn: Callable = eager_attention_forward
