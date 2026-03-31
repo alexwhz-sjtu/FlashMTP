@@ -100,11 +100,13 @@ class Qwen3FlashMTPAttention(nn.Module):
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
-        k_ctx = self.k_proj(target_hidden)
+        k_ctx = self.k_proj(target_hidden) # (B, N*L, H)  
 
-        k_noise = self.k_proj(hidden_states)
+        k_noise = self.k_proj(hidden_states)  # (B, N*S, H) 
         v_ctx = self.v_proj(target_hidden)
         v_noise = self.v_proj(hidden_states)
+
+        if self.chs
 
         k = torch.cat([k_ctx, k_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
         v = torch.cat([v_ctx, v_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
@@ -223,12 +225,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
-        self.fc = nn.Linear(
-            len(self.target_layer_ids) * config.hidden_size,
-            config.hidden_size,
-            bias=False,
-        )
-        self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
         self.chs_concat_mode = flashmtp_config.get("chs_concat_mode", "seq")
@@ -244,7 +240,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.fc = nn.Identity()
-            self.hidden_norm = nn.Identity()
+            # self.hidden_norm = nn.Identity()
+            # maybe need norm
+            self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         print_on_rank0(f"self.chs_concat_mode: {self.chs_concat_mode}")
 
         self.post_init()
