@@ -82,8 +82,9 @@ python scripts/regenerate_train_data.py \
     --concurrency 64 \
     --server-address localhost:30001 localhost:30002 localhost:30003 localhost:30004 localhost:30005 localhost:30006 localhost:30007 localhost:30008 \
     --temperature 0.0 \
-    --input-file-path ./cache/data/sampled_ori/nemotron_test.jsonl \
-    --max-tokens 200 \
+    --input-file-path ./cache/data/sampled_ori/nemotron_400000.jsonl \
+    --max-tokens 32768 \
+    --resume \
     --enable-thinking \
     --output-file-path ./cache/data/regen_data/nemotron_test/nemotron_think_on_samples_test_qwen3_8b_regen.jsonl
 
