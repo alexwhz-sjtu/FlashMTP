@@ -309,9 +309,9 @@ class OnlineFlashMTPModel(nn.Module):
             hidden_states, anchor_positions, self.draft_model.target_layer_ids,
             self.chs_concat_mode)
 
-        print(f"target_hidden shape after prepare: {target_hidden.shape}")
-        print(f"full_position_ids shape: {full_position_ids.shape}")
-        print(f"noise_embedding shape: {noise_embedding.shape}")
+        # print(f"target_hidden shape after prepare: {target_hidden.shape}")
+        # print(f"full_position_ids shape: {full_position_ids.shape}")
+        # print(f"noise_embedding shape: {noise_embedding.shape}")
 
         output_hidden = self.draft_model(
             position_ids=full_position_ids,

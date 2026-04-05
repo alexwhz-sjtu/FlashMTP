@@ -199,3 +199,5 @@ wandb/
 
 # macOS
 .DS_Store
+
+log.txt

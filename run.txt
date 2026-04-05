@@ -13,67 +13,67 @@ launch server:
 
 source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=0 python3 -m sglang.launch_server \
-    --model /share/public/public_models/Qwen3-8B \
+    --model ../models/Qwen/Qwen3.5-9B \
     --cuda-graph-bs 1 2 4 8 16 32 64 128 \
     --dtype bfloat16 \
     --mem-frac=0.8 \
-    --port 30001
+    --port 30011
 
 source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=1 python3 -m sglang.launch_server \
-    --model ../models/Qwen/Qwen3-8B \
+    --model ../models/Qwen/Qwen3.5-9B \
     --cuda-graph-bs 1 2 4 8 16 32 64 128 \
     --dtype bfloat16 \
     --mem-frac=0.8 \
-    --port 30002
+    --port 30012
 
 source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=2 python3 -m sglang.launch_server \
-    --model ../models/Qwen/Qwen3-8B \
+    --model ../models/Qwen/Qwen3.5-9B \
     --cuda-graph-bs 1 2 4 8 16 32 64 128 \
     --dtype bfloat16 \
     --mem-frac=0.8 \
-    --port 30003
+    --port 30013
 
 source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=3 python3 -m sglang.launch_server \
-    --model ../models/Qwen/Qwen3-8B \
+    --model ../models/Qwen/Qwen3.5-9B \
     --cuda-graph-bs 1 2 4 8 16 32 64 128 \
     --dtype bfloat16 \
     --mem-frac=0.8 \
-    --port 30004
+    --port 30014
 
 source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=4 python3 -m sglang.launch_server \
-    --model ../models/Qwen/Qwen3-8B \
+    --model ../models/Qwen/Qwen3.5-9B \
     --cuda-graph-bs 1 2 4 8 16 32 64 128 \
     --dtype bfloat16 \
     --mem-frac=0.8 \
-    --port 30005
+    --port 30015
 
 source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=5 python3 -m sglang.launch_server \
-    --model ../models/Qwen/Qwen3-8B \
+    --model ../models/Qwen/Qwen3.5-9B \
     --cuda-graph-bs 1 2 4 8 16 32 64 128 \
     --dtype bfloat16 \
     --mem-frac=0.8 \
-    --port 30006
+    --port 30016
 
 source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=6 python3 -m sglang.launch_server \
-    --model ../models/Qwen/Qwen3-8B \
+    --model ../models/Qwen/Qwen3.5-9B \
     --cuda-graph-bs 1 2 4 8 16 32 64 128 \
     --dtype bfloat16 \
     --mem-frac=0.8 \
-    --port 30007
+    --port 30017
 
 source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server \
-    --model ../models/Qwen/Qwen3-8B \
+    --model ../models/Qwen/Qwen3.5-9B \
     --cuda-graph-bs 1 2 4 8 16 32 64 128 \
     --dtype bfloat16 \
     --mem-frac=0.8 \
-    --port 30008
+    --port 30018
 
 ---------------------------------------
 
@@ -86,7 +86,16 @@ python scripts/regenerate_train_data.py \
     --max-tokens 32768 \
     --resume \
     --enable-thinking \
-    --output-file-path ./cache/data/regen_data/nemotron_test/nemotron_think_on_samples_test_qwen3_8b_regen.jsonl
+    --output-file-path ./cache/data/regen_data/nemotron_test/nemotron_think_on_samples_test_qwen3_8b_regen.jsonl\
+
+python scripts/regenerate_train_data.py \
+    --model ../models/Qwen/Qwen3.5-9B \
+    --concurrency 64 \
+    --server-address localhost:30011 localhost:30012 localhost:30013 localhost:30014 localhost:30015 localhost:30016 localhost:30017 localhost:30018 \
+    --temperature 0.0 \
+    --input-file-path ./cache/data/sampled_ori/nemotron_40000.jsonl \
+    --max-tokens 24000 \
+    --output-file-path ./cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3.5_9b_regen.jsonl
 
 python scripts/regenerate_train_data.py \
     --model /share/public/public_models/Qwen3-8B \
@@ -100,11 +109,11 @@ python scripts/regenerate_train_data.py \
 
 
 python scripts/regenerate_train_data.py \
-    --model ../models/Qwen/Qwen3-8B \
+    --model ../models/Qwen/Qwen3.5-9B \
     --concurrency 64 \
     --server-address localhost:30001 \
     --temperature 0.0 \
     --input-file-path ./cache/data/sampled_ori/nemotron_4000.jsonl \
-    --max-tokens 200 \
+    --max-tokens 24000 \
     --enable-thinking \
-    --output-file-path ./cache/data/regen_data/nemotron_test/nemotron_think_on_samples_test_qwen3_8b_regen.jsonl
+    --output-file-path ./cache/data/regen_data/nemotron_test/nemotron_think_on_samples_test_qwen3.5_9b_regen.jsonl

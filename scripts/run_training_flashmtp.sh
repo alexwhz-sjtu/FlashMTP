@@ -29,7 +29,7 @@ CKPT_DIR="${CKPT_DIR:-}"
 # 主要数据集参数
 # ========================================
 # 数据特征参数
-DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}"
+DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-400000}"
 ENABLE_THINKING="${ENABLE_THINKING:-on}"
 
 # ========================================
@@ -53,7 +53,9 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
 # 数据目录
-TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_400000_len_4096/nemotron_think_400000_train_regen.jsonl}"
+
+# TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}}"
 CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
@@ -74,7 +76,7 @@ REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_40000}"   # 离线子目录名称 (如: my_run_001，生成 offline-run-my_run_001)
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}}"   # 离线子目录名称 (如: my_run_001，生成 offline-run-my_run_001)
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}"

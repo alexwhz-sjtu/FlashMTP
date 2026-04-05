@@ -43,7 +43,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 class Qwen3FlashMTPAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+    def __init__(self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -83,6 +83,8 @@ class Qwen3FlashMTPAttention(nn.Module):
             if config.layer_types[layer_idx] == "sliding_attention"
             else None
         )
+        
+        self.chs_concat_mode = chs_concat_mode
 
     def forward(
         self,
@@ -106,8 +108,6 @@ class Qwen3FlashMTPAttention(nn.Module):
         v_ctx = self.v_proj(target_hidden)
         v_noise = self.v_proj(hidden_states)
 
-        if self.chs
-
         k = torch.cat([k_ctx, k_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
         v = torch.cat([v_ctx, v_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
 
@@ -116,7 +116,14 @@ class Qwen3FlashMTPAttention(nn.Module):
 
         cos, sin = position_embeddings
         
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        # if seq, only pose position_embed on k_noise
+        if self.chs_concat_mode == "seq":
+            k_ctx_part = k[:, :, :ctx_len, :]  
+            k_noise_part = k[:, :, ctx_len:, :]   
+            q, k_noise_part = apply_rotary_pos_emb(q, k_noise_part, cos, sin)
+            k = torch.cat([k_ctx_part, k_noise_part], dim=2)
+        else:
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -142,10 +149,10 @@ class Qwen3FlashMTPAttention(nn.Module):
 
 
 class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+    def __init__(self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = Qwen3FlashMTPAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = Qwen3FlashMTPAttention(config=config, layer_idx=layer_idx, chs_concat_mode=chs_concat_mode)
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(
@@ -211,13 +218,14 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
     def __init__(self, config) -> None:
         super().__init__(config)
         self.config = config
+        flashmtp_config = getattr(config, "flashmtp_config", {}) or {}
+        self.chs_concat_mode = flashmtp_config.get("chs_concat_mode", "seq")
         self.layers = nn.ModuleList(
             [
-                Qwen3FlashMTPDecoderLayer(config, layer_idx)
+                Qwen3FlashMTPDecoderLayer(config, layer_idx, self.chs_concat_mode)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        flashmtp_config = getattr(config, "flashmtp_config", {}) or {}
         # target_layer_ids: list of layer indices to extract from target model
         self.target_layer_ids = flashmtp_config.get(
             "target_layer_ids",
@@ -227,7 +235,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
-        self.chs_concat_mode = flashmtp_config.get("chs_concat_mode", "seq")
 
         # For seq concat mode: use Identity (no computation, no parameters)
         # For feature mode: use Linear projection and RMSNorm
@@ -260,6 +267,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
+        # position_embeddings = self.rotary_emb(torch.cat([target_hidden, hidden_states], dim=1), position_ids)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
             hidden_states = layer(

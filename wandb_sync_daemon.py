@@ -15,7 +15,7 @@ from pathlib import Path
 
 # ==================== 配置区域 ====================
 # wandb 离线日志目录
-WANDB_DIR = "/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/wandb/offline-run-20260330_093013-y36m03gw"
+WANDB_DIR = "/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/wandb/offline-run-20260402_171351-0gq1e0ja"
 
 # wandb project 名称
 WANDB_PROJECT = "flashmtp_training"
@@ -24,10 +24,10 @@ WANDB_PROJECT = "flashmtp_training"
 SYNC_INTERVAL = 5 * 60  # 5 分钟
 
 # 日志文件路径
-LOG_FILE = "./wandb_sync.log"
+LOG_FILE = "./wandb_sync_2.log"
 
 # 锁文件路径（防止重复执行）
-LOCK_FILE = "./wandb_sync.lock"
+LOCK_FILE = "./wandb_sync_2.lock"
 # ================================================
 
 
