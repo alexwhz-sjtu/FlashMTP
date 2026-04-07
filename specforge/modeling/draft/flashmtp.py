@@ -107,10 +107,10 @@ class Qwen3FlashMTPAttention(nn.Module):
         v = self.v_proj(hidden_states)                                                                                                                                                                                                                                    
                                                                                                                                                                                                                                                                     
         # reshape                                                                                                                                                                                                                                                    
-        q = q.view(bsz, ctx_len + q_len, -1, self.head_dim)
+        q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)                                                                                                                                                                                                                           
-        k = k.view(bsz, ctx_len + q_len, -1, self.head_dim)                                                                                                                                                                                                          
-        v = v.view(bsz, ctx_len + q_len, -1, self.head_dim)   
+        k = k.view(bsz, q_len, -1, self.head_dim)                                                                                                                                                                                                          
+        v = v.view(bsz, q_len, -1, self.head_dim)   
 
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
@@ -268,9 +268,10 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         
         hidden_states = noise_embedding
         bsz, noise_len, _ = hidden_states.shape
-        # maybe we don't need to do norm for target hidden only, move it to layernorm
+        # maybe we don't need to do norm for target hidden exclusively, move it to layernorm
         # target_hidden = self.hidden_norm(self.fc(target_hidden))
-        target_hidden = self.hidden_norm(target_hidden)
+        print(target_hidden.shape)
+        target_hidden = self.fc(target_hidden)
         # position_embeddings = self.rotary_emb(torch.cat([target_hidden, hidden_states], dim=1), position_ids)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         # the whole serves as qkv
