@@ -270,12 +270,11 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         bsz, noise_len, _ = hidden_states.shape
         # maybe we don't need to do norm for target hidden exclusively, move it to layernorm
         # target_hidden = self.hidden_norm(self.fc(target_hidden))
-        print(target_hidden.shape)
+        print(f"Draft forward:{target_hidden.shape}")
         target_hidden = self.fc(target_hidden)
-        # position_embeddings = self.rotary_emb(torch.cat([target_hidden, hidden_states], dim=1), position_ids)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         # the whole serves as qkv
-        hidden_states = torch.cat([target_hidden, hidden_states], dim=1)  # (B, ctx_len+q_len, H)
+        hidden_states = torch.cat([target_hidden, hidden_states], dim=1)  # (B, ctx_len+noise_len, H)
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
