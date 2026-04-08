@@ -283,7 +283,7 @@ class HFFlashMTPTargetModel(FlashMTPTargetModel):
 
         # hidden_states[0] = embedding output; hidden_states[i+1] = layer i output
         # Take all layers except embedding (index 0) and concat in feature dim
-        hidden_states = outputs.hidden_states[1:]
+        hidden_states = outputs.hidden_states
 
         return FlashMTPTargetOutput(
             hidden_states=hidden_states,
