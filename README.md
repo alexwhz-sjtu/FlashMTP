@@ -14,10 +14,11 @@ Like DFlash. But we use all bonus hidden states of all layers. Cuz when generati
 
 ## v1.1 Improved condition injection
 
-To improve model expression and condition info, we input the whole concat seq into the model as Q. Therefore, every layer can
+* To improve model expression and condition info, we input the whole concat seq into the model as Q. Therefore, the prefix can be processed across layers and every layer can have different prefix.
+* We buiding the prefix hidden states, we include the initial embedding to let the model know the begining point.
+*
 
 <img src="assets/v1.1.png" alt="v1.1 structure" width="400"/>
-
 
 ## v2: Improved structure
 

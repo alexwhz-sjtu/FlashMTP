@@ -204,7 +204,8 @@ def extract_context_feature(
     layer_ids: Optional[list[int]],
 ) -> torch.Tensor:
     """Extract hidden states from specified layer IDs. """
-    offset = 1
+    # we include the initial embedding
+    offset = 0
     selected_states = []
     for layer_id in layer_ids:
         selected_states.append(hidden_states[layer_id + offset])
@@ -240,17 +241,22 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         # For seq concat mode: use Identity (no computation, no parameters)
         # For feature mode: use Linear projection and RMSNorm
         if self.chs_concat_mode == "feature":
+            print(config.num_target_layers)
             self.fc = nn.Linear(
                 len(self.target_layer_ids) * config.hidden_size,
                 config.hidden_size,
                 bias=False,
             )
-            self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            # self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
-            self.fc = nn.Identity()
-            # self.hidden_norm = nn.Identity()
+            # self.fc = nn.Identity()
+            self.fc = nn.Linear(
+                config.hidden_size,
+                config.hidden_size,
+                bias=False,
+            )
             # maybe need norm
-            self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            # self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         print_on_rank0(f"self.chs_concat_mode: {self.chs_concat_mode}")
 
         self.post_init()

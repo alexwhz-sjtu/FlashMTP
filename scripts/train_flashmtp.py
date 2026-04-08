@@ -166,7 +166,7 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         draft_config = AutoConfig.from_pretrained(args.target_model_path)
         draft_config.num_hidden_layers = args.num_draft_layers
         draft_config.block_size = args.block_size
-        draft_config.num_target_layers = target_config.num_hidden_layers
+        draft_config.num_target_layers = target_config.num_hidden_layers+1 # include the initial embedding
         print_on_rank0("Auto-generated draft config from target model")
 
     if not hasattr(draft_config, "flashmtp_config") or draft_config.flashmtp_config is None:
