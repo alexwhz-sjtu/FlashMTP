@@ -100,22 +100,20 @@ def create_flashmtp_block_mask(
         total_chs_len = N * chs_len_per_block
 
         # Determine which block group q_idx belongs to
-        if q_idx < total_chs_len:
-            # q_idx is in CHS region
-            q_block_id = q_idx // chs_len_per_block
-            q_in_chs = True
-        else:
-            # q_idx is in Block region
-            q_block_id = (q_idx - total_chs_len) // block_size
-            q_in_chs = False
+        # Use torch.where instead of if-else for vmap compatibility
+        q_in_chs = q_idx < total_chs_len
+
+        # For CHS region: block_id = q_idx // chs_len_per_block
+        q_block_id_chs = q_idx // chs_len_per_block
+        # For Block region: block_id = (q_idx - total_chs_len) // block_size
+        q_block_id_blk = (q_idx - total_chs_len) // block_size
+        q_block_id = torch.where(q_in_chs, q_block_id_chs, q_block_id_blk)
 
         # Determine which block group kv_idx belongs to
-        if kv_idx < total_chs_len:
-            # kv_idx is in CHS region
-            kv_block_id = kv_idx // chs_len_per_block
-        else:
-            # kv_idx is in Block region
-            kv_block_id = (kv_idx - total_chs_len) // block_size
+        kv_in_chs = kv_idx < total_chs_len
+        kv_block_id_chs = kv_idx // chs_len_per_block
+        kv_block_id_blk = (kv_idx - total_chs_len) // block_size
+        kv_block_id = torch.where(kv_in_chs, kv_block_id_chs, kv_block_id_blk)
 
         # Same block group can see each other (bidirectional within group)
         same_group = q_block_id == kv_block_id
