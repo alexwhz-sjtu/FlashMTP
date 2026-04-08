@@ -38,8 +38,6 @@ def prepare_target_hidden(
     """
     # 获取位置 p-1 的 hidden states (用来预测位置 p)
     context_positions = (anchor_positions - 1).clamp(min=0)  # (B, N)
-    print(context_positions.shape)
-    print(hidden_states[1].shape)
 
     # 提取 anchor positions 对应的 hidden states
     # hidden_states[layer] shape: (B, seq_len, H)

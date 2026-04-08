@@ -10,9 +10,13 @@ We propose FlashMTP, which utilize the last hidden states (limited context) and 
 
 Like DFlash. But we use all bonus hidden states of all layers. Cuz when generating the hidden states, all layer focus on different part of context as the attention patern of every head across layers differ a lot. We concat them along feature dim (seq dim fails) and use it as condition. Then we concat bonus clean token and several mask(noise) and forward only once. Noise block serves as Q, concat sequence serves as kv.  Every layer's kv is the same.
 
+![basestructure](assets/base_structure.png)
+
 ## v1.1 Improved condition injection
 
-To improve model expression and condition info, we input the whole concat seq into the model as Q. Therefore, every layer can 
+To improve model expression and condition info, we input the whole concat seq into the model as Q. Therefore, every layer can
+
+<img src="assets/v1.1.png" alt="v1.1 structure" width="400"/>
 
 
 ## v2: Improved structure
