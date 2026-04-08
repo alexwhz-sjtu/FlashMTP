@@ -61,6 +61,7 @@ def prepare_target_hidden(
         # 按特征维度拼接: (B, N, H*L)
         return torch.cat(selected_states, dim=-1)  # (B, N, H*L)
 
+
 def create_flashmtp_block_mask(
     anchor_positions: torch.Tensor,
     block_keep_mask: torch.Tensor,
@@ -80,10 +81,10 @@ def create_flashmtp_block_mask(
         device: torch device
 
     Layout:
-        KV: [CHS_0 | CHS_1 | ... | CHS_{N-1} | Block_0 | Block_1 | ... | Block_{N-1}]
+        QKV: [CHS_0 | CHS_1 | ... | CHS_{N-1} | Block_0 | Block_1 | ... | Block_{N-1}]
             - Each CHS_i has length chs_len_per_block
             - Each Block_i has length block_size
-        Q:  [Block_0 | Block_1 | ... | Block_{N-1}]
+            - [CHS_i:Block_i] serves as Q
 
     Rules:
       1. Block_i only sees CHS_i (its own context).
@@ -95,35 +96,46 @@ def create_flashmtp_block_mask(
     """
 
     def flashmtp_mask_mod(b, h, q_idx, kv_idx):
-        q_block_id = q_idx // block_size
-
         # Total length of all CHS segments
         total_chs_len = N * chs_len_per_block
 
-        # Check if kv_idx falls within the CHS region
-        is_context = kv_idx < total_chs_len
-        # Which CHS segment this kv belongs to
-        chs_block_id = kv_idx // chs_len_per_block
-        # Block i only attends to CHS i (all CHS tokens are needed)
-        mask_context = is_context & (chs_block_id == q_block_id)
+        # Determine which block group q_idx belongs to
+        if q_idx < total_chs_len:
+            # q_idx is in CHS region
+            q_block_id = q_idx // chs_len_per_block
+            q_in_chs = True
+        else:
+            # q_idx is in Block region
+            q_block_id = (q_idx - total_chs_len) // block_size
+            q_in_chs = False
 
-        # Check if kv_idx falls within the draft block region
-        is_draft = kv_idx >= total_chs_len
-        # Which block this draft kv belongs to
-        kv_block_id = (kv_idx - total_chs_len) // block_size
-        # Block i only attends to Block i (bidirectional)
-        mask_draft = is_draft & (kv_block_id == q_block_id)
+        # Determine which block group kv_idx belongs to
+        if kv_idx < total_chs_len:
+            # kv_idx is in CHS region
+            kv_block_id = kv_idx // chs_len_per_block
+        else:
+            # kv_idx is in Block region
+            kv_block_id = (kv_idx - total_chs_len) // block_size
 
-        is_valid_block = block_keep_mask[b, q_block_id]
-        return (mask_context | mask_draft) & is_valid_block
+        # Same block group can see each other (bidirectional within group)
+        same_group = q_block_id == kv_block_id
+
+        # Valid if: same group AND (q in CHS OR block is valid)
+        # CHS queries are always valid, Block queries only valid if block_keep_mask is True
+        is_valid = q_in_chs | block_keep_mask[b, q_block_id]
+
+        return same_group & is_valid
 
     B, N = anchor_positions.shape
     Q_LEN = N * chs_len_per_block + N * block_size
     KV_LEN = N * chs_len_per_block + N * block_size
 
-    return create_block_mask(
-        flashmtp_mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device
-    )
+    return create_block_mask(flashmtp_mask_mod,
+                             B=B,
+                             H=None,
+                             Q_LEN=Q_LEN,
+                             KV_LEN=KV_LEN,
+                             device=device)
 
 
 class OnlineFlashMTPModel(nn.Module):
