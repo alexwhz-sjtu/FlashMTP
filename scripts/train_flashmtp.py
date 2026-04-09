@@ -80,6 +80,14 @@ def parse_args():
         help="Gamma for exponential loss decay weighting (paper Eq.4). "
         "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
     )
+    model_group.add_argument(
+        "--kvcache-window-size",
+        type=int,
+        default=0,
+        help="Window size for KVCache visibility. If 0 (default), blocks can see all KVCache. "
+        "Otherwise, Block_i can only see the most recent W KVCache entries (sliding window). "
+        "This controls how much context each block can attend to during training.",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -87,7 +95,6 @@ def parse_args():
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
-    dataset_group.add_argument("--chs-concat-mode", type=str, default="feature")
     dataset_group.add_argument(
         "--build-dataset-num-proc",
         type=int,
@@ -171,8 +178,6 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
 
     if not hasattr(draft_config, "flashmtp_config") or draft_config.flashmtp_config is None:
         draft_config.flashmtp_config = {}
-        
-    draft_config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
@@ -397,8 +402,7 @@ def main():
 
 
     draft_model.mask_token_id = mask_token_id
-    
-    draft_model.config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
+
     draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
     draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
@@ -427,7 +431,7 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
-        chs_concat_mode=args.chs_concat_mode,
+        kvcache_window_size=args.kvcache_window_size,
     )
 
     flashmtp_model = FSDP(

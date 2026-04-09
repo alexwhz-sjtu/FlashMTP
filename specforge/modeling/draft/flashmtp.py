@@ -43,7 +43,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 class Qwen3FlashMTPAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str):
+    def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -83,52 +83,34 @@ class Qwen3FlashMTPAttention(nn.Module):
             if config.layer_types[layer_idx] == "sliding_attention"
             else None
         )
-        
-        self.chs_concat_mode = chs_concat_mode
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        target_hidden: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        bsz, q_len = hidden_states.shape[:-1]
-        ctx_len = target_hidden.shape[1]
+        bsz, q_len, _ = hidden_states.shape
 
-        # whole seq serves as Q, input is alreadt concat seq                                                                                                                                                                                                                                                                                                                                                                                                           
-                                                                                                                                                                                                                                                    
-        # 统一投影
-        q = self.q_proj(hidden_states)  # Q 现在包含 target_hidden 部分                                                                                                                                                                                                   
-        k = self.k_proj(hidden_states)                                                                                                                                                                                                                                    
-        v = self.v_proj(hidden_states)                                                                                                                                                                                                                                    
-                                                                                                                                                                                                                                                                    
-        # reshape                                                                                                                                                                                                                                                    
+        # Project and reshape
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+
         q = q.view(bsz, q_len, -1, self.head_dim)
-        q = self.q_norm(q).transpose(1, 2)                                                                                                                                                                                                                           
-        k = k.view(bsz, q_len, -1, self.head_dim)                                                                                                                                                                                                          
-        v = v.view(bsz, q_len, -1, self.head_dim)   
+        q = self.q_norm(q).transpose(1, 2)
+        k = k.view(bsz, q_len, -1, self.head_dim)
+        v = v.view(bsz, q_len, -1, self.head_dim)
 
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
 
         cos, sin = position_embeddings
 
-        # # old seq mode
-        # k_ctx_part = k[:, :, :ctx_len, :]
-        # k_noise_part = k[:, :, ctx_len:, :]
-        # # q also needs to be split, as position_embeddings only cover noise positions
-        # q_ctx_part = q[:, :, :ctx_len, :]
-        # q_noise_part = q[:, :, ctx_len:, :]
-        # q_noise_part, k_noise_part = apply_rotary_pos_emb(q_noise_part, k_noise_part, cos, sin)
-        # q = torch.cat([q_ctx_part, q_noise_part], dim=2)
-        # k = torch.cat([k_ctx_part, k_noise_part], dim=2)
-        
-        # apply RoPE to full q and k
-        # position_embeddings now contains positions for both context and noise parts
+        # Apply RoPE to q and k
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         if past_key_values is not None:
@@ -155,10 +137,10 @@ class Qwen3FlashMTPAttention(nn.Module):
 
 
 class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str):
+    def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = Qwen3FlashMTPAttention(config=config, layer_idx=layer_idx, chs_concat_mode=chs_concat_mode)
+        self.self_attn = Qwen3FlashMTPAttention(config=config, layer_idx=layer_idx)
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(
@@ -167,7 +149,6 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
 
     def forward(
         self,
-        target_hidden: Optional[torch.Tensor] = None,
         hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -177,7 +158,7 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
-        ] = None,  # necessary, but kept here for BC
+        ] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -186,14 +167,10 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
-            target_hidden=target_hidden,
             attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
+            past_key_values=past_key_value,
+            cache_position=cache_position,
             **kwargs,
         )[0]
         hidden_states = residual + hidden_states
@@ -226,10 +203,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         super().__init__(config)
         self.config = config
         flashmtp_config = getattr(config, "flashmtp_config", {}) or {}
-        self.chs_concat_mode = flashmtp_config.get("chs_concat_mode", "seq")
         self.layers = nn.ModuleList(
             [
-                Qwen3FlashMTPDecoderLayer(config, layer_idx, self.chs_concat_mode)
+                Qwen3FlashMTPDecoderLayer(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -243,26 +219,24 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
 
-        # For seq concat mode: use Identity (no computation, no parameters)
-        # For feature mode: use Linear projection and RMSNorm
-        if self.chs_concat_mode == "feature":
-            print(config.num_target_layers)
-            self.fc = nn.Linear(
-                len(self.target_layer_ids) * config.hidden_size,
-                config.hidden_size,
-                bias=False,
-            )
-            # self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        else:
-            # self.fc = nn.Identity()
-            self.fc = nn.Linear(
-                config.hidden_size,
-                config.hidden_size,
-                bias=False,
-            )
-            # maybe need norm
-            # self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        print_on_rank0(f"self.chs_concat_mode: {self.chs_concat_mode}")
+        # v2: Project concatenated hidden states (all target layers) to hidden_size
+        num_target_layers = len(self.target_layer_ids)
+        self.fc = nn.Linear(
+            num_target_layers * config.hidden_size,
+            config.hidden_size,
+            bias=False,
+        )
+        # Norm after projection
+        self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # Project concatenated embedding (base + injected hidden) back to hidden_size
+        # This is used for block positions where we inject target hidden states
+        self.block_input_proj = nn.Linear(
+            2 * config.hidden_size,  # base embedding + injected hidden
+            config.hidden_size,
+            bias=False,
+        )
+        self.block_input_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.post_init()
 
@@ -276,19 +250,62 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         use_cache: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
-        
-        hidden_states = noise_embedding
-        bsz, noise_len, _ = hidden_states.shape
-        # maybe we don't need to do norm for target hidden exclusively, move it to layernorm
-        # target_hidden = self.hidden_norm(self.fc(target_hidden))
-        target_hidden = self.fc(target_hidden)
+        """FlashMTP v2 forward pass.
+
+        Layout: [Full Sequence | Block_0 | Block_1 | ... | Block_{N-1}]
+
+        For Block_i, we inject the projected target hidden states at each position.
+
+        Args:
+            position_ids: (B, seq_len + N*block_size) position IDs
+            attention_mask: Flex attention block mask
+            noise_embedding: (B, seq_len + N*block_size, H) embeddings
+                             [full_seq_embeds | block_0_embeds | ...]
+            target_hidden: (B, N, L*H) target hidden states for each block
+            past_key_values: KV cache for generation
+            use_cache: whether to use cache
+
+        Returns:
+            (B, N*block_size, H) - only block outputs for prediction
+        """
+        bsz, total_len, hidden_size = noise_embedding.shape
+        n_blocks = target_hidden.shape[1]
+        seq_len = total_len - n_blocks * self.block_size
+
+        # Project target hidden states: (B, N, L*H) -> (B, N, H)
+        target_hidden_proj = self.fc(target_hidden)
+        target_hidden_proj = self.hidden_norm(target_hidden_proj)
+
+        # Split noise_embedding into full sequence and blocks
+        full_seq_embeds = noise_embedding[:, :seq_len, :]  # (B, seq_len, H)
+        block_embeds = noise_embedding[:, seq_len:, :]  # (B, N*block_size, H)
+
+        # Reshape block_embeds: (B, N*block_size, H) -> (B, N, block_size, H)
+        block_embeds = block_embeds.view(bsz, n_blocks, self.block_size, hidden_size)
+
+        # Expand target_hidden_proj to match block size: (B, N, H) -> (B, N, block_size, H)
+        target_hidden_expanded = target_hidden_proj.unsqueeze(2).expand(-1, -1, self.block_size, -1)
+
+        # Concatenate along feature dimension: (B, N, block_size, 2*H)
+        block_embeds_with_hidden = torch.cat([block_embeds, target_hidden_expanded], dim=-1)
+
+        # Project back to hidden_size: (B, N, block_size, 2*H) -> (B, N, block_size, H)
+        block_embeds_projected = self.block_input_proj(block_embeds_with_hidden)
+        block_embeds_projected = self.block_input_norm(block_embeds_projected)
+
+        # Reshape back: (B, N, block_size, H) -> (B, N*block_size, H)
+        block_embeds_final = block_embeds_projected.view(bsz, n_blocks * self.block_size, hidden_size)
+
+        # Concatenate full sequence with processed blocks
+        hidden_states = torch.cat([full_seq_embeds, block_embeds_final], dim=1)
+
+        # Get position embeddings for RoPE
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        # the whole serves as qkv
-        hidden_states = torch.cat([target_hidden, hidden_states], dim=1)  # (B, ctx_len+noise_len, H)
+
+        # Pass through transformer layers
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
-                target_hidden=target_hidden,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_values,
@@ -296,7 +313,11 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-        return (self.norm(hidden_states))[:, -noise_len:, :]
+
+        hidden_states = self.norm(hidden_states)
+
+        # Only return block outputs: (B, N*block_size, H)
+        return hidden_states[:, seq_len:, :]
 
     @torch.inference_mode()
     def spec_generate(

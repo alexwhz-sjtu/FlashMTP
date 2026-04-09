@@ -22,19 +22,20 @@ def prepare_target_hidden(
     hidden_states: tuple[torch.Tensor],  # (num_layers,)[(B, seq_len, H)]
     anchor_positions: torch.Tensor,  # (B, N)
     target_layer_ids: list[int],
-    chs_concat_mode: str = "seq",
 ) -> torch.Tensor:
-    """Convert full hidden states to CHS format for FlashMTP.
+    """Extract anchor position hidden states for FlashMTP v2 feature injection.
+
+    In v2, the hidden states at anchor_position-1 (from all target layers)
+    are concatenated along feature dimension and will be injected into each
+    noise embedding position after FC projection.
 
     Args:
         hidden_states: All layers' hidden states from target model
-        anchor_positions: Anchor positions for each block
+        anchor_positions: Anchor positions for each block (sorted, increasing)
         target_layer_ids: List of layer IDs to extract
-        chs_concat_mode: "seq" or "feature"
 
     Returns:
-        - seq mode: (B, N*L, H) - L layers concatenated along sequence dim
-        - feature mode: (B, N, H*L) - L layers concatenated along feature dim
+        (B, N, H*L) - L layers concatenated along feature dimension
     """
     # 获取位置 p-1 的 hidden states (用来预测位置 p)
     context_positions = (anchor_positions - 1).clamp(min=0)  # (B, N)
@@ -52,79 +53,91 @@ def prepare_target_hidden(
         )
         selected_states.append(layer_selected)
 
-    if chs_concat_mode == "seq":
-        # 按序列维度拼接: (B, N*L, H)
-        return torch.cat(selected_states, dim=1)  # (B, N*L, H)
-    else:  # feature mode
-        # 按特征维度拼接: (B, N, H*L)
-        return torch.cat(selected_states, dim=-1)  # (B, N, H*L)
+    # v2 only uses feature concat mode
+    # 按特征维度拼接: (B, N, H*L)
+    return torch.cat(selected_states, dim=-1)  # (B, N, H*L)
 
 
 def create_flashmtp_block_mask(
+    seq_len: int,
     anchor_positions: torch.Tensor,
     block_keep_mask: torch.Tensor,
-    chs_len_per_block: int,
     block_size: int,
     device: torch.device,
+    kvcache_window_size: int = 0,  # W: window size for KVCache visibility
 ):
-    """Construct Flex Attention BlockMask for FlashMTP training with per-block CHS.
+    """Construct Flex Attention BlockMask for FlashMTP v2 training.
+
+    Layout: [Full Sequence (seq_len tokens) | Block_0 | Block_1 | ... | Block_{N-1}]
+
+    Attention rules:
+    1. Full Sequence part: causal attention (standard autoregressive)
+    2. Block_i can see Full Sequence in [anchor_i - W + 1, anchor_i] window
+    3. Block_i uses bidirectional attention internally
+    4. Block_i cannot see other blocks
+    5. Invalid blocks (block_keep_mask=False) don't participate in attention
 
     Args:
+        seq_len: Length of the full input sequence
         anchor_positions: (B, N) tensor of anchor positions for each block
         block_keep_mask: (B, N) boolean mask indicating valid blocks
-        chs_len_per_block: Number of tokens per CHS segment
-            - For seq concat mode: num_target_layers (L)
-            - For feature concat mode: 1
         block_size: Number of tokens per draft block
         device: torch device
-
-    Layout:
-        QKV: [CHS_0 | CHS_1 | ... | CHS_{N-1} | Block_0 | Block_1 | ... | Block_{N-1}]
-            - Each CHS_i has length chs_len_per_block
-            - Each Block_i has length block_size
-            - [CHS_i:Block_i] serves as Q
-
-    Rules:
-      1. Block_i only sees CHS_i (its own context).
-         For seq mode: within CHS_i, only tokens < anchor_pos are visible.
-         For feature mode: CHS_i is a single token (always visible if valid).
-      2. Intra-block attention is bidirectional.
-      3. Different blocks are invisible to each other.
-      4. Invalid blocks (block_keep_mask=False) see nothing.
+        kvcache_window_size: Window size W. If 0, blocks see all KVCache up to anchor.
     """
+    B, N = anchor_positions.shape
 
     def flashmtp_mask_mod(b, h, q_idx, kv_idx):
-        # Total length of all CHS segments
-        total_chs_len = N * chs_len_per_block
+        # Full sequence region: [0, seq_len-1]
+        # Block region: [seq_len, seq_len + N*block_size - 1]
 
-        # Determine which block group q_idx belongs to
-        # Use torch.where instead of if-else for vmap compatibility
-        q_in_chs = q_idx < total_chs_len
+        q_in_full_seq = q_idx < seq_len
+        kv_in_full_seq = kv_idx < seq_len
 
-        # For CHS region: block_id = q_idx // chs_len_per_block
-        q_block_id_chs = q_idx // chs_len_per_block
-        # For Block region: block_id = (q_idx - total_chs_len) // block_size
-        q_block_id_blk = (q_idx - total_chs_len) // block_size
-        q_block_id = torch.where(q_in_chs, q_block_id_chs, q_block_id_blk)
+        # Calculate block_id for query in block region
+        # block_id = 0 to N-1
+        q_block_id = (q_idx - seq_len) // block_size
+        kv_block_id = (kv_idx - seq_len) // block_size
 
-        # Determine which block group kv_idx belongs to
-        kv_in_chs = kv_idx < total_chs_len
-        kv_block_id_chs = kv_idx // chs_len_per_block
-        kv_block_id_blk = (kv_idx - total_chs_len) // block_size
-        kv_block_id = torch.where(kv_in_chs, kv_block_id_chs, kv_block_id_blk)
+        # Get anchor position for current query block (if in block region)
+        # anchor_positions[b] gives all anchor positions for batch item b
+        # Shape: (N,), values are positions in [0, seq_len-1]
+        anchor_pos = anchor_positions[b, q_block_id.clamp(min=0, max=N-1)]
 
-        # Same block group can see each other (bidirectional within group)
-        same_group = q_block_id == kv_block_id
+        # Case 1: Both in Full Sequence -> causal attention
+        both_in_full = q_in_full_seq & kv_in_full_seq
+        causal_mask = kv_idx <= q_idx
 
-        # Valid if: same group AND (q in CHS OR block is valid)
-        # CHS queries are always valid, Block queries only valid if block_keep_mask is True
-        is_valid = q_in_chs | block_keep_mask[b, q_block_id]
+        # Case 2: Query in Block, KV in Full Sequence
+        # Block_i can see Full Sequence in [anchor_i - W + 1, anchor_i] window
+        block_q_full_kv = (~q_in_full_seq) & kv_in_full_seq
 
-        return same_group & is_valid
+        # Calculate window boundaries
+        # anchor_pos is the position, block needs to see [anchor_pos - W + 1, anchor_pos - 1]
+        # Note: anchor itself is NOT included because it's the bonus token at block start
 
-    B, N = anchor_positions.shape
-    Q_LEN = N * chs_len_per_block + N * block_size
-    KV_LEN = N * chs_len_per_block + N * block_size
+        window_start = (anchor_pos - kvcache_window_size + 1).clamp(min=0)
+        window_end = anchor_pos - 1  # exclusive of anchor (bonus token is in block)
+
+        # KV position must be in [window_start, window_end]
+        kv_in_window = (kv_idx >= window_start) & (kv_idx <= window_end)
+        block_can_see_full = block_q_full_kv & kv_in_window
+
+        # Case 3: Both in Block -> bidirectional within same block only
+        both_in_block = (~q_in_full_seq) & (~kv_in_full_seq)
+        same_block = q_block_id == kv_block_id
+        block_bidirectional = both_in_block & same_block
+
+        # Combine all valid attention patterns
+        can_attend = (both_in_full & causal_mask) | block_can_see_full | block_bidirectional
+
+        # Valid query if: (in Full Sequence) OR (in valid Block)
+        is_valid = q_in_full_seq | block_keep_mask[b, q_block_id.clamp(min=0, max=N-1)]
+
+        return can_attend & is_valid
+
+    Q_LEN = seq_len + N * block_size
+    KV_LEN = seq_len + N * block_size
 
     return create_block_mask(flashmtp_mask_mod,
                              B=B,
@@ -135,7 +148,14 @@ def create_flashmtp_block_mask(
 
 
 class OnlineFlashMTPModel(nn.Module):
-    """FlashMTP online training wrapper with block-wise CE loss."""
+    """FlashMTP v2 online training wrapper with block-wise CE loss.
+
+    Key v2 features:
+    - Full sequence uses causal attention (standard autoregressive)
+    - Noise blocks use bidirectional attention
+    - Each block can see recent W tokens from full sequence (sliding window)
+    - Hidden states from target model are injected into noise embeddings
+    """
 
     def __init__(
             self,
@@ -147,7 +167,7 @@ class OnlineFlashMTPModel(nn.Module):
             attention_backend: str = "flex_attention",
             num_anchors: int = 512,
             loss_decay_gamma: Optional[float] = None,
-            chs_concat_mode: str = "seq",  # "seq" or "feature"
+            kvcache_window_size: int = 0,  # W: window size for KVCache visibility
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -158,8 +178,7 @@ class OnlineFlashMTPModel(nn.Module):
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
-        self.chs_concat_mode = chs_concat_mode
-        self.draft_model.chs_concat_mode = chs_concat_mode
+        self.kvcache_window_size = kvcache_window_size
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -202,67 +221,81 @@ class OnlineFlashMTPModel(nn.Module):
 
         return anchors, keep_mask
 
-    def prepare_noise_input(
-            self,
-            input_ids: torch.Tensor,
-            block_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Prepare noise input: first token of each block is real, rest are MASK."""
-        bsz, seq_len = input_ids.shape
-        device = input_ids.device
+    def _create_position_ids(
+        self,
+        seq_len: int,
+        anchor_positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Create absolute position IDs for full sequence + draft blocks.
 
-        if block_ids is not None:
-            is_block_start = torch.ones(bsz,
-                                        seq_len,
-                                        dtype=torch.bool,
-                                        device=device)
-            is_block_start[:, 1:] = block_ids[:, 1:] != block_ids[:, :-1]
-        else:
-            positions = torch.arange(seq_len, device=device)
-            is_block_start = (positions % self.block_size) == 0
-            is_block_start = is_block_start.unsqueeze(0).expand(bsz, -1)
+        Layout: [Full Sequence (0 to seq_len-1) | Block_0 | Block_1 | ... | Block_{N-1}]
 
-        noise_input_ids = torch.full_like(input_ids, self.mask_token_id)
-        noise_input_ids[is_block_start] = input_ids[is_block_start]
-        return noise_input_ids
+        Args:
+            seq_len: Length of the full input sequence
+            anchor_positions: (B, N) anchor positions for each block
 
-    def _create_position_ids(self,
-                             anchor_positions: torch.Tensor) -> torch.Tensor:
-        """Create absolute position IDs for parallel draft blocks."""
+        Returns:
+            (B, seq_len + N*block_size) position IDs
+        """
         bsz, n_blocks = anchor_positions.shape
         device = anchor_positions.device
-        offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
-        pos_ids = anchor_positions.unsqueeze(-1) + offsets
-        return pos_ids.view(bsz, -1)
 
-    def _create_noise_embed(self, input_ids, anchor_positions,
-                            block_keep_mask):
+        # Full sequence positions: 0 to seq_len-1
+        full_seq_positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+
+        # Block positions: anchor_position + offset for each position in block
+        offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        block_positions = anchor_positions.unsqueeze(-1) + offsets  # (B, N, block_size)
+        block_positions = block_positions.view(bsz, -1)  # (B, N*block_size)
+
+        # Concatenate: full sequence + block positions
+        return torch.cat([full_seq_positions, block_positions], dim=-1)  # (B, seq_len + N*block_size)
+
+    def _create_block_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Create block embeddings with MASK tokens and bonus token at block start.
+
+        Args:
+            input_ids: (B, seq_len) input token IDs
+            anchor_positions: (B, N) anchor positions for each block
+            block_keep_mask: (B, N) boolean mask for valid blocks
+
+        Returns:
+            (B, N*block_size) block embeddings
+        """
         bsz, seq_len = input_ids.shape
         n = anchor_positions.shape[1]
         bs = self.block_size
         device = input_ids.device
 
-        noise_ids = torch.full((bsz, n * bs),
+        # Create token IDs for blocks: [MASK, MASK, ...] with bonus token at start
+        block_ids = torch.full((bsz, n * bs),
                                self.mask_token_id,
                                dtype=torch.long,
                                device=device)
 
+        # Block starts at positions 0, block_size, 2*block_size, ...
         block_starts = torch.arange(n, device=device) * bs
         block_starts = block_starts.unsqueeze(0).expand(bsz, -1)
 
+        # Get anchor tokens (bonus tokens)
         valid_anchor_positions = anchor_positions.clamp(0, seq_len - 1)
         anchor_tokens = torch.gather(input_ids, 1, valid_anchor_positions)
 
-        flat_batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(
-            bsz, n)
+        flat_batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(bsz, n)
 
-        # substitute the anchor position with label token (bonus token in inference)
-        noise_ids[flat_batch_idx, block_starts] = torch.where(
+        # Place bonus token at the start of each block
+        block_ids[flat_batch_idx, block_starts] = torch.where(
             block_keep_mask,
             anchor_tokens,
             torch.tensor(self.mask_token_id, dtype=torch.long, device=device),
         )
 
-        return self.embed_tokens(noise_ids)
+        return self.embed_tokens(block_ids)
 
     def forward(
         self,
@@ -270,74 +303,59 @@ class OnlineFlashMTPModel(nn.Module):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Parallel block-wise training forward pass."""
+        """Parallel block-wise training forward pass for FlashMTP v2.
+
+        Layout: [Full Sequence (seq_len tokens) | Block_0 | ... | Block_{N-1}]
+        - Full Sequence uses causal attention (standard autoregressive)
+        - Blocks use bidirectional attention
+        - Block_i can see Full Sequence in [anchor_i - W + 1, anchor_i] window
+        - Blocks cannot see each other
+        """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        # TODO: keep_mask meaning: Valid anchor position
+        # Sample anchor positions (sorted, increasing)
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
             seq_len, loss_mask, device)
 
-        noise_embedding = self._create_noise_embed(input_ids, anchor_positions,
-                                                   block_keep_mask)
+        # Create full sequence embeddings (will be the KVCache part)
+        full_seq_embeds = self.embed_tokens(input_ids)  # (B, seq_len, H)
 
-        # we only use the clean bonus token's contextual hidden states(CHS)
-        # context is from position (anchor_position - 1), so use that for position encoding
-        context_position_ids = (anchor_positions - 1).clamp(min=0)  # (bsz, n_blocks)
+        # Create block embeddings (with MASK and bonus token at start)
+        block_embeds = self._create_block_embeddings(
+            input_ids, anchor_positions, block_keep_mask)  # (B, N*block_size, H)
 
-        draft_position_ids = self._create_position_ids(
-            anchor_positions)  # (bsz, n_blocks * block_size)
+        # Concatenate: [Full Sequence | Block_0 | ... | Block_{N-1}]
+        noise_embedding = torch.cat([full_seq_embeds, block_embeds], dim=1)
 
-        # when concat in seq dim, we pose RoPE on CHS with the same position_id
-        # for all layers of the same anchor (since they are from the same token position)
-        if self.chs_concat_mode == "seq":
-            num_target_layers = len(self.draft_model.target_layer_ids)
-            # context_position_ids is (anchor_position - 1), repeated num_target_layers times
-            # since all layers of the same anchor share the same position
-            context_position_ids_expanded = context_position_ids.repeat_interleave(
-                num_target_layers, dim=-1)  # (bsz, n_blocks * num_target_layers)
-            full_position_ids = torch.cat(
-                [context_position_ids_expanded, draft_position_ids],
-                dim=-1)  # (bsz, n_blocks * num_target_layers + n_blocks * block_size)
+        # Create position IDs for the full layout
+        full_position_ids = self._create_position_ids(seq_len, anchor_positions)
 
-        # when concat in feature dim, we pose RoPE on CHS,
-        # so position_ids only includes the one position before anchor position
-        else:  # feature concat
-            full_position_ids = torch.cat(
-                [context_position_ids, draft_position_ids],
-                dim=-1)  # (bsz, n_blocks + n_blocks * block_size)
-
-        # Determine CHS length per block based on concat mode
-        # seq mode: each CHS_i has num_target_layers tokens
-        # feature mode: each CHS_i has 1 token (features concatenated)
-        num_target_layers = getattr(self.draft_model.config,
-                                    "num_target_layers", 1)
-        chs_len_per_block = num_target_layers if self.chs_concat_mode == "seq" else 1
-
+        # Create v2 mask: Full Seq causal + Block bidirectional + sliding window
         flashmtp_attn_mask = create_flashmtp_block_mask(
+            seq_len=seq_len,
             anchor_positions=anchor_positions,
             block_keep_mask=block_keep_mask,
-            chs_len_per_block=chs_len_per_block,
             block_size=self.block_size,
             device=device,
+            kvcache_window_size=self.kvcache_window_size,
         )
 
-        # only use the hidden states from the target model at anchor positions (CHS) as input to the draft model
+        # Prepare target hidden states for injection into blocks
+        # Shape: (B, N, H*L) where L is number of target layers
         target_hidden = prepare_target_hidden(
-            hidden_states, anchor_positions, self.draft_model.target_layer_ids,
-            self.chs_concat_mode)
+            hidden_states, anchor_positions, self.draft_model.target_layer_ids)
 
-        # print(f"target_hidden shape after prepare: {target_hidden.shape}")
-        # print(f"full_position_ids shape: {full_position_ids.shape}")
-        # print(f"noise_embedding shape: {noise_embedding.shape}")
-
+        # Forward through draft model
+        # Draft model will internally inject target_hidden into block positions
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=target_hidden,
             attention_mask=flashmtp_attn_mask,
-        )
+        )  # (B, N*block_size, H) - only block outputs
 
+        # Compute logits for block outputs
         logits = self.lm_head(output_hidden)
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---

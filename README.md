@@ -43,6 +43,8 @@ Besides, the later the posiion of tokens, the less info i can get from the condi
 > \# install specforge
 >
 > uv pip install -v -e . --prerelease=allow
+>
+> uv pip install datasets==4.8.3 pyarrow==23.0.1
 
 ## 📃 Citation
 

@@ -41,6 +41,7 @@ NUM_EPOCHS="${NUM_EPOCHS:-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
+KVCACHE_WINDOW_SIZE="${KVCACHE_WINDOW_SIZE:-16}"
 
 # 恢复训练
 RESUME="${RESUME:-}"
@@ -124,7 +125,6 @@ echo "------------------------------------------"
 echo "数据特征:"
 echo "  样本数量: ${DATA_NUM_SAMPLES}"
 echo "  思考模式: ${ENABLE_THINKING}"
-echo "  数据子目录: ${CHS_CONCAT_MODE}"
 echo "------------------------------------------"
 echo "目标模型: ${TARGET_MODEL}"
 echo "目标模型后端: ${TARGET_MODEL_BACKEND}"
@@ -139,6 +139,7 @@ echo "  块大小: ${BLOCK_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
+echo "  KVCache窗口大小: ${KVCACHE_WINDOW_SIZE:-0(全部可见)}"
 echo "------------------------------------------"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
@@ -255,7 +256,7 @@ EXIT_CODE=0
     --build-dataset-num-proc ${BUILD_DATASET_NUM_PROC} \
     --tp-size ${TP_SIZE} \
     --dist-timeout ${DIST_TIMEOUT} \
-    --chs-concat-mode ${CHS_CONCAT_MODE} \
+    --kvcache-window-size ${KVCACHE_WINDOW_SIZE} \
     --seed 42 \
     ${OPTIONAL_ARGS} 2>&1 || EXIT_CODE=$?
 
