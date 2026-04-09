@@ -39,7 +39,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
-CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-seq}"
+CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
 
 # 恢复训练
@@ -104,7 +104,7 @@ REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}}"   # 离线子目录名称 (如: my_run_001，生成 offline-run-my_run_001)
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v1.1_${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_fixed}"   # 离线子目录名称 (如: my_run_001，生成 offline-run-my_run_001)
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}"

@@ -282,22 +282,30 @@ class OnlineFlashMTPModel(nn.Module):
                                                    block_keep_mask)
 
         # we only use the clean bonus token's contextual hidden states(CHS)
-        context_position_ids = anchor_positions  # (bsz, n_blocks)
+        # context is from position (anchor_position - 1), so use that for position encoding
+        context_position_ids = (anchor_positions - 1).clamp(min=0)  # (bsz, n_blocks)
 
         draft_position_ids = self._create_position_ids(
             anchor_positions)  # (bsz, n_blocks * block_size)
 
-        # when concat in seq dim, we don't pose RoPE on CHS,
-        # so position_ids only includes noise_embedding positions starting from anchor position
+        # when concat in seq dim, we pose RoPE on CHS with the same position_id
+        # for all layers of the same anchor (since they are from the same token position)
         if self.chs_concat_mode == "seq":
-            full_position_ids = draft_position_ids
+            num_target_layers = len(self.draft_model.target_layer_ids)
+            # context_position_ids is (anchor_position - 1), repeated num_target_layers times
+            # since all layers of the same anchor share the same position
+            context_position_ids_expanded = context_position_ids.repeat_interleave(
+                num_target_layers, dim=-1)  # (bsz, n_blocks * num_target_layers)
+            full_position_ids = torch.cat(
+                [context_position_ids_expanded, draft_position_ids],
+                dim=-1)  # (bsz, n_blocks * num_target_layers + n_blocks * block_size)
 
-        # when concat in feature dim, we't pose RoPE on CHS,
+        # when concat in feature dim, we pose RoPE on CHS,
         # so position_ids only includes the one position before anchor position
         else:  # feature concat
             full_position_ids = torch.cat(
                 [context_position_ids, draft_position_ids],
-                dim=-1)  # (bsz, n_block:n_blocks * block_size)
+                dim=-1)  # (bsz, n_blocks + n_blocks * block_size)
 
         # Determine CHS length per block based on concat mode
         # seq mode: each CHS_i has num_target_layers tokens
