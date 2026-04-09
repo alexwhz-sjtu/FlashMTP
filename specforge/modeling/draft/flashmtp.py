@@ -116,12 +116,16 @@ class Qwen3FlashMTPAttention(nn.Module):
         v = v.transpose(1, 2)
 
         cos, sin = position_embeddings
-        
+
         # if seq, only pose position_embed on k_noise
         if self.chs_concat_mode == "seq":
-            k_ctx_part = k[:, :, :ctx_len, :]  
-            k_noise_part = k[:, :, ctx_len:, :]   
-            q, k_noise_part = apply_rotary_pos_emb(q, k_noise_part, cos, sin)
+            k_ctx_part = k[:, :, :ctx_len, :]
+            k_noise_part = k[:, :, ctx_len:, :]
+            # q also needs to be split, as position_embeddings only cover noise positions
+            q_ctx_part = q[:, :, :ctx_len, :]
+            q_noise_part = q[:, :, ctx_len:, :]
+            q_noise_part, k_noise_part = apply_rotary_pos_emb(q_noise_part, k_noise_part, cos, sin)
+            q = torch.cat([q_ctx_part, q_noise_part], dim=2)
             k = torch.cat([k_ctx_part, k_noise_part], dim=2)
         else:
             q, k = apply_rotary_pos_emb(q, k, cos, sin)

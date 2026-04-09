@@ -18,7 +18,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
-CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
+CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-seq}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
 
 # 恢复训练
@@ -57,7 +57,7 @@ MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 # TRAIN_DATA_PATH="${TRAIN_DA/TA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_400000_len_4096/nemotron_think_400000_train_regen.jsonl}"
 
 TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-RAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_test/nemotron_think_on_samples_test_qwen3_8b_regen_error.jsonl"
+TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_test/nemotron_think_on_samples_test_qwen3_8b_regen_error.jsonl"
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
 # OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}}"
 OUTPUT_DIR="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/models/test"
