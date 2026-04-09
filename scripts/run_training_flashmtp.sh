@@ -3,6 +3,27 @@
 
 set -e
 
+# 解析命令行参数
+DT="a800"  # 默认值为 a800
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --dt)
+            DT="$2"
+            shift 2
+            ;;
+        *)
+            # 保留其他参数供后续使用（如果有的话）
+            shift
+            ;;
+    esac
+done
+
+# 验证 dt 参数
+if [[ "$DT" != "qz" && "$DT" != "a800" ]]; then
+    echo "错误: --dt 参数必须是 'qz' 或 'a800'"
+    exit 1
+fi
+
 # 自动激活虚拟环境
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
@@ -41,11 +62,6 @@ MASTER_PORT="${MASTER_PORT:-29501}"
 TP_SIZE="${TP_SIZE:-1}"
 DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
 
-# 目标模型路径
-# TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
-TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
-TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
-
 # 训练参数
 BATCH_SIZE="${BATCH_SIZE:-1}"
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
@@ -53,14 +69,23 @@ LEARNING_RATE="${LEARNING_RATE:-6e-4}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
-# 数据目录
-# TRAIN_DATA_PATH="${TRAIN_DA/TA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_400000_len_4096/nemotron_think_400000_train_regen.jsonl}"
+# 数据目录 - 根据 --dt 参数选择配置
+if [ "$DT" = "qz" ]; then
+    # qz 配置
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}}"
+    TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
+else
+    # a800 配置（默认）
+    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_test/nemotron_think_on_samples_test_qwen3_8b_regen_error.jsonl"
+    OUTPUT_DIR="./cache/models/test"
+    TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
+fi
 
-TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_test/nemotron_think_on_samples_test_qwen3_8b_regen_error.jsonl"
+
+TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
+
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
-# OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}}"
-OUTPUT_DIR="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/models/test"
 CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 
 # 模型参数
@@ -94,6 +119,8 @@ BUILD_DATASET_NUM_PROC="${BUILD_DATASET_NUM_PROC:-8}"
 echo "=========================================="
 echo "FlashMTP 训练启动脚本"
 echo "=========================================="
+echo "运行环境: ${DT}"
+echo "------------------------------------------"
 echo "数据特征:"
 echo "  样本数量: ${DATA_NUM_SAMPLES}"
 echo "  思考模式: ${ENABLE_THINKING}"
