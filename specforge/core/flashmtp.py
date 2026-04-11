@@ -150,6 +150,7 @@ class OnlineFlashMTPModel(nn.Module):
             chs_concat_mode: str = "seq",  # "seq" or "feature"
             loss_type: str = "ce",  # "ce" or "kl"
             distill_temperature: float = 2.0,
+            kl_topk: int = 10,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -165,6 +166,7 @@ class OnlineFlashMTPModel(nn.Module):
             raise ValueError(f"loss_type must be 'ce' or 'kl', got {loss_type!r}")
         self.loss_type = loss_type
         self.distill_temperature = distill_temperature
+        self.kl_topk = kl_topk
         self.draft_model.chs_concat_mode = chs_concat_mode
 
         self._cached_block_mask: Optional[BlockMask] = None
@@ -406,24 +408,46 @@ class OnlineFlashMTPModel(nn.Module):
             # HF hidden_states[-1] is last layer output at each token position.
             context_idx = (safe_label_indices - 1).clamp(min=0)
             h_last = self._last_target_hidden(hidden_states)
-            teacher_h = torch.gather(
-                h_last,
-                1,
-                context_idx.unsqueeze(-1).expand(
-                    -1, -1, -1, h_last.size(-1)),
-            )
+            # gather requires index.ndim == h_last.ndim; flatten block dims then reshape
+            flat_ctx = context_idx.reshape(bsz, -1)
+            gather_idx = flat_ctx.unsqueeze(-1).expand(-1, -1, h_last.size(-1))
+            teacher_h = torch.gather(h_last, 1, gather_idx)
+            teacher_h = teacher_h.view(
+                bsz, n_anchors, self.block_size, h_last.size(-1))
             with torch.no_grad():
                 teacher_logits = self.lm_head(teacher_h)
             t = self.distill_temperature
-            log_p_s = F.log_softmax(logits_3d.float() / t, dim=-1)
-            p_t = F.softmax(teacher_logits.float() / t, dim=-1)
-            # KL(teacher || student) per token; sum over vocab (kl_div reduction='none' is per-dim)
-            kl_per_tok = F.kl_div(
-                log_p_s,
-                p_t,
-                reduction="none",
-                log_target=False,
-            ).sum(dim=-1)
+            vocab = teacher_logits.size(-1)
+            k = self.kl_topk
+            if k is not None and k > 0:
+                k = min(int(k), vocab)
+            use_topk = k is not None and k > 0 and k < vocab
+
+            if use_topk:
+                # 仅对齐教师 logits 的 top-k token：在子集上做 softmax / log_softmax 后 KL
+                tl = teacher_logits.reshape(-1, vocab)
+                sl = logits_3d.reshape(-1, vocab)
+                _, top_idx = torch.topk(tl, k=k, dim=-1)
+                t_top = tl.gather(1, top_idx)
+                s_top = sl.gather(1, top_idx)
+                p_t = F.softmax(t_top / t, dim=-1).detach()
+                log_p_s = F.log_softmax(s_top / t, dim=-1)
+                kl_flat = F.kl_div(
+                    log_p_s,
+                    p_t,
+                    reduction="none",
+                    log_target=False,
+                ).sum(dim=-1)
+                kl_per_tok = kl_flat.view(bsz, n_anchors, self.block_size)
+            else:
+                log_p_s = F.log_softmax(logits_3d / t, dim=-1)
+                p_t = F.softmax(teacher_logits / t, dim=-1).detach()
+                kl_per_tok = F.kl_div(
+                    log_p_s,
+                    p_t,
+                    reduction="none",
+                    log_target=False,
+                ).sum(dim=-1)
             loss = (kl_per_tok * (t * t) * weight_mask).sum() / (
                 weight_mask.sum() + 1e-6)
         else:

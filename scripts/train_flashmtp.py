@@ -94,6 +94,13 @@ def parse_args():
         default=2.0,
         help="Temperature for KL distillation (logits scaled by 1/T; loss scaled by T^2).",
     )
+    model_group.add_argument(
+        "--kl-topk",
+        type=int,
+        default=10,
+        help="KL loss: only align teacher's top-k logits (subset softmax). "
+        "<=0 uses full vocabulary.",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -444,6 +451,7 @@ def main():
         chs_concat_mode=args.chs_concat_mode,
         loss_type=args.flashmtp_loss_type,
         distill_temperature=args.distill_temperature,
+        kl_topk=args.kl_topk,
     )
 
     flashmtp_model = FSDP(

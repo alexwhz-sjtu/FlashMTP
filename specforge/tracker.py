@@ -88,6 +88,10 @@ class NoOpTracker(Tracker):
         pass  # Do nothing
 
 
+def _wandb_offline() -> bool:
+    return os.environ.get("WANDB_MODE", "").lower() == "offline"
+
+
 class WandbTracker(Tracker):
     """Tracks experiments using Weights & Biases."""
 
@@ -97,6 +101,9 @@ class WandbTracker(Tracker):
             parser.error(
                 "To use --report-to wandb, you must install wandb: 'pip install wandb'"
             )
+
+        if _wandb_offline():
+            return
 
         if args.wandb_key is not None:
             return
@@ -122,13 +129,15 @@ class WandbTracker(Tracker):
                 "When --report-to is 'wandb', you must provide a wandb API key via one of:\n"
                 "  1. --wandb-key argument\n"
                 "  2. WANDB_API_KEY environment variable\n"
-                "  3. `wandb login` command"
+                "  3. `wandb login` command\n"
+                "  Or set WANDB_MODE=offline to log locally without an API key."
             )
 
     def __init__(self, args, output_dir: str):
         super().__init__(args, output_dir)
         if self.rank == 0:
-            wandb.login(key=args.wandb_key)
+            if not _wandb_offline():
+                wandb.login(key=args.wandb_key)
             # Support resuming training if wandb_run_id is provided
             init_kwargs = {
                 "project": args.wandb_project,

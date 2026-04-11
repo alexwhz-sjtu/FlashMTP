@@ -96,6 +96,8 @@ LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
 # 损失: ce=交叉熵; kl=相对目标模型 last-hidden 的 KL 蒸馏（需 HF 等返回完整 hidden_states）
 FLASHMTP_LOSS_TYPE="${FLASHMTP_LOSS_TYPE:-ce}"
 DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-2.0}"
+# KL 蒸馏时只对齐教师 top-k logits；<=0 表示全词表
+KL_TOPK="${KL_TOPK:-10}"
 
 # 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
@@ -106,8 +108,13 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-5000}"
 REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
-WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v1.1_${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_fixed}"   # 离线子目录名称 (如: my_run_001，生成 offline-run-my_run_001)
+WANDB_DIR="${WANDB_DIR:-./wandb}"
+# offline: 仅本地写入 ${WANDB_DIR}，无需 API key；上线同步: WANDB_MODE=online 并配置密钥
+WANDB_MODE="${WANDB_MODE:-offline}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v1.1_${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_fixed}"
+
+export WANDB_DIR
+export WANDB_MODE
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}"
@@ -144,6 +151,7 @@ echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
 echo "  损失类型: ${FLASHMTP_LOSS_TYPE} (ce|kl)"
 echo "  蒸馏温度T: ${DISTILL_TEMPERATURE} (仅 kl 时有效)"
+echo "  KL top-k: ${KL_TOPK} (仅 kl；<=0 为全词表)"
 echo "------------------------------------------"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
@@ -160,9 +168,13 @@ echo "  TP_SIZE: ${TP_SIZE}"
 echo "------------------------------------------"
 echo "Tracker: ${REPORT_TO}"
 if [ "${REPORT_TO}" = "wandb" ]; then
+    echo "  WANDB_MODE: ${WANDB_MODE}"
     echo "  WandB目录: ${WANDB_DIR}"
     if [ -n "${WANDB_RUN_ID}" ]; then
-        echo "  WandB运行ID: ${WANDB_RUN_ID} (离线子目录: offline-run-${WANDB_RUN_ID})"
+        echo "  WandB运行ID: ${WANDB_RUN_ID}"
+    fi
+    if [ "${WANDB_MODE}" = "offline" ]; then
+        echo "  (离线) 结束后可: wandb sync ${WANDB_DIR}/offline-run-*"
     fi
 fi
 echo "=========================================="
@@ -191,11 +203,8 @@ echo ""
 echo "==> 开始训练 FlashMTP"
 echo ""
 
-if [ "${NPROC_PER_NODE}" -gt 1 ]; then
-    LAUNCHER=(torchrun --nproc_per_node "${NPROC_PER_NODE}" --master_port "${MASTER_PORT}")
-else
-    LAUNCHER=(python)
-fi
+# train_flashmtp 会 init_process_group，需 torchrun 注入 RANK/WORLD_SIZE（含单卡）
+LAUNCHER=(torchrun --nproc_per_node "${NPROC_PER_NODE}" --master_port "${MASTER_PORT}")
 
 # 构建可选参数
 OPTIONAL_ARGS=""
@@ -263,6 +272,7 @@ EXIT_CODE=0
     --chs-concat-mode ${CHS_CONCAT_MODE} \
     --flashmtp-loss-type ${FLASHMTP_LOSS_TYPE} \
     --distill-temperature ${DISTILL_TEMPERATURE} \
+    --kl-topk ${KL_TOPK} \
     --seed 42 \
     ${OPTIONAL_ARGS} 2>&1 || EXIT_CODE=$?
 

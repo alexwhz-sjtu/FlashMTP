@@ -1,5 +1,6 @@
 # FlashMTP
 
+详情见FRAMEWORK_GUIDE.md
 ## Ours core idea
 
 由于隐状态是模型在**完整上下文**下计算得到的，因此它们可以看作对上下文的**浓缩表示**。在预测后续 block 的 token 时，我们只需要**最新的隐状态**即可。
