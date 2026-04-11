@@ -137,7 +137,8 @@ class WandbTracker(Tracker):
             }
             if hasattr(args, "wandb_run_id") and args.wandb_run_id:
                 init_kwargs["id"] = args.wandb_run_id
-                init_kwargs["resume"] = "must"
+                # "must" 要求该 id 在 W&B 上已存在；脚本里常用 WANDB_RUN_ID 作新实验名，应允许首次创建。
+                init_kwargs["resume"] = "allow"
             wandb.init(**init_kwargs)
             self.is_initialized = True
 

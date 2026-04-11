@@ -228,6 +228,91 @@ class LogSoftmaxLoss(torch.autograd.Function):
         return logits, None, None, None, None
 
 
+def kl_divergence_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    mask: torch.Tensor,
+    reduction: str = "mean",
+    vocab_chunk_size: int = 4096,
+) -> torch.Tensor:
+    """
+    Compute KL divergence loss D_KL(teacher || student).
+
+    Uses chunked accumulation over vocab to avoid materializing full (B, T, V) float32
+    softmax tensors (major OOM source for large V).
+
+    Args:
+        student_logits: (batch, seq_len, vocab_size) or (batch, num_blocks, block_size, vocab_size)
+        teacher_logits: (batch, seq_len, vocab_size) or (batch, num_blocks, block_size, vocab_size)
+        mask: (batch, seq_len) or (batch, num_blocks, block_size) - positions to compute loss
+        reduction: "mean" or "sum" or "none"
+        vocab_chunk_size: chunk size along vocab for the inner sum
+
+    Returns:
+        loss: scalar if reduction is "mean" or "sum", otherwise same shape as mask
+    """
+    s = student_logits.float()
+    t = teacher_logits.float()
+    V = s.shape[-1]
+    log_z_s = torch.logsumexp(s, dim=-1, keepdim=True)
+    log_z_t = torch.logsumexp(t, dim=-1, keepdim=True)
+
+    kl = s.new_zeros(s.shape[:-1])
+    for v0 in range(0, V, vocab_chunk_size):
+        v1 = min(v0 + vocab_chunk_size, V)
+        sc = s[..., v0:v1]
+        tc = t[..., v0:v1]
+        t_lp = tc - log_z_t
+        s_lp = sc - log_z_s
+        p = t_lp.exp()
+        kl = kl + (p * (t_lp - s_lp)).sum(dim=-1)
+
+    # Apply mask
+    if mask is not None:
+        kl = kl * mask.float()
+
+    if reduction == "mean":
+        # Mean over valid positions
+        if mask is not None:
+            valid_count = mask.float().sum() + 1e-8
+            return kl.sum() / valid_count
+        else:
+            return kl.mean()
+    elif reduction == "sum":
+        return kl.sum()
+    else:  # "none"
+        return kl
+
+
+@torch.compile(dynamic=None)
+def compute_kl_loss_vectorized(
+    student_logits: torch.Tensor,
+    teacher_probs: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Vectorized KL loss computation when teacher_probs are pre-computed.
+
+    Args:
+        student_logits: (batch, seq_len, vocab_size)
+        teacher_probs: (batch, seq_len, vocab_size) - pre-computed softmax
+        mask: (batch, seq_len)
+
+    Returns:
+        loss: scalar
+    """
+    student_log_probs = torch.log_softmax(student_logits.float(), dim=-1)
+    kl = teacher_probs * (torch.log(teacher_probs + 1e-10) - student_log_probs)
+    kl = kl.sum(dim=-1)
+
+    if mask is not None:
+        kl = kl * mask.float()
+        valid_count = mask.float().sum() + 1e-8
+        return kl.sum() / valid_count
+    else:
+        return kl.mean()
+
+
 if __name__ == "__main__":
     device = "cuda"
     B, T, V = 1, 1024, 16000

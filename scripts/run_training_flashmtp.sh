@@ -3,6 +3,37 @@
 
 set -e
 
+
+# 解析命令行参数
+DT="a800"  # 默认值为 a800
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --dt)
+            DT="$2"
+            shift 2
+            ;;
+        *)
+            # 保留其他参数供后续使用（如果有的话）
+            shift
+            ;;
+    esac
+done
+
+# 验证 dt 参数
+if [[ "$DT" != "qz" && "$DT" != "a800" ]]; then
+    echo "错误: --dt 参数必须是 'qz' 或 'a800'"
+    exit 1
+fi
+
+# v3 + 大词表 KL + flex/inductor：默认 512 锚点×4096 在 80GB 上易触发显存峰值；a800 未 export 时使用更保守默认
+if [ "$DT" = "a800" ]; then
+    MAX_LENGTH="${MAX_LENGTH:-4096}"
+    NUM_ANCHORS="${NUM_ANCHORS:-256}"
+else
+    MAX_LENGTH="${MAX_LENGTH:-4096}"
+    NUM_ANCHORS="${NUM_ANCHORS:-512}"
+fi
+
 # 自动激活虚拟环境
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
@@ -10,16 +41,17 @@ if [ -f "${PROJECT_DIR}/.venv/bin/activate" ]; then
     source "${PROJECT_DIR}/.venv/bin/activate"
 fi
 
+# 添加项目根目录到 PYTHONPATH
+export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"
+
 # ========================================
 # 主要训练参数
 # ========================================
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
-MAX_LENGTH="${MAX_LENGTH:-4096}"
 CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
-NUM_ANCHORS="${NUM_ANCHORS:-512}"
 
 # 恢复训练
 RESUME="${RESUME:-}"
@@ -29,7 +61,7 @@ CKPT_DIR="${CKPT_DIR:-}"
 # 主要数据集参数
 # ========================================
 # 数据特征参数
-DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-400000}"
+DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}"
 ENABLE_THINKING="${ENABLE_THINKING:-on}"
 
 # ========================================
@@ -42,7 +74,6 @@ TP_SIZE="${TP_SIZE:-1}"
 DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
 
 # 目标模型路径
-TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
 
 # 训练参数
@@ -52,12 +83,20 @@ LEARNING_RATE="${LEARNING_RATE:-6e-4}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
-# 数据目录
-TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_400000_len_4096/nemotron_think_400000_train_regen.jsonl}"
+# 数据目录 - 根据 --dt 参数选择配置
+if [ "$DT" = "qz" ]; then
+    # qz 配置
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}}"
+    TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
+else
+    # a800 配置（默认）
+    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_test/nemotron_think_on_samples_test_qwen3_8b_regen_error.jsonl"
+    OUTPUT_DIR="./cache/models/test"
+    TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
+fi
 
-# TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
-OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}}"
 CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 
 # 模型参数
@@ -65,6 +104,12 @@ NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
+
+# v3 扩散训练参数
+W_DISTILL="${W_DISTILL:-1.0}"
+W_CONS="${W_CONS:-0.6}"
+INNER_BLOCK_SIZE="${INNER_BLOCK_SIZE:-1}"
+ENABLE_CONS_AFTER_STEPS="${ENABLE_CONS_AFTER_STEPS:-100000}"
 
 # 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
@@ -110,6 +155,11 @@ echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
 echo "------------------------------------------"
+echo "v3 扩散训练配置:"
+echo "  Distillation权重: ${W_DISTILL}"
+echo "  Consistency权重: ${W_CONS}"
+echo "  Inner Block大小: ${INNER_BLOCK_SIZE}"
+echo "  Consistency启用步数: ${ENABLE_CONS_AFTER_STEPS}"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
 echo "  批大小: ${BATCH_SIZE} x ${ACCUMULATION_STEPS} = $((BATCH_SIZE * ACCUMULATION_STEPS))"
@@ -198,8 +248,8 @@ if [ "${REPORT_TO}" != "none" ]; then
     fi
 fi
 
-# 运行训练
-EXIT_CODE=0
+# 运行训练（勿在续行末使用「2>&1 || EXIT_CODE=$?」，易破坏续行解析）
+set +e
 "${LAUNCHER[@]}" ./scripts/train_flashmtp.py \
     --target-model-path ${TARGET_MODEL} \
     --target-model-backend ${TARGET_MODEL_BACKEND} \
@@ -226,8 +276,14 @@ EXIT_CODE=0
     --tp-size ${TP_SIZE} \
     --dist-timeout ${DIST_TIMEOUT} \
     --chs-concat-mode ${CHS_CONCAT_MODE} \
+    --w-distill ${W_DISTILL} \
+    --w-cons ${W_CONS} \
+    --inner-block-size ${INNER_BLOCK_SIZE} \
+    --enable-cons-after-steps ${ENABLE_CONS_AFTER_STEPS} \
     --seed 42 \
-    ${OPTIONAL_ARGS} 2>&1 || EXIT_CODE=$?
+    ${OPTIONAL_ARGS}
+EXIT_CODE=$?
+set -e
 
 # 检查训练是否成功
 if [ $EXIT_CODE -ne 0 ]; then

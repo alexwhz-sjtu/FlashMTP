@@ -6,7 +6,6 @@ import torch
 from transformers import AutoConfig
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import (
-    GptOssConfig,
     Llama4Config,
     Llama4TextConfig,
     LlamaConfig,
@@ -18,9 +17,14 @@ from transformers import (
     modeling_utils,
 )
 
+# Try to import optional model configs
+try:
+    from transformers import GptOssConfig
+except ImportError:
+    GptOssConfig = None
+
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
 from .target.custom_backend import (
-    GptOssForCausalLM,
     Llama4ForCausalLM,
     LlamaForCausalLM,
     Phi3ForCausalLM,
@@ -28,6 +32,12 @@ from .target.custom_backend import (
     Qwen3ForCausalLM,
     Qwen3MoeForCausalLM,
 )
+
+# Try to import optional model backends
+try:
+    from .target.custom_backend import GptOssForCausalLM
+except ImportError:
+    GptOssForCausalLM = None
 
 
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):
@@ -92,8 +102,10 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
         LlamaConfig: [LlamaForCausalLM],
         Qwen3Config: [Qwen3ForCausalLM],
         Phi3Config: [Phi3ForCausalLM],
-        GptOssConfig: [GptOssForCausalLM],
     }
+    # Add optional model configs if available
+    if GptOssConfig is not None and GptOssForCausalLM is not None:
+        _model_mapping[GptOssConfig] = [GptOssForCausalLM]
 
     @classmethod
     def from_pretrained(

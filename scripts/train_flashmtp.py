@@ -81,6 +81,33 @@ def parse_args():
         "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
     )
 
+    # v3 diffusion training params
+    v3_group = parser.add_argument_group("v3 diffusion training")
+    v3_group.add_argument(
+        "--w-distill",
+        type=float,
+        default=1.0,
+        help="Weight for distillation loss (default: 1.0)",
+    )
+    v3_group.add_argument(
+        "--w-cons",
+        type=float,
+        default=0.6,
+        help="Weight for consistency loss (default: 0.6)",
+    )
+    v3_group.add_argument(
+        "--inner-block-size",
+        type=int,
+        default=1,
+        help="Inner block size (B_in) for v3 diffusion training (default: 1)",
+    )
+    v3_group.add_argument(
+        "--enable-cons-after-steps",
+        type=int,
+        default=1000,
+        help="Enable consistency loss after this many steps (default: 1000)",
+    )
+
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
@@ -262,13 +289,8 @@ def save_checkpoint(args, epoch, step, flashmtp_model, draft_model, optimizer):
         os.makedirs(save_dir, exist_ok=True)
     dist.barrier()
 
-    with FSDP.state_dict_type(flashmtp_model, StateDictType.FULL_STATE_DICT):
-        state_dict = flashmtp_model.state_dict()
-        draft_state_dict = {
-            k.replace("draft_model.", ""): v
-            for k, v in state_dict.items()
-            if "draft_model." in k
-        }
+    with FSDP.state_dict_type(draft_model, StateDictType.FULL_STATE_DICT):
+        draft_state_dict = draft_model.state_dict()
 
         if dist.get_rank() == 0:
             torch.save(
@@ -300,26 +322,36 @@ def save_checkpoint(args, epoch, step, flashmtp_model, draft_model, optimizer):
     dist.barrier()
 
 
-def record_metrics(
+def record_metrics_v3(
     args,
-    loss: float,
-    accuracy: float,
+    total_loss: float,
+    distill_loss: float,
+    cons_loss: float,
+    distill_acc: float,
+    cons_acc: float,
     global_step: int,
     tracker,
     optimizer,
     train_dataloader=None,
     mode: str = "train",
 ) -> None:
+    """Record v3 diffusion training metrics."""
     logdict = {}
 
     if mode == "train" and optimizer is not None:
         logdict["train/lr"] = optimizer.get_learning_rate()
 
-    logdict[f"{mode}/loss"] = loss
-    logdict[f"{mode}/accuracy"] = accuracy
+    logdict[f"{mode}/total_loss"] = total_loss
+    logdict[f"{mode}/distill_loss"] = distill_loss
+    logdict[f"{mode}/cons_loss"] = cons_loss
+    logdict[f"{mode}/distill_acc"] = distill_acc
+    logdict[f"{mode}/cons_acc"] = cons_acc
 
+    total_steps = args.num_epochs * len(train_dataloader) // args.accumulation_steps
     print_on_rank0(
-        f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}"
+        f"{mode.capitalize()} - Step {global_step}/{total_steps}, "
+        f"Loss: {total_loss:.4f} (distill: {distill_loss:.4f}, cons: {cons_loss:.4f}), "
+        f"Acc: distill={distill_acc:.4f}, cons={cons_acc:.4f}"
     )
 
     tracker.log(logdict, step=global_step)
@@ -403,6 +435,18 @@ def main():
     draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
+    # Shard draft only; wrapping the whole OnlineFlashMTPModel breaks lm_head/embed/fc.
+    draft_model = FSDP(
+        draft_model,
+        use_orig_params=True,
+        mixed_precision=MixedPrecision(
+            param_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        ),
+        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+    )
+    print_with_rank("Initialized FSDP on draft_model")
+
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
 
     steps_per_epoch = math.ceil(len(train_dataloader) / args.accumulation_steps)
@@ -426,20 +470,13 @@ def main():
         mask_token_id=mask_token_id,
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
-        loss_decay_gamma=args.loss_decay_gamma,
         chs_concat_mode=args.chs_concat_mode,
+        # v3 diffusion training params
+        w_distill=args.w_distill,
+        w_cons=args.w_cons,
+        inner_block_size=args.inner_block_size,
+        enable_cons_after_steps=args.enable_cons_after_steps,
     )
-
-    flashmtp_model = FSDP(
-        flashmtp_model,
-        use_orig_params=True,
-        mixed_precision=MixedPrecision(
-            param_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        ),
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-    )
-    print_with_rank("Initialized FSDP")
 
     optimizer = BF16Optimizer(
         draft_model,
@@ -491,15 +528,21 @@ def main():
             target_output = target_model.generate_flashmtp_data(
                 input_ids, attention_mask, loss_mask
             )
-            
-            # 将元组中的每个 tensor 都移动到 GPU
-            hidden_states = tuple(h.cuda() for h in target_output.hidden_states)
-            # hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 
-            loss, accuracy = flashmtp_model(
+            # HF: tuple of (B,L,H) per layer. SGLang: single (B,L,D) fused tensor.
+            # Do NOT ``for h in tensor`` — that walks the batch dimension and breaks lm_head.
+            _hs = target_output.hidden_states
+            if torch.is_tensor(_hs):
+                hidden_states = _hs.cuda()
+            else:
+                hidden_states = tuple(t.cuda() for t in _hs)
+
+            # v3 diffusion training forward pass
+            loss, loss_dict = flashmtp_model.forward_v3(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
+                global_step=global_step,
             )
 
             (loss / args.accumulation_steps).backward()
@@ -508,17 +551,33 @@ def main():
                 optimizer.step()
 
             if global_step % args.log_interval == 0:
-                loss_log = loss.clone()
-                acc_log = accuracy.clone()
-                dist.all_reduce(loss_log)
-                dist.all_reduce(acc_log)
-                loss_log = loss_log / dist.get_world_size()
-                acc_log = acc_log / dist.get_world_size()
+                # v3 metrics: total_loss, distill_loss, cons_loss, distill_acc, cons_acc
+                total_loss_log = loss_dict["total_loss"].clone()
+                distill_loss_log = loss_dict["distill_loss"].clone()
+                cons_loss_log = loss_dict["cons_loss"].clone()
+                distill_acc_log = loss_dict["distill_acc"].clone()
+                cons_acc_log = loss_dict["cons_acc"].clone()
 
-                record_metrics(
+                dist.all_reduce(total_loss_log)
+                dist.all_reduce(distill_loss_log)
+                dist.all_reduce(cons_loss_log)
+                dist.all_reduce(distill_acc_log)
+                dist.all_reduce(cons_acc_log)
+
+                ws = dist.get_world_size()
+                total_loss_log = total_loss_log / ws
+                distill_loss_log = distill_loss_log / ws
+                cons_loss_log = cons_loss_log / ws
+                distill_acc_log = distill_acc_log / ws
+                cons_acc_log = cons_acc_log / ws
+
+                record_metrics_v3(
                     args,
-                    loss_log.item(),
-                    acc_log.item(),
+                    total_loss_log.item(),
+                    distill_loss_log.item(),
+                    cons_loss_log.item(),
+                    distill_acc_log.item(),
+                    cons_acc_log.item(),
                     global_step,
                     tracker,
                     optimizer,
@@ -531,8 +590,10 @@ def main():
                 last_time = time.time()
                 progress_bar.set_postfix(
                     {
-                        "loss": f"{loss.item():.4f}",
-                        "acc": f"{accuracy.item():.4f}",
+                        "loss": f"{loss_dict['total_loss'].item():.4f}",
+                        "distill": f"{loss_dict['distill_loss'].item():.4f}",
+                        "cons": f"{loss_dict['cons_loss'].item():.4f}",
+                        "d_acc": f"{loss_dict['distill_acc'].item():.4f}",
                         "iter_time": f"{elapsed:.2f}s",
                     }
                 )

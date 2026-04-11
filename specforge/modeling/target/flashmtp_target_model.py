@@ -24,10 +24,20 @@ from .sglang_backend import SGLangRunner
 
 @dataclass
 class FlashMTPTargetOutput:
-    hidden_states: torch.Tensor  # [batch, seq_len, hidden_size]
+    hidden_states: torch.Tensor  # [batch, seq_len, hidden_size] or tuple of tensors for all layers
     input_ids: torch.Tensor  # [batch, seq_len]
     attention_mask: torch.Tensor  # [batch, seq_len]
     loss_mask: torch.Tensor  # [batch, seq_len]
+
+
+@dataclass
+class FlashMTPV3Output:
+    """Output for v3 diffusion training with teacher logits."""
+    hidden_states: tuple  # tuple of layer hidden states
+    teacher_logits: torch.Tensor  # [batch, seq_len, vocab_size] - teacher predictions
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    loss_mask: torch.Tensor
 
 
 class FlashMTPTargetModel(ABC):
@@ -58,6 +68,21 @@ class FlashMTPTargetModel(ABC):
         loss_mask: torch.Tensor,
     ) -> FlashMTPTargetOutput:
         """Generate context hidden states for FlashMTP training."""
+
+    @abstractmethod
+    def compute_teacher_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute teacher logits from hidden states using teacher's lm_head.
+
+        Args:
+            hidden_states: (batch, seq_len, hidden_size) - usually the last layer hidden state
+
+        Returns:
+            logits: (batch, seq_len, vocab_size)
+        """
 
     def set_capture_layers(self, layer_ids: List[int]) -> None:
         """Set which layers' hidden states to capture."""
@@ -193,6 +218,31 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         return hidden_states_list
 
     @torch.no_grad()
+    def compute_teacher_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute teacher logits from hidden states using teacher's lm_head.
+        For SGLang backend, we use the lm_head from the underlying model.
+
+        Args:
+            hidden_states: (batch, seq_len, hidden_size)
+
+        Returns:
+            logits: (batch, seq_len, vocab_size)
+        """
+        # Access the lm_head from the SGLang model runner
+        if hasattr(self.model_runner.model, "lm_head"):
+            lm_head = self.model_runner.model.lm_head
+        elif hasattr(self.model_runner.model, "model") and hasattr(self.model_runner.model.model, "lm_head"):
+            lm_head = self.model_runner.model.model.lm_head
+        else:
+            raise AttributeError("Cannot find lm_head in SGLang model runner")
+
+        return lm_head(hidden_states)
+
+    @torch.no_grad()
     def generate_flashmtp_data(
         self,
         input_ids: torch.Tensor,
@@ -266,6 +316,22 @@ class HFFlashMTPTargetModel(FlashMTPTargetModel):
             target_model = target_model.to(device)
 
         return cls(target_model)
+
+    @torch.no_grad()
+    def compute_teacher_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute teacher logits from hidden states using teacher's lm_head.
+
+        Args:
+            hidden_states: (batch, seq_len, hidden_size)
+
+        Returns:
+            logits: (batch, seq_len, vocab_size)
+        """
+        return self.model.lm_head(hidden_states)
 
     @torch.no_grad()
     def generate_flashmtp_data(
