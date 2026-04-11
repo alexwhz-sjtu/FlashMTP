@@ -93,6 +93,9 @@ NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
+# 损失: ce=交叉熵; kl=相对目标模型 last-hidden 的 KL 蒸馏（需 HF 等返回完整 hidden_states）
+FLASHMTP_LOSS_TYPE="${FLASHMTP_LOSS_TYPE:-ce}"
+DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-2.0}"
 
 # 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
@@ -139,6 +142,8 @@ echo "  块大小: ${BLOCK_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
+echo "  损失类型: ${FLASHMTP_LOSS_TYPE} (ce|kl)"
+echo "  蒸馏温度T: ${DISTILL_TEMPERATURE} (仅 kl 时有效)"
 echo "------------------------------------------"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
@@ -256,6 +261,8 @@ EXIT_CODE=0
     --tp-size ${TP_SIZE} \
     --dist-timeout ${DIST_TIMEOUT} \
     --chs-concat-mode ${CHS_CONCAT_MODE} \
+    --flashmtp-loss-type ${FLASHMTP_LOSS_TYPE} \
+    --distill-temperature ${DISTILL_TEMPERATURE} \
     --seed 42 \
     ${OPTIONAL_ARGS} 2>&1 || EXIT_CODE=$?
 

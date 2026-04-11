@@ -80,6 +80,20 @@ def parse_args():
         help="Gamma for exponential loss decay weighting (paper Eq.4). "
         "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
     )
+    model_group.add_argument(
+        "--flashmtp-loss-type",
+        type=str,
+        default="ce",
+        choices=["ce", "kl"],
+        help="ce: cross-entropy on token ids; kl: KL(teacher||student) with teacher "
+        "from target last-layer hidden at label-1 (HF backend).",
+    )
+    model_group.add_argument(
+        "--distill-temperature",
+        type=float,
+        default=2.0,
+        help="Temperature for KL distillation (logits scaled by 1/T; loss scaled by T^2).",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -428,6 +442,8 @@ def main():
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
         chs_concat_mode=args.chs_concat_mode,
+        loss_type=args.flashmtp_loss_type,
+        distill_temperature=args.distill_temperature,
     )
 
     flashmtp_model = FSDP(

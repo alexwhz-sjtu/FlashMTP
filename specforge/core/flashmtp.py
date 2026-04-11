@@ -1,7 +1,7 @@
 # coding=utf-8
 """FlashMTP Training Wrapper."""
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -135,7 +135,7 @@ def create_flashmtp_block_mask(
 
 
 class OnlineFlashMTPModel(nn.Module):
-    """FlashMTP online training wrapper with block-wise CE loss."""
+    """FlashMTP online training wrapper with block-wise CE or KL-to-teacher loss."""
 
     def __init__(
             self,
@@ -148,6 +148,8 @@ class OnlineFlashMTPModel(nn.Module):
             num_anchors: int = 512,
             loss_decay_gamma: Optional[float] = None,
             chs_concat_mode: str = "seq",  # "seq" or "feature"
+            loss_type: str = "ce",  # "ce" or "kl"
+            distill_temperature: float = 2.0,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -159,6 +161,10 @@ class OnlineFlashMTPModel(nn.Module):
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
         self.chs_concat_mode = chs_concat_mode
+        if loss_type not in ("ce", "kl"):
+            raise ValueError(f"loss_type must be 'ce' or 'kl', got {loss_type!r}")
+        self.loss_type = loss_type
+        self.distill_temperature = distill_temperature
         self.draft_model.chs_concat_mode = chs_concat_mode
 
         self._cached_block_mask: Optional[BlockMask] = None
@@ -264,10 +270,21 @@ class OnlineFlashMTPModel(nn.Module):
 
         return self.embed_tokens(noise_ids)
 
+    @staticmethod
+    def _last_target_hidden(
+        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    ) -> torch.Tensor:
+        """Last tensor in the stack (HF: last transformer layer before lm_head)."""
+        if isinstance(hidden_states, torch.Tensor):
+            return hidden_states
+        if not hidden_states:
+            raise ValueError("hidden_states must be non-empty for KL / teacher logits.")
+        return hidden_states[-1]
+
     def forward(
         self,
         input_ids: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
         loss_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Parallel block-wise training forward pass."""
@@ -378,16 +395,43 @@ class OnlineFlashMTPModel(nn.Module):
                                       self.loss_decay_gamma)
             weight_mask = weight_mask * decay_weights
 
-        # --- Cross entropy ---
+        n_anchors = anchor_positions.size(1)
+        logits_3d = logits.view(bsz, n_anchors, self.block_size, -1)
         flat_logits = logits.view(-1, logits.size(-1))
         flat_targets = target_ids.view(-1)
         flat_weights = weight_mask.view(-1)
 
-        loss_per_token = F.cross_entropy(flat_logits,
-                                         flat_targets,
-                                         reduction="none")
-        valid_token_count = flat_weights.sum() + 1e-6
-        loss = (loss_per_token * flat_weights).sum() / valid_token_count
+        if self.loss_type == "kl":
+            # Teacher: causal LM logits at position (label - 1), same lm_head as target.
+            # HF hidden_states[-1] is last layer output at each token position.
+            context_idx = (safe_label_indices - 1).clamp(min=0)
+            h_last = self._last_target_hidden(hidden_states)
+            teacher_h = torch.gather(
+                h_last,
+                1,
+                context_idx.unsqueeze(-1).expand(
+                    -1, -1, -1, h_last.size(-1)),
+            )
+            with torch.no_grad():
+                teacher_logits = self.lm_head(teacher_h)
+            t = self.distill_temperature
+            log_p_s = F.log_softmax(logits_3d.float() / t, dim=-1)
+            p_t = F.softmax(teacher_logits.float() / t, dim=-1)
+            # KL(teacher || student) per token; sum over vocab (kl_div reduction='none' is per-dim)
+            kl_per_tok = F.kl_div(
+                log_p_s,
+                p_t,
+                reduction="none",
+                log_target=False,
+            ).sum(dim=-1)
+            loss = (kl_per_tok * (t * t) * weight_mask).sum() / (
+                weight_mask.sum() + 1e-6)
+        else:
+            loss_per_token = F.cross_entropy(flat_logits,
+                                             flat_targets,
+                                             reduction="none")
+            valid_token_count = flat_weights.sum() + 1e-6
+            loss = (loss_per_token * flat_weights).sum() / valid_token_count
 
         # --- Accuracy ---
         with torch.no_grad():
