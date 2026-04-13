@@ -393,7 +393,7 @@ class OnlineFlashMTPModel(nn.Module):
         Sample intermediate states y and y* for v3 diffusion training.
 
         For each block of size B=block_size:
-        - Sample a position p in [1, B-1] (number of tokens already revealed)
+        - Sample p in [1, B - inner_block_size] (tokens already revealed in y)
         - y: first p tokens are real, rest are MASK
         - y*: first p + inner_block_size tokens are real, rest are MASK
 
@@ -411,23 +411,18 @@ class OnlineFlashMTPModel(nn.Module):
         bsz, n_blocks = anchor_positions.shape
         device = input_ids.device
 
-        # Sample p for each block: random integer in [1, block_size - inner_block_size]
-        # This ensures we have room for both y and y* to be different
         min_p = 1
         max_p = self.block_size - self.inner_block_size
 
-        # Random sampling for valid blocks
         y_unmask_count = torch.zeros((bsz, n_blocks), dtype=torch.long, device=device)
 
         for b in range(bsz):
             for i in range(n_blocks):
                 if block_keep_mask[b, i]:
-                    # Sample p uniformly from [min_p, max_p]
                     y_unmask_count[b, i] = torch.randint(
                         min_p, max_p + 1, (1,), device=device
                     ).item()
 
-        # y* has inner_block_size more tokens unmasked
         y_star_unmask_count = y_unmask_count + self.inner_block_size
         y_star_unmask_count = torch.clamp(y_star_unmask_count, max=self.block_size)
 
@@ -512,6 +507,9 @@ class OnlineFlashMTPModel(nn.Module):
         """
         v3 diffusion-based training forward pass.
 
+        The second draft forward (state y*) runs only when consistency loss is used:
+        ``global_step >= enable_cons_after_steps`` and ``w_cons > 0``.
+
         Args:
             input_ids: (B, seq_len) input token IDs
             hidden_states: HF-style per-layer tuple or SGLang fused ``(B, L, n_layers*H)``
@@ -584,19 +582,24 @@ class OnlineFlashMTPModel(nn.Module):
         student_logits_y = self._apply_lm_head(output_hidden_y)  # (B, N*block_size, vocab_size)
         student_logits_y = student_logits_y.view(bsz, n_blocks, self.block_size, -1)
 
-        # 8. Forward for state y* (with y_star_unmask_count tokens revealed)
-        # y* is the inner block completion state
-        noise_embed_y_star = self._create_noise_embed_for_v3(
-            input_ids, anchor_positions, block_keep_mask, y_star_unmask_count
+        need_cons = (
+            global_step >= self.enable_cons_after_steps and self.w_cons > 0.0
         )
-        output_hidden_y_star = self.draft_model(
-            position_ids=full_position_ids,
-            noise_embedding=noise_embed_y_star,
-            target_hidden=target_hidden,
-            attention_mask=flashmtp_attn_mask,
-        )
-        student_logits_y_star = self._apply_lm_head(output_hidden_y_star)
-        student_logits_y_star = student_logits_y_star.view(bsz, n_blocks, self.block_size, -1)
+        student_logits_y_star = None
+        if need_cons:
+            noise_embed_y_star = self._create_noise_embed_for_v3(
+                input_ids, anchor_positions, block_keep_mask, y_star_unmask_count
+            )
+            output_hidden_y_star = self.draft_model(
+                position_ids=full_position_ids,
+                noise_embedding=noise_embed_y_star,
+                target_hidden=target_hidden,
+                attention_mask=flashmtp_attn_mask,
+            )
+            student_logits_y_star = self._apply_lm_head(output_hidden_y_star)
+            student_logits_y_star = student_logits_y_star.view(
+                bsz, n_blocks, self.block_size, -1
+            )
 
         # 9. Compute Distillation Loss on U_y (positions newly unmasked in y*)
         # L_distill = E[ (1/|U_y|) * sum_{i in U_y} D_KL(p_i^T || q_phi(.|y,x)_i) ]
@@ -610,18 +613,18 @@ class OnlineFlashMTPModel(nn.Module):
         # 10. Compute Consistency Loss on S_y (positions still masked in y*)
         # L_cons = E[ (1/|S_y|) * sum_{i in S_y} D_KL(q_phi^-(.|y*,x)_i || q_phi(.|y,x)_i) ]
         # Note: q_phi^- is stop-gradient
-        if global_step >= self.enable_cons_after_steps:
+        if need_cons and student_logits_y_star is not None:
             cons_loss = kl_divergence_loss(
-                student_logits_y,              # student from state y
+                student_logits_y,  # student from state y
                 student_logits_y_star.detach(),  # student from state y* (stop-gradient)
                 S_y_mask,
-                reduction="mean"
+                reduction="mean",
             )
         else:
             cons_loss = torch.tensor(0.0, device=device)
 
         # 11. Total loss
-        w_cons = self.w_cons if global_step >= self.enable_cons_after_steps else 0.0
+        w_cons = self.w_cons if need_cons else 0.0
         total_loss = self.w_distill * distill_loss + w_cons * cons_loss
 
         # 12. Compute accuracies for monitoring
@@ -633,9 +636,12 @@ class OnlineFlashMTPModel(nn.Module):
             distill_acc = distill_correct.sum().float() / (U_y_mask.sum() + 1e-8)
 
             # Consistency accuracy: student_y matches student_y_star on S_y
-            student_pred_y_star = torch.argmax(student_logits_y_star, dim=-1)
-            cons_correct = (student_pred_y == student_pred_y_star) & S_y_mask
-            cons_acc = cons_correct.sum().float() / (S_y_mask.sum() + 1e-8)
+            if need_cons and student_logits_y_star is not None:
+                student_pred_y_star = torch.argmax(student_logits_y_star, dim=-1)
+                cons_correct = (student_pred_y == student_pred_y_star) & S_y_mask
+                cons_acc = cons_correct.sum().float() / (S_y_mask.sum() + 1e-8)
+            else:
+                cons_acc = torch.tensor(0.0, device=device)
 
         loss_dict = {
             "total_loss": total_loss,

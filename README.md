@@ -65,8 +65,8 @@ $$
 L_{\text{Distillation}} = \mathbb{E} \frac{1}{|U_y|} \sum_{i \in U_y} D_{KL} \left( p_i^{(T)} \parallel q_\phi(\cdot | y, x)_i \right)
 $$
 
-- \( $U_y$ \)：当前 B=16 个位置中，从 y 到 y* 之间**新被 unmask** 的 token 位置。一次B_in个token（即1）
-- ( $p_i^{(T)}$ \)：Teacher 使用 hidden state 重建的 softmax 预测。
+- $U_y$：当前 B=16 个位置中，从 y 到 y* 之间**新被 unmask** 的 token 位置。一次B_in个token（即1）
+- $p_i^{(T)}$：Teacher 使用 hidden state 重建的 softmax 预测。
 - **作用**：强制学生在看到部分 token 的情况下，预测出 Teacher 会最终选择的 16 个 token。
 
 #### 2.2 Consistency Loss（一致性损失，关键稳定损失）
@@ -75,8 +75,8 @@ $$
 L_{\text{Consistency}} = \mathbb{E} \frac{1}{|S_y|} \sum_{i \in S_y} D_{KL} \left( q_\phi^-(\cdot | y^*, x)_i \parallel q_\phi(\cdot | y, x)_i \right)
 $$
 
-- \( $S_y$ \)：在 y* 中仍然保持 masked 的位置（即当前 B 个序列中尚未 final 的 token）。
-- \( $q_\phi^-$ \)：带 stop-gradient 的目标（防止训练不稳定）。
+- $S_y$：在 y* 中仍然保持 masked 的位置（即当前 B 个序列中尚未 final 的 token）。
+- $q_\phi^-$：带 stop-gradient 的目标（防止训练不稳定）。
 - **作用**：让学生在 “少信息状态 y” 和 “innerblock completion 状态 y* ” 之间保持预测一致，实现稳定跳跃。
 
 #### 2.3 总损失函数
@@ -87,8 +87,8 @@ $$
 
 **推荐权重**（B=16, L=1）：
 
-- \( $w_{\text{distill}}$ = 1.0 \)
-- \( $w_{\text{cons}} $= 0.6 \)
+- $w_{\text{distill}} = 1.0$
+- $w_{\text{cons}} = 0.6$
 
 
 这里有一个问题，$q_\phi^-$ 需要学生模型自己来预测。但我是从零初始化，因此需要先训练一个多步迭代扩散草稿模型（纯蒸馏损失），再加入一致性损失。上面的两个权重给出调整接口。
@@ -100,16 +100,16 @@ $$
 1. 使用 自回归目标模型 模型对大量 prompt 生成轨迹。（已完成）
 2. 每条轨迹记录：
 
-   - 人为构建 块内 B 内的 Token 序列轨迹 ($\mathcal{T}_x$\)。按照从左到右的因果顺序。也就是说，解码轨迹模拟自回归生成的轨迹。
+   - 人为构建 块内 B 内的 Token 序列轨迹 ($\mathcal{T}_x$)。按照从左到右的因果顺序。也就是说，解码轨迹模拟自回归生成的轨迹。
    - 对应 hidden state buffer（用于重建 Teacher logits）*这个在线生成
 
 ### 3.2 训练阶段（每一次迭代）
 
-1. 基于base structure，我们已经采样了一个anchor token。那么后面的目标就是预测此锚点块的解码轨迹 \($\mathcal{T}_{x}$）。
+1. 基于base structure，我们已经采样了一个anchor token。那么后面的目标就是预测此锚点块的解码轨迹 $\mathcal{T}_{x}$。
 2. **随机采样中间状态 y**：
    - 在轨迹中随机选择步骤 k。在这里，因为轨迹是因果的，因此可以直接采样一个块内位置p，其之前p个token看作已生成的轨迹，后面的都是mask。
-   - y = \($\mathcal{T}_x$)
-   - y* = \($\mathcal{T}_x'$) 即当前B_in中被全部unmask后的状态。这里就是第p+1个token被unmask
+   - $y = \mathcal{T}_x$
+   - $y^* = \mathcal{T}_x'$ 即当前B_in中被全部unmask后的状态。这里就是第p+1个token被unmask
 3. 计算两个损失（所有计算均限制在当前 B=16 个 token 范围内）：
    - Distillation Loss（在 Uy 上）
    - Consistency Loss（在 Sy 上）
@@ -151,8 +151,4 @@ $$
   publisher={GitHub},
   howpublished={\url{https://github.com/sgl-project/specforge}},
 }
-```
-
-```
-
 ```
