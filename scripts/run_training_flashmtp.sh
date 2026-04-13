@@ -34,8 +34,8 @@ fi
 # ========================================
 # 主要训练参数
 # ========================================
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
@@ -77,8 +77,8 @@ if [ "$DT" = "qz" ]; then
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 else
     # a800 配置（默认）
-    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_test/nemotron_think_on_samples_test_qwen3_8b_regen_error.jsonl"
-    OUTPUT_DIR="./cache/models/test"
+    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
+    OUTPUT_DIR="./cache/models/2layers_40k"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
@@ -89,12 +89,15 @@ EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
 CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 
 # 模型参数
-NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
+NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-2}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
 # 损失: ce=交叉熵; kl=相对目标模型 last-hidden 的 KL 蒸馏（需 HF 等返回完整 hidden_states）
-FLASHMTP_LOSS_TYPE="${FLASHMTP_LOSS_TYPE:-ce}"
+# ce_kl= CE 与 top-k KL 加权: 总损失 = CE_LOSS_WEIGHT * CE + KL_LOSS_WEIGHT * KL（系数为 0 的分支不计算）
+FLASHMTP_LOSS_TYPE="${FLASHMTP_LOSS_TYPE:-ce_kl}"
+CE_LOSS_WEIGHT="${CE_LOSS_WEIGHT:-1}"
+KL_LOSS_WEIGHT="${KL_LOSS_WEIGHT:-0.2}"
 DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-2.0}"
 # KL 蒸馏时只对齐教师 top-k logits；<=0 表示全词表
 KL_TOPK="${KL_TOPK:-10}"
@@ -106,12 +109,12 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-5000}"
 
 # Tracker 参数
 REPORT_TO="${REPORT_TO:-wandb}"
-WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training}"
+WANDB_PROJECT="${WANDB_PROJECT:-flashmtp_training}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"
 # offline: 仅本地写入 ${WANDB_DIR}，无需 API key；上线同步: WANDB_MODE=online 并配置密钥
 WANDB_MODE="${WANDB_MODE:-offline}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v1.1_${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_fixed}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v1.1_nlayer_${NUM_DRAFT_LAYERS}_${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_fixed}"
 
 export WANDB_DIR
 export WANDB_MODE
@@ -149,9 +152,11 @@ echo "  块大小: ${BLOCK_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
-echo "  损失类型: ${FLASHMTP_LOSS_TYPE} (ce|kl)"
-echo "  蒸馏温度T: ${DISTILL_TEMPERATURE} (仅 kl 时有效)"
-echo "  KL top-k: ${KL_TOPK} (仅 kl；<=0 为全词表)"
+echo "  损失类型: ${FLASHMTP_LOSS_TYPE} (ce|kl|ce_kl)"
+echo "  CE 系数: ${CE_LOSS_WEIGHT} (ce_kl 时有效；纯 kl 时不使用)"
+echo "  KL 系数 w: ${KL_LOSS_WEIGHT} (ce_kl 时有效；纯 ce 时不使用)"
+echo "  蒸馏温度T: ${DISTILL_TEMPERATURE} (kl / ce_kl 中 KL 项有效)"
+echo "  KL top-k: ${KL_TOPK} (kl / ce_kl 中 KL 项；<=0 为全词表)"
 echo "------------------------------------------"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
@@ -271,6 +276,8 @@ EXIT_CODE=0
     --dist-timeout ${DIST_TIMEOUT} \
     --chs-concat-mode ${CHS_CONCAT_MODE} \
     --flashmtp-loss-type ${FLASHMTP_LOSS_TYPE} \
+    --ce-loss-weight ${CE_LOSS_WEIGHT} \
+    --kl-loss-weight ${KL_LOSS_WEIGHT} \
     --distill-temperature ${DISTILL_TEMPERATURE} \
     --kl-topk ${KL_TOPK} \
     --seed 42 \

@@ -3,6 +3,26 @@
 
 set -e
 
+# 解析命令行参数
+DT="a800"  # 默认值为 a800
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --dt)
+            DT="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+# 验证 dt 参数
+if [[ "$DT" != "qz" && "$DT" != "a800" ]]; then
+    echo "错误: --dt 参数必须是 'qz' 或 'a800'"
+    exit 1
+fi
+
 # 自动激活虚拟环境
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
@@ -19,8 +39,6 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 MASTER_PORT="${MASTER_PORT:-29501}"
 
-# 目标模型路径
-TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"  # hf 或 sglang
 
 # 训练参数
@@ -32,12 +50,10 @@ MAX_LENGTH="${MAX_LENGTH:-4096}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
-# 数据特征参数（用于自动构建数据路径）
-DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-400000}"
+# 数据特征参数（与 FlashMTP 脚本一致，按 --dt 选择路径）
+DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}"
 ENABLE_THINKING="${ENABLE_THINKING:-on}"
 
-# 构建数据子目录名: n{N|all}_think_{on|off}
-DATASET_BASE_DIR="${DATASET_BASE_DIR:-./cache/dataset}"
 if [ "${ENABLE_THINKING}" = "on" ] || [ "${ENABLE_THINKING}" = "true" ] || [ "${ENABLE_THINKING}" = "1" ]; then
     THINK_STR="on"
 else
@@ -45,14 +61,23 @@ else
 fi
 DATA_SUBDIR="n${DATA_NUM_SAMPLES}_think_${THINK_STR}"
 
-# 数据目录（支持通过 TRAIN_DATA_PATH 直接指定，否则自动构建）
-TRAIN_DATA_PATH="./cache/data/regen_data/nemotron_400000/nemotron_think_on_samples_400000_qwen3_8b_regen.jsonl"
+# 数据目录 - 根据 --dt 参数选择配置（输出目录名含 dflash 关键字）
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
-OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/dflash_sample_400000_think_on_qwen3_8b_maxlen${MAX_LENGTH}}"
-CACHE_DIR="./cache/data/regen_data/nemotron_400000"
+if [ "$DT" = "qz" ]; then
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/dflash_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}}"
+    TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
+else
+    # a800 配置（默认）
+    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
+    OUTPUT_DIR="./cache/models/dflash_2layers_40k"
+    TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
+fi
+
+CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 
 # 模型参数
-NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
+NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-2}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
@@ -68,7 +93,7 @@ REPORT_TO="${REPORT_TO:-wandb}"  # none, wandb, tensorboard
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
-WANDB_RUN_ID="${WANDB_RUN_ID:-dflash_400000}"   # 离线子目录名称 (如: my_run_001，生成 offline-run-my_run_001)
+WANDB_RUN_ID="${WANDB_RUN_ID:-dflash_v1.1_nlayer_${NUM_DRAFT_LAYERS}_${DATA_NUM_SAMPLES}_fixed}"
 
 # 分布式参数
 TP_SIZE="${TP_SIZE:-1}"
@@ -87,6 +112,8 @@ BUILD_DATASET_NUM_PROC="${BUILD_DATASET_NUM_PROC:-8}"
 echo "=========================================="
 echo "DFlash 训练启动脚本"
 echo "=========================================="
+echo "运行环境: ${DT}"
+echo "------------------------------------------"
 echo "数据特征:"
 echo "  样本数量: ${DATA_NUM_SAMPLES}"
 echo "  思考模式: ${THINK_STR}"

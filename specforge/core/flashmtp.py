@@ -148,9 +148,11 @@ class OnlineFlashMTPModel(nn.Module):
             num_anchors: int = 512,
             loss_decay_gamma: Optional[float] = None,
             chs_concat_mode: str = "seq",  # "seq" or "feature"
-            loss_type: str = "ce",  # "ce" or "kl"
+            loss_type: str = "ce",  # "ce", "kl", or "ce_kl"
             distill_temperature: float = 2.0,
             kl_topk: int = 10,
+            ce_loss_weight: float = 1.0,
+            kl_loss_weight: float = 0.0,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -162,11 +164,19 @@ class OnlineFlashMTPModel(nn.Module):
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
         self.chs_concat_mode = chs_concat_mode
-        if loss_type not in ("ce", "kl"):
-            raise ValueError(f"loss_type must be 'ce' or 'kl', got {loss_type!r}")
+        if loss_type not in ("ce", "kl", "ce_kl"):
+            raise ValueError(
+                f"loss_type must be 'ce', 'kl', or 'ce_kl', got {loss_type!r}"
+            )
         self.loss_type = loss_type
         self.distill_temperature = distill_temperature
         self.kl_topk = kl_topk
+        self.ce_loss_weight = float(ce_loss_weight)
+        self.kl_loss_weight = float(kl_loss_weight)
+        if loss_type == "ce_kl" and self.ce_loss_weight <= 0 and self.kl_loss_weight <= 0:
+            raise ValueError(
+                "ce_kl requires at least one of ce_loss_weight or kl_loss_weight > 0"
+            )
         self.draft_model.chs_concat_mode = chs_concat_mode
 
         self._cached_block_mask: Optional[BlockMask] = None
@@ -403,7 +413,26 @@ class OnlineFlashMTPModel(nn.Module):
         flat_targets = target_ids.view(-1)
         flat_weights = weight_mask.view(-1)
 
-        if self.loss_type == "kl":
+        need_ce = self.loss_type == "ce" or (
+            self.loss_type == "ce_kl" and self.ce_loss_weight > 0
+        )
+        need_kl = self.loss_type == "kl" or (
+            self.loss_type == "ce_kl" and self.kl_loss_weight > 0
+        )
+
+        loss = flat_logits.new_tensor(0.0)
+        if need_ce:
+            loss_per_token = F.cross_entropy(
+                flat_logits, flat_targets, reduction="none"
+            )
+            valid_token_count = flat_weights.sum() + 1e-6
+            ce_loss = (loss_per_token * flat_weights).sum() / valid_token_count
+            if self.loss_type == "ce":
+                loss = ce_loss
+            else:
+                loss = loss + self.ce_loss_weight * ce_loss
+
+        if need_kl:
             # Teacher: causal LM logits at position (label - 1), same lm_head as target.
             # HF hidden_states[-1] is last layer output at each token position.
             context_idx = (safe_label_indices - 1).clamp(min=0)
@@ -448,14 +477,12 @@ class OnlineFlashMTPModel(nn.Module):
                     reduction="none",
                     log_target=False,
                 ).sum(dim=-1)
-            loss = (kl_per_tok * (t * t) * weight_mask).sum() / (
+            kl_loss = (kl_per_tok * (t * t) * weight_mask).sum() / (
                 weight_mask.sum() + 1e-6)
-        else:
-            loss_per_token = F.cross_entropy(flat_logits,
-                                             flat_targets,
-                                             reduction="none")
-            valid_token_count = flat_weights.sum() + 1e-6
-            loss = (loss_per_token * flat_weights).sum() / valid_token_count
+            if self.loss_type == "kl":
+                loss = kl_loss
+            else:
+                loss = loss + self.kl_loss_weight * kl_loss
 
         # --- Accuracy ---
         with torch.no_grad():

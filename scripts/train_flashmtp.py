@@ -84,9 +84,21 @@ def parse_args():
         "--flashmtp-loss-type",
         type=str,
         default="ce",
-        choices=["ce", "kl"],
-        help="ce: cross-entropy on token ids; kl: KL(teacher||student) with teacher "
-        "from target last-layer hidden at label-1 (HF backend).",
+        choices=["ce", "kl", "ce_kl"],
+        help="ce: cross-entropy only; kl: top-k KL only; ce_kl: weighted sum "
+        "(ce * --ce-loss-weight + kl * --kl-loss-weight). Unused terms are not computed.",
+    )
+    model_group.add_argument(
+        "--ce-loss-weight",
+        type=float,
+        default=1.0,
+        help="Coefficient for CE when loss type is ce_kl (default 1). Ignored for pure kl.",
+    )
+    model_group.add_argument(
+        "--kl-loss-weight",
+        type=float,
+        default=0.0,
+        help="Coefficient w for KL when loss type is ce_kl. Ignored for pure ce.",
     )
     model_group.add_argument(
         "--distill-temperature",
@@ -189,6 +201,13 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         draft_config.block_size = args.block_size
         draft_config.num_target_layers = target_config.num_hidden_layers+1 # include the initial embedding
         print_on_rank0("Auto-generated draft config from target model")
+
+    # Draft has fewer layers than the target; cloning target config leaves `layer_types` sized
+    # to the target depth, which breaks transformers validation (num_hidden_layers vs len(layer_types))
+    # and save_pretrained. Use one entry per draft layer, all full attention.
+    n_draft = draft_config.num_hidden_layers
+    if hasattr(draft_config, "layer_types"):
+        draft_config.layer_types = ["full_attention"] * n_draft
 
     if not hasattr(draft_config, "flashmtp_config") or draft_config.flashmtp_config is None:
         draft_config.flashmtp_config = {}
@@ -360,6 +379,10 @@ def main():
     )
 
     args = parse_args()
+    if args.flashmtp_loss_type == "ce_kl" and args.ce_loss_weight <= 0 and args.kl_loss_weight <= 0:
+        raise ValueError(
+            "ce_kl requires at least one of --ce-loss-weight or --kl-loss-weight to be > 0"
+        )
     set_seed(args.seed)
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
@@ -452,6 +475,8 @@ def main():
         loss_type=args.flashmtp_loss_type,
         distill_temperature=args.distill_temperature,
         kl_topk=args.kl_topk,
+        ce_loss_weight=args.ce_loss_weight,
+        kl_loss_weight=args.kl_loss_weight,
     )
 
     flashmtp_model = FSDP(
