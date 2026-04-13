@@ -41,9 +41,9 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 
 class Qwen3FlashMTPAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+    """Multi-headed attention with asymmetric RoPE: only mask tokens get RoPE."""
 
-    def __init__(self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str):
+    def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -83,8 +83,6 @@ class Qwen3FlashMTPAttention(nn.Module):
             if config.layer_types[layer_idx] == "sliding_attention"
             else None
         )
-        
-        self.chs_concat_mode = chs_concat_mode
 
     def forward(
         self,
@@ -99,37 +97,26 @@ class Qwen3FlashMTPAttention(nn.Module):
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden.shape[1]
 
-        # whole seq serves as Q, input is alreadt concat seq                                                                                                                                                                                                                                                                                                                                                                                                           
-                                                                                                                                                                                                                                                    
-        # 统一投影
-        q = self.q_proj(hidden_states)  # Q 现在包含 target_hidden 部分                                                                                                                                                                                                   
-        k = self.k_proj(hidden_states)                                                                                                                                                                                                                                    
-        v = self.v_proj(hidden_states)                                                                                                                                                                                                                                    
-                                                                                                                                                                                                                                                                    
-        # reshape                                                                                                                                                                                                                                                    
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+
         q = q.view(bsz, q_len, -1, self.head_dim)
-        q = self.q_norm(q).transpose(1, 2)                                                                                                                                                                                                                           
-        k = k.view(bsz, q_len, -1, self.head_dim)                                                                                                                                                                                                          
-        v = v.view(bsz, q_len, -1, self.head_dim)   
+        q = self.q_norm(q).transpose(1, 2)
+        k = k.view(bsz, q_len, -1, self.head_dim)
+        v = v.view(bsz, q_len, -1, self.head_dim)
 
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
 
         cos, sin = position_embeddings
 
-        # # old seq mode
-        # k_ctx_part = k[:, :, :ctx_len, :]
-        # k_noise_part = k[:, :, ctx_len:, :]
-        # # q also needs to be split, as position_embeddings only cover noise positions
-        # q_ctx_part = q[:, :, :ctx_len, :]
-        # q_noise_part = q[:, :, ctx_len:, :]
-        # q_noise_part, k_noise_part = apply_rotary_pos_emb(q_noise_part, k_noise_part, cos, sin)
-        # q = torch.cat([q_ctx_part, q_noise_part], dim=2)
-        # k = torch.cat([k_ctx_part, k_noise_part], dim=2)
-        
-        # apply RoPE to full q and k
-        # position_embeddings now contains positions for both context and noise parts
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        # RoPE only on mask (noise) tokens; layer tokens have no positional encoding
+        q_layer, q_mask = q[:, :, :ctx_len, :], q[:, :, ctx_len:, :]
+        k_layer, k_mask = k[:, :, :ctx_len, :], k[:, :, ctx_len:, :]
+        q_mask, k_mask = apply_rotary_pos_emb(q_mask, k_mask, cos, sin)
+        q = torch.cat([q_layer, q_mask], dim=2)
+        k = torch.cat([k_layer, k_mask], dim=2)
 
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -155,10 +142,10 @@ class Qwen3FlashMTPAttention(nn.Module):
 
 
 class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str):
+    def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = Qwen3FlashMTPAttention(config=config, layer_idx=layer_idx, chs_concat_mode=chs_concat_mode)
+        self.self_attn = Qwen3FlashMTPAttention(config=config, layer_idx=layer_idx)
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(
@@ -208,14 +195,19 @@ def extract_context_feature(
     hidden_states: list[torch.Tensor],
     layer_ids: Optional[list[int]],
 ) -> torch.Tensor:
-    """Extract hidden states from specified layer IDs. """
-    # we include the initial embedding
-    offset = 0
+    """Extract hidden states from specified layer IDs (seq mode).
+
+    Returns:
+        (B, S*L, H) where L = len(layer_ids), interleaved per-position:
+        [layer0_pos0, layer1_pos0, ..., layer0_pos1, layer1_pos1, ...]
+    """
     selected_states = []
     for layer_id in layer_ids:
-        selected_states.append(hidden_states[layer_id + offset])
-    target_hidden = torch.cat(selected_states, dim=-1)
-    return target_hidden
+        selected_states.append(hidden_states[layer_id])
+    # stack along a new layer dim then interleave: (B, S, L, H) -> (B, S*L, H)
+    stacked = torch.stack(selected_states, dim=2)  # (B, S, L, H)
+    B, S, L, H = stacked.shape
+    return stacked.reshape(B, S * L, H)
 
 
 class FlashMTPDraftModel(Qwen3PreTrainedModel):
@@ -226,14 +218,12 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         super().__init__(config)
         self.config = config
         flashmtp_config = getattr(config, "flashmtp_config", {}) or {}
-        self.chs_concat_mode = flashmtp_config.get("chs_concat_mode", "seq")
         self.layers = nn.ModuleList(
             [
-                Qwen3FlashMTPDecoderLayer(config, layer_idx, self.chs_concat_mode)
+                Qwen3FlashMTPDecoderLayer(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        # target_layer_ids: list of layer indices to extract from target model
         self.target_layer_ids = flashmtp_config.get(
             "target_layer_ids",
             list(range(config.num_target_layers)),
@@ -243,26 +233,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
 
-        # For seq concat mode: use Identity (no computation, no parameters)
-        # For feature mode: use Linear projection and RMSNorm
-        if self.chs_concat_mode == "feature":
-            print(config.num_target_layers)
-            self.fc = nn.Linear(
-                len(self.target_layer_ids) * config.hidden_size,
-                config.hidden_size,
-                bias=False,
-            )
-            # self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        else:
-            # self.fc = nn.Identity()
-            self.fc = nn.Linear(
-                config.hidden_size,
-                config.hidden_size,
-                bias=False,
-            )
-            # maybe need norm
-            # self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        print_on_rank0(f"self.chs_concat_mode: {self.chs_concat_mode}")
+        self.fc = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layer_embedding = nn.Embedding(config.num_target_layers, config.hidden_size)
 
         self.post_init()
 
@@ -276,14 +249,20 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         use_cache: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
-        
         hidden_states = noise_embedding
         bsz, noise_len, _ = hidden_states.shape
-        # maybe we don't need to do norm for target hidden exclusively, move it to layernorm
-        # target_hidden = self.hidden_norm(self.fc(target_hidden))
-        target_hidden = self.fc(target_hidden)
+        device = hidden_states.device
+
+        # Layer token construction: project + norm + layer-ID embedding
+        target_hidden = self.hidden_norm(self.fc(target_hidden))  # (B, N*L, H)
+        num_layers = len(self.target_layer_ids)
+        n_blocks = target_hidden.shape[1] // num_layers
+        layer_ids = torch.arange(num_layers, device=device).repeat(n_blocks)  # (N*L,)
+        target_hidden = target_hidden + self.layer_embedding(layer_ids)
+
+        # RoPE only for mask (noise) tokens — position_ids should be local (0..B-1 per block)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        # the whole serves as qkv
+
         hidden_states = torch.cat([target_hidden, hidden_states], dim=1)  # (B, ctx_len+noise_len, H)
         for layer in self.layers:
             hidden_states = layer(
@@ -312,18 +291,23 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         max_length = num_input_tokens + max_new_tokens
 
         block_size = self.block_size
+        device = target.device
         output_ids = torch.full(
             (1, max_length + block_size),
             self.mask_token_id,
             dtype=torch.long,
-            device=target.device,
+            device=device,
         )
         position_ids = torch.arange(
-            output_ids.shape[1], device=target.device
+            output_ids.shape[1], device=device
         ).unsqueeze(0)
 
+        # Local position IDs for mask tokens within a block: [0, 1, ..., block_size-1]
+        local_position_ids = torch.arange(
+            block_size, device=device
+        ).unsqueeze(0)  # (1, block_size)
+
         past_key_values_target = DynamicCache()
-        past_key_values_draft = DynamicCache()
 
         # Prefill stage
         output = target(
@@ -343,7 +327,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             output.hidden_states, self.target_layer_ids
         )
 
-        # Decode stage
+        # Decode stage — no draft KV cache: each step is independent
         acceptance_lengths = []
         start = input_ids.shape[1]
         while start < max_length:
@@ -354,15 +338,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 self(
                     target_hidden=target_hidden,
                     noise_embedding=noise_embedding,
-                    position_ids=position_ids[
-                        :, past_key_values_draft.get_seq_length() : start + block_size
-                    ],
-                    past_key_values=past_key_values_draft,
-                    use_cache=True,
-                    is_causal=False,
+                    position_ids=local_position_ids,
                 )[:, -block_size + 1 :, :]
             )
-            past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = sample(draft_logits)
 
             output = target(

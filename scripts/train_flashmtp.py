@@ -108,7 +108,6 @@ def parse_args():
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
-    dataset_group.add_argument("--chs-concat-mode", type=str, default="feature")
     dataset_group.add_argument(
         "--build-dataset-num-proc",
         type=int,
@@ -192,8 +191,6 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
 
     if not hasattr(draft_config, "flashmtp_config") or draft_config.flashmtp_config is None:
         draft_config.flashmtp_config = {}
-        
-    draft_config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
@@ -419,7 +416,6 @@ def main():
 
     draft_model.mask_token_id = mask_token_id
     
-    draft_model.config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
     draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
     draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
@@ -448,7 +444,6 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
-        chs_concat_mode=args.chs_concat_mode,
         loss_type=args.flashmtp_loss_type,
         distill_temperature=args.distill_temperature,
         kl_topk=args.kl_topk,
