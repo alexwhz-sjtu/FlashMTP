@@ -34,8 +34,8 @@ fi
 # ========================================
 # 主要训练参数
 # ========================================
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
@@ -56,6 +56,70 @@ ENABLE_THINKING="${ENABLE_THINKING:-on}"
 # 默认参数（通常不需要修改）
 # ========================================
 
+
+# 模型参数
+NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
+BLOCK_SIZE="${BLOCK_SIZE:-16}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
+LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
+DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-2.0}"
+# KL 蒸馏时只对齐教师 top-k logits；<=0 表示全词表
+KL_TOPK="${KL_TOPK:-5}"
+
+# 损失类型: ce | kl | mixed（mixed 可用 CE_LOSS_WEIGHT / KL_LOSS_WEIGHT 覆盖默认 0.5/0.5）
+LOSS_TYPE="${LOSS_TYPE:-ce}"
+case "$LOSS_TYPE" in
+    ce)
+        : "${CE_LOSS_WEIGHT:=1.0}"
+        : "${KL_LOSS_WEIGHT:=0.0}"
+        ;;
+    kl)
+        : "${CE_LOSS_WEIGHT:=0.0}"
+        : "${KL_LOSS_WEIGHT:=1.0}"
+        ;;
+    mixed)
+        : "${CE_LOSS_WEIGHT:=0.5}"
+        : "${KL_LOSS_WEIGHT:=0.5}"
+        ;;
+    *)
+        echo "错误: LOSS_TYPE 必须是 ce、kl 或 mixed"
+        exit 1
+        ;;
+esac
+if python3 -c "import sys; c=float('${CE_LOSS_WEIGHT}'); k=float('${KL_LOSS_WEIGHT}'); sys.exit(0 if (c > 0 or k > 0) else 1)"; then
+    :
+else
+    echo "错误: CE_LOSS_WEIGHT 与 KL_LOSS_WEIGHT 不能同时为 0 或负数"
+    exit 1
+fi
+# 用于路径 / WandB run id 的短标签（mixed 带权重，避免歧义）
+CE_TAG="${CE_LOSS_WEIGHT//./_}"
+KL_TAG="${KL_LOSS_WEIGHT//./_}"
+case "$LOSS_TYPE" in
+    ce) LOSS_SHORT="ce" ;;
+    kl) LOSS_SHORT="kl" ;;
+    mixed) LOSS_SHORT="mix_ce${CE_TAG}_kl${KL_TAG}" ;;
+esac
+
+# 数据目录 - 根据 --dt 参数选择配置（默认 OUTPUT_DIR / WANDB_RUN_ID 含 loss 与 epoch）
+if [ "$DT" = "qz" ]; then
+    # qz 配置
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v1.2_nlayers_${NUM_DRAFT_LAYERS}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_loss_${LOSS_SHORT}_ep${NUM_EPOCHS}}"
+    TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
+else
+    # a800 配置（默认）
+    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v1.2_nlayers_${NUM_DRAFT_LAYERS}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_loss_${LOSS_SHORT}_ep${NUM_EPOCHS}}"
+    TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
+fi
+
+
+TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
+
+EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
+CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
+
 # GPU 设置
 MASTER_PORT="${MASTER_PORT:-29501}"
 TP_SIZE="${TP_SIZE:-1}"
@@ -67,36 +131,6 @@ ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
 LEARNING_RATE="${LEARNING_RATE:-6e-4}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
-
-# 数据目录 - 根据 --dt 参数选择配置
-if [ "$DT" = "qz" ]; then
-    # qz 配置
-    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v1.2_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}}"
-    TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
-else
-    # a800 配置（默认）
-    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_test/nemotron_think_on_samples_test_qwen3_8b_regen_error.jsonl"
-    OUTPUT_DIR="./cache/models/test"
-    TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
-fi
-
-
-TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
-
-EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
-CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
-
-# 模型参数
-NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
-BLOCK_SIZE="${BLOCK_SIZE:-16}"
-ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
-LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
-# 损失: ce=交叉熵; kl=相对目标模型 last-hidden 的 KL 蒸馏（需 HF 等返回完整 hidden_states）
-FLASHMTP_LOSS_TYPE="${FLASHMTP_LOSS_TYPE:-ce}"
-DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-2.0}"
-# KL 蒸馏时只对齐教师 top-k logits；<=0 表示全词表
-KL_TOPK="${KL_TOPK:-10}"
 
 # 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
@@ -110,7 +144,7 @@ WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"
 # offline: 仅本地写入 ${WANDB_DIR}，无需 API key；上线同步: WANDB_MODE=online 并配置密钥
 WANDB_MODE="${WANDB_MODE:-offline}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v1.2_${DATA_NUM_SAMPLES}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v1.2_${DATA_NUM_SAMPLES}_loss_${LOSS_SHORT}_ep${NUM_EPOCHS}}"
 
 export WANDB_DIR
 export WANDB_MODE
@@ -147,9 +181,11 @@ echo "  块大小: ${BLOCK_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
-echo "  损失类型: ${FLASHMTP_LOSS_TYPE} (ce|kl)"
-echo "  蒸馏温度T: ${DISTILL_TEMPERATURE} (仅 kl 时有效)"
-echo "  KL top-k: ${KL_TOPK} (仅 kl；<=0 为全词表)"
+echo "  损失类型 LOSS_TYPE: ${LOSS_TYPE} (路径标签: ${LOSS_SHORT})"
+echo "  CE 损失权重: ${CE_LOSS_WEIGHT} (0 则不计算 CE)"
+echo "  KL 损失权重: ${KL_LOSS_WEIGHT} (0 则不计算 KL)"
+echo "  蒸馏温度T: ${DISTILL_TEMPERATURE} (KL 权重>0 时有效)"
+echo "  KL top-k: ${KL_TOPK} (KL 权重>0；<=0 为全词表)"
 echo "------------------------------------------"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
@@ -267,7 +303,9 @@ EXIT_CODE=0
     --build-dataset-num-proc ${BUILD_DATASET_NUM_PROC} \
     --tp-size ${TP_SIZE} \
     --dist-timeout ${DIST_TIMEOUT} \
-    --flashmtp-loss-type ${FLASHMTP_LOSS_TYPE} \
+    --loss-type ${LOSS_TYPE} \
+    --ce-loss-weight ${CE_LOSS_WEIGHT} \
+    --kl-loss-weight ${KL_LOSS_WEIGHT} \
     --distill-temperature ${DISTILL_TEMPERATURE} \
     --kl-topk ${KL_TOPK} \
     --seed 42 \

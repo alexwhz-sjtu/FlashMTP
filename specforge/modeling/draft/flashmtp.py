@@ -165,12 +165,16 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
+        layer_emb: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        if layer_emb is not None:
+            ctx_len = target_hidden.shape[1]
+            hidden_states[:, :ctx_len, :] = hidden_states[:, :ctx_len, :] + layer_emb
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             target_hidden=target_hidden,
@@ -253,12 +257,12 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         bsz, noise_len, _ = hidden_states.shape
         device = hidden_states.device
 
-        # Layer token construction: project + norm + layer-ID embedding
+        # Layer token construction: project + norm (layer-ID embedding injected each decoder layer)
         target_hidden = self.hidden_norm(self.fc(target_hidden))  # (B, N*L, H)
         num_layers = len(self.target_layer_ids)
         n_blocks = target_hidden.shape[1] // num_layers
         layer_ids = torch.arange(num_layers, device=device).repeat(n_blocks)  # (N*L,)
-        target_hidden = target_hidden + self.layer_embedding(layer_ids)
+        layer_emb = self.layer_embedding(layer_ids)  # (N*L, H), added on ctx tokens before each attn
 
         # RoPE only for mask (noise) tokens — position_ids should be local (0..B-1 per block)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -273,6 +277,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
+                layer_emb=layer_emb,
                 **kwargs,
             )
         return (self.norm(hidden_states))[:, -noise_len:, :]

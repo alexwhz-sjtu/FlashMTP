@@ -1,7 +1,7 @@
 # coding=utf-8
 """FlashMTP Training Wrapper."""
 
-from typing import Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -111,7 +111,7 @@ def create_flashmtp_block_mask(
 
 
 class OnlineFlashMTPModel(nn.Module):
-    """FlashMTP online training wrapper with block-wise CE or KL-to-teacher loss."""
+    """FlashMTP online training wrapper with block-wise CE and/or KL-to-teacher loss."""
 
     def __init__(
             self,
@@ -123,7 +123,8 @@ class OnlineFlashMTPModel(nn.Module):
             attention_backend: str = "flex_attention",
             num_anchors: int = 512,
             loss_decay_gamma: Optional[float] = None,
-            loss_type: str = "ce",  # "ce" or "kl"
+            ce_loss_weight: float = 1.0,
+            kl_loss_weight: float = 0.0,
             distill_temperature: float = 2.0,
             kl_topk: int = 10,
     ):
@@ -136,9 +137,12 @@ class OnlineFlashMTPModel(nn.Module):
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
-        if loss_type not in ("ce", "kl"):
-            raise ValueError(f"loss_type must be 'ce' or 'kl', got {loss_type!r}")
-        self.loss_type = loss_type
+        self.ce_loss_weight = float(ce_loss_weight)
+        self.kl_loss_weight = float(kl_loss_weight)
+        if self.ce_loss_weight <= 0.0 and self.kl_loss_weight <= 0.0:
+            raise ValueError(
+                "At least one of ce_loss_weight or kl_loss_weight must be positive."
+            )
         self.distill_temperature = distill_temperature
         self.kl_topk = kl_topk
 
@@ -261,8 +265,13 @@ class OnlineFlashMTPModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
         loss_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Parallel block-wise training forward pass."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Optional[torch.Tensor]]]:
+        """Parallel block-wise training forward pass.
+
+        Returns:
+            total_loss, accuracy, loss_parts — ``loss_parts`` maps ``ce`` / ``kl`` to
+            unweighted mean component losses (or None if that branch was skipped).
+        """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
@@ -346,7 +355,19 @@ class OnlineFlashMTPModel(nn.Module):
         flat_targets = target_ids.view(-1)
         flat_weights = weight_mask.view(-1)
 
-        if self.loss_type == "kl":
+        loss_parts: Dict[str, Optional[torch.Tensor]] = {"ce": None, "kl": None}
+        loss = logits.new_zeros(())
+
+        if self.ce_loss_weight > 0.0:
+            loss_per_token = F.cross_entropy(
+                flat_logits, flat_targets, reduction="none"
+            )
+            valid_token_count = flat_weights.sum() + 1e-6
+            ce_loss = (loss_per_token * flat_weights).sum() / valid_token_count
+            loss_parts["ce"] = ce_loss.detach()
+            loss = loss + self.ce_loss_weight * ce_loss
+
+        if self.kl_loss_weight > 0.0:
             # Teacher: causal LM logits at position (label - 1), same lm_head as target.
             # HF hidden_states[-1] is last layer output at each token position.
             context_idx = (safe_label_indices - 1).clamp(min=0)
@@ -391,14 +412,11 @@ class OnlineFlashMTPModel(nn.Module):
                     reduction="none",
                     log_target=False,
                 ).sum(dim=-1)
-            loss = (kl_per_tok * (t * t) * weight_mask).sum() / (
-                weight_mask.sum() + 1e-6)
-        else:
-            loss_per_token = F.cross_entropy(flat_logits,
-                                             flat_targets,
-                                             reduction="none")
-            valid_token_count = flat_weights.sum() + 1e-6
-            loss = (loss_per_token * flat_weights).sum() / valid_token_count
+            kl_loss = (kl_per_tok * (t * t) * weight_mask).sum() / (
+                weight_mask.sum() + 1e-6
+            )
+            loss_parts["kl"] = kl_loss.detach()
+            loss = loss + self.kl_loss_weight * kl_loss
 
         # --- Accuracy ---
         with torch.no_grad():
@@ -407,4 +425,4 @@ class OnlineFlashMTPModel(nn.Module):
             actual_token_count = binary_eval_mask.sum() + 1e-6
             accuracy = correct.sum().float() / actual_token_count
 
-        return loss, accuracy
+        return loss, accuracy, loss_parts

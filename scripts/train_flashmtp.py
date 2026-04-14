@@ -81,12 +81,24 @@ def parse_args():
         "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
     )
     model_group.add_argument(
-        "--flashmtp-loss-type",
+        "--loss-type",
         type=str,
-        default="ce",
-        choices=["ce", "kl"],
-        help="ce: cross-entropy on token ids; kl: KL(teacher||student) with teacher "
-        "from target last-layer hidden at label-1 (HF backend).",
+        default=None,
+        choices=["ce", "kl", "mixed"],
+        help="Loss recipe tag: ce (CE only), kl (KL only), mixed (CE+KL). "
+        "Used in logs/checkpoints; actual terms use --ce-loss-weight / --kl-loss-weight.",
+    )
+    model_group.add_argument(
+        "--ce-loss-weight",
+        type=float,
+        default=1.0,
+        help="Weight for cross-entropy loss. If 0, CE is not computed.",
+    )
+    model_group.add_argument(
+        "--kl-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight for KL(teacher||student) distillation. If 0, KL is not computed.",
     )
     model_group.add_argument(
         "--distill-temperature",
@@ -327,6 +339,7 @@ def record_metrics(
     optimizer,
     train_dataloader=None,
     mode: str = "train",
+    loss_parts: Optional[dict] = None,
 ) -> None:
     logdict = {}
 
@@ -335,9 +348,21 @@ def record_metrics(
 
     logdict[f"{mode}/loss"] = loss
     logdict[f"{mode}/accuracy"] = accuracy
+    if loss_parts:
+        if loss_parts.get("ce") is not None:
+            logdict[f"{mode}/ce_loss"] = loss_parts["ce"]
+        if loss_parts.get("kl") is not None:
+            logdict[f"{mode}/kl_loss"] = loss_parts["kl"]
+
+    extra = ""
+    if loss_parts:
+        if loss_parts.get("ce") is not None:
+            extra += f", CE: {loss_parts['ce']:.4f}"
+        if loss_parts.get("kl") is not None:
+            extra += f", KL: {loss_parts['kl']:.4f}"
 
     print_on_rank0(
-        f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}"
+        f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}{extra}"
     )
 
     tracker.log(logdict, step=global_step)
@@ -357,6 +382,17 @@ def main():
     )
 
     args = parse_args()
+    if args.ce_loss_weight <= 0.0 and args.kl_loss_weight <= 0.0:
+        raise ValueError(
+            "At least one of --ce-loss-weight or --kl-loss-weight must be positive."
+        )
+    if args.loss_type is None:
+        if args.ce_loss_weight > 0.0 and args.kl_loss_weight > 0.0:
+            args.loss_type = "mixed"
+        elif args.ce_loss_weight > 0.0:
+            args.loss_type = "ce"
+        else:
+            args.loss_type = "kl"
     set_seed(args.seed)
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
@@ -419,6 +455,10 @@ def main():
     draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
     draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
+    print_on_rank0(
+        f"Loss: type={args.loss_type}, ce_weight={args.ce_loss_weight}, "
+        f"kl_weight={args.kl_loss_weight}"
+    )
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
 
@@ -444,7 +484,8 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
-        loss_type=args.flashmtp_loss_type,
+        ce_loss_weight=args.ce_loss_weight,
+        kl_loss_weight=args.kl_loss_weight,
         distill_temperature=args.distill_temperature,
         kl_topk=args.kl_topk,
     )
@@ -515,7 +556,7 @@ def main():
             hidden_states = tuple(h.cuda() for h in target_output.hidden_states)
             # hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 
-            loss, accuracy = flashmtp_model(
+            loss, accuracy, loss_parts = flashmtp_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
@@ -534,6 +575,16 @@ def main():
                 loss_log = loss_log / dist.get_world_size()
                 acc_log = acc_log / dist.get_world_size()
 
+                logged_parts = {}
+                if loss_parts.get("ce") is not None:
+                    ce_log = loss_parts["ce"].clone()
+                    dist.all_reduce(ce_log)
+                    logged_parts["ce"] = (ce_log / dist.get_world_size()).item()
+                if loss_parts.get("kl") is not None:
+                    kl_log = loss_parts["kl"].clone()
+                    dist.all_reduce(kl_log)
+                    logged_parts["kl"] = (kl_log / dist.get_world_size()).item()
+
                 record_metrics(
                     args,
                     loss_log.item(),
@@ -543,6 +594,7 @@ def main():
                     optimizer,
                     train_dataloader,
                     mode="train",
+                    loss_parts=logged_parts or None,
                 )
 
             if dist.get_rank() == 0:
