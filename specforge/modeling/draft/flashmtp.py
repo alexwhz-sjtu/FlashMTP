@@ -151,6 +151,10 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         self.post_attention_layernorm = Qwen3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # g = σ(W_g·h), h = input_layernorm(x); ctx: h + g⊙E (mask tokens: h unchanged)
+        self.layer_emb_gate = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=config.attention_bias
+        )
 
     def forward(
         self,
@@ -172,9 +176,13 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
     ]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+
         if layer_emb is not None:
             ctx_len = target_hidden.shape[1]
-            hidden_states[:, :ctx_len, :] = hidden_states[:, :ctx_len, :] + layer_emb
+            c = hidden_states[:, :ctx_len, :]
+            g = torch.sigmoid(self.layer_emb_gate(c))
+            hidden_states[:, :ctx_len, :] = c + g * layer_emb.unsqueeze(0)
+
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             target_hidden=target_hidden,
@@ -193,6 +201,45 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
+
+
+def build_flashmtp_target_layer_ids(
+    num_target_transformer_layers: int,
+    num_draft_layers: int,
+) -> list[int]:
+    """Pick target hidden-state indices for FlashMTP CHS (HuggingFace ``hidden_states`` order).
+
+    Indexing matches ``outputs.hidden_states``: ``0`` is embedding output; index ``k`` for
+    ``1 <= k <= num_target_transformer_layers`` is the output after decoder layer ``k-1``.
+
+    Selection:
+      - Always include embedding (index ``0``) and the last two decoder outputs (indices
+        ``num_target_transformer_layers - 1`` and ``num_target_transformer_layers``).
+      - Additionally include ``num_draft_layers`` indices spaced evenly (inclusive endpoints)
+        over the interior range ``[1, num_target_transformer_layers - 2]`` when that range
+        is non-empty.
+
+    The result is sorted ascending and deduplicated.
+    """
+    n = num_target_transformer_layers
+    if n <= 0:
+        raise ValueError("num_target_transformer_layers must be positive")
+
+    last_two = [n - 1, n]
+    low, high = 1, n - 2
+    if num_draft_layers <= 0 or low > high:
+        middle: list[int] = []
+    elif num_draft_layers == 1:
+        middle = [(low + high) // 2]
+    else:
+        span = high - low
+        middle = [
+            int(round(low + i * span / (num_draft_layers - 1)))
+            for i in range(num_draft_layers)
+        ]
+
+    combined = [0] + middle + last_two
+    return sorted(set(combined))
 
 
 def extract_context_feature(
@@ -228,10 +275,19 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.target_layer_ids = flashmtp_config.get(
-            "target_layer_ids",
-            list(range(config.num_target_layers)),
-        )
+        n_tt = flashmtp_config.get("num_target_transformer_layers")
+        if flashmtp_config.get("target_layer_ids") is not None:
+            self.target_layer_ids = list(flashmtp_config["target_layer_ids"])
+        elif n_tt is not None:
+            self.target_layer_ids = build_flashmtp_target_layer_ids(
+                int(n_tt), int(config.num_hidden_layers)
+            )
+        else:
+            self.target_layer_ids = list(range(config.num_target_layers))
+
+        n_chs = len(self.target_layer_ids)
+        config.num_target_layers = n_chs
+
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.block_size = config.block_size
@@ -239,7 +295,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
 
         self.fc = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.layer_embedding = nn.Embedding(config.num_target_layers, config.hidden_size)
+        self.layer_embedding = nn.Embedding(n_chs, config.hidden_size)
+        self.layer_emb_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.post_init()
 
@@ -262,7 +319,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         num_layers = len(self.target_layer_ids)
         n_blocks = target_hidden.shape[1] // num_layers
         layer_ids = torch.arange(num_layers, device=device).repeat(n_blocks)  # (N*L,)
-        layer_emb = self.layer_embedding(layer_ids)  # (N*L, H), added on ctx tokens before each attn
+        layer_emb = self.layer_emb_norm(self.layer_embedding(layer_ids))  # (N*L, H); gated in decoder after input_layernorm
 
         # RoPE only for mask (noise) tokens — position_ids should be local (0..B-1 per block)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)

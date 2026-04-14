@@ -25,7 +25,10 @@ from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.flashmtp import OnlineFlashMTPModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
-from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
+from specforge.modeling.draft.flashmtp import (
+    FlashMTPDraftModel,
+    build_flashmtp_target_layer_ids,
+)
 from specforge.modeling.target.flashmtp_target_model import (
     FlashMTPTargetModel,
     get_flashmtp_target_model,
@@ -190,19 +193,29 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         **target_model_kwargs,
     )
 
+    target_config = AutoConfig.from_pretrained(args.target_model_path)
+
     if args.draft_config_path:
         draft_config = AutoConfig.from_pretrained(args.draft_config_path)
         print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
     else:
-        target_config = AutoConfig.from_pretrained(args.target_model_path)
         draft_config = AutoConfig.from_pretrained(args.target_model_path)
         draft_config.num_hidden_layers = args.num_draft_layers
         draft_config.block_size = args.block_size
-        draft_config.num_target_layers = target_config.num_hidden_layers+1 # include the initial embedding
         print_on_rank0("Auto-generated draft config from target model")
 
     if not hasattr(draft_config, "flashmtp_config") or draft_config.flashmtp_config is None:
         draft_config.flashmtp_config = {}
+
+    draft_config.flashmtp_config["num_target_transformer_layers"] = (
+        target_config.num_hidden_layers
+    )
+    _tl_ids = build_flashmtp_target_layer_ids(
+        target_config.num_hidden_layers,
+        draft_config.num_hidden_layers,
+    )
+    draft_config.num_target_layers = len(_tl_ids)
+    draft_config.flashmtp_config["target_layer_ids"] = _tl_ids
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
@@ -214,7 +227,8 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     print_on_rank0(
         f"Draft config: block_size={draft_config.block_size}, "
         f"num_hidden_layers={draft_config.num_hidden_layers}, "
-        f"num_target_layers={draft_config.num_target_layers}"
+        f"num_target_layers={draft_config.num_target_layers}, "
+        f"target_layer_ids={draft_model.target_layer_ids}"
     )
     print_on_rank0(
         f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}"

@@ -25,6 +25,10 @@ def prepare_target_hidden(
 ) -> torch.Tensor:
     """Convert full hidden states to CHS format for FlashMTP (seq mode).
 
+    ``hidden_states`` follows HuggingFace order: index ``0`` is embedding output;
+    index ``k >= 1`` is the output after decoder layer ``k - 1``.
+    ``target_layer_ids`` entries are indices into that tuple.
+
     Returns:
         (B, N*L, H) interleaved per-anchor:
         [layer0_anchor0, layer1_anchor0, ..., layer0_anchor1, layer1_anchor1, ...]
