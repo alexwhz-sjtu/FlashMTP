@@ -10,12 +10,11 @@ import torch.nn.functional as F
 from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
 
 try:
-    from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+    from torch.nn.attention.flex_attention import create_block_mask
 
     FLEX_ATTENTION_AVAILABLE = True
 except ImportError:
     FLEX_ATTENTION_AVAILABLE = False
-    BlockMask = None
     create_block_mask = None
 
 def prepare_target_hidden(
@@ -114,6 +113,58 @@ def create_flashmtp_block_mask(
                              device=device)
 
 
+def build_flashmtp_dense_attn_bias(
+    batch_size: int,
+    num_blocks: int,
+    chs_len_per_block: int,
+    block_size: int,
+    block_keep_mask: torch.Tensor,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Additive attention bias for **mask-only queries** × (CHS + mask) keys/values.
+
+    Used by the current draft attention (queries only on mask positions). KV layout matches
+    :func:`create_flashmtp_block_mask`: ``[CHS_0 | ... | CHS_{N-1} | Block_0 | ...]``.
+
+    Returns:
+        Tensor ``(B, 1, QM, KV_LEN)`` with ``0`` at allowed positions and ``finfo.min`` elsewhere.
+    """
+    device = block_keep_mask.device
+    Bsz, N = block_keep_mask.shape
+    if Bsz != batch_size or N != num_blocks:
+        raise ValueError(
+            f"block_keep_mask shape {block_keep_mask.shape} does not match "
+            f"batch_size={batch_size}, num_blocks={num_blocks}"
+        )
+    C = chs_len_per_block
+    total_chs = N * C
+    kv_len = total_chs + N * block_size
+    qm = N * block_size
+
+    min_val = torch.finfo(dtype).min
+
+    qi = torch.arange(qm, device=device)
+    q_block_id = qi // block_size
+    kv = torch.arange(kv_len, device=device).view(1, 1, -1)
+    kv_in_chs = kv < total_chs
+    kv_block_id = torch.where(
+        kv_in_chs,
+        kv // C,
+        (kv - total_chs) // block_size,
+    )
+
+    same_group = q_block_id.view(1, qm, 1) == kv_block_id
+    valid = block_keep_mask[:, q_block_id]
+    allowed = same_group & valid.unsqueeze(-1)
+
+    bias = torch.where(
+        allowed,
+        torch.zeros((), device=device, dtype=dtype),
+        torch.tensor(min_val, device=device, dtype=dtype),
+    )
+    return bias.unsqueeze(1)
+
+
 class OnlineFlashMTPModel(nn.Module):
     """FlashMTP online training wrapper with block-wise CE and/or KL-to-teacher loss."""
 
@@ -149,10 +200,6 @@ class OnlineFlashMTPModel(nn.Module):
             )
         self.distill_temperature = distill_temperature
         self.kl_topk = kl_topk
-
-        self._cached_block_mask: Optional[BlockMask] = None
-        self._cached_seq_len: Optional[int] = None
-        self._cached_bsz: Optional[int] = None
 
     def _sample_anchor_positions(
             self, seq_len: int, loss_mask: torch.Tensor,
@@ -295,12 +342,13 @@ class OnlineFlashMTPModel(nn.Module):
                                     "num_target_layers", 1)
         chs_len_per_block = num_target_layers
 
-        flashmtp_attn_mask = create_flashmtp_block_mask(
-            anchor_positions=anchor_positions,
-            block_keep_mask=block_keep_mask,
-            chs_len_per_block=chs_len_per_block,
-            block_size=self.block_size,
-            device=device,
+        flashmtp_attn_mask = build_flashmtp_dense_attn_bias(
+            bsz,
+            n_blocks,
+            chs_len_per_block,
+            self.block_size,
+            block_keep_mask,
+            dtype=torch.float32,
         )
 
         target_hidden = prepare_target_hidden(

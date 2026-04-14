@@ -1,1 +1,12 @@
-0.2.0
+v1.2.0
+加入每层layerembed
+v1.2.1
+加入门控layerembed，提取深度信息
+v1.2.2
+CHS：RMSNorm(W_proj·H + E_layer)，去掉 decoder 门控与 layer_emb_norm
+v1.2.3
+decoder 前不拼接 ctx/mask；input_layernorm 仅 mask，attention 前再 cat
+v1.2.4
+仅 mask 为 Q；ctx_init 各层固定；训练用稠密 attn bias（mask_Q × CHS+mask_KV）
+v1.2.5
+build_flashmtp_dense_attn_bias 并入 core/flashmtp.py；草稿 forward 不再构造 mask

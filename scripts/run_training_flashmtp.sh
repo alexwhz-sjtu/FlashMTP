@@ -67,7 +67,7 @@ DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-2.0}"
 KL_TOPK="${KL_TOPK:-5}"
 
 # 损失类型: ce | kl | mixed（mixed 可用 CE_LOSS_WEIGHT / KL_LOSS_WEIGHT 覆盖默认 0.5/0.5）
-LOSS_TYPE="${LOSS_TYPE:-mixed}"
+LOSS_TYPE="${LOSS_TYPE:-ce}"
 case "$LOSS_TYPE" in
     ce)
         : "${CE_LOSS_WEIGHT:=1.0}"
@@ -105,12 +105,12 @@ esac
 if [ "$DT" = "qz" ]; then
     # qz 配置
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v1.2_nlayers_${NUM_DRAFT_LAYERS}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_loss_${LOSS_SHORT}_ep${NUM_EPOCHS}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v1.2.2_nlayers_${NUM_DRAFT_LAYERS}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_loss_${LOSS_SHORT}_ep${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 else
     # a800 配置（默认）
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v1.2_nlayers_${NUM_DRAFT_LAYERS}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_loss_${LOSS_SHORT}_ep${NUM_EPOCHS}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v1.2.2_nlayers_${NUM_DRAFT_LAYERS}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_loss_${LOSS_SHORT}_ep${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
@@ -144,7 +144,7 @@ WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"
 # offline: 仅本地写入 ${WANDB_DIR}，无需 API key；上线同步: WANDB_MODE=online 并配置密钥
 WANDB_MODE="${WANDB_MODE:-offline}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v1.2_${DATA_NUM_SAMPLES}_loss_${LOSS_SHORT}_ep${NUM_EPOCHS}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v1.2.2_${DATA_NUM_SAMPLES}_loss_${LOSS_SHORT}_ep${NUM_EPOCHS}}"
 
 export WANDB_DIR
 export WANDB_MODE

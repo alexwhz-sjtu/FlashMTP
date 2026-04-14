@@ -41,7 +41,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 
 class Qwen3FlashMTPAttention(nn.Module):
-    """Multi-headed attention with asymmetric RoPE: only mask tokens get RoPE."""
+    """Mask-only queries; KV = [ctx | mask]; RoPE on all Q and on K's mask segment."""
 
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
@@ -94,28 +94,37 @@ class Qwen3FlashMTPAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        bsz, q_len = hidden_states.shape[:-1]
+        """Only mask positions query; ``target_hidden`` is the fixed CHS prefix on the KV axis.
+
+        ``hidden_states`` is ``input_layernorm(noise)`` (mask segment only). Keys/values use
+        ``concat(target_hidden, hidden_states)`` along sequence dim.
+        """
         ctx_len = target_hidden.shape[1]
+        bsz, q_len, _ = hidden_states.shape
+        kv_in = torch.cat([target_hidden, hidden_states], dim=1)
+        kv_len = kv_in.shape[1]
+        if kv_len != ctx_len + q_len:
+            raise ValueError(
+                f"KV length {kv_len} != ctx_len {ctx_len} + mask_len {q_len}"
+            )
 
         q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        k = self.k_proj(kv_in)
+        v = self.v_proj(kv_in)
 
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
-        k = k.view(bsz, q_len, -1, self.head_dim)
-        v = v.view(bsz, q_len, -1, self.head_dim)
+        k = k.view(bsz, kv_len, -1, self.head_dim)
+        v = v.view(bsz, kv_len, -1, self.head_dim)
 
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
 
         cos, sin = position_embeddings
 
-        # RoPE only on mask (noise) tokens; layer tokens have no positional encoding
-        q_layer, q_mask = q[:, :, :ctx_len, :], q[:, :, ctx_len:, :]
+        # All queries are mask positions → RoPE on full Q; K split: ctx (no RoPE) + mask (RoPE)
         k_layer, k_mask = k[:, :, :ctx_len, :], k[:, :, ctx_len:, :]
-        q_mask, k_mask = apply_rotary_pos_emb(q_mask, k_mask, cos, sin)
-        q = torch.cat([q_layer, q_mask], dim=2)
+        q, k_mask = apply_rotary_pos_emb(q, k_mask, cos, sin)
         k = torch.cat([k_layer, k_mask], dim=2)
 
         if past_key_values is not None:
@@ -151,15 +160,11 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         self.post_attention_layernorm = Qwen3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        # g = σ(W_g·h), h = input_layernorm(x); ctx: h + g⊙E (mask tokens: h unchanged)
-        self.layer_emb_gate = nn.Linear(
-            config.hidden_size, config.hidden_size, bias=config.attention_bias
-        )
 
     def forward(
         self,
-        target_hidden: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
+        target_hidden: torch.Tensor,
+        hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
@@ -169,23 +174,15 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
-        layer_emb: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Tuple[
-        torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
-    ]:
+    ) -> torch.Tensor:
+        """``target_hidden`` (CHS) is fixed; only the mask stream ``hidden_states`` is updated."""
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        if layer_emb is not None:
-            ctx_len = target_hidden.shape[1]
-            c = hidden_states[:, :ctx_len, :]
-            g = torch.sigmoid(self.layer_emb_gate(c))
-            hidden_states = torch.cat([c + g * layer_emb.unsqueeze(0), hidden_states[:, ctx_len:, :]], dim=1)
-
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            target_hidden=target_hidden,
+        attn_out = self.self_attn(
+            hidden_states,
+            target_hidden,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_value,
@@ -195,7 +192,7 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )[0]
-        hidden_states = residual + hidden_states
+        hidden_states = residual + attn_out
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -296,7 +293,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.fc = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layer_embedding = nn.Embedding(n_chs, config.hidden_size)
-        self.layer_emb_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.post_init()
 
@@ -314,30 +310,34 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         bsz, noise_len, _ = hidden_states.shape
         device = hidden_states.device
 
-        # Layer token construction: project + norm (layer-ID embedding injected each decoder layer)
-        target_hidden = self.hidden_norm(self.fc(target_hidden))  # (B, N*L, H)
+        # Layer tokens: RMSNorm(W_proj·H + E_layer); fixed across draft layers (not overwritten below)
         num_layers = len(self.target_layer_ids)
         n_blocks = target_hidden.shape[1] // num_layers
         layer_ids = torch.arange(num_layers, device=device).repeat(n_blocks)  # (N*L,)
-        layer_emb = self.layer_emb_norm(self.layer_embedding(layer_ids))  # (N*L, H); gated in decoder after input_layernorm
+        target_hidden = self.fc(target_hidden) + self.layer_embedding(layer_ids)
+        target_hidden = self.hidden_norm(target_hidden)
 
         # RoPE only for mask (noise) tokens — position_ids should be local (0..B-1 per block)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        hidden_states = torch.cat([target_hidden, hidden_states], dim=1)  # (B, ctx_len+noise_len, H)
+        if attention_mask is None:
+            raise ValueError(
+                "attention_mask must be built by the caller (e.g. OnlineFlashMTPModel or "
+                "build_flashmtp_dense_attn_bias in spec_generate); not constructed inside forward."
+            )
+
         for layer in self.layers:
             hidden_states = layer(
-                hidden_states=hidden_states,
                 target_hidden=target_hidden,
+                hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
-                layer_emb=layer_emb,
                 **kwargs,
             )
-        return (self.norm(hidden_states))[:, -noise_len:, :]
+        return (self.norm(hidden_states))
 
     @torch.inference_mode()
     def spec_generate(
@@ -349,6 +349,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         temperature: float,
     ):
         self.eval()
+        from specforge.core.flashmtp import build_flashmtp_dense_attn_bias
+
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
 
@@ -396,11 +398,26 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
             noise_embedding = target.model.embed_tokens(block_output_ids)
+            nl = len(self.target_layer_ids)
+            n_blk = target_hidden.shape[1] // nl
+            if target_hidden.shape[1] != n_blk * nl or noise_embedding.shape[1] != n_blk * block_size:
+                raise ValueError(
+                    "target_hidden / noise_embedding length mismatch for attn mask (per-block CHS/mask layout)."
+                )
+            attn_bias = build_flashmtp_dense_attn_bias(
+                1,
+                n_blk,
+                nl,
+                block_size,
+                torch.ones(1, n_blk, dtype=torch.bool, device=device),
+                dtype=torch.float32,
+            )
             draft_logits = target.lm_head(
                 self(
                     target_hidden=target_hidden,
                     noise_embedding=noise_embedding,
                     position_ids=local_position_ids,
+                    attention_mask=attn_bias,
                 )[:, -block_size + 1 :, :]
             )
             block_output_ids[:, 1:] = sample(draft_logits)
