@@ -354,7 +354,7 @@ def main():
             )
 
     if args.resume and os.path.isdir(args.output_dir):
-        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(
+        draft_model_last_checkpoint, _, _ = get_last_checkpoint(
             args.output_dir, prefix=r"epoch_\d+_step"
         )
         print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
@@ -445,13 +445,11 @@ def main():
     global_step = 0
     skip_steps = 0
     if resume_state is not None:
-        start_epoch = ckpt_info[0]
-        global_step = ckpt_info[1]
-        optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+        optimizer.load_state_dict(resume_state)
         start_epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
         del resume_state
-        print_on_rank0(f"Restored scheduler, lr={optimizer.get_learning_rate():.6f}")
+        print_on_rank0(f"Restored optimizer and scheduler, lr={optimizer.get_learning_rate():.6f}")
 
         skip_steps = global_step - start_epoch * len(train_dataloader)
 

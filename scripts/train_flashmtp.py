@@ -102,10 +102,10 @@ def parse_args():
         help="Inner block size (B_in) for v3 diffusion training (default: 1)",
     )
     v3_group.add_argument(
-        "--enable-cons-after-steps",
+        "--enable-cons-after-epoch",
         type=int,
-        default=1000,
-        help="Enable consistency loss after this many steps (default: 1000)",
+        default=1,
+        help="Enable consistency loss after this epoch (0-based, default: 1)",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -389,7 +389,7 @@ def main():
             )
 
     if args.resume and os.path.isdir(args.output_dir):
-        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(
+        draft_model_last_checkpoint, _, _ = get_last_checkpoint(
             args.output_dir, prefix=r"epoch_\d+_step"
         )
         print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
@@ -401,7 +401,7 @@ def main():
         )
         draft_model.load_state_dict(loaded_model.state_dict())
         del loaded_model
-        print_on_rank0("Loaded draft model weights from checkpoint")
+        print_on_rank0(f"[RESUME] Loaded draft model weights from checkpoint: {draft_model_last_checkpoint}")
 
         training_state_path = os.path.join(
             draft_model_last_checkpoint, "training_state.pt"
@@ -475,7 +475,7 @@ def main():
         w_distill=args.w_distill,
         w_cons=args.w_cons,
         inner_block_size=args.inner_block_size,
-        enable_cons_after_steps=args.enable_cons_after_steps,
+        enable_cons_after_epoch=args.enable_cons_after_epoch,
     )
 
     optimizer = BF16Optimizer(
@@ -489,11 +489,11 @@ def main():
     start_epoch = 0
     global_step = 0
     if resume_state is not None:
-        optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+        optimizer.load_state_dict(resume_state)
         start_epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
         del resume_state
-        print_on_rank0(f"Restored scheduler, lr={optimizer.get_learning_rate():.6f}")
+        print_on_rank0(f"Restored optimizer and scheduler, lr={optimizer.get_learning_rate():.6f}")
 
         skip_steps = global_step - start_epoch * len(train_dataloader)
 
@@ -542,7 +542,7 @@ def main():
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
-                global_step=global_step,
+                epoch=epoch,
             )
 
             (loss / args.accumulation_steps).backward()

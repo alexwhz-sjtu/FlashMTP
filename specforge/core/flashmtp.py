@@ -231,7 +231,7 @@ class OnlineFlashMTPModel(nn.Module):
         w_distill: float = 1.0,
         w_cons: float = 0.6,
         inner_block_size: int = 1,
-        enable_cons_after_steps: int = 1000,
+        enable_cons_after_epoch: int = 1,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -248,7 +248,7 @@ class OnlineFlashMTPModel(nn.Module):
         self.w_distill = w_distill
         self.w_cons = w_cons
         self.inner_block_size = inner_block_size
-        self.enable_cons_after_steps = enable_cons_after_steps
+        self.enable_cons_after_epoch = enable_cons_after_epoch
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -502,19 +502,19 @@ class OnlineFlashMTPModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
         loss_mask: torch.Tensor,
-        global_step: int = 0,
+        epoch: int = 0,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         v3 diffusion-based training forward pass.
 
         The second draft forward (state y*) runs only when consistency loss is used:
-        ``global_step >= enable_cons_after_steps`` and ``w_cons > 0``.
+        ``epoch >= enable_cons_after_epoch`` and ``w_cons > 0``.
 
         Args:
             input_ids: (B, seq_len) input token IDs
             hidden_states: HF-style per-layer tuple or SGLang fused ``(B, L, n_layers*H)``
             loss_mask: (B, seq_len) loss mask
-            global_step: current training step
+            epoch: current training epoch (0-based)
 
         Returns:
             - total_loss: scalar
@@ -583,7 +583,7 @@ class OnlineFlashMTPModel(nn.Module):
         student_logits_y = student_logits_y.view(bsz, n_blocks, self.block_size, -1)
 
         need_cons = (
-            global_step >= self.enable_cons_after_steps and self.w_cons > 0.0
+            epoch >= self.enable_cons_after_epoch and self.w_cons > 0.0
         )
         student_logits_y_star = None
         if need_cons:

@@ -15,7 +15,7 @@ from pathlib import Path
 
 # ==================== 配置区域 ====================
 # wandb 离线日志目录
-WANDB_DIR = "/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/wandb/offline-run-20260402_171351-0gq1e0ja"
+WANDB_DIR = "/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP_v3/wandb/offline-run-20260413_062546-flashmtp_v3_40000_feature"
 
 # wandb project 名称
 WANDB_PROJECT = "flashmtp_training"
@@ -24,10 +24,10 @@ WANDB_PROJECT = "flashmtp_training"
 SYNC_INTERVAL = 5 * 60  # 5 分钟
 
 # 日志文件路径
-LOG_FILE = "./wandb_sync_2.log"
+LOG_FILE = "./wandb_sync.log"
 
 # 锁文件路径（防止重复执行）
-LOCK_FILE = "./wandb_sync_2.lock"
+LOCK_FILE = "./wandb_sync.lock"
 # ================================================
 
 
@@ -79,7 +79,7 @@ def is_process_running(pid):
 
 def sync_wandb():
     """执行 wandb sync 命令"""
-    cmd = f"wandb sync --project {WANDB_PROJECT} {WANDB_DIR}"
+    cmd = f"wandb sync --project {WANDB_PROJECT} --id flashmtp_v3_40000_feature_fixed {WANDB_DIR}"
     
     logging.info(f"开始执行同步命令：{cmd}")
     

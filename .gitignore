@@ -196,8 +196,11 @@ outputs/
 wandb/
 .idea
 .vscode/
+*.log
+*.lock
 
 # macOS
 .DS_Store
 
 log.txt
+wandb_sync_daemon.py

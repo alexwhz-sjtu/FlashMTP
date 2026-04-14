@@ -30,8 +30,8 @@ if [ "$DT" = "a800" ]; then
     MAX_LENGTH="${MAX_LENGTH:-4096}"
     NUM_ANCHORS="${NUM_ANCHORS:-256}"
 else
-    MAX_LENGTH="${MAX_LENGTH:-4096}"
-    NUM_ANCHORS="${NUM_ANCHORS:-512}"
+    MAX_LENGTH="${MAX_LENGTH:-10240}"
+    NUM_ANCHORS="${NUM_ANCHORS:-1024}"
 fi
 
 # 自动激活虚拟环境
@@ -47,15 +47,15 @@ export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"
 # ========================================
 # 主要训练参数
 # ========================================
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 
-NUM_EPOCHS="${NUM_EPOCHS:-6}"
+NUM_EPOCHS="${NUM_EPOCHS:-10}"
 CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
 
 # 恢复训练
-RESUME="${RESUME:-}"
-CKPT_DIR="${CKPT_DIR:-}"
+RESUME="${RESUME:-True}"
+CKPT_DIR="${CKPT_DIR:-./cache/models/flashmtp_v3_nlayers__feature_sample_40000_think_on_qwen3_8b_maxlen10240/epoch_10_step_21280}"
 
 # ========================================
 # 主要数据集参数
@@ -83,11 +83,17 @@ LEARNING_RATE="${LEARNING_RATE:-6e-4}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
+# 模型参数
+NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
+BLOCK_SIZE="${BLOCK_SIZE:-16}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
+LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
+
 # 数据目录 - 根据 --dt 参数选择配置
 if [ "$DT" = "qz" ]; then
     # qz 配置
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v3_nlayers_${NUM_DRAFT_LAYERS}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 else
     # a800 配置（默认）
@@ -99,17 +105,11 @@ fi
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
 CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 
-# 模型参数
-NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
-BLOCK_SIZE="${BLOCK_SIZE:-16}"
-ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
-LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
-
 # v3 扩散训练参数
 W_DISTILL="${W_DISTILL:-1.0}"
 W_CONS="${W_CONS:-0.6}"
 INNER_BLOCK_SIZE="${INNER_BLOCK_SIZE:-1}"
-ENABLE_CONS_AFTER_STEPS="${ENABLE_CONS_AFTER_STEPS:-100000}"
+ENABLE_CONS_AFTER_EPOCH="${ENABLE_CONS_AFTER_EPOCH:-1}"
 
 # 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
@@ -121,7 +121,7 @@ REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}}"   # 离线子目录名称 (如: my_run_001，生成 offline-run-my_run_001)
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v3_${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}}"   # 离线子目录名称 (如: my_run_001，生成 offline-run-my_run_001)
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}"
@@ -159,7 +159,7 @@ echo "v3 扩散训练配置:"
 echo "  Distillation权重: ${W_DISTILL}"
 echo "  Consistency权重: ${W_CONS}"
 echo "  Inner Block大小: ${INNER_BLOCK_SIZE}"
-echo "  Consistency启用步数: ${ENABLE_CONS_AFTER_STEPS}"
+echo "  Consistency启用epoch: ${ENABLE_CONS_AFTER_EPOCH}"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
 echo "  批大小: ${BATCH_SIZE} x ${ACCUMULATION_STEPS} = $((BATCH_SIZE * ACCUMULATION_STEPS))"
@@ -279,7 +279,7 @@ set +e
     --w-distill ${W_DISTILL} \
     --w-cons ${W_CONS} \
     --inner-block-size ${INNER_BLOCK_SIZE} \
-    --enable-cons-after-steps ${ENABLE_CONS_AFTER_STEPS} \
+    --enable-cons-after-epoch ${ENABLE_CONS_AFTER_EPOCH} \
     --seed 42 \
     ${OPTIONAL_ARGS}
 EXIT_CODE=$?
