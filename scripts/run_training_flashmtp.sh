@@ -67,7 +67,7 @@ DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-2.0}"
 KL_TOPK="${KL_TOPK:-5}"
 
 # 损失类型: ce | kl | mixed（mixed 可用 CE_LOSS_WEIGHT / KL_LOSS_WEIGHT 覆盖默认 0.5/0.5）
-LOSS_TYPE="${LOSS_TYPE:-ce}"
+LOSS_TYPE="${LOSS_TYPE:-mixed}"
 case "$LOSS_TYPE" in
     ce)
         : "${CE_LOSS_WEIGHT:=1.0}"
@@ -78,8 +78,8 @@ case "$LOSS_TYPE" in
         : "${KL_LOSS_WEIGHT:=1.0}"
         ;;
     mixed)
-        : "${CE_LOSS_WEIGHT:=0.5}"
-        : "${KL_LOSS_WEIGHT:=0.5}"
+        : "${CE_LOSS_WEIGHT:=1.0}"
+        : "${KL_LOSS_WEIGHT:=0.1}"
         ;;
     *)
         echo "错误: LOSS_TYPE 必须是 ce、kl 或 mixed"

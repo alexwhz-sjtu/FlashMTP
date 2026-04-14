@@ -181,7 +181,7 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
             ctx_len = target_hidden.shape[1]
             c = hidden_states[:, :ctx_len, :]
             g = torch.sigmoid(self.layer_emb_gate(c))
-            hidden_states[:, :ctx_len, :] = c + g * layer_emb.unsqueeze(0)
+            hidden_states = torch.cat([c + g * layer_emb.unsqueeze(0), hidden_states[:, ctx_len:, :]], dim=1)
 
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
