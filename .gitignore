@@ -201,3 +201,6 @@ wandb/
 .DS_Store
 
 log.txt
+
+# 本地再生成数据，勿提交
+nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl
