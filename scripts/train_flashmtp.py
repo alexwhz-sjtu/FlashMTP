@@ -113,6 +113,13 @@ def parse_args():
         help="KL loss: only align teacher's top-k logits (subset softmax). "
         "<=0 uses full vocabulary.",
     )
+    model_group.add_argument(
+        "--chs-window-size",
+        type=int,
+        default=1,
+        help="Sliding window length W: use target hiddens at the latest W positions "
+        "ending at anchor-1 (clamped). 1 matches the previous single-position CHS.",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -477,6 +484,7 @@ def main():
         kl_topk=args.kl_topk,
         ce_loss_weight=args.ce_loss_weight,
         kl_loss_weight=args.kl_loss_weight,
+        chs_window_size=args.chs_window_size,
     )
 
     flashmtp_model = FSDP(

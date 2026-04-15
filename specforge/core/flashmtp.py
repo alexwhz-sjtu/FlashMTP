@@ -23,41 +23,48 @@ def prepare_target_hidden(
     anchor_positions: torch.Tensor,  # (B, N)
     target_layer_ids: list[int],
     chs_concat_mode: str = "seq",
+    window_size: int = 1,
 ) -> torch.Tensor:
     """Convert full hidden states to CHS format for FlashMTP.
+
+    Uses a sliding window of the latest ``window_size`` target positions ending at
+    ``anchor - 1`` (i.e. ``anchor - W + k`` for ``k = 0 .. W-1``, clamped to 0).
 
     Args:
         hidden_states: All layers' hidden states from target model
         anchor_positions: Anchor positions for each block
         target_layer_ids: List of layer IDs to extract
         chs_concat_mode: "seq" or "feature"
+        window_size: Number of consecutive target token positions (W) in the window.
 
     Returns:
-        - seq mode: (B, N*L, H) - L layers concatenated along sequence dim
-        - feature mode: (B, N, H*L) - L layers concatenated along feature dim
+        - seq mode: (B, N*W*L, H) — layer-major: each layer block is
+          ``n0w0..n0w_{W-1}, n1w0, ...``
+        - feature mode: (B, N*W, H*L) — L layers concatenated along feature dim per (n,w)
     """
-    # 获取位置 p-1 的 hidden states (用来预测位置 p)
-    context_positions = (anchor_positions - 1).clamp(min=0)  # (B, N)
+    device = anchor_positions.device
+    w = max(int(window_size), 1)
+    bsz, n_blocks = anchor_positions.shape
+    # Latest W positions before anchor: [anchor-W, ..., anchor-1]
+    rel = torch.arange(w, device=device).view(1, 1, w)
+    win_pos = (anchor_positions.unsqueeze(-1) - w + rel).clamp(min=0)  # (B, N, w)
+    flat_pos = win_pos.reshape(bsz, n_blocks * w)
 
-    # 提取 anchor positions 对应的 hidden states
-    # hidden_states[layer] shape: (B, seq_len, H)
     selected_states = []
     for layer_id in target_layer_ids:
         layer_hidden = hidden_states[layer_id]  # (B, seq_len, H)
-        # Gather: (B, N, H)
         layer_selected = torch.gather(
             layer_hidden,
             dim=1,
-            index=context_positions.unsqueeze(-1).expand(-1, -1, layer_hidden.size(-1))
+            index=flat_pos.unsqueeze(-1).expand(-1, -1, layer_hidden.size(-1)),
         )
         selected_states.append(layer_selected)
 
     if chs_concat_mode == "seq":
-        # 按序列维度拼接: (B, N*L, H)
-        return torch.cat(selected_states, dim=1)  # (B, N*L, H)
-    else:  # feature mode
-        # 按特征维度拼接: (B, N, H*L)
-        return torch.cat(selected_states, dim=-1)  # (B, N, H*L)
+        # Layer-major along sequence dim: (B, N*w*L, H)
+        return torch.cat(selected_states, dim=1)
+    else:
+        return torch.cat(selected_states, dim=-1)  # (B, N*w, H*L)
 
 
 def create_flashmtp_block_mask(
@@ -153,6 +160,7 @@ class OnlineFlashMTPModel(nn.Module):
             kl_topk: int = 10,
             ce_loss_weight: float = 1.0,
             kl_loss_weight: float = 0.0,
+            chs_window_size: int = 1,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -177,6 +185,7 @@ class OnlineFlashMTPModel(nn.Module):
             raise ValueError(
                 "ce_kl requires at least one of ce_loss_weight or kl_loss_weight > 0"
             )
+        self.chs_window_size = max(int(chs_window_size), 1)
         self.draft_model.chs_concat_mode = chs_concat_mode
 
         self._cached_block_mask: Optional[BlockMask] = None
@@ -310,38 +319,34 @@ class OnlineFlashMTPModel(nn.Module):
         noise_embedding = self._create_noise_embed(input_ids, anchor_positions,
                                                    block_keep_mask)
 
-        # we only use the clean bonus token's contextual hidden states(CHS)
-        # context is from position (anchor_position - 1), so use that for position encoding
-        context_position_ids = (anchor_positions - 1).clamp(min=0)  # (bsz, n_blocks)
+        w = self.chs_window_size
+        rel = torch.arange(w, device=device).view(1, 1, w)
+        win_pos = (anchor_positions.unsqueeze(-1) - w + rel).clamp(min=0)  # (bsz, n_anchors, w)
+        n_anchors = anchor_positions.size(1)
+        flat_ctx_pos = win_pos.reshape(bsz, n_anchors * w)
 
         draft_position_ids = self._create_position_ids(
             anchor_positions)  # (bsz, n_blocks * block_size)
 
-        # when concat in seq dim, we pose RoPE on CHS with the same position_id
-        # for all layers of the same anchor (since they are from the same token position)
+        num_target_layers = len(self.draft_model.target_layer_ids)
+        # RoPE: CHS token order is layer-major (see prepare_target_hidden); repeat each
+        # (n,w) position id once per target layer.
         if self.chs_concat_mode == "seq":
-            num_target_layers = len(self.draft_model.target_layer_ids)
-            # context_position_ids is (anchor_position - 1), repeated num_target_layers times
-            # since all layers of the same anchor share the same position
-            context_position_ids_expanded = context_position_ids.repeat_interleave(
-                num_target_layers, dim=-1)  # (bsz, n_blocks * num_target_layers)
+            context_position_ids_expanded = flat_ctx_pos.repeat(1, num_target_layers)
             full_position_ids = torch.cat(
                 [context_position_ids_expanded, draft_position_ids],
-                dim=-1)  # (bsz, n_blocks * num_target_layers + n_blocks * block_size)
-
-        # when concat in feature dim, we pose RoPE on CHS,
-        # so position_ids only includes the one position before anchor position
-        else:  # feature concat
+                dim=-1,
+            )
+        else:
             full_position_ids = torch.cat(
-                [context_position_ids, draft_position_ids],
-                dim=-1)  # (bsz, n_blocks + n_blocks * block_size)
+                [flat_ctx_pos, draft_position_ids],
+                dim=-1,
+            )
 
-        # Determine CHS length per block based on concat mode
-        # seq mode: each CHS_i has num_target_layers tokens
-        # feature mode: each CHS_i has 1 token (features concatenated)
-        num_target_layers = getattr(self.draft_model.config,
-                                    "num_target_layers", 1)
-        chs_len_per_block = num_target_layers if self.chs_concat_mode == "seq" else 1
+        # CHS length per block: W spatial steps × (L layers in seq mode, else 1)
+        chs_len_per_block = (
+            w * num_target_layers if self.chs_concat_mode == "seq" else w
+        )
 
         flashmtp_attn_mask = create_flashmtp_block_mask(
             anchor_positions=anchor_positions,
@@ -351,10 +356,14 @@ class OnlineFlashMTPModel(nn.Module):
             device=device,
         )
 
-        # only use the hidden states from the target model at anchor positions (CHS) as input to the draft model
+        # Target-side context (CHS): sliding window of W positions before each anchor.
         target_hidden = prepare_target_hidden(
-            hidden_states, anchor_positions, self.draft_model.target_layer_ids,
-            self.chs_concat_mode)
+            hidden_states,
+            anchor_positions,
+            self.draft_model.target_layer_ids,
+            self.chs_concat_mode,
+            window_size=w,
+        )
 
         # print(f"target_hidden shape after prepare: {target_hidden.shape}")
         # print(f"full_position_ids shape: {full_position_ids.shape}")
@@ -407,7 +416,6 @@ class OnlineFlashMTPModel(nn.Module):
                                       self.loss_decay_gamma)
             weight_mask = weight_mask * decay_weights
 
-        n_anchors = anchor_positions.size(1)
         logits_3d = logits.view(bsz, n_anchors, self.block_size, -1)
         flat_logits = logits.view(-1, logits.size(-1))
         flat_targets = target_ids.view(-1)

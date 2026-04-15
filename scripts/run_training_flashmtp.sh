@@ -40,6 +40,8 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
+# CHS 滑动窗口：取 anchor 之前最近 W 个 target 位置的 hidden（含 position_ids）；1 与旧版单点上下文一致
+CHS_WINDOW_SIZE="${CHS_WINDOW_SIZE:-64}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
 
 # 恢复训练
@@ -78,7 +80,7 @@ if [ "$DT" = "qz" ]; then
 else
     # a800 配置（默认）
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
-    OUTPUT_DIR="./cache/models/2layers_40k"
+    OUTPUT_DIR="./cache/models/flashmtp_v1.1_slw64_40000"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
@@ -89,13 +91,13 @@ EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
 CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 
 # 模型参数
-NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-2}"
+NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
 # 损失: ce=交叉熵; kl=相对目标模型 last-hidden 的 KL 蒸馏（需 HF 等返回完整 hidden_states）
 # ce_kl= CE 与 top-k KL 加权: 总损失 = CE_LOSS_WEIGHT * CE + KL_LOSS_WEIGHT * KL（系数为 0 的分支不计算）
-FLASHMTP_LOSS_TYPE="${FLASHMTP_LOSS_TYPE:-ce_kl}"
+FLASHMTP_LOSS_TYPE="${FLASHMTP_LOSS_TYPE:-ce}"
 CE_LOSS_WEIGHT="${CE_LOSS_WEIGHT:-1}"
 KL_LOSS_WEIGHT="${KL_LOSS_WEIGHT:-0.2}"
 DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-2.0}"
@@ -114,7 +116,7 @@ WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"
 # offline: 仅本地写入 ${WANDB_DIR}，无需 API key；上线同步: WANDB_MODE=online 并配置密钥
 WANDB_MODE="${WANDB_MODE:-offline}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v1.1_nlayer_${NUM_DRAFT_LAYERS}_${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_fixed}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v1.1_slw64_nlayer_${NUM_DRAFT_LAYERS}_${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_fixed}"
 
 export WANDB_DIR
 export WANDB_MODE
@@ -149,6 +151,7 @@ echo "------------------------------------------"
 echo "模型配置:"
 echo "  草稿模型层数: ${NUM_DRAFT_LAYERS}"
 echo "  块大小: ${BLOCK_SIZE}"
+echo "  CHS 窗口 W: ${CHS_WINDOW_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
@@ -275,6 +278,7 @@ EXIT_CODE=0
     --tp-size ${TP_SIZE} \
     --dist-timeout ${DIST_TIMEOUT} \
     --chs-concat-mode ${CHS_CONCAT_MODE} \
+    --chs-window-size ${CHS_WINDOW_SIZE} \
     --flashmtp-loss-type ${FLASHMTP_LOSS_TYPE} \
     --ce-loss-weight ${CE_LOSS_WEIGHT} \
     --kl-loss-weight ${KL_LOSS_WEIGHT} \
