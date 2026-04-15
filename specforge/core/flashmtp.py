@@ -227,6 +227,7 @@ class OnlineFlashMTPModel(nn.Module):
         num_anchors: int = 512,
         chs_concat_mode: str = "seq",  # "seq" or "feature"
         loss_decay_gamma: Optional[float] = None,
+        prefix_len_sample_bias: float = 0.6,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -240,6 +241,11 @@ class OnlineFlashMTPModel(nn.Module):
         self.draft_model.chs_concat_mode = chs_concat_mode
 
         self.loss_decay_gamma = loss_decay_gamma
+        if not (0.0 < prefix_len_sample_bias <= 1.0):
+            raise ValueError(
+                "prefix_len_sample_bias must be in (0, 1]; use 1.0 for uniform sampling"
+            )
+        self.prefix_len_sample_bias = prefix_len_sample_bias
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -372,7 +378,12 @@ class OnlineFlashMTPModel(nn.Module):
         self,
         block_keep_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Sample clean prefix length p per block: p ~ Uniform{0, ..., B-1}.
+        """Sample clean prefix length p per block with front-heavy mass on small p.
+
+        Inference often starts with no in-block prefix (p=0); training matches that by
+        sampling p from a truncated geometric-style law: P(p=k) ∝ r^k for k in
+        {0,...,B-1}, with ``r = prefix_len_sample_bias`` (<1 favors small p). Set
+        ``prefix_len_sample_bias=1.0`` to recover uniform sampling.
 
         Args:
             block_keep_mask: (B, N) valid block mask
@@ -383,7 +394,19 @@ class OnlineFlashMTPModel(nn.Module):
         bsz, n_blocks = block_keep_mask.shape
         device = block_keep_mask.device
         bs = self.block_size
-        p = torch.randint(0, bs, (bsz, n_blocks), device=device, dtype=torch.long)
+        r = self.prefix_len_sample_bias
+        if r >= 1.0:
+            p = torch.randint(0, bs, (bsz, n_blocks), device=device, dtype=torch.long)
+        else:
+            idx = torch.arange(bs, device=device, dtype=torch.float32)
+            probs = torch.pow(
+                torch.tensor(r, device=device, dtype=torch.float32), idx
+            )
+            probs = probs / probs.sum()
+            flat = torch.multinomial(
+                probs, num_samples=bsz * n_blocks, replacement=True
+            )
+            p = flat.view(bsz, n_blocks)
         return torch.where(block_keep_mask, p, torch.zeros_like(p))
 
     def forward(
