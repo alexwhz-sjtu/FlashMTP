@@ -77,17 +77,9 @@ def parse_args():
         "--loss-decay-gamma",
         type=float,
         default=None,
-        help="Temperature for exp decay on completion suffix. "
-        "absolute: w∝exp(-(d-1)/gamma). "
-        "normalized: w∝exp(-u/gamma), u∈[0,1] along suffix (re-tune vs absolute). "
+        help="Temperature for exp decay on completion suffix: w∝exp(-(d-1)/gamma), "
+        "where d is 1-based index within the suffix (first predicted token d=1). "
         "None => uniform over supervised positions.",
-    )
-    model_group.add_argument(
-        "--loss-decay-suffix-mode",
-        type=str,
-        default="normalized",
-        choices=["absolute", "normalized"],
-        help="absolute: index d in 1..R; normalized: u=(d-1)/max(R-1,1).",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -445,7 +437,6 @@ def main():
         num_anchors=args.num_anchors,
         chs_concat_mode=args.chs_concat_mode,
         loss_decay_gamma=args.loss_decay_gamma,
-        loss_decay_suffix_mode=args.loss_decay_suffix_mode,
     )
 
     optimizer = BF16Optimizer(

@@ -227,7 +227,6 @@ class OnlineFlashMTPModel(nn.Module):
         num_anchors: int = 512,
         chs_concat_mode: str = "seq",  # "seq" or "feature"
         loss_decay_gamma: Optional[float] = None,
-        loss_decay_suffix_mode: str = "normalized",
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -241,7 +240,6 @@ class OnlineFlashMTPModel(nn.Module):
         self.draft_model.chs_concat_mode = chs_concat_mode
 
         self.loss_decay_gamma = loss_decay_gamma
-        self.loss_decay_suffix_mode = loss_decay_suffix_mode
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -480,19 +478,13 @@ class OnlineFlashMTPModel(nn.Module):
             reduction="none",
         ).view(bsz, n_blocks, self.block_size)
 
+        # d: 1-based index within the completion suffix (first supervised token has d=1).
         d = pos_in_block - prefix_len.unsqueeze(-1) + 1
         gamma = self.loss_decay_gamma
         if gamma is None or gamma <= 0:
             raw_w = completion_mask.float()
         else:
-            if self.loss_decay_suffix_mode == "absolute":
-                w_d = torch.exp(-(d - 1).float().clamp(min=0) / gamma)
-            else:
-                # R = B - p remaining length; u in [0,1] along the suffix (stable across R).
-                r_suffix = (self.block_size - prefix_len).unsqueeze(-1).float()
-                denom_u = (r_suffix - 1.0).clamp(min=1.0)
-                u = (d - 1).float().clamp(min=0) / denom_u
-                w_d = torch.exp(-u / gamma)
+            w_d = torch.exp(-(d - 1).float().clamp(min=0) / gamma)
             raw_w = w_d * completion_mask.float()
 
         denom = raw_w.sum(dim=-1, keepdim=True).clamp(min=1e-8)

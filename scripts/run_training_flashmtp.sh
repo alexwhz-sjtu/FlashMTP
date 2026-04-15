@@ -103,9 +103,8 @@ CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
+# 后缀 CE 权重 w∝exp(-(d-1)/gamma)，d 为块内后缀的 1-based 位置（首个待预测 token 为 d=1）
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
-# v3.1: normalized = 沿后缀归一化坐标 u∈[0,1] 上衰减，不同剩余长度 R 下首尾相对权重比一致
-LOSS_DECAY_SUFFIX_MODE="${LOSS_DECAY_SUFFIX_MODE:-normalized}"
 
 # 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
@@ -149,8 +148,7 @@ echo "  草稿模型层数: ${NUM_DRAFT_LAYERS}"
 echo "  块大小: ${BLOCK_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
-echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
-echo "  Loss后缀衰减模式: ${LOSS_DECAY_SUFFIX_MODE} (absolute=按 d; normalized=按 u=(d-1)/(R-1))"
+echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)} (w∝exp(-(d-1)/γ)，d=后缀内序号)"
 echo "------------------------------------------"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
@@ -214,7 +212,6 @@ fi
 if [ -n "${LOSS_DECAY_GAMMA}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --loss-decay-gamma ${LOSS_DECAY_GAMMA}"
 fi
-OPTIONAL_ARGS="${OPTIONAL_ARGS} --loss-decay-suffix-mode ${LOSS_DECAY_SUFFIX_MODE}"
 
 if [ -n "${IS_PREFORMATTED}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --is-preformatted"
