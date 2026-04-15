@@ -37,7 +37,7 @@ fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 
-NUM_EPOCHS="${NUM_EPOCHS:-6}"
+NUM_EPOCHS="${NUM_EPOCHS:-10}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
 
@@ -105,7 +105,7 @@ esac
 if [ "$DT" = "qz" ]; then
     # qz 配置
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v1.2.2_nlayers_${NUM_DRAFT_LAYERS}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_loss_${LOSS_SHORT}_ep${NUM_EPOCHS}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v1.2.2_nolayerembedn_nlayers_${NUM_DRAFT_LAYERS}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_loss_${LOSS_SHORT}_ep${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 else
     # a800 配置（默认）
@@ -144,7 +144,7 @@ WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"
 # offline: 仅本地写入 ${WANDB_DIR}，无需 API key；上线同步: WANDB_MODE=online 并配置密钥
 WANDB_MODE="${WANDB_MODE:-offline}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v1.2.2_${DATA_NUM_SAMPLES}_loss_${LOSS_SHORT}_ep${NUM_EPOCHS}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v1.2.2_nolayerembedn_${DATA_NUM_SAMPLES}_loss_${LOSS_SHORT}_ep${NUM_EPOCHS}}"
 
 export WANDB_DIR
 export WANDB_MODE

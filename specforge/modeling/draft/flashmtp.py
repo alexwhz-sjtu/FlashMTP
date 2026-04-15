@@ -290,7 +290,13 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
 
-        self.fc = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        # One projection per selected target layer (CHS slot), aligned with ``target_layer_ids`` order.
+        self.layer_fcs = nn.ModuleList(
+            [
+                nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+                for _ in range(n_chs)
+            ]
+        )
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layer_embedding = nn.Embedding(n_chs, config.hidden_size)
 
@@ -314,7 +320,13 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         num_layers = len(self.target_layer_ids)
         n_blocks = target_hidden.shape[1] // num_layers
         layer_ids = torch.arange(num_layers, device=device).repeat(n_blocks)  # (N*L,)
-        target_hidden = self.fc(target_hidden) + self.layer_embedding(layer_ids)
+        b, sl, h = target_hidden.shape
+        target_hidden = target_hidden.view(b, n_blocks, num_layers, h)
+        target_hidden = torch.stack(
+            [self.layer_fcs[i](target_hidden[:, :, i, :]) for i in range(num_layers)],
+            dim=2,
+        )
+        target_hidden = target_hidden.reshape(b, sl, h) + self.layer_embedding(layer_ids)
         target_hidden = self.hidden_norm(target_hidden)
 
         # RoPE only for mask (noise) tokens — position_ids should be local (0..B-1 per block)

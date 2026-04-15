@@ -210,6 +210,8 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     draft_config.flashmtp_config["num_target_transformer_layers"] = (
         target_config.num_hidden_layers
     )
+
+    # all layers (exp)
     _tl_ids = build_flashmtp_target_layer_ids(
         target_config.num_hidden_layers,
         draft_config.num_hidden_layers,
