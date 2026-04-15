@@ -104,12 +104,8 @@ NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
-
-# v3 扩散训练参数
-W_DISTILL="${W_DISTILL:-1.0}"
-W_CONS="${W_CONS:-0.6}"
-INNER_BLOCK_SIZE="${INNER_BLOCK_SIZE:-1}"
-ENABLE_CONS_AFTER_STEPS="${ENABLE_CONS_AFTER_STEPS:-100000}"
+# v3.1: normalized = 沿后缀归一化坐标 u∈[0,1] 上衰减，不同剩余长度 R 下首尾相对权重比一致
+LOSS_DECAY_SUFFIX_MODE="${LOSS_DECAY_SUFFIX_MODE:-normalized}"
 
 # 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
@@ -154,12 +150,8 @@ echo "  块大小: ${BLOCK_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
+echo "  Loss后缀衰减模式: ${LOSS_DECAY_SUFFIX_MODE} (absolute=按 d; normalized=按 u=(d-1)/(R-1))"
 echo "------------------------------------------"
-echo "v3 扩散训练配置:"
-echo "  Distillation权重: ${W_DISTILL}"
-echo "  Consistency权重: ${W_CONS}"
-echo "  Inner Block大小: ${INNER_BLOCK_SIZE}"
-echo "  Consistency启用步数: ${ENABLE_CONS_AFTER_STEPS}"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
 echo "  批大小: ${BATCH_SIZE} x ${ACCUMULATION_STEPS} = $((BATCH_SIZE * ACCUMULATION_STEPS))"
@@ -222,6 +214,7 @@ fi
 if [ -n "${LOSS_DECAY_GAMMA}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --loss-decay-gamma ${LOSS_DECAY_GAMMA}"
 fi
+OPTIONAL_ARGS="${OPTIONAL_ARGS} --loss-decay-suffix-mode ${LOSS_DECAY_SUFFIX_MODE}"
 
 if [ -n "${IS_PREFORMATTED}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --is-preformatted"
@@ -276,10 +269,6 @@ set +e
     --tp-size ${TP_SIZE} \
     --dist-timeout ${DIST_TIMEOUT} \
     --chs-concat-mode ${CHS_CONCAT_MODE} \
-    --w-distill ${W_DISTILL} \
-    --w-cons ${W_CONS} \
-    --inner-block-size ${INNER_BLOCK_SIZE} \
-    --enable-cons-after-steps ${ENABLE_CONS_AFTER_STEPS} \
     --seed 42 \
     ${OPTIONAL_ARGS}
 EXIT_CODE=$?

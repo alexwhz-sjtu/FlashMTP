@@ -1,5 +1,5 @@
 # coding=utf-8
-"""FlashMTP Training Wrapper - v3 Diffusion-based Training."""
+"""FlashMTP training wrapper: clean-prefix completion (iterative block generation)."""
 
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
-from specforge.core.loss import kl_divergence_loss
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -215,7 +214,7 @@ def create_flashmtp_block_mask(
 
 
 class OnlineFlashMTPModel(nn.Module):
-    """FlashMTP v3 online training wrapper with diffusion-based consistency distillation."""
+    """Online FlashMTP training: CHS-conditioned draft with clean-prefix completion CE."""
 
     def __init__(
         self,
@@ -227,11 +226,8 @@ class OnlineFlashMTPModel(nn.Module):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         chs_concat_mode: str = "seq",  # "seq" or "feature"
-        # v3 diffusion training params
-        w_distill: float = 1.0,
-        w_cons: float = 0.6,
-        inner_block_size: int = 1,
-        enable_cons_after_steps: int = 1000,
+        loss_decay_gamma: Optional[float] = None,
+        loss_decay_suffix_mode: str = "normalized",
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -244,11 +240,8 @@ class OnlineFlashMTPModel(nn.Module):
         self.chs_concat_mode = chs_concat_mode
         self.draft_model.chs_concat_mode = chs_concat_mode
 
-        # v3 params
-        self.w_distill = w_distill
-        self.w_cons = w_cons
-        self.inner_block_size = inner_block_size
-        self.enable_cons_after_steps = enable_cons_after_steps
+        self.loss_decay_gamma = loss_decay_gamma
+        self.loss_decay_suffix_mode = loss_decay_suffix_mode
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -330,28 +323,22 @@ class OnlineFlashMTPModel(nn.Module):
         pos_ids = anchor_positions.unsqueeze(-1) + offsets
         return pos_ids.view(bsz, -1)
 
-    def _create_noise_embed_for_v3(
+    def _create_masked_prefix_noise_embedding(
         self,
         input_ids: torch.Tensor,
         anchor_positions: torch.Tensor,
         block_keep_mask: torch.Tensor,
-        unmask_positions: torch.Tensor,  # (B, N) - how many tokens are unmasked in each block
+        unmask_positions: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Create noise embedding for v3 diffusion training.
-
-        For each block:
-        - First `unmask_positions[b, n]` tokens are real (from input_ids)
-        - Remaining tokens are MASK
+        Build draft block inputs: first ``unmask_positions`` tokens per block from
+        ``input_ids``, remainder MASK embeddings.
 
         Args:
-            input_ids: (B, seq_len) full sequence
-            anchor_positions: (B, N) anchor position for each block
-            block_keep_mask: (B, N) valid block mask
-            unmask_positions: (B, N) number of unmasked tokens in each block (includes anchor)
+            unmask_positions: (B, N) prefix length (number of real tokens from anchor).
 
         Returns:
-            noise_embedding: (B, N*block_size, hidden_size)
+            (B, N*block_size, hidden_size)
         """
         bsz, seq_len = input_ids.shape
         n = anchor_positions.shape[1]
@@ -383,316 +370,31 @@ class OnlineFlashMTPModel(nn.Module):
 
         return self.embed_tokens(noise_ids)
 
-    def sample_intermediate_states(
+    def sample_clean_prefix_lengths(
         self,
-        input_ids: torch.Tensor,
-        anchor_positions: torch.Tensor,
-        block_keep_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Sample intermediate states y and y* for v3 diffusion training.
-
-        For each block of size B=block_size:
-        - Sample p in [1, B - inner_block_size] (tokens already revealed in y)
-        - y: first p tokens are real, rest are MASK
-        - y*: first p + inner_block_size tokens are real, rest are MASK
-
-        Args:
-            input_ids: (B, seq_len) full sequence
-            anchor_positions: (B, N) anchor positions
-            block_keep_mask: (B, N) valid block mask
-
-        Returns:
-            - y_unmask_count: (B, N) number of unmasked tokens in y for each block
-            - y_star_unmask_count: (B, N) number of unmasked tokens in y* for each block
-            - U_y_mask: (B, N, block_size) mask for U_y positions (newly unmasked in y*)
-            - S_y_mask: (B, N, block_size) mask for S_y positions (still masked in y*)
-        """
-        bsz, n_blocks = anchor_positions.shape
-        device = input_ids.device
-
-        min_p = 1
-        max_p = self.block_size - self.inner_block_size
-
-        y_unmask_count = torch.zeros((bsz, n_blocks), dtype=torch.long, device=device)
-
-        for b in range(bsz):
-            for i in range(n_blocks):
-                if block_keep_mask[b, i]:
-                    y_unmask_count[b, i] = torch.randint(
-                        min_p, max_p + 1, (1,), device=device
-                    ).item()
-
-        y_star_unmask_count = y_unmask_count + self.inner_block_size
-        y_star_unmask_count = torch.clamp(y_star_unmask_count, max=self.block_size)
-
-        # Create U_y mask: positions newly unmasked in y* (i.e., [y_unmask_count, y_star_unmask_count))
-        pos_indices = torch.arange(self.block_size, device=device).view(1, 1, -1)
-        U_y_mask = (pos_indices >= y_unmask_count.unsqueeze(-1)) & \
-                   (pos_indices < y_star_unmask_count.unsqueeze(-1))
-        U_y_mask = U_y_mask & block_keep_mask.unsqueeze(-1)
-
-        # Create S_y mask: positions still masked in y* (i.e., >= y_star_unmask_count)
-        S_y_mask = pos_indices >= y_star_unmask_count.unsqueeze(-1)
-        S_y_mask = S_y_mask & block_keep_mask.unsqueeze(-1)
-
-        return y_unmask_count, y_star_unmask_count, U_y_mask, S_y_mask
-
-    def get_teacher_logits_at_positions(
-        self,
-        hidden_states: Tuple[torch.Tensor, ...],
-        anchor_positions: torch.Tensor,
         block_keep_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Get teacher logits at all block positions using teacher's lm_head.
-
-        For each position in each block, use the corresponding hidden state
-        from the last layer to compute teacher's prediction.
+        """Sample clean prefix length p per block: p ~ Uniform{0, ..., B-1}.
 
         Args:
-            hidden_states: tuple of (num_layers,) tensors of (B, seq_len, H)
-            anchor_positions: (B, N) anchor positions
             block_keep_mask: (B, N) valid block mask
 
         Returns:
-            teacher_logits: (B, N, block_size, vocab_size)
+            prefix_len: (B, N) long, in [0, block_size - 1] for valid blocks
         """
-        bsz, n_blocks = anchor_positions.shape
-        device = anchor_positions.device
-
-        # Last transformer layer (same indexing as prepare_target_hidden)
-        last_layer_hidden = hidden_states[-1]  # (B, seq_len, H)
-        inf = self._target_lm_in_features
-        if last_layer_hidden.shape[-1] != inf:
-            ld = last_layer_hidden.shape[-1]
-            if ld > inf and ld % inf == 0:
-                last_layer_hidden = last_layer_hidden[..., -inf:].contiguous()
-            else:
-                raise ValueError(
-                    f"Teacher last-layer hidden dim {ld} cannot align to lm_head in={inf}"
-                )
-
-        # Gather hidden states for all positions in all blocks
-        # Block position i corresponds to anchor_position + i
-        offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)  # (1, 1, block_size)
-        all_positions = anchor_positions.unsqueeze(-1) + offsets  # (B, N, block_size)
-
-        # Clamp to valid range
-        seq_len = last_layer_hidden.shape[1]
-        all_positions_clamped = all_positions.clamp(0, seq_len - 1)
-
-        # Gather hidden states: (B, N, block_size, H)
-        gathered_hidden = torch.gather(
-            last_layer_hidden.unsqueeze(1).expand(-1, n_blocks, -1, -1),
-            dim=2,
-            index=all_positions_clamped.unsqueeze(-1).expand(-1, -1, -1, last_layer_hidden.shape[-1])
-        )
-
-        # Apply lm_head to get logits: (B, N, block_size, vocab_size)
-        original_shape = gathered_hidden.shape
-        flat_hidden = gathered_hidden.reshape(-1, original_shape[-1])
-        logits = self._apply_lm_head(flat_hidden)
-        logits = logits.reshape(*original_shape[:-1], -1)
-
-        return logits
-
-    def forward_v3(
-        self,
-        input_ids: torch.Tensor,
-        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
-        loss_mask: torch.Tensor,
-        global_step: int = 0,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        v3 diffusion-based training forward pass.
-
-        The second draft forward (state y*) runs only when consistency loss is used:
-        ``global_step >= enable_cons_after_steps`` and ``w_cons > 0``.
-
-        Args:
-            input_ids: (B, seq_len) input token IDs
-            hidden_states: HF-style per-layer tuple or SGLang fused ``(B, L, n_layers*H)``
-            loss_mask: (B, seq_len) loss mask
-            global_step: current training step
-
-        Returns:
-            - total_loss: scalar
-            - loss_dict: dict containing individual loss components and metrics
-        """
-        bsz, seq_len = input_ids.shape
-        device = input_ids.device
-
-        hidden_states = normalize_teacher_hidden_to_layer_tuple(
-            hidden_states,
-            target_layer_ids=self.draft_model.target_layer_ids,
-            hidden_size=self.draft_model.config.hidden_size,
-        )
-
-        # 1. Sample anchor positions
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device)
-        n_blocks = anchor_positions.shape[1]
-
-        # 2. Sample intermediate states y and y*
-        y_unmask_count, y_star_unmask_count, U_y_mask, S_y_mask = \
-            self.sample_intermediate_states(input_ids, anchor_positions, block_keep_mask)
-
-        # 3. Get teacher logits for all positions (used for distillation)
-        with torch.no_grad():
-            teacher_logits = self.get_teacher_logits_at_positions(
-                hidden_states, anchor_positions, block_keep_mask
-            )  # (B, N, block_size, vocab_size)
-
-        # 4. Prepare CHS (context hidden states)
-        num_target_layers = getattr(self.draft_model.config, "num_target_layers", 1)
-        chs_len_per_block = num_target_layers if self.chs_concat_mode == "seq" else 1
-
-        target_hidden = prepare_target_hidden(
-            hidden_states, anchor_positions, self.draft_model.target_layer_ids,
-            self.chs_concat_mode)
-
-        # 5. Create attention mask
-        flashmtp_attn_mask = create_flashmtp_block_mask(
-            anchor_positions=anchor_positions,
-            block_keep_mask=block_keep_mask,
-            chs_len_per_block=chs_len_per_block,
-            block_size=self.block_size,
-            device=device,
-        )
-
-        # 6. Create position IDs
-        draft_position_ids = self._create_position_ids(anchor_positions)
-        if self.chs_concat_mode == "seq":
-            full_position_ids = draft_position_ids
-        else:
-            full_position_ids = torch.cat(
-                [anchor_positions, draft_position_ids], dim=-1)
-
-        # 7. Forward for state y (with y_unmask_count tokens revealed)
-        noise_embed_y = self._create_noise_embed_for_v3(
-            input_ids, anchor_positions, block_keep_mask, y_unmask_count
-        )
-        output_hidden_y = self.draft_model(
-            position_ids=full_position_ids,
-            noise_embedding=noise_embed_y,
-            target_hidden=target_hidden,
-            attention_mask=flashmtp_attn_mask,
-        )
-        student_logits_y = self._apply_lm_head(output_hidden_y)  # (B, N*block_size, vocab_size)
-        student_logits_y = student_logits_y.view(bsz, n_blocks, self.block_size, -1)
-
-        need_cons = (
-            global_step >= self.enable_cons_after_steps and self.w_cons > 0.0
-        )
-        student_logits_y_star = None
-        if need_cons:
-            noise_embed_y_star = self._create_noise_embed_for_v3(
-                input_ids, anchor_positions, block_keep_mask, y_star_unmask_count
-            )
-            output_hidden_y_star = self.draft_model(
-                position_ids=full_position_ids,
-                noise_embedding=noise_embed_y_star,
-                target_hidden=target_hidden,
-                attention_mask=flashmtp_attn_mask,
-            )
-            student_logits_y_star = self._apply_lm_head(output_hidden_y_star)
-            student_logits_y_star = student_logits_y_star.view(
-                bsz, n_blocks, self.block_size, -1
-            )
-
-        # 9. Compute Distillation Loss on U_y (positions newly unmasked in y*)
-        # L_distill = E[ (1/|U_y|) * sum_{i in U_y} D_KL(p_i^T || q_phi(.|y,x)_i) ]
-        distill_loss = kl_divergence_loss(
-            student_logits_y,  # student predicts from state y
-            teacher_logits,    # teacher's distribution
-            U_y_mask,
-            reduction="mean"
-        )
-
-        # 10. Compute Consistency Loss on S_y (positions still masked in y*)
-        # L_cons = E[ (1/|S_y|) * sum_{i in S_y} D_KL(q_phi^-(.|y*,x)_i || q_phi(.|y,x)_i) ]
-        # Note: q_phi^- is stop-gradient
-        if need_cons and student_logits_y_star is not None:
-            cons_loss = kl_divergence_loss(
-                student_logits_y,  # student from state y
-                student_logits_y_star.detach(),  # student from state y* (stop-gradient)
-                S_y_mask,
-                reduction="mean",
-            )
-        else:
-            cons_loss = torch.tensor(0.0, device=device)
-
-        # 11. Total loss
-        w_cons = self.w_cons if need_cons else 0.0
-        total_loss = self.w_distill * distill_loss + w_cons * cons_loss
-
-        # 12. Compute accuracies for monitoring
-        with torch.no_grad():
-            # Distillation accuracy: student matches teacher's argmax on U_y
-            student_pred_y = torch.argmax(student_logits_y, dim=-1)
-            teacher_pred = torch.argmax(teacher_logits, dim=-1)
-            distill_correct = (student_pred_y == teacher_pred) & U_y_mask
-            distill_acc = distill_correct.sum().float() / (U_y_mask.sum() + 1e-8)
-
-            # Consistency accuracy: student_y matches student_y_star on S_y
-            if need_cons and student_logits_y_star is not None:
-                student_pred_y_star = torch.argmax(student_logits_y_star, dim=-1)
-                cons_correct = (student_pred_y == student_pred_y_star) & S_y_mask
-                cons_acc = cons_correct.sum().float() / (S_y_mask.sum() + 1e-8)
-            else:
-                cons_acc = torch.tensor(0.0, device=device)
-
-        loss_dict = {
-            "total_loss": total_loss,
-            "distill_loss": distill_loss,
-            "cons_loss": cons_loss,
-            "distill_acc": distill_acc,
-            "cons_acc": cons_acc,
-        }
-
-        return total_loss, loss_dict
-
-    # ==================== Legacy forward (kept for reference) ====================
-
-    def _create_noise_embed(self, input_ids, anchor_positions,
-                            block_keep_mask):
-        """Create noise embedding for base structure (first token real, rest MASK)."""
-        bsz, seq_len = input_ids.shape
-        n = anchor_positions.shape[1]
+        bsz, n_blocks = block_keep_mask.shape
+        device = block_keep_mask.device
         bs = self.block_size
-        device = input_ids.device
-
-        noise_ids = torch.full((bsz, n * bs),
-                               self.mask_token_id,
-                               dtype=torch.long,
-                               device=device)
-
-        block_starts = torch.arange(n, device=device) * bs
-        block_starts = block_starts.unsqueeze(0).expand(bsz, -1)
-
-        valid_anchor_positions = anchor_positions.clamp(0, seq_len - 1)
-        anchor_tokens = torch.gather(input_ids, 1, valid_anchor_positions)
-
-        flat_batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(
-            bsz, n)
-
-        # substitute the anchor position with label token (bonus token in inference)
-        noise_ids[flat_batch_idx, block_starts] = torch.where(
-            block_keep_mask,
-            anchor_tokens,
-            torch.tensor(self.mask_token_id, dtype=torch.long, device=device),
-        )
-
-        return self.embed_tokens(noise_ids)
+        p = torch.randint(0, bs, (bsz, n_blocks), device=device, dtype=torch.long)
+        return torch.where(block_keep_mask, p, torch.zeros_like(p))
 
     def forward(
         self,
         input_ids: torch.Tensor,
         hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
         loss_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Legacy forward for base structure - kept for backward compatibility."""
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Clean-prefix completion: weighted CE on the masked suffix (see design doc §5–6)."""
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
@@ -703,24 +405,21 @@ class OnlineFlashMTPModel(nn.Module):
         )
 
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device)
+            seq_len, loss_mask, device
+        )
+        n_blocks = anchor_positions.shape[1]
 
-        noise_embedding = self._create_noise_embed(input_ids, anchor_positions,
-                                                   block_keep_mask)
+        prefix_len = self.sample_clean_prefix_lengths(block_keep_mask)
 
-        context_position_ids = anchor_positions
-        draft_position_ids = self._create_position_ids(anchor_positions)
-
-        if self.chs_concat_mode == "seq":
-            full_position_ids = draft_position_ids
-        else:
-            full_position_ids = torch.cat(
-                [context_position_ids, draft_position_ids],
-                dim=-1)
-
-        num_target_layers = getattr(self.draft_model.config,
-                                    "num_target_layers", 1)
+        num_target_layers = getattr(self.draft_model.config, "num_target_layers", 1)
         chs_len_per_block = num_target_layers if self.chs_concat_mode == "seq" else 1
+
+        target_hidden = prepare_target_hidden(
+            hidden_states,
+            anchor_positions,
+            self.draft_model.target_layer_ids,
+            self.chs_concat_mode,
+        )
 
         flashmtp_attn_mask = create_flashmtp_block_mask(
             anchor_positions=anchor_positions,
@@ -730,66 +429,93 @@ class OnlineFlashMTPModel(nn.Module):
             device=device,
         )
 
-        target_hidden = prepare_target_hidden(
-            hidden_states, anchor_positions, self.draft_model.target_layer_ids,
-            self.chs_concat_mode)
+        draft_position_ids = self._create_position_ids(anchor_positions)
+        if self.chs_concat_mode == "seq":
+            full_position_ids = draft_position_ids
+        else:
+            full_position_ids = torch.cat(
+                [anchor_positions, draft_position_ids], dim=-1
+            )
+
+        noise_embed = self._create_masked_prefix_noise_embedding(
+            input_ids, anchor_positions, block_keep_mask, prefix_len
+        )
 
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
-            noise_embedding=noise_embedding,
+            noise_embedding=noise_embed,
             target_hidden=target_hidden,
             attention_mask=flashmtp_attn_mask,
         )
+        student_logits = self._apply_lm_head(output_hidden)
+        student_logits = student_logits.view(bsz, n_blocks, self.block_size, -1)
 
-        logits = self._apply_lm_head(output_hidden)
-
-        # Labels: same-position prediction
-        label_offsets = torch.arange(0, self.block_size,
-                                     device=device).view(1, 1, -1)
-        label_indices = anchor_positions.unsqueeze(-1) + label_offsets
+        pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        label_indices = anchor_positions.unsqueeze(-1) + pos_in_block
         valid_label_mask = label_indices < seq_len
         safe_label_indices = label_indices.clamp(max=seq_len - 1)
-
         target_ids = torch.gather(
-            input_ids.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
+            input_ids.unsqueeze(1).expand(-1, n_blocks, -1),
             2,
             safe_label_indices,
         )
-
-        # Weight mask
-        weight_mask = (block_keep_mask.unsqueeze(-1).expand(
-            -1, -1, self.block_size).float())
-        weight_mask = weight_mask * valid_label_mask.float()
-
-        pos_in_block = torch.arange(self.block_size,
-                                    device=device).view(1, 1, -1)
-        weight_mask = weight_mask * (pos_in_block > 0).float()
 
         original_loss_mask_gathered = torch.gather(
-            loss_mask.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
+            loss_mask.unsqueeze(1).expand(-1, n_blocks, -1),
             2,
             safe_label_indices,
         )
-        weight_mask = weight_mask * original_loss_mask_gathered
 
-        binary_eval_mask = weight_mask.view(-1)
+        completion_mask = pos_in_block >= prefix_len.unsqueeze(-1)
+        completion_mask = (
+            completion_mask
+            & block_keep_mask.unsqueeze(-1)
+            & valid_label_mask
+            & (original_loss_mask_gathered > 0.5)
+        )
 
-        # Cross entropy
-        flat_logits = logits.view(-1, logits.size(-1))
-        flat_targets = target_ids.view(-1)
-        flat_weights = weight_mask.view(-1)
+        ce_per_pos = F.cross_entropy(
+            student_logits.reshape(-1, student_logits.size(-1)),
+            target_ids.reshape(-1),
+            reduction="none",
+        ).view(bsz, n_blocks, self.block_size)
 
-        loss_per_token = F.cross_entropy(flat_logits,
-                                         flat_targets,
-                                         reduction="none")
-        valid_token_count = flat_weights.sum() + 1e-6
-        loss = (loss_per_token * flat_weights).sum() / valid_token_count
+        d = pos_in_block - prefix_len.unsqueeze(-1) + 1
+        gamma = self.loss_decay_gamma
+        if gamma is None or gamma <= 0:
+            raw_w = completion_mask.float()
+        else:
+            if self.loss_decay_suffix_mode == "absolute":
+                w_d = torch.exp(-(d - 1).float().clamp(min=0) / gamma)
+            else:
+                # R = B - p remaining length; u in [0,1] along the suffix (stable across R).
+                r_suffix = (self.block_size - prefix_len).unsqueeze(-1).float()
+                denom_u = (r_suffix - 1.0).clamp(min=1.0)
+                u = (d - 1).float().clamp(min=0) / denom_u
+                w_d = torch.exp(-u / gamma)
+            raw_w = w_d * completion_mask.float()
 
-        # Accuracy
+        denom = raw_w.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        tilde_w = raw_w / denom
+
+        weighted = ce_per_pos * tilde_w
+        per_block_loss = weighted.sum(dim=-1)
+        per_block_loss = per_block_loss * block_keep_mask.float()
+        n_valid = block_keep_mask.sum().float().clamp(min=1.0)
+        total_loss = per_block_loss.sum() / n_valid
+
         with torch.no_grad():
-            pred_ids = torch.argmax(flat_logits, dim=-1)
-            correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
-            actual_token_count = binary_eval_mask.sum() + 1e-6
-            accuracy = correct.sum().float() / actual_token_count
+            preds = torch.argmax(student_logits, dim=-1)
+            correct = (preds == target_ids) & completion_mask
+            ce_acc = correct.sum().float() / completion_mask.sum().float().clamp(
+                min=1.0
+            )
+            mean_p = (prefix_len.float() * block_keep_mask.float()).sum() / n_valid
 
-        return loss, accuracy
+        loss_dict = {
+            "total_loss": total_loss,
+            "ce_acc": ce_acc,
+            "mean_prefix_len": mean_p,
+        }
+
+        return total_loss, loss_dict

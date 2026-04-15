@@ -121,6 +121,9 @@ $$
 - 输入：大模型融合hiddenstates + 当前需要 draft 的 16 个 masked 位置。
 - 一次前向传播：模型直接预测当前 16 个 token。
 
+
+*** 采样 $p$：构建 $y$（$p$ 之前是 clean）。采样 $\Delta$：构建 $y^*$（$p+\Delta$ 之前是 clean）。计算 Distill：在 $y^*$ 比 $y$ 多出的那几个位置上学老师。计算 Consistency：在剩下的 MASK 位置上，让 $y$ 的预测去追 $y^*$。
+
 ## Use UV
 
 > \# git clone the source code

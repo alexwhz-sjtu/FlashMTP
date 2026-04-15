@@ -77,35 +77,17 @@ def parse_args():
         "--loss-decay-gamma",
         type=float,
         default=None,
-        help="Gamma for exponential loss decay weighting (paper Eq.4). "
-        "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
+        help="Temperature for exp decay on completion suffix. "
+        "absolute: w∝exp(-(d-1)/gamma). "
+        "normalized: w∝exp(-u/gamma), u∈[0,1] along suffix (re-tune vs absolute). "
+        "None => uniform over supervised positions.",
     )
-
-    # v3 diffusion training params
-    v3_group = parser.add_argument_group("v3 diffusion training")
-    v3_group.add_argument(
-        "--w-distill",
-        type=float,
-        default=1.0,
-        help="Weight for distillation loss (default: 1.0)",
-    )
-    v3_group.add_argument(
-        "--w-cons",
-        type=float,
-        default=0.6,
-        help="Weight for consistency loss (default: 0.6)",
-    )
-    v3_group.add_argument(
-        "--inner-block-size",
-        type=int,
-        default=1,
-        help="Inner block size (B_in) for v3 diffusion training (default: 1)",
-    )
-    v3_group.add_argument(
-        "--enable-cons-after-steps",
-        type=int,
-        default=1000,
-        help="Enable consistency loss after this many steps (default: 1000)",
+    model_group.add_argument(
+        "--loss-decay-suffix-mode",
+        type=str,
+        default="normalized",
+        choices=["absolute", "normalized"],
+        help="absolute: index d in 1..R; normalized: u=(d-1)/max(R-1,1).",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -322,38 +304,29 @@ def save_checkpoint(args, epoch, step, flashmtp_model, draft_model, optimizer):
     dist.barrier()
 
 
-def record_metrics_v3(
+def record_metrics(
     args,
     total_loss: float,
-    distill_loss: float,
-    cons_loss: float,
-    distill_acc: float,
-    cons_acc: float,
+    ce_acc: float,
+    mean_prefix_len: float,
     global_step: int,
     tracker,
     optimizer,
     train_dataloader=None,
     mode: str = "train",
 ) -> None:
-    """Record v3 diffusion training metrics."""
+    """Log clean-prefix completion metrics."""
     logdict = {}
-
     if mode == "train" and optimizer is not None:
         logdict["train/lr"] = optimizer.get_learning_rate()
-
     logdict[f"{mode}/total_loss"] = total_loss
-    logdict[f"{mode}/distill_loss"] = distill_loss
-    logdict[f"{mode}/cons_loss"] = cons_loss
-    logdict[f"{mode}/distill_acc"] = distill_acc
-    logdict[f"{mode}/cons_acc"] = cons_acc
-
+    logdict[f"{mode}/ce_acc"] = ce_acc
+    logdict[f"{mode}/mean_prefix_len"] = mean_prefix_len
     total_steps = args.num_epochs * len(train_dataloader) // args.accumulation_steps
     print_on_rank0(
         f"{mode.capitalize()} - Step {global_step}/{total_steps}, "
-        f"Loss: {total_loss:.4f} (distill: {distill_loss:.4f}, cons: {cons_loss:.4f}), "
-        f"Acc: distill={distill_acc:.4f}, cons={cons_acc:.4f}"
+        f"Loss: {total_loss:.4f}, ce_acc: {ce_acc:.4f}, mean_prefix_len: {mean_prefix_len:.2f}"
     )
-
     tracker.log(logdict, step=global_step)
 
 
@@ -471,11 +444,8 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         chs_concat_mode=args.chs_concat_mode,
-        # v3 diffusion training params
-        w_distill=args.w_distill,
-        w_cons=args.w_cons,
-        inner_block_size=args.inner_block_size,
-        enable_cons_after_steps=args.enable_cons_after_steps,
+        loss_decay_gamma=args.loss_decay_gamma,
+        loss_decay_suffix_mode=args.loss_decay_suffix_mode,
     )
 
     optimizer = BF16Optimizer(
@@ -537,12 +507,10 @@ def main():
             else:
                 hidden_states = tuple(t.cuda() for t in _hs)
 
-            # v3 diffusion training forward pass
-            loss, loss_dict = flashmtp_model.forward_v3(
+            loss, loss_dict = flashmtp_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
-                global_step=global_step,
             )
 
             (loss / args.accumulation_steps).backward()
@@ -551,33 +519,22 @@ def main():
                 optimizer.step()
 
             if global_step % args.log_interval == 0:
-                # v3 metrics: total_loss, distill_loss, cons_loss, distill_acc, cons_acc
                 total_loss_log = loss_dict["total_loss"].clone()
-                distill_loss_log = loss_dict["distill_loss"].clone()
-                cons_loss_log = loss_dict["cons_loss"].clone()
-                distill_acc_log = loss_dict["distill_acc"].clone()
-                cons_acc_log = loss_dict["cons_acc"].clone()
-
                 dist.all_reduce(total_loss_log)
-                dist.all_reduce(distill_loss_log)
-                dist.all_reduce(cons_loss_log)
-                dist.all_reduce(distill_acc_log)
-                dist.all_reduce(cons_acc_log)
+                total_loss_log = total_loss_log / dist.get_world_size()
 
+                ce_acc_log = loss_dict["ce_acc"].clone()
+                mean_p_log = loss_dict["mean_prefix_len"].clone()
+                dist.all_reduce(ce_acc_log)
+                dist.all_reduce(mean_p_log)
                 ws = dist.get_world_size()
-                total_loss_log = total_loss_log / ws
-                distill_loss_log = distill_loss_log / ws
-                cons_loss_log = cons_loss_log / ws
-                distill_acc_log = distill_acc_log / ws
-                cons_acc_log = cons_acc_log / ws
-
-                record_metrics_v3(
+                ce_acc_log = ce_acc_log / ws
+                mean_p_log = mean_p_log / ws
+                record_metrics(
                     args,
                     total_loss_log.item(),
-                    distill_loss_log.item(),
-                    cons_loss_log.item(),
-                    distill_acc_log.item(),
-                    cons_acc_log.item(),
+                    ce_acc_log.item(),
+                    mean_p_log.item(),
                     global_step,
                     tracker,
                     optimizer,
@@ -591,9 +548,8 @@ def main():
                 progress_bar.set_postfix(
                     {
                         "loss": f"{loss_dict['total_loss'].item():.4f}",
-                        "distill": f"{loss_dict['distill_loss'].item():.4f}",
-                        "cons": f"{loss_dict['cons_loss'].item():.4f}",
-                        "d_acc": f"{loss_dict['distill_acc'].item():.4f}",
+                        "ce_acc": f"{loss_dict['ce_acc'].item():.4f}",
+                        "mean_p": f"{loss_dict['mean_prefix_len'].item():.2f}",
                         "iter_time": f"{elapsed:.2f}s",
                     }
                 )
