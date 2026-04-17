@@ -74,6 +74,14 @@ def parse_args():
         help="Number of anchor positions per sequence",
     )
     model_group.add_argument(
+        "--context-window-size",
+        type=int,
+        default=1,
+        help="Sliding window W: each draft block may attend to at most W teacher token "
+        "positions before its anchor (full target hidden is prepended; mask restricts). "
+        "W=1 matches the previous single-(anchor-1) conditioning.",
+    )
+    model_group.add_argument(
         "--loss-decay-gamma",
         type=float,
         default=None,
@@ -110,7 +118,6 @@ def parse_args():
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
-    dataset_group.add_argument("--chs-concat-mode", type=str, default="feature")
     dataset_group.add_argument(
         "--build-dataset-num-proc",
         type=int,
@@ -195,7 +202,7 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     if not hasattr(draft_config, "flashmtp_config") or draft_config.flashmtp_config is None:
         draft_config.flashmtp_config = {}
         
-    draft_config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
+    draft_config.flashmtp_config["context_window_size"] = args.context_window_size
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
@@ -440,9 +447,9 @@ def main():
 
     draft_model.mask_token_id = mask_token_id
     
-    draft_model.config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
     draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
     draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
+    draft_model.config.flashmtp_config["context_window_size"] = args.context_window_size
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
     # Shard draft only; wrapping the whole OnlineFlashMTPModel breaks lm_head/embed/fc.
@@ -480,11 +487,11 @@ def main():
         mask_token_id=mask_token_id,
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
-        chs_concat_mode=args.chs_concat_mode,
         loss_decay_gamma=args.loss_decay_gamma,
         cold_start_loss_weight=args.cold_start_loss_weight,
         continuation_loss_weight=args.continuation_loss_weight,
         continuation_warmup_epochs=args.continuation_warmup_epochs,
+        context_window_size=args.context_window_size,
     )
 
     optimizer = BF16Optimizer(

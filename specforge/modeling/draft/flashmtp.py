@@ -5,7 +5,6 @@ from torch import nn
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from ...utils import print_on_rank0
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
     FlashAttentionKwargs,
@@ -43,7 +42,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 class Qwen3FlashMTPAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str):
+    def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -83,8 +82,6 @@ class Qwen3FlashMTPAttention(nn.Module):
             if config.layer_types[layer_idx] == "sliding_attention"
             else None
         )
-        
-        self.chs_concat_mode = chs_concat_mode
 
     def forward(
         self,
@@ -102,9 +99,8 @@ class Qwen3FlashMTPAttention(nn.Module):
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
-        k_ctx = self.k_proj(target_hidden) # (B, N*L, H)  
-
-        k_noise = self.k_proj(hidden_states)  # (B, N*S, H) 
+        k_ctx = self.k_proj(target_hidden)  # (B, ctx_len, H)
+        k_noise = self.k_proj(hidden_states)  # (B, q_len, H) 
         v_ctx = self.v_proj(target_hidden)
         v_noise = self.v_proj(hidden_states)
 
@@ -115,15 +111,7 @@ class Qwen3FlashMTPAttention(nn.Module):
         v = v.transpose(1, 2)
 
         cos, sin = position_embeddings
-        
-        # if seq, only pose position_embed on k_noise
-        if self.chs_concat_mode == "seq":
-            k_ctx_part = k[:, :, :ctx_len, :]  
-            k_noise_part = k[:, :, ctx_len:, :]   
-            q, k_noise_part = apply_rotary_pos_emb(q, k_noise_part, cos, sin)
-            k = torch.cat([k_ctx_part, k_noise_part], dim=2)
-        else:
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -149,10 +137,10 @@ class Qwen3FlashMTPAttention(nn.Module):
 
 
 class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str):
+    def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = Qwen3FlashMTPAttention(config=config, layer_idx=layer_idx, chs_concat_mode=chs_concat_mode)
+        self.self_attn = Qwen3FlashMTPAttention(config=config, layer_idx=layer_idx)
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(
@@ -219,10 +207,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         super().__init__(config)
         self.config = config
         flashmtp_config = getattr(config, "flashmtp_config", {}) or {}
-        self.chs_concat_mode = flashmtp_config.get("chs_concat_mode", "seq")
         self.layers = nn.ModuleList(
             [
-                Qwen3FlashMTPDecoderLayer(config, layer_idx, self.chs_concat_mode)
+                Qwen3FlashMTPDecoderLayer(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -235,22 +222,12 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
+        # Training sliding-window width W (also set via ``--context-window-size``).
+        self.context_window_size = int(flashmtp_config.get("context_window_size", 1))
 
-        # For seq concat mode: use Identity (no computation, no parameters)
-        # For feature mode: use Linear projection and RMSNorm
-        if self.chs_concat_mode == "feature":
-            self.fc = nn.Linear(
-                len(self.target_layer_ids) * config.hidden_size,
-                config.hidden_size,
-                bias=False,
-            )
-            self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        else:
-            self.fc = nn.Identity()
-            # self.hidden_norm = nn.Identity()
-            # maybe need norm
-            self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        print_on_rank0(f"self.chs_concat_mode: {self.chs_concat_mode}")
+        fused_in = len(self.target_layer_ids) * config.hidden_size
+        self.fc = nn.Linear(fused_in, config.hidden_size, bias=False)
+        self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.post_init()
 

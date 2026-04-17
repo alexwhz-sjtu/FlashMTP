@@ -33,7 +33,7 @@ def normalize_teacher_hidden_to_layer_tuple(
     Args:
         hidden_states: Either a tuple/list of ``(B, seq, H)`` per layer (HF), or a
             single ``(B, seq, D)`` tensor where ``D == len(layers) * H`` (SGLang cat).
-        target_layer_ids: Layer indices used by ``prepare_target_hidden`` (e.g. 0..L-1).
+        target_layer_ids: Layer indices used by ``build_full_context_target_hidden`` (e.g. 0..L-1).
         hidden_size: Model hidden size ``H``.
 
     Returns:
@@ -106,107 +106,73 @@ def normalize_teacher_hidden_to_layer_tuple(
     )
 
 
-def prepare_target_hidden(
-    hidden_states: Tuple[torch.Tensor, ...],  # (num_layers,)[(B, seq_len, H)]
-    anchor_positions: torch.Tensor,  # (B, N)
+def build_full_context_target_hidden(
+    hidden_states: Tuple[torch.Tensor, ...],
     target_layer_ids: list[int],
-    chs_concat_mode: str = "seq",
 ) -> torch.Tensor:
-    """Convert full hidden states to CHS format for FlashMTP.
+    """将整段 teacher hidden 在特征维拼接，形状 ``(B, T, H*L)``，放在噪声块之前。
 
-    Args:
-        hidden_states: All layers' hidden states from target model
-        anchor_positions: Anchor positions for each block
-        target_layer_ids: List of layer IDs to extract
-        chs_concat_mode: "seq" or "feature"
+    KV 下标 ``kv_idx`` 对应 token 位置 ``t = kv_idx``（与 ``seq_len`` 一致）。
 
-    Returns:
-        - seq mode: (B, N*L, H) - L layers concatenated along sequence dim
-        - feature mode: (B, N, H*L) - L layers concatenated along feature dim
+    训练时与 ``create_flashmtp_block_mask(..., context_window=W)`` 联用：
+    第 i 个噪声块只能看到 token 位置 ``[anchor_i - W, anchor_i - 1]`` 上的 context（及块内）。
     """
-    # 获取位置 p-1 的 hidden states (用来预测位置 p)
-    context_positions = (anchor_positions - 1).clamp(min=0)  # (B, N)
-
-    # 提取 anchor positions 对应的 hidden states
-    # hidden_states[layer] shape: (B, seq_len, H)
-    selected_states = []
-    for layer_id in target_layer_ids:
-        layer_hidden = hidden_states[layer_id]  # (B, seq_len, H)
-        # Gather: (B, N, H)
-        layer_selected = torch.gather(
-            layer_hidden,
-            dim=1,
-            index=context_positions.unsqueeze(-1).expand(-1, -1, layer_hidden.size(-1))
-        )
-        selected_states.append(layer_selected)
-
-    if chs_concat_mode == "seq":
-        # 按序列维度拼接: (B, N*L, H)
-        return torch.cat(selected_states, dim=1)  # (B, N*L, H)
-    else:  # feature mode
-        # 按特征维度拼接: (B, N, H*L)
-        return torch.cat(selected_states, dim=-1)  # (B, N, H*L)
+    return torch.cat(
+        [hidden_states[layer_id] for layer_id in target_layer_ids],
+        dim=-1,
+    )
 
 
 def create_flashmtp_block_mask(
     anchor_positions: torch.Tensor,
     block_keep_mask: torch.Tensor,
-    chs_len_per_block: int,
     block_size: int,
     device: torch.device,
+    *,
+    seq_len: int,
+    context_window: int,
 ):
-    """Construct Flex Attention BlockMask for FlashMTP training with per-block CHS.
+    """Construct Flex Attention BlockMask for FlashMTP training（滑动窗口 context）。
 
     Args:
-        anchor_positions: (B, N) tensor of anchor positions for each block
-        block_keep_mask: (B, N) boolean mask indicating valid blocks
-        chs_len_per_block: Number of tokens per CHS segment
-            - For seq concat mode: num_target_layers (L)
-            - For feature concat mode: 1
-        block_size: Number of tokens per draft block
-        device: torch device
+        anchor_positions: (B, N) 每个块的 anchor（块内第一个预测位置）
+        block_keep_mask: (B, N) 块是否有效
+        block_size: 每块噪声 token 数
+        seq_len: 序列长度（与 teacher hidden 一致）
+        context_window: W，每个块仅可见 anchor 之前长度为 W 的 target 区间
+            ``t in [max(0, anchor - W), anchor - 1]``（含端点）
 
     Layout:
-        KV: [CHS_0 | CHS_1 | ... | CHS_{N-1} | Block_0 | Block_1 | ... | Block_{N-1}]
-            - Each CHS_i has length chs_len_per_block
-            - Each Block_i has length block_size
+        KV: [FullTarget_0 ... FullTarget_{T-1} | Block_0 | ... | Block_{N-1}]
         Q:  [Block_0 | Block_1 | ... | Block_{N-1}]
 
     Rules:
-      1. Block_i only sees CHS_i (its own context).
-         For seq mode: within CHS_i, only tokens < anchor_pos are visible.
-         For feature mode: CHS_i is a single token (always visible if valid).
-      2. Intra-block attention is bidirectional.
-      3. Different blocks are invisible to each other.
-      4. Invalid blocks (block_keep_mask=False) see nothing.
+      1. Block_i 仅可见满足 ``max(0, anchor_i - W) <= t < anchor_i`` 的 context KV。
+      2. 块内注意力双向。
+      3. 块与块之间互不可见。
+      4. ``block_keep_mask=False`` 的块无可见内容。
     """
+    B, N = anchor_positions.shape
+    ctx_kv_len = seq_len
 
     def flashmtp_mask_mod(b, h, q_idx, kv_idx):
         q_block_id = q_idx // block_size
+        anchor = anchor_positions[b, q_block_id]
+        t_low = (anchor - context_window).clamp(min=0)
+        # 可见 token 位置 t ∈ [t_low, anchor) 即 anchor 前至多 W 个位置
+        is_context = kv_idx < ctx_kv_len
+        t = kv_idx
+        mask_context = is_context & (t >= t_low) & (t < anchor)
 
-        # Total length of all CHS segments
-        total_chs_len = N * chs_len_per_block
-
-        # Check if kv_idx falls within the CHS region
-        is_context = kv_idx < total_chs_len
-        # Which CHS segment this kv belongs to
-        chs_block_id = kv_idx // chs_len_per_block
-        # Block i only attends to CHS i (all CHS tokens are needed)
-        mask_context = is_context & (chs_block_id == q_block_id)
-
-        # Check if kv_idx falls within the draft block region
-        is_draft = kv_idx >= total_chs_len
-        # Which block this draft kv belongs to
-        kv_block_id = (kv_idx - total_chs_len) // block_size
-        # Block i only attends to Block i (bidirectional)
+        is_draft = kv_idx >= ctx_kv_len
+        kv_block_id = (kv_idx - ctx_kv_len) // block_size
         mask_draft = is_draft & (kv_block_id == q_block_id)
 
         is_valid_block = block_keep_mask[b, q_block_id]
         return (mask_context | mask_draft) & is_valid_block
 
-    B, N = anchor_positions.shape
     Q_LEN = N * block_size
-    KV_LEN = N * chs_len_per_block + N * block_size
+    KV_LEN = ctx_kv_len + N * block_size
 
     return create_block_mask(
         flashmtp_mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device
@@ -225,12 +191,12 @@ class OnlineFlashMTPModel(nn.Module):
         block_size: int = 16,
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
-        chs_concat_mode: str = "seq",  # "seq" or "feature"
         loss_decay_gamma: Optional[float] = None,
         prefix_len_sample_bias: float = 0.6,
         cold_start_loss_weight: float = 1.0,
         continuation_loss_weight: float = 1.0,
         continuation_warmup_epochs: float = 0.0,
+        context_window_size: int = 1,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -240,8 +206,11 @@ class OnlineFlashMTPModel(nn.Module):
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
-        self.chs_concat_mode = chs_concat_mode
-        self.draft_model.chs_concat_mode = chs_concat_mode
+        if context_window_size < 1:
+            raise ValueError(
+                f"context_window_size must be >= 1; got {context_window_size}"
+            )
+        self.context_window_size = context_window_size
 
         self.loss_decay_gamma = loss_decay_gamma
         if not (0.0 < prefix_len_sample_bias <= 1.0):
@@ -520,31 +489,22 @@ class OnlineFlashMTPModel(nn.Module):
                 1.0, float(training_epoch) / float(we)
             )
 
-        num_target_layers = getattr(self.draft_model.config, "num_target_layers", 1)
-        chs_len_per_block = num_target_layers if self.chs_concat_mode == "seq" else 1
-
-        target_hidden = prepare_target_hidden(
+        target_hidden = build_full_context_target_hidden(
             hidden_states,
-            anchor_positions,
             self.draft_model.target_layer_ids,
-            self.chs_concat_mode,
         )
 
         flashmtp_attn_mask = create_flashmtp_block_mask(
             anchor_positions=anchor_positions,
             block_keep_mask=block_keep_mask,
-            chs_len_per_block=chs_len_per_block,
             block_size=self.block_size,
             device=device,
+            seq_len=seq_len,
+            context_window=self.context_window_size,
         )
 
         draft_position_ids = self._create_position_ids(anchor_positions)
-        if self.chs_concat_mode == "seq":
-            full_position_ids = draft_position_ids
-        else:
-            full_position_ids = torch.cat(
-                [anchor_positions, draft_position_ids], dim=-1
-            )
+        full_position_ids = draft_position_ids
 
         noise_embed = self._create_masked_prefix_noise_embedding(
             input_ids, anchor_positions, block_keep_mask, prefix_len
