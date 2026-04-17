@@ -37,11 +37,11 @@ fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 
-NUM_EPOCHS="${NUM_EPOCHS:-6}"
+NUM_EPOCHS="${NUM_EPOCHS:-16}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
 # CHS 滑动窗口：取 anchor 之前最近 W 个 target 位置的 hidden（含 position_ids）；1 与旧版单点上下文一致
-CHS_WINDOW_SIZE="${CHS_WINDOW_SIZE:-64}"
+CHS_WINDOW_SIZE="${CHS_WINDOW_SIZE:-128}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
 
 # 恢复训练
@@ -74,9 +74,9 @@ MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 # 数据目录 - 根据 --dt 参数选择配置
 if [ "$DT" = "qz" ]; then
     # qz 配置
-    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}}"
-    TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}_old/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v1.1.2_slw_${CHS_WINDOW_SIZE}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}}"
+    TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 else
     # a800 配置（默认）
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
@@ -116,7 +116,7 @@ WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"
 # offline: 仅本地写入 ${WANDB_DIR}，无需 API key；上线同步: WANDB_MODE=online 并配置密钥
 WANDB_MODE="${WANDB_MODE:-offline}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v1.1_slw64_nlayer_${NUM_DRAFT_LAYERS}_${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_fixed}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v1.1_slw_${CHS_WINDOW_SIZE}_nlayer_${NUM_DRAFT_LAYERS}_${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_fixed}"
 
 export WANDB_DIR
 export WANDB_MODE

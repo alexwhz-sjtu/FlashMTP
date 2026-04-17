@@ -15,19 +15,19 @@ from pathlib import Path
 
 # ==================== 配置区域 ====================
 # wandb 离线日志目录
-WANDB_DIR = "/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/wandb/wandb/offline-run-20260415_174543-flashmtp_v1.1_slw_nlayer_5_40000_feature_fixed"
+WANDB_DIR = "/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP_v3.1/wandb/offline-run-20260416_022643-flashmtp_v3.1_40000_feature"
 
 # wandb project 名称
-WANDB_PROJECT = "flashmtp_training"
+WANDB_PROJECT = "flashmtp_training_new"
 
 # 同步间隔（秒）
 SYNC_INTERVAL = 5 * 60  # 5 分钟
 
 # 日志文件路径
-LOG_FILE = "./wandb_sync_2.log"
+LOG_FILE = "./wandb_sync2.log"
 
 # 锁文件路径（防止重复执行）
-LOCK_FILE = "./wandb_sync_2.lock"
+LOCK_FILE = "./wandb_sync2.lock"
 # ================================================
 
 
@@ -79,7 +79,7 @@ def is_process_running(pid):
 
 def sync_wandb():
     """执行 wandb sync 命令"""
-    cmd = f"wandb sync --project {WANDB_PROJECT} {WANDB_DIR}"
+    cmd = f"wandb sync --project {WANDB_PROJECT} --id flashmtp_v3.1_40000_feature_ep20 {WANDB_DIR}"
     
     logging.info(f"开始执行同步命令：{cmd}")
     
