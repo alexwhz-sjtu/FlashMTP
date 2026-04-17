@@ -1,47 +1,33 @@
 #!/bin/bash
-# FlashMTP 训练启动脚本（与 scripts/train_flashmtp.py 参数对应）
-
+# FlashMTP 训练：与 scripts/train_flashmtp.py 参数一致；用法: bash scripts/run_training_flashmtp.sh [--dt qz|a800]
 set -e
 
-
-# 解析命令行参数
-DT="a800"  # 默认值为 a800
+DT="a800"
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --dt)
-            DT="$2"
-            shift 2
-            ;;
-        *)
-            # 保留其他参数供后续使用（如果有的话）
-            shift
-            ;;
+        --dt) DT="$2"; shift 2 ;;
+        *) shift ;;
     esac
 done
-
-# 验证 dt 参数
 if [[ "$DT" != "qz" && "$DT" != "a800" ]]; then
-    echo "错误: --dt 参数必须是 'qz' 或 'a800'"
+    echo "错误: --dt 须为 qz 或 a800"
     exit 1
 fi
 
-# v3 + 大词表 KL + flex/inductor：默认 512 锚点×4096 在 80GB 上易触发显存峰值；a800 未 export 时使用更保守默认
+# a800：更保守锚点数，减轻显存峰值
 if [ "$DT" = "a800" ]; then
     MAX_LENGTH="${MAX_LENGTH:-4096}"
-    NUM_ANCHORS="${NUM_ANCHORS:-256}"
-else
-    MAX_LENGTH="${MAX_LENGTH:-4096}"
     NUM_ANCHORS="${NUM_ANCHORS:-512}"
+else
+    MAX_LENGTH="${MAX_LENGTH:-10240}"
+    NUM_ANCHORS="${NUM_ANCHORS:-1024}"
 fi
 
-# 自动激活虚拟环境
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
 if [ -f "${PROJECT_DIR}/.venv/bin/activate" ]; then
     source "${PROJECT_DIR}/.venv/bin/activate"
 fi
-
-# 添加项目根目录到 PYTHONPATH
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"
 
 # ========================================
@@ -49,47 +35,55 @@ export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"
 # ========================================
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
-
 NUM_EPOCHS="${NUM_EPOCHS:-10}"
-
-# 恢复训练
 RESUME="${RESUME:-}"
 CKPT_DIR="${CKPT_DIR:-}"
 
 # ========================================
 # 主要数据集参数
 # ========================================
-# 数据特征参数
 DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}"
 ENABLE_THINKING="${ENABLE_THINKING:-on}"
+NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
+BLOCK_SIZE="${BLOCK_SIZE:-16}"
 
 # ========================================
-# 默认参数（通常不需要修改）
+# 模型参数
 # ========================================
+# Teacher 条件窗长 W：每个块在 mask 内最多 attend anchor 之前 W 个 token 的 target hidden；W=1 等价于仅用 anchor-1
+CONTEXT_WINDOW_SIZE="${CONTEXT_WINDOW_SIZE:-64}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
+LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
 
-# GPU 设置
-MASTER_PORT="${MASTER_PORT:-29501}"
-TP_SIZE="${TP_SIZE:-1}"
-DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
-
-# 目标模型路径
-TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
-
+# ========================================
 # 训练参数
+# ========================================
+# 双任务 loss：每个 anchor 并行冷启动(p=1) + 延续(p∈{2..B-1})，一次 forward；总损失 =
+#   cold_w * mean(冷启子块) + λ2_eff * mean(延续子块)，
+#   λ2_eff = continuation_w * min(1, training_epoch / CONTINUATION_WARMUP_EPOCHS)
+#   training_epoch = 当前 epoch + 当前 batch 下标/每轮 batch 数（浮点，从 0 起算）
+COLD_START_LOSS_WEIGHT="${COLD_START_LOSS_WEIGHT:-1.0}"
+# 延续项最大权重，建议 ∈ (0, 1]
+CONTINUATION_LOSS_WEIGHT="${CONTINUATION_LOSS_WEIGHT:-1.0}"
+CONTINUATION_WARMUP_EPOCHS="${CONTINUATION_WARMUP_EPOCHS:-6}"
+
 BATCH_SIZE="${BATCH_SIZE:-1}"
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
 LEARNING_RATE="${LEARNING_RATE:-6e-4}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
-# 数据目录 - 根据 --dt 参数选择配置
+MASTER_PORT="${MASTER_PORT:-29501}"
+TP_SIZE="${TP_SIZE:-1}"
+DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
+
+TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
+
 if [ "$DT" = "qz" ]; then
-    # qz 配置
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v3.1_swa_${CONTEXT_WINDOW_SIZE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 else
-    # a800 配置（默认）
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
     OUTPUT_DIR="./cache/models/flashmtp_v3.1_nemotron_think_on_samples_40000_qwen3_8b"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
@@ -98,47 +92,24 @@ fi
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
 CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 
-# 模型参数
-NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
-BLOCK_SIZE="${BLOCK_SIZE:-16}"
-ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
-# 后缀 CE 权重 w∝exp(-(d-1)/gamma)，d 为块内后缀的 1-based 位置（首个待预测 token 为 d=1）
-LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
-
-# 双任务 loss：每个 anchor 并行冷启动(p=1) + 延续(p∈{2..B-1})，一次 forward；总损失 =
-#   cold_w * mean(冷启子块) + λ2_eff * mean(延续子块)，
-#   λ2_eff = continuation_w * min(1, training_epoch / CONTINUATION_WARMUP_EPOCHS)
-#   training_epoch = 当前 epoch + 当前 batch 下标/每轮 batch 数（浮点，从 0 起算）
-COLD_START_LOSS_WEIGHT="${COLD_START_LOSS_WEIGHT:-1.0}"
-# 延续项最大权重，建议 ∈ (0, 1]
-CONTINUATION_LOSS_WEIGHT="${CONTINUATION_LOSS_WEIGHT:-1.0}"
-# 延续项线性 warmup 长度（单位：epoch，可小数，如 0.5 表示半轮）；0 表示从一开始就用满权重
-CONTINUATION_WARMUP_EPOCHS="${CONTINUATION_WARMUP_EPOCHS:-6}"
-
-# 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-5000}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-5000}"
 
-# Tracker 参数
 REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
-WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v3.1_${DATA_NUM_SAMPLES}}"   # 离线子目录名称 (如: my_run_001，生成 offline-run-my_run_001)
+WANDB_DIR="${WANDB_DIR:-./wandb}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v3.1_swa_${CONTEXT_WINDOW_SIZE}_${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}}"
 
-# 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}"
 IS_PREFORMATTED="${IS_PREFORMATTED:-}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
 BUILD_DATASET_NUM_PROC="${BUILD_DATASET_NUM_PROC:-8}"
 
 
-# ========================================
-# 显示配置
-# ========================================
 echo "=========================================="
-echo "FlashMTP 训练启动脚本"
+echo "FlashMTP 训练 (${DT})"
 echo "=========================================="
 echo "数据特征:"
 echo "  样本数量: ${DATA_NUM_SAMPLES}"
@@ -154,12 +125,13 @@ echo "------------------------------------------"
 echo "模型配置:"
 echo "  草稿模型层数: ${NUM_DRAFT_LAYERS}"
 echo "  块大小: ${BLOCK_SIZE}"
+echo "  条件窗长 W (context-window-size): ${CONTEXT_WINDOW_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)} (w∝exp(-(d-1)/γ)，d=后缀内序号)"
 echo "  冷启动loss权重: ${COLD_START_LOSS_WEIGHT}"
 echo "  延续loss权重(最大): ${CONTINUATION_LOSS_WEIGHT}"
-echo "  延续warmup步数: ${CONTINUATION_WARMUP_STEPS} (0=关闭)"
+echo "  延续 warmup(epoch): ${CONTINUATION_WARMUP_EPOCHS}"
 echo "------------------------------------------"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
@@ -184,7 +156,6 @@ fi
 echo "=========================================="
 echo ""
 
-# 如果输出目录已存在，自动添加数字后缀
 original_output_dir="${OUTPUT_DIR}"
 suffix=1
 while [ -d "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null)" ]; do
@@ -195,25 +166,13 @@ if [ "${OUTPUT_DIR}" != "${original_output_dir}" ]; then
     echo "警告: 输出目录 ${original_output_dir} 已存在且非空，自动切换到: ${OUTPUT_DIR}"
 fi
 
-# 创建输出目录
 mkdir -p ${OUTPUT_DIR}
 mkdir -p ${CACHE_DIR}
 mkdir -p ${WANDB_DIR}
 
-# ========================================
-# 训练
-# ========================================
 echo ""
-echo "==> 开始训练 FlashMTP"
-echo ""
-
-if [ "${NPROC_PER_NODE}" -gt 1 ]; then
-    LAUNCHER=(torchrun --nproc_per_node "${NPROC_PER_NODE}" --master_port "${MASTER_PORT}")
-else
-    LAUNCHER=(python)
-fi
-
-# 构建可选参数
+echo "==> train_flashmtp.py (torchrun)"
+LAUNCHER=(torchrun --nproc_per_node "${NPROC_PER_NODE}" --master_port "${MASTER_PORT}")
 OPTIONAL_ARGS=""
 
 if [ -n "${EVAL_DATA_PATH}" ]; then
@@ -249,7 +208,6 @@ if [ "${REPORT_TO}" != "none" ]; then
     fi
 fi
 
-# 运行训练（勿在续行末使用「2>&1 || EXIT_CODE=$?」，易破坏续行解析）
 set +e
 "${LAUNCHER[@]}" ./scripts/train_flashmtp.py \
     --target-model-path ${TARGET_MODEL} \
@@ -260,6 +218,7 @@ set +e
     --num-draft-layers ${NUM_DRAFT_LAYERS} \
     --block-size ${BLOCK_SIZE} \
     --num-anchors ${NUM_ANCHORS} \
+    --context-window-size ${CONTEXT_WINDOW_SIZE} \
     --attention-backend ${ATTENTION_BACKEND} \
     --learning-rate ${LEARNING_RATE} \
     --warmup-ratio ${WARMUP_RATIO} \
@@ -284,7 +243,6 @@ set +e
 EXIT_CODE=$?
 set -e
 
-# 检查训练是否成功
 if [ $EXIT_CODE -ne 0 ]; then
     echo ""
     echo "=========================================="
@@ -293,19 +251,9 @@ if [ $EXIT_CODE -ne 0 ]; then
     exit $EXIT_CODE
 fi
 
-# ========================================
-# 训练完成
-# ========================================
 echo ""
 echo "=========================================="
-echo "训练完成！"
+echo "训练完成"
 echo "=========================================="
-echo "模型保存在: ${OUTPUT_DIR}"
-echo ""
-echo "使用示例："
-echo "  from specforge.modeling.draft.flashmtp import FlashMTPDraftModel"
-echo "  draft_model = FlashMTPDraftModel.from_pretrained('${OUTPUT_DIR}/epoch_${NUM_EPOCHS}_step_<step>')"
-echo ""
-echo "运行推理："
-echo "  python benchmark.py --draft-model ${OUTPUT_DIR}/epoch_${NUM_EPOCHS}_step_<step>"
+echo "保存路径: ${OUTPUT_DIR}  |  加载: FlashMTPDraftModel.from_pretrained('<epoch_dir>')"
 echo "=========================================="

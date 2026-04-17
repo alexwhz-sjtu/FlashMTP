@@ -39,6 +39,13 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+def apply_rotary_pos_emb_to_k(k, cos, sin, unsqueeze_dim=1):
+    """仅对 k 施加 RoPE（与 ``cos/sin`` 序列长度对齐）。"""
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    return (k * cos) + (rotate_half(k) * sin)
+
+
 class Qwen3FlashMTPAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -110,11 +117,21 @@ class Qwen3FlashMTPAttention(nn.Module):
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
 
-        cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        cos_ctx, sin_ctx, cos_noise, sin_noise = position_embeddings
+        k_ctx_part = k[:, :, :ctx_len, :]
+        k_noise_part = k[:, :, ctx_len:, :]
+        k_ctx_part = apply_rotary_pos_emb_to_k(k_ctx_part, cos_ctx, sin_ctx)
+        q, k_noise_part = apply_rotary_pos_emb(q, k_noise_part, cos_noise, sin_noise)
+        k = torch.cat([k_ctx_part, k_noise_part], dim=2)
 
         if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            cos_full = torch.cat([cos_ctx, cos_noise], dim=1)
+            sin_full = torch.cat([sin_ctx, sin_noise], dim=1)
+            cache_kwargs = {
+                "sin": sin_full,
+                "cos": cos_full,
+                "cache_position": cache_position,
+            }
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
 
         attn_fn: Callable = eager_attention_forward
@@ -237,15 +254,34 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         noise_embedding: Optional[torch.Tensor] = None,
         target_hidden: Optional[torch.Tensor] = None,
+        target_position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
-        
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
-        # position_embeddings = self.rotary_emb(torch.cat([target_hidden, hidden_states], dim=1), position_ids)
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        bsz, ctx_len, _ = target_hidden.shape
+        bsz_n, q_len, _ = hidden_states.shape
+        assert bsz == bsz_n, f"batch mismatch: target {bsz} vs noise {bsz_n}"
+
+        # Teacher 全序列：默认 [0 .. ctx_len-1]；推理时可传全局 token 下标（如 anchor 起算的绝对位置）
+        if target_position_ids is None:
+            tgt_pos = torch.arange(
+                ctx_len, device=target_hidden.device, dtype=torch.long
+            ).unsqueeze(0).expand(bsz, -1)
+        else:
+            tgt_pos = target_position_ids
+            if tgt_pos.shape != (bsz, ctx_len):
+                raise ValueError(
+                    f"target_position_ids expected shape ({bsz}, {ctx_len}), "
+                    f"got {tuple(tgt_pos.shape)}"
+                )
+
+        # RoPE：x 仅用于 dtype/device；cos/sin 长度由 position_ids 最后一维决定
+        cos_ctx, sin_ctx = self.rotary_emb(hidden_states[:, :1, :], tgt_pos)
+        cos_noise, sin_noise = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = (cos_ctx, sin_ctx, cos_noise, sin_noise)
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
@@ -304,13 +340,26 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             output.hidden_states, self.target_layer_ids
         )
 
-        # Decode stage
+        # Decode stage：短 target_hidden 列与「当前块」起始全局位置对齐，用于 RoPE（prefill 全序列用默认 0..T-1）
         acceptance_lengths = []
         start = input_ids.shape[1]
+        next_block_ctx_pos_start: Optional[int] = None
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
             noise_embedding = target.model.embed_tokens(block_output_ids)
+            Lctx = target_hidden.shape[1]
+            if next_block_ctx_pos_start is None:
+                draft_tp = None
+            else:
+                draft_tp = (
+                    torch.arange(
+                        Lctx,
+                        device=target_hidden.device,
+                        dtype=torch.long,
+                    )
+                    + next_block_ctx_pos_start
+                ).unsqueeze(0)
             draft_logits = target.lm_head(
                 self(
                     target_hidden=target_hidden,
@@ -318,6 +367,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                     position_ids=position_ids[
                         :, past_key_values_draft.get_seq_length() : start + block_size
                     ],
+                    target_position_ids=draft_tp,
                     past_key_values=past_key_values_draft,
                     use_cache=True,
                     is_causal=False,
@@ -347,6 +397,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             output_ids[:, start + acceptance_length + 1] = posterior[
                 :, acceptance_length
             ]
+            next_block_ctx_pos_start = int(start)
             start += acceptance_length + 1
             past_key_values_target.crop(start)
             target_hidden = extract_context_feature(

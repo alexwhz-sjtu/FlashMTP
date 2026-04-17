@@ -510,10 +510,15 @@ class OnlineFlashMTPModel(nn.Module):
             input_ids, anchor_positions, block_keep_mask, prefix_len
         )
 
+        target_position_ids = torch.arange(
+            seq_len, device=device, dtype=torch.long
+        ).unsqueeze(0).expand(bsz, -1)
+
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embed,
             target_hidden=target_hidden,
+            target_position_ids=target_position_ids,
             attention_mask=flashmtp_attn_mask,
         )
         student_logits = self._apply_lm_head(output_hidden)
