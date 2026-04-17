@@ -81,6 +81,28 @@ def parse_args():
         "where d is 1-based index within the suffix (first predicted token d=1). "
         "None => uniform over supervised positions.",
     )
+    model_group.add_argument(
+        "--cold-start-loss-weight",
+        type=float,
+        default=1.0,
+        help="Weight for cold-start blocks (only anchor token clean, p=1).",
+    )
+    model_group.add_argument(
+        "--continuation-loss-weight",
+        type=float,
+        default=1.0,
+        help="Max weight for continuation blocks (p in {2,..,B-1}); scaled by warmup. "
+        "Must be in (0, 1].",
+    )
+    model_group.add_argument(
+        "--continuation-warmup-epochs",
+        type=float,
+        default=0.0,
+        help="Linear continuation warmup in **epoch** units: "
+        "eff_weight = max_weight * min(1, training_epoch / this). "
+        "training_epoch = epoch + step_in_epoch/len(dataloader). "
+        "0 = full continuation weight from the start.",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -306,6 +328,9 @@ def record_metrics(
     optimizer,
     train_dataloader=None,
     mode: str = "train",
+    lambda2_eff: Optional[float] = None,
+    mean_prefix_len_cold: Optional[float] = None,
+    mean_prefix_len_cont: Optional[float] = None,
 ) -> None:
     """Log clean-prefix completion metrics."""
     logdict = {}
@@ -314,10 +339,20 @@ def record_metrics(
     logdict[f"{mode}/total_loss"] = total_loss
     logdict[f"{mode}/ce_acc"] = ce_acc
     logdict[f"{mode}/mean_prefix_len"] = mean_prefix_len
+    if lambda2_eff is not None:
+        logdict[f"{mode}/lambda2_eff"] = lambda2_eff
+    if mean_prefix_len_cold is not None:
+        logdict[f"{mode}/mean_prefix_len_cold"] = mean_prefix_len_cold
+    if mean_prefix_len_cont is not None:
+        logdict[f"{mode}/mean_prefix_len_cont"] = mean_prefix_len_cont
     total_steps = args.num_epochs * len(train_dataloader) // args.accumulation_steps
+    extra = ""
+    if lambda2_eff is not None:
+        extra += f", λ2_eff: {lambda2_eff:.4f}"
     print_on_rank0(
         f"{mode.capitalize()} - Step {global_step}/{total_steps}, "
         f"Loss: {total_loss:.4f}, ce_acc: {ce_acc:.4f}, mean_prefix_len: {mean_prefix_len:.2f}"
+        f"{extra}"
     )
     tracker.log(logdict, step=global_step)
 
@@ -336,6 +371,16 @@ def main():
     )
 
     args = parse_args()
+    if not (0.0 < args.continuation_loss_weight <= 1.0):
+        raise ValueError(
+            "--continuation-loss-weight must be in (0, 1]; got "
+            f"{args.continuation_loss_weight}"
+        )
+    if args.continuation_warmup_epochs < 0.0:
+        raise ValueError(
+            "--continuation-warmup-epochs must be >= 0; got "
+            f"{args.continuation_warmup_epochs}"
+        )
     set_seed(args.seed)
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
@@ -437,6 +482,9 @@ def main():
         num_anchors=args.num_anchors,
         chs_concat_mode=args.chs_concat_mode,
         loss_decay_gamma=args.loss_decay_gamma,
+        cold_start_loss_weight=args.cold_start_loss_weight,
+        continuation_loss_weight=args.continuation_loss_weight,
+        continuation_warmup_epochs=args.continuation_warmup_epochs,
     )
 
     optimizer = BF16Optimizer(
@@ -464,6 +512,8 @@ def main():
 
     last_time = time.time()
     print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
+
+    batches_per_epoch = max(len(train_dataloader), 1)
 
     for epoch in range(start_epoch, args.num_epochs):
         train_dataloader.sampler.set_epoch(epoch)
@@ -498,10 +548,14 @@ def main():
             else:
                 hidden_states = tuple(t.cuda() for t in _hs)
 
+            training_epoch = float(epoch) + float(step_in_epoch) / float(
+                batches_per_epoch
+            )
             loss, loss_dict = flashmtp_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
+                training_epoch=training_epoch,
             )
 
             (loss / args.accumulation_steps).backward()
@@ -516,11 +570,20 @@ def main():
 
                 ce_acc_log = loss_dict["ce_acc"].clone()
                 mean_p_log = loss_dict["mean_prefix_len"].clone()
+                mean_p_cold_log = loss_dict["mean_prefix_len_cold"].clone()
+                mean_p_cont_log = loss_dict["mean_prefix_len_cont"].clone()
+                lambda2_log = loss_dict["lambda2_eff"].clone()
                 dist.all_reduce(ce_acc_log)
                 dist.all_reduce(mean_p_log)
+                dist.all_reduce(mean_p_cold_log)
+                dist.all_reduce(mean_p_cont_log)
+                dist.all_reduce(lambda2_log)
                 ws = dist.get_world_size()
                 ce_acc_log = ce_acc_log / ws
                 mean_p_log = mean_p_log / ws
+                mean_p_cold_log = mean_p_cold_log / ws
+                mean_p_cont_log = mean_p_cont_log / ws
+                lambda2_log = lambda2_log / ws
                 record_metrics(
                     args,
                     total_loss_log.item(),
@@ -531,6 +594,9 @@ def main():
                     optimizer,
                     train_dataloader,
                     mode="train",
+                    lambda2_eff=lambda2_log.item(),
+                    mean_prefix_len_cold=mean_p_cold_log.item(),
+                    mean_prefix_len_cont=mean_p_cont_log.item(),
                 )
 
             if dist.get_rank() == 0:
@@ -541,6 +607,7 @@ def main():
                         "loss": f"{loss_dict['total_loss'].item():.4f}",
                         "ce_acc": f"{loss_dict['ce_acc'].item():.4f}",
                         "mean_p": f"{loss_dict['mean_prefix_len'].item():.2f}",
+                        "l2": f"{loss_dict['lambda2_eff'].item():.3f}",
                         "iter_time": f"{elapsed:.2f}s",
                     }
                 )

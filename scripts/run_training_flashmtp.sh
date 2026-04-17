@@ -1,5 +1,5 @@
 #!/bin/bash
-# DFlash 训练启动脚本
+# FlashMTP 训练启动脚本（与 scripts/train_flashmtp.py 参数对应）
 
 set -e
 
@@ -47,10 +47,10 @@ export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"
 # ========================================
 # 主要训练参数
 # ========================================
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 
-NUM_EPOCHS="${NUM_EPOCHS:-6}"
+NUM_EPOCHS="${NUM_EPOCHS:-10}"
 CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
 
 # 恢复训练
@@ -91,8 +91,8 @@ if [ "$DT" = "qz" ]; then
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 else
     # a800 配置（默认）
-    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_test/nemotron_think_on_samples_test_qwen3_8b_regen_error.jsonl"
-    OUTPUT_DIR="./cache/models/test"
+    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
+    OUTPUT_DIR="./cache/models/flashmtp_v3.1_nemotron_think_on_samples_40000_qwen3_8b"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
@@ -105,6 +105,16 @@ BLOCK_SIZE="${BLOCK_SIZE:-16}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 # 后缀 CE 权重 w∝exp(-(d-1)/gamma)，d 为块内后缀的 1-based 位置（首个待预测 token 为 d=1）
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
+
+# 双任务 loss：每个 anchor 并行冷启动(p=1) + 延续(p∈{2..B-1})，一次 forward；总损失 =
+#   cold_w * mean(冷启子块) + λ2_eff * mean(延续子块)，
+#   λ2_eff = continuation_w * min(1, training_epoch / CONTINUATION_WARMUP_EPOCHS)
+#   training_epoch = 当前 epoch + 当前 batch 下标/每轮 batch 数（浮点，从 0 起算）
+COLD_START_LOSS_WEIGHT="${COLD_START_LOSS_WEIGHT:-1.0}"
+# 延续项最大权重，建议 ∈ (0, 1]
+CONTINUATION_LOSS_WEIGHT="${CONTINUATION_LOSS_WEIGHT:-1.0}"
+# 延续项线性 warmup 长度（单位：epoch，可小数，如 0.5 表示半轮）；0 表示从一开始就用满权重
+CONTINUATION_WARMUP_EPOCHS="${CONTINUATION_WARMUP_EPOCHS:-6}"
 
 # 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
@@ -149,6 +159,9 @@ echo "  块大小: ${BLOCK_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)} (w∝exp(-(d-1)/γ)，d=后缀内序号)"
+echo "  冷启动loss权重: ${COLD_START_LOSS_WEIGHT}"
+echo "  延续loss权重(最大): ${CONTINUATION_LOSS_WEIGHT}"
+echo "  延续warmup步数: ${CONTINUATION_WARMUP_STEPS} (0=关闭)"
 echo "------------------------------------------"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
@@ -266,6 +279,9 @@ set +e
     --tp-size ${TP_SIZE} \
     --dist-timeout ${DIST_TIMEOUT} \
     --chs-concat-mode ${CHS_CONCAT_MODE} \
+    --cold-start-loss-weight ${COLD_START_LOSS_WEIGHT} \
+    --continuation-loss-weight ${CONTINUATION_LOSS_WEIGHT} \
+    --continuation-warmup-epochs ${CONTINUATION_WARMUP_EPOCHS} \
     --seed 42 \
     ${OPTIONAL_ARGS}
 EXIT_CODE=$?
@@ -290,8 +306,8 @@ echo "=========================================="
 echo "模型保存在: ${OUTPUT_DIR}"
 echo ""
 echo "使用示例："
-echo "  from specforge.modeling.draft.dflash import DFlashDraftModel"
-echo "  draft_model = DFlashDraftModel.from_pretrained('${OUTPUT_DIR}/epoch_${NUM_EPOCHS}_step_<step>')"
+echo "  from specforge.modeling.draft.flashmtp import FlashMTPDraftModel"
+echo "  draft_model = FlashMTPDraftModel.from_pretrained('${OUTPUT_DIR}/epoch_${NUM_EPOCHS}_step_<step>')"
 echo ""
 echo "运行推理："
 echo "  python benchmark.py --draft-model ${OUTPUT_DIR}/epoch_${NUM_EPOCHS}_step_<step>"

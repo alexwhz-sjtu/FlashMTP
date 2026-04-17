@@ -228,6 +228,9 @@ class OnlineFlashMTPModel(nn.Module):
         chs_concat_mode: str = "seq",  # "seq" or "feature"
         loss_decay_gamma: Optional[float] = None,
         prefix_len_sample_bias: float = 0.6,
+        cold_start_loss_weight: float = 1.0,
+        continuation_loss_weight: float = 1.0,
+        continuation_warmup_epochs: float = 0.0,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -246,6 +249,19 @@ class OnlineFlashMTPModel(nn.Module):
                 "prefix_len_sample_bias must be in (0, 1]; use 1.0 for uniform sampling"
             )
         self.prefix_len_sample_bias = prefix_len_sample_bias
+
+        self.cold_start_loss_weight = cold_start_loss_weight
+        if not (0.0 < continuation_loss_weight <= 1.0):
+            raise ValueError(
+                "continuation_loss_weight must be in (0, 1]; got "
+                f"{continuation_loss_weight}"
+            )
+        self.continuation_loss_weight = continuation_loss_weight
+        if continuation_warmup_epochs < 0.0:
+            raise ValueError(
+                f"continuation_warmup_epochs must be >= 0; got {continuation_warmup_epochs}"
+            )
+        self.continuation_warmup_epochs = float(continuation_warmup_epochs)
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -409,13 +425,58 @@ class OnlineFlashMTPModel(nn.Module):
             p = flat.view(bsz, n_blocks)
         return torch.where(block_keep_mask, p, torch.zeros_like(p))
 
+    def sample_continuation_prefix_lengths(
+        self,
+        block_keep_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sample clean prefix length for continuation loss: p in {2, ..., B-1} (biased).
+
+        Matches ``sample_clean_prefix_lengths`` mass shape (P(k) ∝ r^k) but restricted to
+        k >= 2 so that anchor-only cold-start (p=1) is handled by the other loss term.
+        For ``block_size < 3`` the valid range is empty; returns ones (caller should not
+        use continuation mode in that case).
+        """
+        bsz, n_blocks = block_keep_mask.shape
+        device = block_keep_mask.device
+        bs = self.block_size
+        r = self.prefix_len_sample_bias
+        if bs < 3:
+            return torch.ones((bsz, n_blocks), device=device, dtype=torch.long)
+
+        ks_idx = torch.arange(2, bs, device=device, dtype=torch.long)
+        ks_f = ks_idx.float()
+        n_choices = ks_idx.numel()
+        if r >= 1.0:
+            flat = torch.randint(
+                0,
+                int(n_choices),
+                (bsz * n_blocks,),
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            probs = torch.pow(torch.tensor(r, device=device, dtype=torch.float32), ks_f)
+            probs = probs / probs.sum()
+            flat = torch.multinomial(
+                probs, num_samples=bsz * n_blocks, replacement=True
+            )
+        p = ks_idx[flat].view(bsz, n_blocks)
+        return torch.where(block_keep_mask, p, torch.zeros_like(p))
+
     def forward(
         self,
         input_ids: torch.Tensor,
         hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
         loss_mask: torch.Tensor,
+        training_epoch: float = 0.0,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Clean-prefix completion: weighted CE on the masked suffix (see design doc §5–6)."""
+        """Clean-prefix completion: each anchor block is duplicated — cold-start (p=1) and
+        continuation (p ~ biased on {{2..B-1}}) — in one forward (2N parallel blocks).
+
+        Args:
+            training_epoch: Fractional training time in epochs, e.g.
+                ``epoch + step_in_epoch / len(dataloader)``, used for continuation warmup.
+        """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
@@ -425,12 +486,39 @@ class OnlineFlashMTPModel(nn.Module):
             hidden_size=self.draft_model.config.hidden_size,
         )
 
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(
+        anchor_orig, keep_orig = self._sample_anchor_positions(
             seq_len, loss_mask, device
         )
+        n_orig = anchor_orig.shape[1]
+
+        p_cont = self.sample_continuation_prefix_lengths(keep_orig)
+        ones = torch.ones_like(p_cont)
+        prefix_len = torch.empty(
+            bsz, 2 * n_orig, dtype=torch.long, device=device
+        )
+        prefix_len[:, 0::2] = torch.where(keep_orig, ones, torch.zeros_like(ones))
+        prefix_len[:, 1::2] = torch.where(keep_orig, p_cont, torch.zeros_like(p_cont))
+
+        anchor_positions = anchor_orig.repeat_interleave(2, dim=1)
+        block_keep_mask = keep_orig.repeat_interleave(2, dim=1)
         n_blocks = anchor_positions.shape[1]
 
-        prefix_len = self.sample_clean_prefix_lengths(block_keep_mask)
+        is_cold_start = torch.zeros(
+            bsz, n_blocks, dtype=torch.bool, device=device
+        )
+        is_cold_start[:, 0::2] = keep_orig
+        is_continuation = torch.zeros(
+            bsz, n_blocks, dtype=torch.bool, device=device
+        )
+        is_continuation[:, 1::2] = keep_orig
+
+        we = self.continuation_warmup_epochs
+        if we <= 0.0:
+            lambda2_eff = float(self.continuation_loss_weight)
+        else:
+            lambda2_eff = self.continuation_loss_weight * min(
+                1.0, float(training_epoch) / float(we)
+            )
 
         num_target_layers = getattr(self.draft_model.config, "num_target_layers", 1)
         chs_len_per_block = num_target_layers if self.chs_concat_mode == "seq" else 1
@@ -515,9 +603,23 @@ class OnlineFlashMTPModel(nn.Module):
 
         weighted = ce_per_pos * tilde_w
         per_block_loss = weighted.sum(dim=-1)
-        per_block_loss = per_block_loss * block_keep_mask.float()
+
+        cold_mask = is_cold_start.float()
+        cont_mask = is_continuation.float()
+        n_cold = cold_mask.sum().clamp(min=0.0)
+        n_cont = cont_mask.sum().clamp(min=0.0)
+
+        cold_sum = (per_block_loss * cold_mask).sum()
+        cont_sum = (per_block_loss * cont_mask).sum()
+
+        w1 = float(self.cold_start_loss_weight)
+        total_loss = torch.zeros((), device=device, dtype=per_block_loss.dtype)
+        if n_cold > 0:
+            total_loss = total_loss + w1 * cold_sum / n_cold
+        if n_cont > 0:
+            total_loss = total_loss + lambda2_eff * cont_sum / n_cont
+
         n_valid = block_keep_mask.sum().float().clamp(min=1.0)
-        total_loss = per_block_loss.sum() / n_valid
 
         with torch.no_grad():
             preds = torch.argmax(student_logits, dim=-1)
@@ -526,11 +628,24 @@ class OnlineFlashMTPModel(nn.Module):
                 min=1.0
             )
             mean_p = (prefix_len.float() * block_keep_mask.float()).sum() / n_valid
+            mean_p_cold = torch.where(
+                n_cold > 0,
+                (prefix_len.float() * cold_mask).sum() / n_cold,
+                torch.zeros((), device=device),
+            )
+            mean_p_cont = torch.where(
+                n_cont > 0,
+                (prefix_len.float() * cont_mask).sum() / n_cont,
+                torch.zeros((), device=device),
+            )
 
         loss_dict = {
             "total_loss": total_loss,
             "ce_acc": ce_acc,
             "mean_prefix_len": mean_p,
+            "mean_prefix_len_cold": mean_p_cold,
+            "mean_prefix_len_cont": mean_p_cont,
+            "lambda2_eff": torch.tensor(lambda2_eff, device=device),
         }
 
         return total_loss, loss_dict
