@@ -46,7 +46,7 @@ NUM_EPOCHS="${NUM_EPOCHS:-6}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
 LEARNING_RATE="${LEARNING_RATE:-6e-4}"
-MAX_LENGTH="${MAX_LENGTH:-4096}"
+MAX_LENGTH="${MAX_LENGTH:-10240}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
@@ -70,14 +70,14 @@ if [ "$DT" = "qz" ]; then
 else
     # a800 配置（默认）
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
-    OUTPUT_DIR="./cache/models/dflash_2layers_40k"
+    OUTPUT_DIR="./cache/models/dflash_5layers_40k"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
 CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 
 # 模型参数
-NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-2}"
+NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"

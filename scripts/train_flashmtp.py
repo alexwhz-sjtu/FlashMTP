@@ -117,8 +117,9 @@ def parse_args():
         "--chs-window-size",
         type=int,
         default=1,
-        help="Sliding window length W: use target hiddens at the latest W positions "
-        "ending at anchor-1 (clamped). 1 matches the previous single-position CHS.",
+        help="Attention mask window W on the full teacher sequence: each noise block may "
+        "attend to target indices [max(anchor-W,0), anchor-1] (inclusive). KV is the "
+        "full-sequence teacher hidden (feature-concat layers) plus noise.",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -127,7 +128,13 @@ def parse_args():
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
-    dataset_group.add_argument("--chs-concat-mode", type=str, default="feature")
+    dataset_group.add_argument(
+        "--chs-concat-mode",
+        type=str,
+        default="feature",
+        choices=["feature"],
+        help="Only feature concat (multi-layer on last dim) is supported.",
+    )
     dataset_group.add_argument(
         "--build-dataset-num-proc",
         type=int,
@@ -478,7 +485,6 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
-        chs_concat_mode=args.chs_concat_mode,
         loss_type=args.flashmtp_loss_type,
         distill_temperature=args.distill_temperature,
         kl_topk=args.kl_topk,

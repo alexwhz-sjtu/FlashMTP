@@ -37,12 +37,12 @@ fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 
-NUM_EPOCHS="${NUM_EPOCHS:-6}"
-MAX_LENGTH="${MAX_LENGTH:-4096}"
+NUM_EPOCHS="${NUM_EPOCHS:-10}"
+MAX_LENGTH="${MAX_LENGTH:-10240}"
 CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
 # CHS 滑动窗口：取 anchor 之前最近 W 个 target 位置的 hidden（含 position_ids）；1 与旧版单点上下文一致
 CHS_WINDOW_SIZE="${CHS_WINDOW_SIZE:-64}"
-NUM_ANCHORS="${NUM_ANCHORS:-512}"
+NUM_ANCHORS="${NUM_ANCHORS:-1024}"
 
 # 恢复训练
 RESUME="${RESUME:-}"
@@ -71,16 +71,25 @@ LEARNING_RATE="${LEARNING_RATE:-6e-4}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
+# 损失: ce=交叉熵; kl=相对目标模型 last-hidden 的 KL 蒸馏（需 HF 等返回完整 hidden_states）
+# ce_kl= CE 与 top-k KL 加权: 总损失 = CE_LOSS_WEIGHT * CE + KL_LOSS_WEIGHT * KL（系数为 0 的分支不计算）
+FLASHMTP_LOSS_TYPE="${FLASHMTP_LOSS_TYPE:-ce}"
+CE_LOSS_WEIGHT="${CE_LOSS_WEIGHT:-1}"
+KL_LOSS_WEIGHT="${KL_LOSS_WEIGHT:-0.2}"
+DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-1.0}"
+# KL 蒸馏时只对齐教师 top-k logits；<=0 表示全词表
+KL_TOPK="${KL_TOPK:-20}"
+
 # 数据目录 - 根据 --dt 参数选择配置
 if [ "$DT" = "qz" ]; then
     # qz 配置
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v1.3_swa_${CHS_WINDOW_SIZE}_loss_${FLASHMTP_LOSS_TYPE}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_epoch${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 else
     # a800 配置（默认）
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
-    OUTPUT_DIR="./cache/models/flashmtp_v1.1_slw64_40000"
+    OUTPUT_DIR="./cache/models/flashmtp_v1.3_swa_${CHS_WINDOW_SIZE}_loss_${FLASHMTP_LOSS_TYPE}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_epoch${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
@@ -95,14 +104,6 @@ NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
-# 损失: ce=交叉熵; kl=相对目标模型 last-hidden 的 KL 蒸馏（需 HF 等返回完整 hidden_states）
-# ce_kl= CE 与 top-k KL 加权: 总损失 = CE_LOSS_WEIGHT * CE + KL_LOSS_WEIGHT * KL（系数为 0 的分支不计算）
-FLASHMTP_LOSS_TYPE="${FLASHMTP_LOSS_TYPE:-ce}"
-CE_LOSS_WEIGHT="${CE_LOSS_WEIGHT:-1}"
-KL_LOSS_WEIGHT="${KL_LOSS_WEIGHT:-0.2}"
-DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-2.0}"
-# KL 蒸馏时只对齐教师 top-k logits；<=0 表示全词表
-KL_TOPK="${KL_TOPK:-20}"
 
 # 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
@@ -116,7 +117,7 @@ WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"
 # offline: 仅本地写入 ${WANDB_DIR}，无需 API key；上线同步: WANDB_MODE=online 并配置密钥
 WANDB_MODE="${WANDB_MODE:-offline}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v1.1_slw64_nlayer_${NUM_DRAFT_LAYERS}_${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_fixed}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v1.3_loss_${FLASHMTP_LOSS_TYPE}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_epoch${NUM_EPOCHS}}"
 
 export WANDB_DIR
 export WANDB_MODE
