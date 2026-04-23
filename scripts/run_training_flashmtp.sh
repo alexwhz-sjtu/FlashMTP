@@ -74,15 +74,24 @@ TP_SIZE="${TP_SIZE:-1}"
 DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
 
 TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
+LW_CE_TAG="${LOSS_WEIGHT_CE//./p}"
+LW_KL_TAG="${LOSS_WEIGHT_KL//./p}"
+LW_MSE_TAG="${LOSS_WEIGHT_MSE//./p}"
+if [ "${LOSS_KL_TOPK}" -gt 0 ]; then
+    KL_TOPK_TAG="k${LOSS_KL_TOPK}"
+else
+    KL_TOPK_TAG="kall"
+fi
+LOSS_TAG="ce${LW_CE_TAG}_kl${LW_KL_TAG}_${KL_TOPK_TAG}_mse${LW_MSE_TAG}"
 
 if [ "$DT" = "qz" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v3.2_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v3.2_${LOSS_TAG}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
     export WANDB_MODE=offline
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
-    OUTPUT_DIR="./cache/models/flashmtp_v3.1_nemotron_think_on_samples_40000_qwen3_8b"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v3.2_${LOSS_TAG}_nemotron_think_on_samples_40000_qwen3_8b}"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
@@ -97,7 +106,7 @@ REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp_v3.2-training}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v3.2_${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v3.2_${LOSS_TAG}_${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}}"
 
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}"
 IS_PREFORMATTED="${IS_PREFORMATTED:-}"
