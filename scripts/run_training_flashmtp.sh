@@ -57,6 +57,7 @@ LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
 LOSS_WEIGHT_CE="${LOSS_WEIGHT_CE:-1.0}"
 LOSS_WEIGHT_KL="${LOSS_WEIGHT_KL:-0.6}"
 LOSS_WEIGHT_MSE="${LOSS_WEIGHT_MSE:-0.2}"
+LOSS_KL_TOPK="${LOSS_KL_TOPK:-0}"
 
 # ========================================
 # 训练参数
@@ -78,6 +79,7 @@ if [ "$DT" = "qz" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
     OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v3.2_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
+    export WANDB_MODE=offline
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
     OUTPUT_DIR="./cache/models/flashmtp_v3.1_nemotron_think_on_samples_40000_qwen3_8b"
@@ -125,6 +127,7 @@ echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)} (w∝exp(-j/γ)，j=块内位置, anchor j=0不监督)"
 echo "  Loss权重: CE=${LOSS_WEIGHT_CE}, KL=${LOSS_WEIGHT_KL}, MSE=${LOSS_WEIGHT_MSE}"
+echo "  KL词表范围: ${LOSS_KL_TOPK} (0=全词表, >0=teacher top-k)"
 echo "------------------------------------------"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
@@ -216,6 +219,7 @@ set +e
     --loss-weight-ce ${LOSS_WEIGHT_CE} \
     --loss-weight-kl ${LOSS_WEIGHT_KL} \
     --loss-weight-mse ${LOSS_WEIGHT_MSE} \
+    --loss-kl-topk ${LOSS_KL_TOPK} \
     --learning-rate ${LEARNING_RATE} \
     --warmup-ratio ${WARMUP_RATIO} \
     --num-epochs ${NUM_EPOCHS} \

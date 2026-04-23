@@ -201,6 +201,7 @@ class OnlineFlashMTPModel(nn.Module):
         loss_weight_ce: float = 1.0,
         loss_weight_kl: float = 0.0,
         loss_weight_mse: float = 0.0,
+        loss_kl_topk: int = 0,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -241,6 +242,9 @@ class OnlineFlashMTPModel(nn.Module):
         self.loss_weight_mse = float(loss_weight_mse)
         if self.loss_weight_ce < 0.0 or self.loss_weight_kl < 0.0 or self.loss_weight_mse < 0.0:
             raise ValueError("loss_weight_ce, loss_weight_kl, loss_weight_mse must be >= 0")
+        self.loss_kl_topk = int(loss_kl_topk)
+        if self.loss_kl_topk < 0:
+            raise ValueError(f"loss_kl_topk must be >= 0; got {self.loss_kl_topk}")
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -566,11 +570,26 @@ class OnlineFlashMTPModel(nn.Module):
                     bsz, seq_len, t_flat.size(-1)
                 )
             teacher_logits_at = teacher_logits_full[b_idx, safe_label_indices, :]
-            kl_per_pos = F.kl_div(
-                F.log_softmax(student_logits.float(), dim=-1),
-                F.softmax(teacher_logits_at.float(), dim=-1),
-                reduction="none",
-            ).sum(dim=-1)
+            if self.loss_kl_topk > 0 and self.loss_kl_topk < teacher_logits_at.size(-1):
+                k = self.loss_kl_topk
+                # KL over teacher top-k support only; both sides normalized on same support.
+                teacher_topk_logits, teacher_topk_idx = torch.topk(
+                    teacher_logits_at.float(), k=k, dim=-1
+                )
+                student_topk_logits = torch.gather(
+                    student_logits.float(), dim=-1, index=teacher_topk_idx
+                )
+                kl_per_pos = F.kl_div(
+                    F.log_softmax(student_topk_logits, dim=-1),
+                    F.softmax(teacher_topk_logits, dim=-1),
+                    reduction="none",
+                ).sum(dim=-1)
+            else:
+                kl_per_pos = F.kl_div(
+                    F.log_softmax(student_logits.float(), dim=-1),
+                    F.softmax(teacher_logits_at.float(), dim=-1),
+                    reduction="none",
+                ).sum(dim=-1)
             kl_block = (kl_per_pos * tilde_w).sum(dim=-1)
         else:
             kl_block = torch.zeros(

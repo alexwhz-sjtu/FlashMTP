@@ -133,6 +133,13 @@ def parse_args():
         default=0.0,
         help="Weight for MSE between draft and teacher last-layer hidden (discrete_diffusion).",
     )
+    model_group.add_argument(
+        "--loss-kl-topk",
+        type=int,
+        default=0,
+        help="If >0, compute KL only on teacher top-k vocab support per token; "
+        "0 means full-vocab KL.",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -510,6 +517,7 @@ def main():
         loss_weight_ce=args.loss_weight_ce,
         loss_weight_kl=args.loss_weight_kl,
         loss_weight_mse=args.loss_weight_mse,
+        loss_kl_topk=args.loss_kl_topk,
     )
 
     optimizer = BF16Optimizer(
