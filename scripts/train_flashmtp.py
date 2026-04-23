@@ -85,31 +85,53 @@ def parse_args():
         "--loss-decay-gamma",
         type=float,
         default=None,
-        help="Temperature for exp decay on completion suffix: w∝exp(-(d-1)/gamma), "
-        "where d is 1-based index within the suffix (first predicted token d=1). "
+        help="Temperature for exp decay on supervised in-block positions: "
+        "w∝exp(-j/gamma), where j is 0-based in-block offset (anchor j=0 is never supervised). "
         "None => uniform over supervised positions.",
     )
     model_group.add_argument(
-        "--cold-start-loss-weight",
-        type=float,
-        default=1.0,
-        help="Weight for cold-start blocks (only anchor token clean, p=1).",
+        "--training-mode",
+        type=str,
+        default="discrete_diffusion",
+        choices=["discrete_diffusion"],
+        help="Only supports discrete_diffusion: random mask schedule, CE (+ optional KL/MSE).",
     )
     model_group.add_argument(
-        "--continuation-loss-weight",
-        type=float,
-        default=1.0,
-        help="Max weight for continuation blocks (p in {2,..,B-1}); scaled by warmup. "
-        "Must be in (0, 1].",
+        "--diffusion-mask-schedule",
+        type=str,
+        default="uniform",
+        choices=["uniform", "cosine"],
+        help="How to sample mask ratio per block (discrete_diffusion only).",
     )
     model_group.add_argument(
-        "--continuation-warmup-epochs",
+        "--diffusion-mask-ratio-min",
+        type=float,
+        default=0.1,
+        help="Lower bound of mask ratio in [0,1] (discrete_diffusion).",
+    )
+    model_group.add_argument(
+        "--diffusion-mask-ratio-max",
+        type=float,
+        default=1.0,
+        help="Upper bound of mask ratio in [0,1] (discrete_diffusion).",
+    )
+    model_group.add_argument(
+        "--loss-weight-ce",
+        type=float,
+        default=1.0,
+        help="Weight for token CE on masked positions (discrete_diffusion).",
+    )
+    model_group.add_argument(
+        "--loss-weight-kl",
         type=float,
         default=0.0,
-        help="Linear continuation warmup in **epoch** units: "
-        "eff_weight = max_weight * min(1, training_epoch / this). "
-        "training_epoch = epoch + step_in_epoch/len(dataloader). "
-        "0 = full continuation weight from the start.",
+        help="Weight for KL(student || teacher) on masked positions (discrete_diffusion).",
+    )
+    model_group.add_argument(
+        "--loss-weight-mse",
+        type=float,
+        default=0.0,
+        help="Weight for MSE between draft and teacher last-layer hidden (discrete_diffusion).",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -335,27 +357,30 @@ def record_metrics(
     optimizer,
     train_dataloader=None,
     mode: str = "train",
-    lambda2_eff: Optional[float] = None,
-    mean_prefix_len_cold: Optional[float] = None,
-    mean_prefix_len_cont: Optional[float] = None,
+    loss_ce_mean: Optional[float] = None,
+    loss_kl_mean: Optional[float] = None,
+    loss_mse_mean: Optional[float] = None,
+    mean_mask_ratio: Optional[float] = None,
 ) -> None:
-    """Log clean-prefix completion metrics."""
+    """Log FlashMTP training metrics (clean-prefix and/or discrete diffusion)."""
     logdict = {}
     if mode == "train" and optimizer is not None:
         logdict["train/lr"] = optimizer.get_learning_rate()
     logdict[f"{mode}/total_loss"] = total_loss
     logdict[f"{mode}/ce_acc"] = ce_acc
     logdict[f"{mode}/mean_prefix_len"] = mean_prefix_len
-    if lambda2_eff is not None:
-        logdict[f"{mode}/lambda2_eff"] = lambda2_eff
-    if mean_prefix_len_cold is not None:
-        logdict[f"{mode}/mean_prefix_len_cold"] = mean_prefix_len_cold
-    if mean_prefix_len_cont is not None:
-        logdict[f"{mode}/mean_prefix_len_cont"] = mean_prefix_len_cont
+    if loss_ce_mean is not None:
+        logdict[f"{mode}/loss_ce_mean"] = loss_ce_mean
+    if loss_kl_mean is not None:
+        logdict[f"{mode}/loss_kl_mean"] = loss_kl_mean
+    if loss_mse_mean is not None:
+        logdict[f"{mode}/loss_mse_mean"] = loss_mse_mean
+    if mean_mask_ratio is not None:
+        logdict[f"{mode}/mean_mask_ratio"] = mean_mask_ratio
     total_steps = args.num_epochs * len(train_dataloader) // args.accumulation_steps
     extra = ""
-    if lambda2_eff is not None:
-        extra += f", λ2_eff: {lambda2_eff:.4f}"
+    if mean_mask_ratio is not None:
+        extra += f", mask_ratio: {mean_mask_ratio:.3f}"
     print_on_rank0(
         f"{mode.capitalize()} - Step {global_step}/{total_steps}, "
         f"Loss: {total_loss:.4f}, ce_acc: {ce_acc:.4f}, mean_prefix_len: {mean_prefix_len:.2f}"
@@ -378,16 +403,6 @@ def main():
     )
 
     args = parse_args()
-    if not (0.0 < args.continuation_loss_weight <= 1.0):
-        raise ValueError(
-            "--continuation-loss-weight must be in (0, 1]; got "
-            f"{args.continuation_loss_weight}"
-        )
-    if args.continuation_warmup_epochs < 0.0:
-        raise ValueError(
-            "--continuation-warmup-epochs must be >= 0; got "
-            f"{args.continuation_warmup_epochs}"
-        )
     set_seed(args.seed)
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
@@ -488,10 +503,13 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
-        cold_start_loss_weight=args.cold_start_loss_weight,
-        continuation_loss_weight=args.continuation_loss_weight,
-        continuation_warmup_epochs=args.continuation_warmup_epochs,
         context_window_size=args.context_window_size,
+        diffusion_mask_schedule=args.diffusion_mask_schedule,
+        diffusion_mask_ratio_min=args.diffusion_mask_ratio_min,
+        diffusion_mask_ratio_max=args.diffusion_mask_ratio_max,
+        loss_weight_ce=args.loss_weight_ce,
+        loss_weight_kl=args.loss_weight_kl,
+        loss_weight_mse=args.loss_weight_mse,
     )
 
     optimizer = BF16Optimizer(
@@ -571,26 +589,37 @@ def main():
                 optimizer.step()
 
             if global_step % args.log_interval == 0:
+                ws = float(dist.get_world_size())
                 total_loss_log = loss_dict["total_loss"].clone()
                 dist.all_reduce(total_loss_log)
-                total_loss_log = total_loss_log / dist.get_world_size()
+                total_loss_log = total_loss_log / ws
 
                 ce_acc_log = loss_dict["ce_acc"].clone()
                 mean_p_log = loss_dict["mean_prefix_len"].clone()
-                mean_p_cold_log = loss_dict["mean_prefix_len_cold"].clone()
-                mean_p_cont_log = loss_dict["mean_prefix_len_cont"].clone()
-                lambda2_log = loss_dict["lambda2_eff"].clone()
                 dist.all_reduce(ce_acc_log)
                 dist.all_reduce(mean_p_log)
-                dist.all_reduce(mean_p_cold_log)
-                dist.all_reduce(mean_p_cont_log)
-                dist.all_reduce(lambda2_log)
-                ws = dist.get_world_size()
                 ce_acc_log = ce_acc_log / ws
                 mean_p_log = mean_p_log / ws
-                mean_p_cold_log = mean_p_cold_log / ws
-                mean_p_cont_log = mean_p_cont_log / ws
-                lambda2_log = lambda2_log / ws
+
+                rec_kwargs = {
+                    "loss_ce_mean": None,
+                    "loss_kl_mean": None,
+                    "loss_mse_mean": None,
+                    "mean_mask_ratio": None,
+                }
+                loss_ce_m = loss_dict["loss_ce_mean"].clone()
+                loss_kl_m = loss_dict["loss_kl_mean"].clone()
+                loss_mse_m = loss_dict["loss_mse_mean"].clone()
+                mean_mr = loss_dict["mean_mask_ratio"].clone()
+                dist.all_reduce(loss_ce_m)
+                dist.all_reduce(loss_kl_m)
+                dist.all_reduce(loss_mse_m)
+                dist.all_reduce(mean_mr)
+                rec_kwargs["loss_ce_mean"] = (loss_ce_m / ws).item()
+                rec_kwargs["loss_kl_mean"] = (loss_kl_m / ws).item()
+                rec_kwargs["loss_mse_mean"] = (loss_mse_m / ws).item()
+                rec_kwargs["mean_mask_ratio"] = (mean_mr / ws).item()
+
                 record_metrics(
                     args,
                     total_loss_log.item(),
@@ -601,23 +630,22 @@ def main():
                     optimizer,
                     train_dataloader,
                     mode="train",
-                    lambda2_eff=lambda2_log.item(),
-                    mean_prefix_len_cold=mean_p_cold_log.item(),
-                    mean_prefix_len_cont=mean_p_cont_log.item(),
+                    **rec_kwargs,
                 )
 
             if dist.get_rank() == 0:
                 elapsed = time.time() - last_time
                 last_time = time.time()
-                progress_bar.set_postfix(
-                    {
-                        "loss": f"{loss_dict['total_loss'].item():.4f}",
-                        "ce_acc": f"{loss_dict['ce_acc'].item():.4f}",
-                        "mean_p": f"{loss_dict['mean_prefix_len'].item():.2f}",
-                        "l2": f"{loss_dict['lambda2_eff'].item():.3f}",
-                        "iter_time": f"{elapsed:.2f}s",
-                    }
-                )
+                postfix = {
+                    "loss": f"{loss_dict['total_loss'].item():.4f}",
+                    "ce_acc": f"{loss_dict['ce_acc'].item():.4f}",
+                    "iter_time": f"{elapsed:.2f}s",
+                }
+                postfix["mask_r"] = f"{loss_dict['mean_mask_ratio'].item():.3f}"
+                postfix["ce_m"] = f"{loss_dict['loss_ce_mean'].item():.4f}"
+                postfix["kl_m"] = f"{loss_dict['loss_kl_mean'].item():.4f}"
+                postfix["mse_m"] = f"{loss_dict['loss_mse_mean'].item():.4f}"
+                progress_bar.set_postfix(postfix)
 
             if global_step % args.save_interval == 0:
                 save_checkpoint(

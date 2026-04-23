@@ -1,6 +1,7 @@
 # coding=utf-8
-"""FlashMTP training wrapper: clean-prefix completion (iterative block generation)."""
+"""FlashMTP training wrapper: discrete diffusion draft training."""
 
+import math
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -180,7 +181,7 @@ def create_flashmtp_block_mask(
 
 
 class OnlineFlashMTPModel(nn.Module):
-    """Online FlashMTP training: CHS-conditioned draft with clean-prefix completion CE."""
+    """Online FlashMTP training: CHS-conditioned draft with discrete diffusion loss."""
 
     def __init__(
         self,
@@ -193,10 +194,13 @@ class OnlineFlashMTPModel(nn.Module):
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
         prefix_len_sample_bias: float = 0.6,
-        cold_start_loss_weight: float = 1.0,
-        continuation_loss_weight: float = 1.0,
-        continuation_warmup_epochs: float = 0.0,
         context_window_size: int = 1,
+        diffusion_mask_schedule: str = "uniform",
+        diffusion_mask_ratio_min: float = 0.1,
+        diffusion_mask_ratio_max: float = 1.0,
+        loss_weight_ce: float = 1.0,
+        loss_weight_kl: float = 0.0,
+        loss_weight_mse: float = 0.0,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -219,18 +223,24 @@ class OnlineFlashMTPModel(nn.Module):
             )
         self.prefix_len_sample_bias = prefix_len_sample_bias
 
-        self.cold_start_loss_weight = cold_start_loss_weight
-        if not (0.0 < continuation_loss_weight <= 1.0):
+        if diffusion_mask_schedule not in ("uniform", "cosine"):
             raise ValueError(
-                "continuation_loss_weight must be in (0, 1]; got "
-                f"{continuation_loss_weight}"
+                f"diffusion_mask_schedule must be 'uniform' or 'cosine'; "
+                f"got {diffusion_mask_schedule!r}"
             )
-        self.continuation_loss_weight = continuation_loss_weight
-        if continuation_warmup_epochs < 0.0:
+        self.diffusion_mask_schedule = diffusion_mask_schedule
+        if not (0.0 <= diffusion_mask_ratio_min <= diffusion_mask_ratio_max <= 1.0):
             raise ValueError(
-                f"continuation_warmup_epochs must be >= 0; got {continuation_warmup_epochs}"
+                "Need 0 <= diffusion_mask_ratio_min <= diffusion_mask_ratio_max <= 1.0"
             )
-        self.continuation_warmup_epochs = float(continuation_warmup_epochs)
+        self.diffusion_mask_ratio_min = float(diffusion_mask_ratio_min)
+        self.diffusion_mask_ratio_max = float(diffusion_mask_ratio_max)
+
+        self.loss_weight_ce = float(loss_weight_ce)
+        self.loss_weight_kl = float(loss_weight_kl)
+        self.loss_weight_mse = float(loss_weight_mse)
+        if self.loss_weight_ce < 0.0 or self.loss_weight_kl < 0.0 or self.loss_weight_mse < 0.0:
+            raise ValueError("loss_weight_ce, loss_weight_kl, loss_weight_mse must be >= 0")
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -312,125 +322,106 @@ class OnlineFlashMTPModel(nn.Module):
         pos_ids = anchor_positions.unsqueeze(-1) + offsets
         return pos_ids.view(bsz, -1)
 
-    def _create_masked_prefix_noise_embedding(
+    def _sample_diffusion_mask_ratios(
+        self,
+        block_keep_mask: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        """Sample per-block mask ratio in [min, max] using ``diffusion_mask_schedule``."""
+        bsz, n_blocks = block_keep_mask.shape
+        u = torch.rand(bsz, n_blocks, device=device, dtype=dtype)
+        lo = self.diffusion_mask_ratio_min
+        hi = self.diffusion_mask_ratio_max
+        if self.diffusion_mask_schedule == "uniform":
+            r = lo + (hi - lo) * u
+        else:
+            # t in [0,1] -> sin^2(pi t / 2) in [0,1], smoother toward high mask late in "time"
+            t = u
+            r = lo + (hi - lo) * (torch.sin(t * (math.pi / 2.0)) ** 2)
+        return torch.where(block_keep_mask, r, torch.zeros_like(r))
+
+    def _sample_diffusion_mask_pattern(
+        self,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+        mask_ratio: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Randomly choose masked positions per block (True = predict / supervise).
+
+        The in-block anchor token (j=0) is always clean (never masked), and never
+        contributes to loss. We therefore sample masks only from j>=1 valid positions.
+        """
+        bsz, n_blocks = anchor_positions.shape
+        bs = self.block_size
+        device = anchor_positions.device
+        mask_pattern = torch.zeros(
+            bsz, n_blocks, bs, dtype=torch.bool, device=device
+        )
+
+        pos_in_seq = anchor_positions.unsqueeze(-1) + torch.arange(
+            bs, device=device, dtype=torch.long
+        ).view(1, 1, -1)
+        in_bounds = pos_in_seq < seq_len
+
+        for bi in range(bsz):
+            for ni in range(n_blocks):
+                if not block_keep_mask[bi, ni].item():
+                    continue
+                r = float(mask_ratio[bi, ni].item())
+                valid_j = in_bounds[bi, ni].nonzero(as_tuple=False).view(-1)
+                if valid_j.numel() == 0:
+                    continue
+                # Anchor token (j=0) must stay clean.
+                candidate_j = valid_j[valid_j > 0]
+                n_candidates = int(candidate_j.numel())
+                if n_candidates <= 0:
+                    continue
+                k_float = max(1.0, min(float(n_candidates), r * float(n_candidates)))
+                k_mask = int(round(k_float))
+                k_mask = max(1, min(n_candidates, k_mask))
+                perm = candidate_j[
+                    torch.randperm(n_candidates, device=device)[:k_mask]
+                ]
+                mask_pattern[bi, ni, perm] = True
+
+        return mask_pattern
+
+    def _create_random_mask_noise_embedding(
         self,
         input_ids: torch.Tensor,
         anchor_positions: torch.Tensor,
         block_keep_mask: torch.Tensor,
-        unmask_positions: torch.Tensor,
+        mask_positions: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Build draft block inputs: first ``unmask_positions`` tokens per block from
-        ``input_ids``, remainder MASK embeddings.
-
-        Args:
-            unmask_positions: (B, N) prefix length (number of real tokens from anchor).
-
-        Returns:
-            (B, N*block_size, hidden_size)
-        """
+        """Draft block inputs: unmasked positions use data tokens; masked use [MASK]."""
         bsz, seq_len = input_ids.shape
         n = anchor_positions.shape[1]
         bs = self.block_size
         device = input_ids.device
 
-        # Initialize all as MASK
-        noise_ids = torch.full((bsz, n * bs),
-                               self.mask_token_id,
-                               dtype=torch.long,
-                               device=device)
-
-        # For each block, fill in the unmasked tokens
-        for b in range(bsz):
-            for i in range(n):
-                if not block_keep_mask[b, i]:
-                    continue
-                anchor_pos = anchor_positions[b, i].item()
-                num_unmask = unmask_positions[b, i].item()
-
-                # Block start in noise_ids
-                block_start = i * bs
-
-                # Fill in unmasked tokens
-                for j in range(num_unmask):
-                    pos = anchor_pos + j
-                    if pos < seq_len:
-                        noise_ids[b, block_start + j] = input_ids[b, pos]
-
+        pos_in_seq = anchor_positions.unsqueeze(-1) + torch.arange(
+            bs, device=device, dtype=torch.long
+        ).view(1, 1, -1)
+        safe_pos = pos_in_seq.clamp(max=seq_len - 1)
+        gathered = torch.gather(
+            input_ids.unsqueeze(1).expand(-1, n, -1),
+            2,
+            safe_pos,
+        )
+        use_clean = (
+            (~mask_positions)
+            & (pos_in_seq < seq_len)
+            & block_keep_mask.unsqueeze(-1)
+        )
+        noise_ids = torch.where(
+            use_clean,
+            gathered,
+            torch.full((), self.mask_token_id, device=device, dtype=torch.long),
+        )
+        noise_ids = noise_ids.view(bsz, n * bs)
         return self.embed_tokens(noise_ids)
-
-    def sample_clean_prefix_lengths(
-        self,
-        block_keep_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Sample clean prefix length p per block with front-heavy mass on small p.
-
-        Inference often starts with no in-block prefix (p=0); training matches that by
-        sampling p from a truncated geometric-style law: P(p=k) ∝ r^k for k in
-        {0,...,B-1}, with ``r = prefix_len_sample_bias`` (<1 favors small p). Set
-        ``prefix_len_sample_bias=1.0`` to recover uniform sampling.
-
-        Args:
-            block_keep_mask: (B, N) valid block mask
-
-        Returns:
-            prefix_len: (B, N) long, in [0, block_size - 1] for valid blocks
-        """
-        bsz, n_blocks = block_keep_mask.shape
-        device = block_keep_mask.device
-        bs = self.block_size
-        r = self.prefix_len_sample_bias
-        if r >= 1.0:
-            p = torch.randint(0, bs, (bsz, n_blocks), device=device, dtype=torch.long)
-        else:
-            idx = torch.arange(bs, device=device, dtype=torch.float32)
-            probs = torch.pow(
-                torch.tensor(r, device=device, dtype=torch.float32), idx
-            )
-            probs = probs / probs.sum()
-            flat = torch.multinomial(
-                probs, num_samples=bsz * n_blocks, replacement=True
-            )
-            p = flat.view(bsz, n_blocks)
-        return torch.where(block_keep_mask, p, torch.zeros_like(p))
-
-    def sample_continuation_prefix_lengths(
-        self,
-        block_keep_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Sample clean prefix length for continuation loss: p in {2, ..., B-1} (biased).
-
-        Matches ``sample_clean_prefix_lengths`` mass shape (P(k) ∝ r^k) but restricted to
-        k >= 2 so that anchor-only cold-start (p=1) is handled by the other loss term.
-        For ``block_size < 3`` the valid range is empty; returns ones (caller should not
-        use continuation mode in that case).
-        """
-        bsz, n_blocks = block_keep_mask.shape
-        device = block_keep_mask.device
-        bs = self.block_size
-        r = self.prefix_len_sample_bias
-        if bs < 3:
-            return torch.ones((bsz, n_blocks), device=device, dtype=torch.long)
-
-        ks_idx = torch.arange(2, bs, device=device, dtype=torch.long)
-        ks_f = ks_idx.float()
-        n_choices = ks_idx.numel()
-        if r >= 1.0:
-            flat = torch.randint(
-                0,
-                int(n_choices),
-                (bsz * n_blocks,),
-                device=device,
-                dtype=torch.long,
-            )
-        else:
-            probs = torch.pow(torch.tensor(r, device=device, dtype=torch.float32), ks_f)
-            probs = probs / probs.sum()
-            flat = torch.multinomial(
-                probs, num_samples=bsz * n_blocks, replacement=True
-            )
-        p = ks_idx[flat].view(bsz, n_blocks)
-        return torch.where(block_keep_mask, p, torch.zeros_like(p))
 
     def forward(
         self,
@@ -439,55 +430,41 @@ class OnlineFlashMTPModel(nn.Module):
         loss_mask: torch.Tensor,
         training_epoch: float = 0.0,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Clean-prefix completion: each anchor block is duplicated — cold-start (p=1) and
-        continuation (p ~ biased on {{2..B-1}}) — in one forward (2N parallel blocks).
-
-        Args:
-            training_epoch: Fractional training time in epochs, e.g.
-                ``epoch + step_in_epoch / len(dataloader)``, used for continuation warmup.
-        """
-        bsz, seq_len = input_ids.shape
-        device = input_ids.device
-
-        hidden_states = normalize_teacher_hidden_to_layer_tuple(
+        """FlashMTP training with discrete diffusion objective."""
+        hidden_states_t = normalize_teacher_hidden_to_layer_tuple(
             hidden_states,
             target_layer_ids=self.draft_model.target_layer_ids,
             hidden_size=self.draft_model.config.hidden_size,
         )
 
-        anchor_orig, keep_orig = self._sample_anchor_positions(
+        return self._forward_discrete_diffusion(
+            input_ids, loss_mask, hidden_states_t, training_epoch
+        )
+
+    def _forward_discrete_diffusion(
+        self,
+        input_ids: torch.Tensor,
+        loss_mask: torch.Tensor,
+        hidden_states: Tuple[torch.Tensor, ...],
+        training_epoch: float,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Noise-schedule random masking: predict masked tokens from visible context (CE + KL + MSE)."""
+        del training_epoch  # reserved for future schedule / warmup
+        bsz, seq_len = input_ids.shape
+        device = input_ids.device
+
+        last_layer_id = self.draft_model.target_layer_ids[-1]
+        teacher_last_hidden = hidden_states[last_layer_id]
+
+        anchor_positions, block_keep_mask = self._sample_anchor_positions(
             seq_len, loss_mask, device
         )
-        n_orig = anchor_orig.shape[1]
-
-        p_cont = self.sample_continuation_prefix_lengths(keep_orig)
-        ones = torch.ones_like(p_cont)
-        prefix_len = torch.empty(
-            bsz, 2 * n_orig, dtype=torch.long, device=device
-        )
-        prefix_len[:, 0::2] = torch.where(keep_orig, ones, torch.zeros_like(ones))
-        prefix_len[:, 1::2] = torch.where(keep_orig, p_cont, torch.zeros_like(p_cont))
-
-        anchor_positions = anchor_orig.repeat_interleave(2, dim=1)
-        block_keep_mask = keep_orig.repeat_interleave(2, dim=1)
         n_blocks = anchor_positions.shape[1]
 
-        is_cold_start = torch.zeros(
-            bsz, n_blocks, dtype=torch.bool, device=device
+        mask_ratio = self._sample_diffusion_mask_ratios(block_keep_mask, device)
+        mask_pattern = self._sample_diffusion_mask_pattern(
+            anchor_positions, block_keep_mask, mask_ratio, seq_len
         )
-        is_cold_start[:, 0::2] = keep_orig
-        is_continuation = torch.zeros(
-            bsz, n_blocks, dtype=torch.bool, device=device
-        )
-        is_continuation[:, 1::2] = keep_orig
-
-        we = self.continuation_warmup_epochs
-        if we <= 0.0:
-            lambda2_eff = float(self.continuation_loss_weight)
-        else:
-            lambda2_eff = self.continuation_loss_weight * min(
-                1.0, float(training_epoch) / float(we)
-            )
 
         target_hidden = build_full_context_target_hidden(
             hidden_states,
@@ -503,13 +480,11 @@ class OnlineFlashMTPModel(nn.Module):
             context_window=self.context_window_size,
         )
 
-        draft_position_ids = self._create_position_ids(anchor_positions)
-        full_position_ids = draft_position_ids
-
-        noise_embed = self._create_masked_prefix_noise_embedding(
-            input_ids, anchor_positions, block_keep_mask, prefix_len
+        noise_embed = self._create_random_mask_noise_embedding(
+            input_ids, anchor_positions, block_keep_mask, mask_pattern
         )
 
+        full_position_ids = self._create_position_ids(anchor_positions)
         target_position_ids = torch.arange(
             seq_len, device=device, dtype=torch.long
         ).unsqueeze(0).expand(bsz, -1)
@@ -540,12 +515,28 @@ class OnlineFlashMTPModel(nn.Module):
             safe_label_indices,
         )
 
-        completion_mask = pos_in_block >= prefix_len.unsqueeze(-1)
-        completion_mask = (
-            completion_mask
+        # Never supervise the in-block anchor token (j=0), even if user loss_mask=1.
+        non_anchor_positions = pos_in_block > 0
+        supervision_mask = (
+            mask_pattern
             & block_keep_mask.unsqueeze(-1)
             & valid_label_mask
+            & non_anchor_positions
             & (original_loss_mask_gathered > 0.5)
+        )
+
+        j = pos_in_block.float()
+        gamma = self.loss_decay_gamma
+        if gamma is None or gamma <= 0:
+            raw_w = supervision_mask.float()
+        else:
+            raw_w = torch.exp(-j / float(gamma)) * supervision_mask.float()
+
+        denom = raw_w.sum(dim=-1, keepdim=True)
+        tilde_w = torch.where(
+            denom > 0,
+            raw_w / denom.clamp(min=1e-8),
+            torch.zeros_like(raw_w),
         )
 
         ce_per_pos = F.cross_entropy(
@@ -554,63 +545,73 @@ class OnlineFlashMTPModel(nn.Module):
             reduction="none",
         ).view(bsz, n_blocks, self.block_size)
 
-        # d: 1-based index within the completion suffix (first supervised token has d=1).
-        d = pos_in_block - prefix_len.unsqueeze(-1) + 1
-        gamma = self.loss_decay_gamma
-        if gamma is None or gamma <= 0:
-            raw_w = completion_mask.float()
+        b_idx = torch.arange(bsz, device=device).view(-1, 1, 1).expand(
+            bsz, n_blocks, self.block_size
+        )
+        teacher_h_at = teacher_last_hidden[b_idx, safe_label_indices, :]
+        student_h_block = output_hidden.view(bsz, n_blocks, self.block_size, -1)
+
+        w_ce = self.loss_weight_ce
+        w_kl = self.loss_weight_kl
+        w_mse = self.loss_weight_mse
+
+        ce_block = (ce_per_pos * tilde_w).sum(dim=-1)
+
+        if w_kl > 0.0:
+            with torch.no_grad():
+                t_flat = self.lm_head(
+                    teacher_last_hidden.reshape(-1, teacher_last_hidden.size(-1))
+                )
+                teacher_logits_full = t_flat.view(
+                    bsz, seq_len, t_flat.size(-1)
+                )
+            teacher_logits_at = teacher_logits_full[b_idx, safe_label_indices, :]
+            kl_per_pos = F.kl_div(
+                F.log_softmax(student_logits.float(), dim=-1),
+                F.softmax(teacher_logits_at.float(), dim=-1),
+                reduction="none",
+            ).sum(dim=-1)
+            kl_block = (kl_per_pos * tilde_w).sum(dim=-1)
         else:
-            w_d = torch.exp(-(d - 1).float().clamp(min=0) / gamma)
-            raw_w = w_d * completion_mask.float()
+            kl_block = torch.zeros(
+                (bsz, n_blocks), device=device, dtype=ce_block.dtype
+            )
 
-        denom = raw_w.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        tilde_w = raw_w / denom
+        if w_mse > 0.0:
+            mse_per_pos = F.mse_loss(
+                student_h_block.float(),
+                teacher_h_at.detach().float(),
+                reduction="none",
+            ).mean(dim=-1)
+            mse_block = (mse_per_pos * tilde_w).sum(dim=-1)
+        else:
+            mse_block = torch.zeros(
+                (bsz, n_blocks), device=device, dtype=ce_block.dtype
+            )
 
-        weighted = ce_per_pos * tilde_w
-        per_block_loss = weighted.sum(dim=-1)
-
-        cold_mask = is_cold_start.float()
-        cont_mask = is_continuation.float()
-        n_cold = cold_mask.sum().clamp(min=0.0)
-        n_cont = cont_mask.sum().clamp(min=0.0)
-
-        cold_sum = (per_block_loss * cold_mask).sum()
-        cont_sum = (per_block_loss * cont_mask).sum()
-
-        w1 = float(self.cold_start_loss_weight)
-        total_loss = torch.zeros((), device=device, dtype=per_block_loss.dtype)
-        if n_cold > 0:
-            total_loss = total_loss + w1 * cold_sum / n_cold
-        if n_cont > 0:
-            total_loss = total_loss + lambda2_eff * cont_sum / n_cont
-
-        n_valid = block_keep_mask.sum().float().clamp(min=1.0)
+        per_block_loss = w_ce * ce_block + w_kl * kl_block + w_mse * mse_block
+        n_blk = block_keep_mask.sum().float().clamp(min=1.0)
+        total_loss = (per_block_loss * block_keep_mask.float()).sum() / n_blk
 
         with torch.no_grad():
             preds = torch.argmax(student_logits, dim=-1)
-            correct = (preds == target_ids) & completion_mask
-            ce_acc = correct.sum().float() / completion_mask.sum().float().clamp(
+            correct = (preds == target_ids) & supervision_mask
+            ce_acc = correct.sum().float() / supervision_mask.sum().float().clamp(
                 min=1.0
             )
-            mean_p = (prefix_len.float() * block_keep_mask.float()).sum() / n_valid
-            mean_p_cold = torch.where(
-                n_cold > 0,
-                (prefix_len.float() * cold_mask).sum() / n_cold,
-                torch.zeros((), device=device),
-            )
-            mean_p_cont = torch.where(
-                n_cont > 0,
-                (prefix_len.float() * cont_mask).sum() / n_cont,
-                torch.zeros((), device=device),
+            br = mask_pattern.float().sum(dim=-1) / float(self.block_size)
+            mean_mask_ratio = (br * block_keep_mask.float()).sum() / block_keep_mask.float().sum().clamp(
+                min=1.0
             )
 
         loss_dict = {
             "total_loss": total_loss,
             "ce_acc": ce_acc,
-            "mean_prefix_len": mean_p,
-            "mean_prefix_len_cold": mean_p_cold,
-            "mean_prefix_len_cont": mean_p_cont,
-            "lambda2_eff": torch.tensor(lambda2_eff, device=device),
+            "mean_prefix_len": torch.tensor(0.0, device=device),
+            "loss_ce_mean": (ce_block * block_keep_mask.float()).sum() / n_blk,
+            "loss_kl_mean": (kl_block * block_keep_mask.float()).sum() / n_blk,
+            "loss_mse_mean": (mse_block * block_keep_mask.float()).sum() / n_blk,
+            "mean_mask_ratio": mean_mask_ratio,
         }
 
         return total_loss, loss_dict
