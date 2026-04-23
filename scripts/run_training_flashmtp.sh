@@ -51,22 +51,17 @@ BLOCK_SIZE="${BLOCK_SIZE:-16}"
 # 模型参数
 # ========================================
 # Teacher 条件窗长 W：每个块在 mask 内最多 attend anchor 之前 W 个 token 的 target hidden；W=1 等价于仅用 anchor-1
-CONTEXT_WINDOW_SIZE="${CONTEXT_WINDOW_SIZE:-64}"
+CONTEXT_WINDOW_SIZE="${CONTEXT_WINDOW_SIZE:-1}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
+LOSS_WEIGHT_CE="${LOSS_WEIGHT_CE:-1.0}"
+LOSS_WEIGHT_KL="${LOSS_WEIGHT_KL:-0.6}"
+LOSS_WEIGHT_MSE="${LOSS_WEIGHT_MSE:-0.2}"
 
 # ========================================
 # 训练参数
 # ========================================
-# 双任务 loss：每个 anchor 并行冷启动(p=1) + 延续(p∈{2..B-1})，一次 forward；总损失 =
-#   cold_w * mean(冷启子块) + λ2_eff * mean(延续子块)，
-#   λ2_eff = continuation_w * min(1, training_epoch / CONTINUATION_WARMUP_EPOCHS)
-#   training_epoch = 当前 epoch + 当前 batch 下标/每轮 batch 数（浮点，从 0 起算）
-COLD_START_LOSS_WEIGHT="${COLD_START_LOSS_WEIGHT:-1.0}"
-# 延续项最大权重，建议 ∈ (0, 1]
-CONTINUATION_LOSS_WEIGHT="${CONTINUATION_LOSS_WEIGHT:-1.0}"
-CONTINUATION_WARMUP_EPOCHS="${CONTINUATION_WARMUP_EPOCHS:-6}"
-
+# 离散扩散单任务 loss（CE + 可选 KL/MSE），anchor token 永远 clean 且不计入 loss
 BATCH_SIZE="${BATCH_SIZE:-1}"
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
 LEARNING_RATE="${LEARNING_RATE:-6e-4}"
@@ -81,7 +76,7 @@ TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
 
 if [ "$DT" = "qz" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v3.1_swa_${CONTEXT_WINDOW_SIZE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v3.2_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
@@ -97,10 +92,10 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-5000}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-5000}"
 
 REPORT_TO="${REPORT_TO:-wandb}"
-WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training}"
+WANDB_PROJECT="${WANDB_PROJECT:-flashmtp_v3.2-training}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v3.1_swa_${CONTEXT_WINDOW_SIZE}_${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v3.2_${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}}"
 
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}"
 IS_PREFORMATTED="${IS_PREFORMATTED:-}"
@@ -128,10 +123,8 @@ echo "  块大小: ${BLOCK_SIZE}"
 echo "  条件窗长 W (context-window-size): ${CONTEXT_WINDOW_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
-echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)} (w∝exp(-(d-1)/γ)，d=后缀内序号)"
-echo "  冷启动loss权重: ${COLD_START_LOSS_WEIGHT}"
-echo "  延续loss权重(最大): ${CONTINUATION_LOSS_WEIGHT}"
-echo "  延续 warmup(epoch): ${CONTINUATION_WARMUP_EPOCHS}"
+echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)} (w∝exp(-j/γ)，j=块内位置, anchor j=0不监督)"
+echo "  Loss权重: CE=${LOSS_WEIGHT_CE}, KL=${LOSS_WEIGHT_KL}, MSE=${LOSS_WEIGHT_MSE}"
 echo "------------------------------------------"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
@@ -220,6 +213,9 @@ set +e
     --num-anchors ${NUM_ANCHORS} \
     --context-window-size ${CONTEXT_WINDOW_SIZE} \
     --attention-backend ${ATTENTION_BACKEND} \
+    --loss-weight-ce ${LOSS_WEIGHT_CE} \
+    --loss-weight-kl ${LOSS_WEIGHT_KL} \
+    --loss-weight-mse ${LOSS_WEIGHT_MSE} \
     --learning-rate ${LEARNING_RATE} \
     --warmup-ratio ${WARMUP_RATIO} \
     --num-epochs ${NUM_EPOCHS} \
@@ -235,9 +231,6 @@ set +e
     --build-dataset-num-proc ${BUILD_DATASET_NUM_PROC} \
     --tp-size ${TP_SIZE} \
     --dist-timeout ${DIST_TIMEOUT} \
-    --cold-start-loss-weight ${COLD_START_LOSS_WEIGHT} \
-    --continuation-loss-weight ${CONTINUATION_LOSS_WEIGHT} \
-    --continuation-warmup-epochs ${CONTINUATION_WARMUP_EPOCHS} \
     --seed 42 \
     ${OPTIONAL_ARGS}
 EXIT_CODE=$?
