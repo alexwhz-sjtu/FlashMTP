@@ -224,9 +224,9 @@ class OnlineFlashMTPModel(nn.Module):
             )
         self.prefix_len_sample_bias = prefix_len_sample_bias
 
-        if diffusion_mask_schedule not in ("uniform", "cosine"):
+        if diffusion_mask_schedule not in ("uniform", "cosine", "mask_high"):
             raise ValueError(
-                f"diffusion_mask_schedule must be 'uniform' or 'cosine'; "
+                f"diffusion_mask_schedule must be 'uniform', 'cosine', or 'mask_high'; "
                 f"got {diffusion_mask_schedule!r}"
             )
         self.diffusion_mask_schedule = diffusion_mask_schedule
@@ -339,10 +339,13 @@ class OnlineFlashMTPModel(nn.Module):
         hi = self.diffusion_mask_ratio_max
         if self.diffusion_mask_schedule == "uniform":
             r = lo + (hi - lo) * u
-        else:
-            # t in [0,1] -> sin^2(pi t / 2) in [0,1], smoother toward high mask late in "time"
+        elif self.diffusion_mask_schedule == "cosine":
+            # t in [0,1] -> sin^2(pi t / 2) in [0,1], U-shaped in t similar to v-diffusion
             t = u
             r = lo + (hi - lo) * (torch.sin(t * (math.pi / 2.0)) ** 2)
+        else:
+            # u ~ U(0,1), sqrt(u) has density 2t on [0,1] -> more high mask, less low mask
+            r = lo + (hi - lo) * torch.sqrt(u)
         return torch.where(block_keep_mask, r, torch.zeros_like(r))
 
     def _sample_diffusion_mask_pattern(

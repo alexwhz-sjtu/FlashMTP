@@ -100,8 +100,8 @@ def parse_args():
         "--diffusion-mask-schedule",
         type=str,
         default="uniform",
-        choices=["uniform", "cosine"],
-        help="How to sample mask ratio per block (discrete_diffusion only).",
+        choices=["uniform", "cosine", "mask_high"],
+        help="Mask ratio per block: uniform, cosine (sin^2), or mask_high (sqrt bias to high r).",
     )
     model_group.add_argument(
         "--diffusion-mask-ratio-min",

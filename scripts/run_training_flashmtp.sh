@@ -42,7 +42,7 @@ CKPT_DIR="${CKPT_DIR:-}"
 # ========================================
 # 主要数据集参数
 # ========================================
-DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}"
+DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-400000}"
 ENABLE_THINKING="${ENABLE_THINKING:-on}"
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
@@ -53,7 +53,7 @@ BLOCK_SIZE="${BLOCK_SIZE:-16}"
 # Teacher 条件窗长 W：每个块在 mask 内最多 attend anchor 之前 W 个 token 的 target hidden；W=1 等价于仅用 anchor-1
 CONTEXT_WINDOW_SIZE="${CONTEXT_WINDOW_SIZE:-1}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
-DIFFUSION_MASK_SCHEDULE="${DIFFUSION_MASK_SCHEDULE:-uniform}"
+DIFFUSION_MASK_SCHEDULE="${DIFFUSION_MASK_SCHEDULE:-mask_high}" # ("uniform", "cosine", "mask_high")
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
 LOSS_WEIGHT_CE="${LOSS_WEIGHT_CE:-1.0}"
 LOSS_WEIGHT_KL="${LOSS_WEIGHT_KL:-0.6}"
