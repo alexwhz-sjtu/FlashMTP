@@ -53,6 +53,7 @@ BLOCK_SIZE="${BLOCK_SIZE:-16}"
 # Teacher 条件窗长 W：每个块在 mask 内最多 attend anchor 之前 W 个 token 的 target hidden；W=1 等价于仅用 anchor-1
 CONTEXT_WINDOW_SIZE="${CONTEXT_WINDOW_SIZE:-1}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
+DIFFUSION_MASK_SCHEDULE="${DIFFUSION_MASK_SCHEDULE:-uniform}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
 LOSS_WEIGHT_CE="${LOSS_WEIGHT_CE:-1.0}"
 LOSS_WEIGHT_KL="${LOSS_WEIGHT_KL:-0.6}"
@@ -134,6 +135,7 @@ echo "  块大小: ${BLOCK_SIZE}"
 echo "  条件窗长 W (context-window-size): ${CONTEXT_WINDOW_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
+echo "  Diffusion mask schedule: ${DIFFUSION_MASK_SCHEDULE}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)} (w∝exp(-j/γ)，j=块内位置, anchor j=0不监督)"
 echo "  Loss权重: CE=${LOSS_WEIGHT_CE}, KL=${LOSS_WEIGHT_KL}, MSE=${LOSS_WEIGHT_MSE}"
 echo "  KL词表范围: ${LOSS_KL_TOPK} (0=全词表, >0=teacher top-k)"
@@ -225,6 +227,7 @@ set +e
     --num-anchors ${NUM_ANCHORS} \
     --context-window-size ${CONTEXT_WINDOW_SIZE} \
     --attention-backend ${ATTENTION_BACKEND} \
+    --diffusion-mask-schedule ${DIFFUSION_MASK_SCHEDULE} \
     --loss-weight-ce ${LOSS_WEIGHT_CE} \
     --loss-weight-kl ${LOSS_WEIGHT_KL} \
     --loss-weight-mse ${LOSS_WEIGHT_MSE} \
