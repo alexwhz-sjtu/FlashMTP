@@ -70,7 +70,32 @@ LEARNING_RATE="${LEARNING_RATE:-6e-4}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
-MASTER_PORT="${MASTER_PORT:-29501}"
+# 分布式 rendezvous：MASTER_ADDR / MASTER_PORT
+# - 未显式设置 MASTER_ADDR 时：优先 PET_MASTER_ADDR（PyTorch elastic / 调度常见），
+#   否则 SLURM / PBS 首节点，再否则 127.0.0.1（单机多卡可放心用）。
+# - 未显式设置 MASTER_PORT 时：优先 PET_MASTER_PORT，否则 29501。
+# - 若你已在环境 export MASTER_ADDR/MASTER_PORT，以你为准，不再覆盖。
+if [ -z "${MASTER_ADDR:-}" ]; then
+    if [ -n "${PET_MASTER_ADDR:-}" ]; then
+        MASTER_ADDR="${PET_MASTER_ADDR}"
+    else
+        _NLIST="${SLURM_STEP_NODELIST:-${SLURM_JOB_NODELIST:-}}"
+        if [ -n "${_NLIST}" ] && command -v scontrol >/dev/null 2>&1; then
+            MASTER_ADDR=$(scontrol show hostnames "${_NLIST}" 2>/dev/null | head -1) || true
+        fi
+        if [ -z "${MASTER_ADDR:-}" ] && [ -n "${PBS_NODEFILE:-}" ] && [ -f "${PBS_NODEFILE}" ]; then
+            MASTER_ADDR=$(head -1 "${PBS_NODEFILE}" | tr -d '\r\n' || true)
+        fi
+        if [ -z "${MASTER_ADDR:-}" ]; then
+            MASTER_ADDR=127.0.0.1
+        fi
+    fi
+    unset _NLIST
+fi
+MASTER_PORT="${MASTER_PORT:-${PET_MASTER_PORT:-29501}}"
+export MASTER_ADDR
+export MASTER_PORT
+
 TP_SIZE="${TP_SIZE:-1}"
 DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
 
@@ -149,6 +174,10 @@ echo "  预热比例: ${WARMUP_RATIO}"
 echo "  梯度裁剪: ${MAX_GRAD_NORM}"
 echo "------------------------------------------"
 echo "分布式配置:"
+echo "  环境变量 PET_MASTER_ADDR: ${PET_MASTER_ADDR:-<未设置>}"
+echo "  环境变量 PET_MASTER_PORT: ${PET_MASTER_PORT:-<未设置>}"
+echo "  实际使用 MASTER_ADDR: ${MASTER_ADDR}"
+echo "  实际使用 MASTER_PORT: ${MASTER_PORT}"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 echo "  NPROC_PER_NODE: ${NPROC_PER_NODE}"
 echo "  TP_SIZE: ${TP_SIZE}"
@@ -179,7 +208,12 @@ mkdir -p ${WANDB_DIR}
 
 echo ""
 echo "==> train_flashmtp.py (torchrun)"
-LAUNCHER=(torchrun --nproc_per_node "${NPROC_PER_NODE}" --master_port "${MASTER_PORT}")
+LAUNCHER=(
+    torchrun
+    --nproc_per_node "${NPROC_PER_NODE}"
+    --master_addr "${MASTER_ADDR}"
+    --master_port "${MASTER_PORT}"
+)
 OPTIONAL_ARGS=""
 
 if [ -n "${EVAL_DATA_PATH}" ]; then
