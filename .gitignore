@@ -201,3 +201,5 @@ wandb/
 .DS_Store
 
 log.txt
+
+wandb_sync_daemon.py

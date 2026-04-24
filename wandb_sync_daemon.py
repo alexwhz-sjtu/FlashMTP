@@ -15,10 +15,10 @@ from pathlib import Path
 
 # ==================== 配置区域 ====================
 # wandb 离线日志目录
-WANDB_DIR = "/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/wandb/offline-run-20260402_171351-0gq1e0ja"
+WANDB_DIR = "/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP_v3.2/wandb/offline-run-20260424_092800-flashmtp_v3.2_ce1p0_kl0p6_kall_mse0p2_400000_mask_high_epochs10"
 
 # wandb project 名称
-WANDB_PROJECT = "flashmtp_training"
+WANDB_PROJECT = "flashmtp_v3.2_training"
 
 # 同步间隔（秒）
 SYNC_INTERVAL = 5 * 60  # 5 分钟

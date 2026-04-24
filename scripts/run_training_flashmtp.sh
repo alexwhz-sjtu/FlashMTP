@@ -112,7 +112,7 @@ LOSS_TAG="ce${LW_CE_TAG}_kl${LW_KL_TAG}_${KL_TOPK_TAG}_mse${LW_MSE_TAG}"
 
 if [ "$DT" = "qz" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v3.2_${LOSS_TAG}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v3.2_${LOSS_TAG}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_dist}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
     export WANDB_MODE=offline
 else
@@ -132,7 +132,7 @@ REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp_v3.2-training}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v3.2_${LOSS_TAG}_${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v3.2_${LOSS_TAG}_${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_dist}"
 
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}"
 IS_PREFORMATTED="${IS_PREFORMATTED:-}"
