@@ -2,7 +2,7 @@
 
 ### 1.1 任务定义
 
-小模型（Draft Model）接收大模型（Target Model）最后一个token的**所有层hidden states拼接**（序列维度或者特征维度，可选，请给出选择接口），预测接下来**B个token**（B=block_size，默认16）。
+小模型（Draft Model）接收大模型（Target Model）最后一个token的**所有层hidden states拼接**（序列维度或者特征维度，可选，请给出选择接口），预测接下来**B个token**（B=block_size，默认16）。小模型无kvcache
 
 ### 1.2 关键特点
 
@@ -13,7 +13,7 @@
 
 一、核心设计思想
 
-你的小模型接收大模型最后一个token的所有层hidden states拼接作为输入，预测接下来B个token（block_size，默认16）。关键创新是：预测块内token时不依赖ground truth的embedding，而是用mask token填充。
+你的小模型接收大模型最后一个token的所有层hidden states拼接作为输入，预测接下来B个token（block_size，默认16）。关键创新是：小模型完全抛弃kvcache，条件只有大模型融合hiddenstates和bonus token。
 
 二、推理流程（带详细图解）
 
