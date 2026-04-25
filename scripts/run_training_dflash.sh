@@ -61,6 +61,11 @@ fi
 export MASTER_ADDR
 export MASTER_PORT
 
+# 见 run_training_flashmtp.sh：K8s 主机名作 MASTER 时 c10d IPv6 解析告警；强制 IPv4。
+if [ -z "${NCCL_SOCKET_FAMILY:-}" ]; then
+    export NCCL_SOCKET_FAMILY=AF_INET
+fi
+
 # 多机：NNODES / NODE_RANK
 if [ -z "${NNODES:-}" ]; then
     if [ -n "${PET_NNODES:-}" ]; then

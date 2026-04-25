@@ -1,5 +1,12 @@
 #!/bin/bash
 # FlashMTP 训练：与 scripts/train_flashmtp.py 参数一致；用法: bash scripts/run_training_flashmtp.sh [--dt qz|a800]
+#
+# 分布式：支持环境变量
+#   MASTER_ADDR, MASTER_PORT, PET_MASTER_ADDR, PET_MASTER_PORT
+#   PET_NPROC_PER_NODE, PET_NNODES, PET_NODE_RANK
+#   (WORLD_SIZE / RANK 由 torchrun 或训练进程设置，仅作日志)
+# 单机多卡：默认 NNODES=1, MASTER=127.0.0.1:29501
+# 多机：各节点同 MASTER/PORT/NNODES，异 NODE_RANK（或 PET_NNODES / PET_NODE_RANK）
 set -e
 
 DT="a800"
@@ -35,6 +42,21 @@ export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"
 # ========================================
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+if [ -n "${PET_NPROC_PER_NODE:-}" ]; then
+    NPROC_PER_NODE="${PET_NPROC_PER_NODE}"
+else
+    # 常见错误：4 张卡仍起 8 进程 -> NCCL / local rank 与 GPU 不符；若 nproc 大于可见卡数则下调
+    if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+        _cvd="${CUDA_VISIBLE_DEVICES// /}"
+        if [[ "${_cvd}" =~ ^[0-9,]+$ ]]; then
+            _ng=$(echo "${_cvd}" | awk -F',' '{print NF}')
+            if [ "${_ng}" -ge 1 ] 2>/dev/null && [ "${NPROC_PER_NODE}" -gt "${_ng}" ] 2>/dev/null; then
+                echo "提示: NPROC_PER_NODE=${NPROC_PER_NODE} 大于 CUDA_VISIBLE_DEVICES 中 GPU 数=${_ng}，已自动改为 ${_ng}（可设置 PET_NPROC_PER_NODE 显式覆盖）"
+                NPROC_PER_NODE="${_ng}"
+            fi
+        fi
+    fi
+fi
 NUM_EPOCHS="${NUM_EPOCHS:-10}"
 RESUME="${RESUME:-}"
 CKPT_DIR="${CKPT_DIR:-}"
@@ -71,10 +93,8 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
 # 分布式 rendezvous：MASTER_ADDR / MASTER_PORT
-# - 未显式设置 MASTER_ADDR 时：优先 PET_MASTER_ADDR（PyTorch elastic / 调度常见），
-#   否则 SLURM / PBS 首节点，再否则 127.0.0.1（单机多卡可放心用）。
-# - 未显式设置 MASTER_PORT 时：优先 PET_MASTER_PORT，否则 29501。
-# - 若你已在环境 export MASTER_ADDR/MASTER_PORT，以你为准，不再覆盖。
+# - 未显式设置 MASTER_ADDR 时：优先 PET_MASTER_ADDR，再 SLURM / PBS 首节点，再否则 127.0.0.1
+# - 未显式设置 MASTER_PORT 时：优先 PET_MASTER_PORT，再 29501
 if [ -z "${MASTER_ADDR:-}" ]; then
     if [ -n "${PET_MASTER_ADDR:-}" ]; then
         MASTER_ADDR="${PET_MASTER_ADDR}"
@@ -92,9 +112,47 @@ if [ -z "${MASTER_ADDR:-}" ]; then
     fi
     unset _NLIST
 fi
-MASTER_PORT="${MASTER_PORT:-${PET_MASTER_PORT:-29501}}"
+if [ -z "${MASTER_PORT:-}" ]; then
+    if [ -n "${PET_MASTER_PORT:-}" ]; then
+        MASTER_PORT="${PET_MASTER_PORT}"
+    else
+        MASTER_PORT=29501
+    fi
+fi
 export MASTER_ADDR
 export MASTER_PORT
+
+# K8s/部分集群用 Pod 主机名作 MASTER 时，c10d 会尝试解析 IPv6 并告警
+#   "The IPv6 network addresses of (hostname, port) cannot be retrieved (gai error: -2)"
+# 强制走 IPv4 通常可消除告警并避免偶发卡死；多机时仍建议将 PET_MASTER_ADDR 设为
+# rank0 可联通的**数字 IPv4**（或 Headless Service 的 ClusterIP）而非无 AAAA 的 DNS 名。
+if [ -z "${NCCL_SOCKET_FAMILY:-}" ]; then
+    export NCCL_SOCKET_FAMILY=AF_INET
+fi
+
+# 多机：NNODES / NODE_RANK
+if [ -z "${NNODES:-}" ]; then
+    if [ -n "${PET_NNODES:-}" ]; then
+        NNODES="${PET_NNODES}"
+    elif [ -n "${SLURM_JOB_NUM_NODES:-}" ]; then
+        NNODES="${SLURM_JOB_NUM_NODES}"
+    else
+        NNODES=1
+    fi
+fi
+if [ -z "${NNODES}" ] || [ "${NNODES}" = "0" ]; then
+    NNODES=1
+fi
+
+if [ -z "${NODE_RANK:-}" ]; then
+    if [ -n "${PET_NODE_RANK:-}" ]; then
+        NODE_RANK="${PET_NODE_RANK}"
+    elif [ -n "${SLURM_NODEID:-}" ]; then
+        NODE_RANK="${SLURM_NODEID}"
+    else
+        NODE_RANK=0
+    fi
+fi
 
 TP_SIZE="${TP_SIZE:-1}"
 DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
@@ -174,10 +232,17 @@ echo "  预热比例: ${WARMUP_RATIO}"
 echo "  梯度裁剪: ${MAX_GRAD_NORM}"
 echo "------------------------------------------"
 echo "分布式配置:"
-echo "  环境变量 PET_MASTER_ADDR: ${PET_MASTER_ADDR:-<未设置>}"
-echo "  环境变量 PET_MASTER_PORT: ${PET_MASTER_PORT:-<未设置>}"
+echo "  PET_MASTER_ADDR: ${PET_MASTER_ADDR:-<未设置>}"
+echo "  PET_MASTER_PORT: ${PET_MASTER_PORT:-<未设置>}"
+echo "  PET_NNODES: ${PET_NNODES:-<未设置>}"
+echo "  PET_NPROC_PER_NODE: ${PET_NPROC_PER_NODE:-<未设置>}"
+echo "  PET_NODE_RANK: ${PET_NODE_RANK:-<未设置>}"
 echo "  实际使用 MASTER_ADDR: ${MASTER_ADDR}"
 echo "  实际使用 MASTER_PORT: ${MASTER_PORT}"
+echo "  NNODES: ${NNODES}"
+echo "  NODE_RANK: ${NODE_RANK}"
+echo "  期望 WORLD_SIZE: $((NNODES * NPROC_PER_NODE)) (RANK/WORLD_SIZE 在 torchrun/子进程内)"
+echo "  当前壳层 RANK/WORLD_SIZE: RANK=${RANK:-<未置>}, WORLD_SIZE=${WORLD_SIZE:-<未置>}"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 echo "  NPROC_PER_NODE: ${NPROC_PER_NODE}"
 echo "  TP_SIZE: ${TP_SIZE}"
@@ -211,6 +276,8 @@ echo "==> train_flashmtp.py (torchrun)"
 LAUNCHER=(
     torchrun
     --nproc_per_node "${NPROC_PER_NODE}"
+    --nnodes "${NNODES}"
+    --node_rank "${NODE_RANK}"
     --master_addr "${MASTER_ADDR}"
     --master_port "${MASTER_PORT}"
 )
