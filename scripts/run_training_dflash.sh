@@ -1,14 +1,9 @@
 #!/bin/bash
 # DFlash 训练启动脚本
 #
-# 分布式环境变量（调度器 / torchrun 常见）本脚本会识别并用于构建 torchrun：
-#   MASTER_ADDR, MASTER_PORT
-#   PET_MASTER_ADDR, PET_MASTER_PORT
-#   PET_NPROC_PER_NODE, PET_NNODES, PET_NODE_RANK
-#   WORLD_SIZE, RANK（仅用于日志展示；由 torchrun/训练进程在运行时设置）
-# 单机多卡：不设置或 NNODES=1、MASTER_ADDR=127.0.0.1 即可（脚本默认）。
-# 多机多卡：在每台机器上执行本脚本，并设置同一 MASTER_ADDR/MASTER_PORT、
-# 相同 NNODES、不同的 NODE_RANK（或 PET_NNODES / PET_NODE_RANK 等效变量）。
+# 分布式：与 DFlash++ 启动脚本对齐
+#   PET_NPROC_PER_NODE, PET_NNODES, PET_NODE_RANK, PET_MASTER_*, MASTER_*
+# NPROC>1 或 NNODES>1 时用 torchrun，否则 python。默认 MASTER_PORT=29502（与 DFlash++ 一致）。
 
 set -e
 
@@ -24,71 +19,23 @@ fi
 # 配置参数
 # ========================================
 
-# GPU / 进程数：PET_NPROC_PER_NODE 优先于本脚本的 NPROC_PER_NODE
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
-if [ -n "${PET_NPROC_PER_NODE:-}" ]; then
+if [ -n "${PET_NPROC_PER_NODE}" ]; then
     NPROC_PER_NODE="${PET_NPROC_PER_NODE}"
+else
+    NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 fi
+NNODES="${PET_NNODES:-${NNODES:-1}}"
+NODE_RANK="${PET_NODE_RANK:-${NODE_RANK:-0}}"
+MASTER_ADDR="${MASTER_ADDR:-${PET_MASTER_ADDR:-127.0.0.1}}"
+MASTER_PORT="${MASTER_PORT:-${PET_MASTER_PORT:-29502}}"
 
-# 分布式 rendezvous：MASTER_ADDR / MASTER_PORT
-# - 未显式设置 MASTER_ADDR 时：优先 PET_MASTER_ADDR，再 SLURM / PBS 首节点，再否则 127.0.0.1
-# - 未显式设置 MASTER_PORT 时：优先 PET_MASTER_PORT，再 MASTER_PORT，再 29501
-if [ -z "${MASTER_ADDR:-}" ]; then
-    if [ -n "${PET_MASTER_ADDR:-}" ]; then
-        MASTER_ADDR="${PET_MASTER_ADDR}"
-    else
-        _NLIST="${SLURM_STEP_NODELIST:-${SLURM_JOB_NODELIST:-}}"
-        if [ -n "${_NLIST}" ] && command -v scontrol >/dev/null 2>&1; then
-            MASTER_ADDR=$(scontrol show hostnames "${_NLIST}" 2>/dev/null | head -1) || true
-        fi
-        if [ -z "${MASTER_ADDR:-}" ] && [ -n "${PBS_NODEFILE:-}" ] && [ -f "${PBS_NODEFILE}" ]; then
-            MASTER_ADDR=$(head -1 "${PBS_NODEFILE}" | tr -d '\r\n' || true)
-        fi
-        if [ -z "${MASTER_ADDR:-}" ]; then
-            MASTER_ADDR=127.0.0.1
-        fi
-    fi
-    unset _NLIST
-fi
-if [ -z "${MASTER_PORT:-}" ]; then
-    if [ -n "${PET_MASTER_PORT:-}" ]; then
-        MASTER_PORT="${PET_MASTER_PORT}"
-    else
-        MASTER_PORT=29501
-    fi
+if [ "${NNODES}" -gt 1 ] 2>/dev/null && { [ "${MASTER_ADDR}" = "127.0.0.1" ] || [ "${MASTER_ADDR}" = "localhost" ]; }; then
+    echo "错误: 多机训练 (NNODES=${NNODES}) 须设置 MASTER_ADDR 或 PET_MASTER_ADDR 为可互通的主节点地址。" >&2
+    exit 1
 fi
 export MASTER_ADDR
 export MASTER_PORT
-
-# 见 run_training_flashmtp.sh：K8s 主机名作 MASTER 时 c10d IPv6 解析告警；强制 IPv4。
-if [ -z "${NCCL_SOCKET_FAMILY:-}" ]; then
-    export NCCL_SOCKET_FAMILY=AF_INET
-fi
-
-# 多机：NNODES / NODE_RANK
-if [ -z "${NNODES:-}" ]; then
-    if [ -n "${PET_NNODES:-}" ]; then
-        NNODES="${PET_NNODES}"
-    elif [ -n "${SLURM_JOB_NUM_NODES:-}" ]; then
-        NNODES="${SLURM_JOB_NUM_NODES}"
-    else
-        NNODES=1
-    fi
-fi
-if [ -z "${NNODES}" ] || [ "${NNODES}" = "0" ]; then
-    NNODES=1
-fi
-
-if [ -z "${NODE_RANK:-}" ]; then
-    if [ -n "${PET_NODE_RANK:-}" ]; then
-        NODE_RANK="${PET_NODE_RANK}"
-    elif [ -n "${SLURM_NODEID:-}" ]; then
-        NODE_RANK="${SLURM_NODEID}"
-    else
-        NODE_RANK=0
-    fi
-fi
 
 # 目标模型路径
 TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
@@ -195,8 +142,13 @@ echo "  PET_NPROC_PER_NODE: ${PET_NPROC_PER_NODE:-<未设置>}"
 echo "  PET_NODE_RANK: ${PET_NODE_RANK:-<未设置>}"
 echo "  NNODES: ${NNODES}"
 echo "  NODE_RANK: ${NODE_RANK}"
-echo "  期望 WORLD_SIZE (未启动前): $((NNODES * NPROC_PER_NODE))"
-echo "  运行时 RANK / WORLD_SIZE: 由 torchrun/训练进程设置; 当前: RANK=${RANK:-<未启动>}, WORLD_SIZE=${WORLD_SIZE:-<未启动>}"
+echo "  期望 WORLD_SIZE: $((NNODES * NPROC_PER_NODE)) (实际由 torchrun 设定)"
+if [ -n "${WORLD_SIZE}" ]; then
+    echo "  (环境) WORLD_SIZE: ${WORLD_SIZE}  (用于对照)"
+fi
+if [ -n "${RANK}" ]; then
+    echo "  (环境) RANK: ${RANK}  (全局进程 rank，与 NODE_RANK 不同)"
+fi
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 echo "  NPROC_PER_NODE: ${NPROC_PER_NODE}"
 echo "  TP_SIZE: ${TP_SIZE}"
@@ -224,19 +176,21 @@ mkdir -p ${CACHE_DIR}
 # 训练
 # ========================================
 echo ""
-echo "==> 开始训练 DFlash"
+if [ "${NPROC_PER_NODE}" -gt 1 ] || [ "${NNODES}" -gt 1 ] 2>/dev/null; then
+    echo "==> 开始训练 DFlash (torchrun，与 DFlash++ 一致)"
+    LAUNCHER=(
+        torchrun
+        --nproc_per_node "${NPROC_PER_NODE}"
+        --nnodes "${NNODES}"
+        --node_rank "${NODE_RANK}"
+        --master_addr "${MASTER_ADDR}"
+        --master_port "${MASTER_PORT}"
+    )
+else
+    echo "==> 开始训练 DFlash (python，与 DFlash++ 一致：单进程单节点)"
+    LAUNCHER=(python)
+fi
 echo ""
-
-# torchrun：FSDP/NCCL 需正确 RANK/WORLD_SIZE；单卡/单进程也使用
-#   torchrun --nproc_per_node=1 --nnodes=1 以保证 init_process_group 与多机时一致
-LAUNCHER=(
-    torchrun
-    --nproc_per_node "${NPROC_PER_NODE}"
-    --nnodes "${NNODES}"
-    --node_rank "${NODE_RANK}"
-    --master_addr "${MASTER_ADDR}"
-    --master_port "${MASTER_PORT}"
-)
 
 # 构建可选参数
 OPTIONAL_ARGS=""
