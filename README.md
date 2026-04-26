@@ -69,6 +69,7 @@ We would like to extend our sincere thanks to [Voltage Park](https://www.voltage
 > \# install specforge
 > 
 > uv pip install -v -e . --prerelease=allow
+> uv pip install datasets==4.8.3 pyarrow==23.0.1
 
 ## 📃 Citation
 

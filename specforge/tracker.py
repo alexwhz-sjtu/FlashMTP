@@ -135,9 +135,10 @@ class WandbTracker(Tracker):
                 "name": args.wandb_name,
                 "config": vars(args),
             }
+            # "must" 要求远端已存在同 id 的 run，新实验会报错； "allow" 可新建或续跑
             if hasattr(args, "wandb_run_id") and args.wandb_run_id:
                 init_kwargs["id"] = args.wandb_run_id
-                init_kwargs["resume"] = "must"
+                init_kwargs["resume"] = "allow"
             wandb.init(**init_kwargs)
             self.is_initialized = True
 

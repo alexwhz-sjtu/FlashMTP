@@ -1,4 +1,4 @@
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence, Union
 
 import torch
 from torch import nn
@@ -10,6 +10,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
     FlashAttentionKwargs,
     GradientCheckpointingLayer,
+    Qwen3Attention,
     Qwen3Config,
     Qwen3MLP,
     Qwen3PreTrainedModel,
@@ -40,10 +41,91 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-class Qwen3FlashMTPAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+def stack_hidden_states_for_positions(
+    hidden_states: Union[Sequence[torch.Tensor], torch.Tensor],
+    context_positions: torch.Tensor,
+) -> torch.Tensor:
+    """Gather embed + every decoder layer at context_positions -> (B, N, S, H).
 
-    def __init__(self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str):
+    hidden_states: tuple of (B, T, H) for each of S sources, or (B, T, S, H) stacked.
+    context_positions: (B, N) indices along T.
+    """
+    if isinstance(hidden_states, torch.Tensor) and hidden_states.dim() == 4:
+        b, t, s, d = hidden_states.shape
+        n = context_positions.size(1)
+        b_idx = (
+            torch.arange(b, device=hidden_states.device)[:, None].expand(b, n)
+        )
+        return hidden_states[b_idx, context_positions, :, :]
+    if isinstance(hidden_states, torch.Tensor):
+        raise ValueError("Expected tuple of (B, T, H) or stacked (B, T, S, H).")
+    out = []
+    for h in hidden_states:
+        g = torch.gather(
+            h,
+            1,
+            context_positions.unsqueeze(-1).expand(
+                -1, -1, h.size(-1)
+            ),
+        )
+        out.append(g)
+    return torch.stack(out, dim=2)
+
+
+class CHSQueryFusion(nn.Module):
+    """Depth-axis non-causal self-attn: last slot (top-layer HS) queries all S sources.
+
+    Sequence order is [embed, layer_0, …, layer_{L-1}] with S=L+1. RoPE uses positions
+    0..S-1. The output is the last position's representation (last layer's Q attends
+    to every K/V) and is fed as the single CHS condition token per block.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3Config,
+        num_chs_source_tokens: int,
+        chs_fusion_layer_idx: int = 0,
+    ):
+        super().__init__()
+        d = config.hidden_size
+        self.S = num_chs_source_tokens
+        self.input_layernorm = Qwen3RMSNorm(d, eps=config.rms_norm_eps)
+        # Same Qwen3 self-attn as the draft stack; not causal (no attention mask)
+        self.attn = Qwen3Attention(config, layer_idx=chs_fusion_layer_idx)
+        self.attn.is_causal = False
+        self.rotary_emb = Qwen3RotaryEmbedding(config)
+        self.out_norm = Qwen3RMSNorm(d, eps=config.rms_norm_eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, N, S, d) — embed + each target layer at anchor-1
+        bsz, n, s, d = x.shape
+        if s != self.S:
+            raise ValueError(
+                f"CHSQueryFusion: expected S={self.S} stacked inputs, got {s}."
+            )
+        flat = x.view(bsz * n, s, d)
+        slen = s
+        position_ids = torch.arange(
+            0, slen, device=flat.device, dtype=torch.long
+        ).view(1, -1)
+        position_ids = position_ids.expand(flat.size(0), -1)
+        position_embeddings = self.rotary_emb(flat, position_ids)
+        h = self.input_layernorm(flat)
+        attn_out, _ = self.attn(
+            h,
+            position_embeddings,
+            attention_mask=None,
+            past_key_value=None,
+        )
+        # Last index = final decoder layer; its output is the fusion readout
+        out = attn_out[:, -1, :].view(bsz, n, d)
+        return self.out_norm(out)
+
+
+class Qwen3FlashMTPAttention(nn.Module):
+    """Non-causal self-attn: K/V = context + draft, full RoPE on k."""
+
+    def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -83,8 +165,6 @@ class Qwen3FlashMTPAttention(nn.Module):
             if config.layer_types[layer_idx] == "sliding_attention"
             else None
         )
-        
-        self.chs_concat_mode = chs_concat_mode
 
     def forward(
         self,
@@ -102,28 +182,23 @@ class Qwen3FlashMTPAttention(nn.Module):
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
-        k_ctx = self.k_proj(target_hidden) # (B, N*L, H)  
-
-        k_noise = self.k_proj(hidden_states)  # (B, N*S, H) 
+        k_ctx = self.k_proj(target_hidden)
+        k_noise = self.k_proj(hidden_states)
         v_ctx = self.v_proj(target_hidden)
         v_noise = self.v_proj(hidden_states)
 
-        k = torch.cat([k_ctx, k_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
-        v = torch.cat([v_ctx, v_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
+        k = torch.cat([k_ctx, k_noise], dim=1).view(
+            bsz, ctx_len + q_len, -1, self.head_dim
+        )
+        v = torch.cat([v_ctx, v_noise], dim=1).view(
+            bsz, ctx_len + q_len, -1, self.head_dim
+        )
 
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
 
         cos, sin = position_embeddings
-        
-        # if seq, only pose position_embed on k_noise
-        if self.chs_concat_mode == "seq":
-            k_ctx_part = k[:, :, :ctx_len, :]  
-            k_noise_part = k[:, :, ctx_len:, :]   
-            q, k_noise_part = apply_rotary_pos_emb(q, k_noise_part, cos, sin)
-            k = torch.cat([k_ctx_part, k_noise_part], dim=2)
-        else:
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -149,12 +224,14 @@ class Qwen3FlashMTPAttention(nn.Module):
 
 
 class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str):
+    def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = Qwen3FlashMTPAttention(config=config, layer_idx=layer_idx, chs_concat_mode=chs_concat_mode)
+        self.self_attn = Qwen3FlashMTPAttention(config=config, layer_idx=layer_idx)
         self.mlp = Qwen3MLP(config)
-        self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = Qwen3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.post_attention_layernorm = Qwen3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -171,7 +248,7 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
-        ] = None,  # necessary, but kept here for BC
+        ] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -198,17 +275,25 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
-def extract_context_feature(
-    hidden_states: list[torch.Tensor],
-    layer_ids: Optional[list[int]],
+def extract_stacked_chs(
+    hidden_states: Union[Sequence[torch.Tensor], torch.Tensor],
+    time_indices: torch.Tensor,
 ) -> torch.Tensor:
-    """Extract hidden states from specified layer IDs. """
-    offset = 1
-    selected_states = []
-    for layer_id in layer_ids:
-        selected_states.append(hidden_states[layer_id + offset])
-    target_hidden = torch.cat(selected_states, dim=-1)
-    return target_hidden
+    """Stacked CHS at per-token indices (B, T) from target forward, shape (B, T, S, H)."""
+    if isinstance(hidden_states, torch.Tensor) and hidden_states.dim() == 4:
+        b, t, s, d = hidden_states.shape
+        npos = time_indices.size(1)
+        b_idx = torch.arange(b, device=hidden_states.device)[:, None].expand(b, npos)
+        return hidden_states[b_idx, time_indices, :, :]
+    if isinstance(hidden_states, torch.Tensor):
+        raise ValueError("Expected tuple of (B, T, H) or stacked (B, T, S, H).")
+    out = []
+    for h in hidden_states:
+        g = torch.gather(
+            h, 1, time_indices.unsqueeze(-1).expand(-1, -1, h.size(-1))
+        )
+        out.append(g)
+    return torch.stack(out, dim=2)
 
 
 class FlashMTPDraftModel(Qwen3PreTrainedModel):
@@ -219,39 +304,36 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         super().__init__(config)
         self.config = config
         flashmtp_config = getattr(config, "flashmtp_config", {}) or {}
-        self.chs_concat_mode = flashmtp_config.get("chs_concat_mode", "seq")
+        nsrc = int(
+            flashmtp_config.get(
+                "num_chs_source_tokens",
+                getattr(config, "num_target_layers", 0) + 1,
+            )
+        )
+        self.num_chs_source_tokens = nsrc
+        chs_fusion_layer_idx = int(
+            flashmtp_config.get("chs_fusion_layer_idx", 0)
+        )
         self.layers = nn.ModuleList(
             [
-                Qwen3FlashMTPDecoderLayer(config, layer_idx, self.chs_concat_mode)
+                Qwen3FlashMTPDecoderLayer(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        # target_layer_ids: list of layer indices to extract from target model
-        self.target_layer_ids = flashmtp_config.get(
-            "target_layer_ids",
-            list(range(config.num_target_layers)),
+        self.chs_fusion = CHSQueryFusion(
+            config,
+            nsrc,
+            chs_fusion_layer_idx=chs_fusion_layer_idx,
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
-
-        # For seq concat mode: use Identity (no computation, no parameters)
-        # For feature mode: use Linear projection and RMSNorm
-        if self.chs_concat_mode == "feature":
-            self.fc = nn.Linear(
-                len(self.target_layer_ids) * config.hidden_size,
-                config.hidden_size,
-                bias=False,
-            )
-            self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        else:
-            self.fc = nn.Identity()
-            # self.hidden_norm = nn.Identity()
-            # maybe need norm
-            self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        print_on_rank0(f"self.chs_concat_mode: {self.chs_concat_mode}")
-
+        print_on_rank0(
+            "FlashMTP: num_chs_source_tokens="
+            f"{self.num_chs_source_tokens} (embed+layers), "
+            "CHS fusion=depth self-attn, readout=last layer slot"
+        )
         self.post_init()
 
     def forward(
@@ -264,11 +346,30 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         use_cache: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
-        
         hidden_states = noise_embedding
-        target_hidden = self.hidden_norm(self.fc(target_hidden))
-        # position_embeddings = self.rotary_emb(torch.cat([target_hidden, hidden_states], dim=1), position_ids)
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        if target_hidden is None:
+            raise ValueError("target_hidden is required.")
+        # (B, N, S, H) before fusion
+        target_hidden = self.chs_fusion(target_hidden)
+        # RoPE must cover K/V = [context | draft]. Previously only `hidden_states` (draft)
+        # was used, so cos/sin length did not match concat(k_ctx, k_noise) in attention.
+        bs = self.block_size
+        dlen = hidden_states.size(1)
+        if dlen % bs != 0:
+            raise ValueError(
+                f"Draft sequence length {dlen} must be divisible by block_size {bs}."
+            )
+        n_blocks = dlen // bs
+        if target_hidden.size(1) != n_blocks:
+            raise ValueError(
+                f"Fused target_hidden len {target_hidden.size(1)} != num_blocks {n_blocks}."
+            )
+        # Block i draft starts at position_ids[:, i * bs] (= anchor i); CHS uses anchor-1.
+        first_of_block = position_ids[:, ::bs]
+        ctx_position_ids = (first_of_block - 1).clamp(min=0)
+        pos_full = torch.cat([ctx_position_ids, position_ids], dim=1)
+        h_full = torch.cat([target_hidden, hidden_states], dim=1)
+        position_embeddings = self.rotary_emb(h_full, pos_full)
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
@@ -309,7 +410,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         past_key_values_target = DynamicCache()
         past_key_values_draft = DynamicCache()
 
-        # Prefill stage
         output = target(
             input_ids,
             position_ids=position_ids[:, :num_input_tokens],
@@ -323,12 +423,10 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
             output.logits, temperature
         )
-        target_hidden = extract_context_feature(
-            output.hidden_states, self.target_layer_ids
-        )
+        pre_idx = (num_input_tokens - 1) * torch.ones(1, 1, device=target.device, dtype=torch.long)
+        pre_idx = pre_idx.clamp(min=0)
+        target_hidden = extract_stacked_chs(output.hidden_states, pre_idx)
 
-        # Decode stage
-        acceptance_lengths = []
         start = input_ids.shape[1]
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -339,7 +437,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                     target_hidden=target_hidden,
                     noise_embedding=noise_embedding,
                     position_ids=position_ids[
-                        :, past_key_values_draft.get_seq_length() : start + block_size
+                        :, past_key_values_draft.get_seq_length() : start
+                        + block_size
                     ],
                     past_key_values=past_key_values_draft,
                     use_cache=True,
@@ -372,10 +471,15 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             ]
             start += acceptance_length + 1
             past_key_values_target.crop(start)
-            target_hidden = extract_context_feature(
-                output.hidden_states, self.target_layer_ids
-            )[:, : acceptance_length + 1, :]
-            acceptance_lengths.append(acceptance_length + 1)
+            tlen = int(acceptance_length) + 1
+            tlen = max(tlen, 1)
+            pos = torch.arange(
+                tlen, device=target.device, dtype=torch.long
+            ).view(1, -1)
+            pos = pos.clamp(
+                0, output.hidden_states[0].shape[1] - 1
+            )
+            target_hidden = extract_stacked_chs(output.hidden_states, pos)
             if stop_token_ids is not None and any(
                 stop_token_id in output_ids[:, num_input_tokens:]
                 for stop_token_id in stop_token_ids

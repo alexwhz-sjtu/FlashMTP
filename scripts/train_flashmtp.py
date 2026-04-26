@@ -80,6 +80,21 @@ def parse_args():
         help="Gamma for exponential loss decay weighting (paper Eq.4). "
         "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
     )
+    model_group.add_argument(
+        "--chs-fusion-layer-idx",
+        type=int,
+        default=0,
+        help="Which Qwen3 layer type index to use for CHS Qwen3Attention (sliding window / norm).",
+    )
+    model_group.add_argument(
+        "--chs-concat-mode",
+        type=str,
+        default="feature",
+        choices=["feature", "seq"],
+        help="CHS layout stored in flashmtp_config. 'feature': stacked target layers (embed+decoders) "
+        "at anchor-1 with depth self-attn fusion, one context token per block. "
+        "'seq': not implemented in this tree (multi-token CHS + mask changes required).",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -87,7 +102,6 @@ def parse_args():
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
-    dataset_group.add_argument("--chs-concat-mode", type=str, default="feature")
     dataset_group.add_argument(
         "--build-dataset-num-proc",
         type=int,
@@ -171,20 +185,37 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
 
     if not hasattr(draft_config, "flashmtp_config") or draft_config.flashmtp_config is None:
         draft_config.flashmtp_config = {}
-        
+
+    if args.chs_concat_mode == "seq":
+        raise NotImplementedError(
+            "--chs-concat-mode seq is not supported in this FlashMTP version "
+            "(requires multiple CHS keys per block and block-mask changes). Use --chs-concat-mode feature."
+        )
+
+    target_cfg = AutoConfig.from_pretrained(args.target_model_path)
+    n_chs_default = target_cfg.num_hidden_layers + 1
+    n_chs = int(
+        draft_config.flashmtp_config.get("num_chs_source_tokens", n_chs_default)
+    )
+    draft_config.flashmtp_config["num_chs_source_tokens"] = n_chs
+    draft_config.flashmtp_config["chs_fusion_layer_idx"] = args.chs_fusion_layer_idx
     draft_config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
+    print_on_rank0(f"CHS concat mode: {args.chs_concat_mode}")
 
     draft_model = FlashMTPDraftModel(draft_config).cuda().to(torch.bfloat16)
 
-    target_model.set_capture_layers(draft_model.target_layer_ids)
+    # SGLang: capture embed (0) + every decoder layer
+    target_model.set_capture_layers(
+        list(range(target_cfg.num_hidden_layers + 1))
+    )
 
     print_on_rank0(
         f"Draft config: block_size={draft_config.block_size}, "
         f"num_hidden_layers={draft_config.num_hidden_layers}, "
-        f"num_target_layers={draft_config.num_target_layers}"
+        f"num_chs_source_tokens={n_chs} (embed + {target_cfg.num_hidden_layers} layers)"
     )
     print_on_rank0(
         f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}"
@@ -398,9 +429,7 @@ def main():
 
     draft_model.mask_token_id = mask_token_id
     
-    draft_model.config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
     draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
-    draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
@@ -427,7 +456,6 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
-        chs_concat_mode=args.chs_concat_mode,
     )
 
     flashmtp_model = FSDP(

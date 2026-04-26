@@ -281,12 +281,9 @@ class HFFlashMTPTargetModel(FlashMTPTargetModel):
             use_cache=False,
         )
 
-        # hidden_states[0] = embedding output; hidden_states[i+1] = layer i output
-        # Take all layers except embedding (index 0) and concat in feature dim
-        hidden_states = outputs.hidden_states[1:]
-
+        # Full tuple: [0]=embedding output, [1]..[L] = after each decoder layer
         return FlashMTPTargetOutput(
-            hidden_states=hidden_states,
+            hidden_states=outputs.hidden_states,
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
