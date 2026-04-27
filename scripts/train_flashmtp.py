@@ -492,7 +492,6 @@ def main():
                 input_ids, attention_mask, loss_mask
             )
             
-            # 将元组中的每个 tensor 都移动到 GPU
             hidden_states = tuple(h.cuda() for h in target_output.hidden_states)
             # hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 

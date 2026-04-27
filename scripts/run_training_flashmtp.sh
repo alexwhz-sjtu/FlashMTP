@@ -1,5 +1,5 @@
 #!/bin/bash
-# DFlash 训练启动脚本
+# FlashMTP 训练启动脚本（单目标 CE，无 DFlash++ 的 L_dflash/L_con 等多损失）
 
 set -e
 
@@ -8,6 +8,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
 if [ -f "${PROJECT_DIR}/.venv/bin/activate" ]; then
     source "${PROJECT_DIR}/.venv/bin/activate"
+fi
+
+cd "${PROJECT_DIR}"
+
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --dt) DT="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+DT="${DT:-a800}"
+if [[ "$DT" != "qz" && "$DT" != "a800" ]]; then
+    echo "错误: --dt 须为 qz 或 a800"
+    exit 1
 fi
 
 # ========================================
@@ -32,6 +47,9 @@ CKPT_DIR="${CKPT_DIR:-}"
 DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-400000}"
 ENABLE_THINKING="${ENABLE_THINKING:-on}"
 
+# 草稿层数：默认目录名/ WandB id/ run name 中均带 nlayers${NUM_DRAFT_LAYERS}
+NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
+
 # ========================================
 # 默认参数（通常不需要修改）
 # ========================================
@@ -41,8 +59,20 @@ MASTER_PORT="${MASTER_PORT:-29501}"
 TP_SIZE="${TP_SIZE:-1}"
 DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
 
-# 目标模型路径
-TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
+if [ "$DT" = "qz" ]; then
+    # export NNODES=2
+    # export NODE_RANK=${RANK:-0}
+    export WANDB_MODE=offline
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
+else
+    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
+fi
+
+
 TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
 
 # 训练参数
@@ -52,16 +82,10 @@ LEARNING_RATE="${LEARNING_RATE:-6e-4}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
-# 数据目录
-TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_400000_len_4096/nemotron_think_400000_train_regen.jsonl}"
-
-# TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
-OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}}"
 CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 
 # 模型参数
-NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
@@ -74,9 +98,10 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-5000}"
 # Tracker 参数
 REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training}"
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}}"   # 离线子目录名称 (如: my_run_001，生成 offline-run-my_run_001)
+# 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DT}_nlayers${NUM_DRAFT_LAYERS}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}}"
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}"
@@ -91,6 +116,7 @@ BUILD_DATASET_NUM_PROC="${BUILD_DATASET_NUM_PROC:-8}"
 echo "=========================================="
 echo "FlashMTP 训练启动脚本"
 echo "=========================================="
+echo "运行环境: --dt ${DT} (qz | a800)"
 echo "数据特征:"
 echo "  样本数量: ${DATA_NUM_SAMPLES}"
 echo "  思考模式: ${ENABLE_THINKING}"
@@ -126,8 +152,11 @@ echo "------------------------------------------"
 echo "Tracker: ${REPORT_TO}"
 if [ "${REPORT_TO}" = "wandb" ]; then
     echo "  WandB目录: ${WANDB_DIR}"
+    if [ -n "${WANDB_RUN_NAME}" ]; then
+        echo "  WandB run 名称: ${WANDB_RUN_NAME}"
+    fi
     if [ -n "${WANDB_RUN_ID}" ]; then
-        echo "  WandB运行ID: ${WANDB_RUN_ID} (离线子目录: offline-run-${WANDB_RUN_ID})"
+        echo "  WandB run id: ${WANDB_RUN_ID} (离线: offline-run-${WANDB_RUN_ID})"
     fi
 fi
 echo "=========================================="
@@ -156,11 +185,8 @@ echo ""
 echo "==> 开始训练 FlashMTP"
 echo ""
 
-if [ "${NPROC_PER_NODE}" -gt 1 ]; then
-    LAUNCHER=(torchrun --nproc_per_node "${NPROC_PER_NODE}" --master_port "${MASTER_PORT}")
-else
-    LAUNCHER=(python)
-fi
+# train_flashmtp.py 始终 init_distributed()，需 torchrun 提供 RANK/WORLD_SIZE/LOCAL_RANK
+LAUNCHER=(torchrun --nproc_per_node "${NPROC_PER_NODE}" --master_port "${MASTER_PORT}")
 
 # 构建可选参数
 OPTIONAL_ARGS=""
@@ -248,8 +274,8 @@ echo "=========================================="
 echo "模型保存在: ${OUTPUT_DIR}"
 echo ""
 echo "使用示例："
-echo "  from specforge.modeling.draft.dflash import DFlashDraftModel"
-echo "  draft_model = DFlashDraftModel.from_pretrained('${OUTPUT_DIR}/epoch_${NUM_EPOCHS}_step_<step>')"
+echo "  from specforge.modeling.draft.flashmtp import FlashMTPDraftModel"
+echo "  draft_model = FlashMTPDraftModel.from_pretrained('${OUTPUT_DIR}/epoch_${NUM_EPOCHS}_step_<step>')"
 echo ""
 echo "运行推理："
 echo "  python benchmark.py --draft-model ${OUTPUT_DIR}/epoch_${NUM_EPOCHS}_step_<step>"
