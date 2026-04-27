@@ -101,7 +101,7 @@ WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
 WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DT}_nlayers${NUM_DRAFT_LAYERS}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}}"
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}}"
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}"
