@@ -121,6 +121,6 @@ python scripts/regenerate_train_data.py \
 cd /inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP_v1.4 && \
 mkdir -p whz_mtp_logs && \
 export NUM_EPOCHS=18 && \
-export NUM_DRAFT_LAYERS=5 && \
+export NUM_DRAFT_LAYERS=7 && \
 bash scripts/run_training_flashmtp.sh --dt qz \
   > "whz_mtp_logs/train_flashmtp_qz_dist_$(date +%Y%m%d_%H%M%S).log" 2>&1
