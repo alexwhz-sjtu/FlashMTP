@@ -201,3 +201,5 @@ wandb/
 .DS_Store
 
 log.txt
+
+model_answer/
