@@ -117,3 +117,10 @@ python scripts/regenerate_train_data.py \
     --max-tokens 24000 \
     --enable-thinking \
     --output-file-path ./cache/data/regen_data/nemotron_test/nemotron_think_on_samples_test_qwen3.5_9b_regen.jsonl
+
+cd /inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP_v1.4 && \
+mkdir -p whz_mtp_logs && \
+export NUM_EPOCHS=18 && \
+export NUM_DRAFT_LAYERS=5 && \
+bash scripts/run_training_flashmtp.sh --dt qz \
+  > "whz_mtp_logs/train_flashmtp_qz_dist_$(date +%Y%m%d_%H%M%S).log" 2>&1

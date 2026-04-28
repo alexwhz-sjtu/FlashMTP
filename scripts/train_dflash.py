@@ -107,7 +107,8 @@ def parse_args():
         "--ckpt-dir",
         type=str,
         default=None,
-        help="Directory of the checkpoint to resume training from",
+        help="Direct path to one checkpoint folder (weights, config, training_state.pt, etc.). "
+        "If set, used as-is; no automatic last-checkpoint scan under --output-dir.",
     )
 
     output_group = parser.add_argument_group("output")
@@ -347,16 +348,14 @@ def main():
     if args.ckpt_dir is not None:
         if os.path.isdir(args.ckpt_dir):
             draft_model_last_checkpoint = args.ckpt_dir
-            print_on_rank0(f"Using checkpoint: {draft_model_last_checkpoint}")
+            print_on_rank0(f"Using checkpoint dir: {draft_model_last_checkpoint}")
         else:
             raise ValueError(
                 f"Provided ckpt dir {args.ckpt_dir} is not a valid directory."
             )
 
-    if args.resume and os.path.isdir(args.output_dir):
-        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(
-            args.output_dir, prefix=r"epoch_\d+_step"
-        )
+    elif args.resume and os.path.isdir(args.output_dir):
+        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
         print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
 
     resume_state = None

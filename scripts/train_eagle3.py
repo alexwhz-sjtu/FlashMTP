@@ -395,8 +395,8 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
                 f"Provided base model dir {args.ckpt_dir} is not a valid directory."
             )
 
-    # detecting last ckpt for draft model
-    if args.resume and os.path.isdir(args.output_dir):
+    # detecting last ckpt under output_dir only when ckpt-dir was not specified
+    elif args.resume and os.path.isdir(args.output_dir):
         print_on_rank0(args.output_dir)
         draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
         print(f"Last checkpoint detected: {draft_model_last_checkpoint}")

@@ -57,23 +57,26 @@ def print_with_rank(message):
 
 
 def print_args_with_dots(args):
-    if dist.get_rank() == 0:
-        args_dict = vars(args)
-        max_key_length = max(len(key) for key in args_dict.keys())
-        total_width = 50
+    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+        return
+    args_dict = vars(args)
+    max_key_length = max(len(key) for key in args_dict.keys())
+    total_width = 50
 
-        print("\n -----------【args】-----------")
-        for key, value in args_dict.items():
-            key_str = f"{key:<{max_key_length}}"
-            value_str = str(value)
-            dot_count = total_width - len(key_str) - len(value_str)
-            dot_fill = "·" * dot_count
-            print(f"{key_str} {dot_fill} {value_str}")
+    print("\n -----------【args】-----------")
+    for key, value in args_dict.items():
+        key_str = f"{key:<{max_key_length}}"
+        value_str = str(value)
+        dot_count = total_width - len(key_str) - len(value_str)
+        dot_fill = "·" * dot_count
+        print(f"{key_str} {dot_fill} {value_str}")
 
 
 def print_on_rank0(message):
-    if dist.get_rank() == 0:
-        logger.info(message)
+    if dist.is_available() and dist.is_initialized():
+        if dist.get_rank() != 0:
+            return
+    logger.info(message)
 
 
 def get_last_checkpoint(folder, prefix="epoch"):
@@ -85,12 +88,12 @@ def get_last_checkpoint(folder, prefix="epoch"):
         prefix: The prefix for checkpoint directories, default is "epoch".
 
     Returns:
-        tuple: (checkpoint_path, epoch, step)
-               - Returns (None, None, None) if no checkpoint is found.
+        tuple: (checkpoint_path, (epoch, step))
+               - Returns (None, None) if no checkpoint is found (same arity as success).
                - step is 0 if not present in the directory name.
     """
     content = os.listdir(folder)
-    # Match: epoch_X or epoch_X_step_Y
+    # Match: epoch_X or epoch_X_step_Y (prefix should be e.g. "epoch", not a regex)
     _re_checkpoint = re.compile(rf"^{re.escape(prefix)}_(\d+)(?:_step_(\d+))?$")
 
     checkpoints = [
@@ -101,7 +104,7 @@ def get_last_checkpoint(folder, prefix="epoch"):
     ]
 
     if len(checkpoints) == 0:
-        return None, None, None
+        return None, None
 
     # Sort key: (epoch, step), step=0 when not present
     def sort_key(x):

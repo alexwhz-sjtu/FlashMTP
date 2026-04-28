@@ -1,4 +1,4 @@
-from typing import Callable, Optional, Sequence, Union
+from typing import Callable, List, Optional, Sequence, Union
 
 import torch
 from torch import nn
@@ -296,6 +296,18 @@ def extract_stacked_chs(
     return torch.stack(out, dim=2)
 
 
+def _merged_flashmtp_config(config: Qwen3Config) -> dict:
+    """Train 写入 flashmtp_config；部分 checkpoint 仅存 dflashconfig，需合并。"""
+    fc = getattr(config, "flashmtp_config", None) or {}
+    dc = getattr(config, "dflashconfig", None) or {}
+    if not fc and not dc:
+        raw = config.to_dict() if hasattr(config, "to_dict") else {}
+        fc = raw.get("flashmtp_config") or {}
+        dc = raw.get("dflashconfig") or {}
+    merged = {**(dict(dc) if dc else {}), **(dict(fc) if fc else {})}
+    return merged
+
+
 class FlashMTPDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3FlashMTPDecoderLayer"]
@@ -303,7 +315,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
     def __init__(self, config) -> None:
         super().__init__(config)
         self.config = config
-        flashmtp_config = getattr(config, "flashmtp_config", {}) or {}
+        flashmtp_config = _merged_flashmtp_config(config)
         nsrc = int(
             flashmtp_config.get(
                 "num_chs_source_tokens",
@@ -391,8 +403,15 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         max_new_tokens: int,
         stop_token_ids: list[int],
         temperature: float,
+        accept_lengths_out: Optional[List[int]] = None,
     ):
         self.eval()
+        if self.mask_token_id is None:
+            raise ValueError(
+                "mask_token_id is None: set config.flashmtp_config['mask_token_id'] "
+                "or config.dflashconfig['mask_token_id'] (training checkpoint)."
+            )
+        dev = input_ids.device
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
 
@@ -401,15 +420,12 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             (1, max_length + block_size),
             self.mask_token_id,
             dtype=torch.long,
-            device=target.device,
+            device=dev,
         )
-        position_ids = torch.arange(
-            output_ids.shape[1], device=target.device
-        ).unsqueeze(0)
+        position_ids = torch.arange(output_ids.shape[1], device=dev).unsqueeze(0)
 
         past_key_values_target = DynamicCache()
-        past_key_values_draft = DynamicCache()
-
+        # 与训练一致：每个投机块单独一次 draft 前向，不用 KV cache（训练为整段 N*bs 单次前向）
         output = target(
             input_ids,
             position_ids=position_ids[:, :num_input_tokens],
@@ -423,7 +439,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
             output.logits, temperature
         )
-        pre_idx = (num_input_tokens - 1) * torch.ones(1, 1, device=target.device, dtype=torch.long)
+        pre_idx = (num_input_tokens - 1) * torch.ones(1, 1, device=dev, dtype=torch.long)
         pre_idx = pre_idx.clamp(min=0)
         target_hidden = extract_stacked_chs(output.hidden_states, pre_idx)
 
@@ -432,20 +448,20 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
             noise_embedding = target.model.embed_tokens(block_output_ids)
+            # 与 OnlineFlashMTPModel._create_position_ids 一致：块内为 [anchor, anchor+1, ...]
+            block_position_ids_for_draft = position_ids[
+                :, start : start + block_size
+            ]
             draft_logits = target.lm_head(
                 self(
                     target_hidden=target_hidden,
                     noise_embedding=noise_embedding,
-                    position_ids=position_ids[
-                        :, past_key_values_draft.get_seq_length() : start
-                        + block_size
-                    ],
-                    past_key_values=past_key_values_draft,
-                    use_cache=True,
+                    position_ids=block_position_ids_for_draft,
+                    past_key_values=None,
+                    use_cache=False,
                     is_causal=False,
                 )[:, -block_size + 1 :, :]
             )
-            past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = sample(draft_logits)
 
             output = target(
@@ -463,6 +479,10 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 .sum(dim=1)[0]
                 .item()
             )
+            # 与 DFlash/eval 一致：连续接受的 draft 位置数 + 块首 seed，记为一步的「接收长度」
+            accept_len_report = int(acceptance_length) + 1
+            if accept_lengths_out is not None:
+                accept_lengths_out.append(accept_len_report)
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
                 :, : acceptance_length + 1
             ]
@@ -471,15 +491,14 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             ]
             start += acceptance_length + 1
             past_key_values_target.crop(start)
-            tlen = int(acceptance_length) + 1
-            tlen = max(tlen, 1)
-            pos = torch.arange(
-                tlen, device=target.device, dtype=torch.long
-            ).view(1, -1)
-            pos = pos.clamp(
-                0, output.hidden_states[0].shape[1] - 1
+            # 下一块的 CHS 对应新 anchor 的前一位置：即本步 target 块内最后采纳位置（与训练 context=anchor-1 对齐）
+            hs_len = output.hidden_states[0].shape[1]
+            last_chunk_idx = min(int(acceptance_length), hs_len - 1)
+            last_chunk_idx = max(last_chunk_idx, 0)
+            target_hidden = extract_stacked_chs(
+                output.hidden_states,
+                torch.tensor([[last_chunk_idx]], device=dev, dtype=torch.long),
             )
-            target_hidden = extract_stacked_chs(output.hidden_states, pos)
             if stop_token_ids is not None and any(
                 stop_token_id in output_ids[:, num_input_tokens:]
                 for stop_token_id in stop_token_ids
