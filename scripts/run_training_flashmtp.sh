@@ -29,16 +29,29 @@ fi
 # 主要训练参数
 # ========================================
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+if [ -n "${PET_NPROC_PER_NODE}" ]; then
+    NPROC_PER_NODE="${PET_NPROC_PER_NODE}"
+else
+    NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+fi
+NNODES="${PET_NNODES:-${NNODES:-1}}"
+NODE_RANK="${PET_NODE_RANK:-${NODE_RANK:-0}}"
+MASTER_ADDR="${MASTER_ADDR:-${PET_MASTER_ADDR:-127.0.0.1}}"
+MASTER_PORT="${MASTER_PORT:-${PET_MASTER_PORT:-29502}}"
 
-NUM_EPOCHS="${NUM_EPOCHS:-6}"
+if [ "${NNODES}" -gt 1 ] 2>/dev/null && { [ "${MASTER_ADDR}" = "127.0.0.1" ] || [ "${MASTER_ADDR}" = "localhost" ]; }; then
+    echo "错误: 多机训练 (NNODES=${NNODES}) 须设置 MASTER_ADDR 或 PET_MASTER_ADDR 为可互通的主节点地址。" >&2
+    exit 1
+fi
+export MASTER_ADDR
+export MASTER_PORT
+
+NUM_EPOCHS="${NUM_EPOCHS:-18}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
 
-# 恢复训练
-RESUME="${RESUME:-}"
-CKPT_DIR="${CKPT_DIR:-}"
+NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-7}"
 
 # ========================================
 # 主要数据集参数
@@ -57,11 +70,9 @@ TP_SIZE="${TP_SIZE:-1}"
 DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
 
 if [ "$DT" = "qz" ]; then
-    # export NNODES=2
-    # export NODE_RANK=${RANK:-0}
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/DFlash_pp_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_lbase_${DFLASH_LOSS_WEIGHT}_lcon_${COMPLETION_LOSS_WEIGHT}_lK${LCON_MIN_PREFIX_LEN}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v1.4_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
@@ -71,6 +82,9 @@ fi
 
 
 TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
+# 恢复训练
+RESUME="${RESUME:-True}"
+CKPT_DIR="${CKPT_DIR:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP_v1.4/cache/models/FlashMTP_v1.4_nlayers7_sample_400000_think_on_qwen3_8b_maxlen4096_epochs18_nnodes4/epoch_13_step_140000}"
 
 # 训练参数
 BATCH_SIZE="${BATCH_SIZE:-1}"
@@ -83,7 +97,7 @@ EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
 CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 
 # 模型参数
-NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
+NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-7}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
