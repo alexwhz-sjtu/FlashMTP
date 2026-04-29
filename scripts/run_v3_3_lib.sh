@@ -86,9 +86,9 @@ v33_export_common_training_env() {
   ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}" # 草案 attention：需与 flex BlockMask 一致时用 flex_attention
   TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"       # hf | sglang
   LEARNING_RATE_MDLM="${LEARNING_RATE_MDLM:-6e-4}"
-  LEARNING_RATE_STREAK="${LEARNING_RATE_STREAK:-4e-4}"     # Streak 阶段通常可略低于 MDLM
+  LEARNING_RATE_STREAK="${LEARNING_RATE_STREAK:-6e-4}"     # Streak 阶段通常可略低于 MDLM
   STREAK_WEIGHT="${STREAK_WEIGHT:-1.0}"                    # conf-streak 主 loss 系数
-  STREAK_CE_WEIGHT="${STREAK_CE_WEIGHT:-0.2}"              # 逐位置 CE 辅助项系数
+  STREAK_CE_WEIGHT="${STREAK_CE_WEIGHT:-0.4}"              # 逐位置 CE 辅助项系数
 
   export NUM_EPOCHS NUM_EPOCHS_MDLM NUM_EPOCHS_STREAK MAX_LENGTH DATA_NUM_SAMPLES ENABLE_THINKING NUM_DRAFT_LAYERS BLOCK_SIZE NUM_ANCHORS
   export BATCH_SIZE ACCUMULATION_STEPS TP_SIZE DIST_TIMEOUT CHAT_TEMPLATE REPORT_TO
@@ -105,13 +105,14 @@ v33_export_paths_for_dt() {
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
     CACHE_ROOT="${CACHE_ROOT:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
   else
-    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+    export DATA_NUM_SAMPLES=40000
+    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
-    CACHE_ROOT="${CACHE_ROOT:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
+    CACHE_ROOT="${CACHE_ROOT:-./cache/data/regen_data/nemotron_40000}"
   fi
 
   STAMP="v33_${DT}_nlayers${NUM_DRAFT_LAYERS}_bs${BLOCK_SIZE}_samples${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_maxlen${MAX_LENGTH}_kl_${KL_WEIGHT}_epm${NUM_EPOCHS_MDLM}_eps${NUM_EPOCHS_STREAK}"
-  STREAK_STAMP="${STAMP}_sw${STREAK_WEIGHT}_sce${STREAK_CE_WEIGHT}"
+  STREAK_STAMP="${STAMP}_lst${STREAK_WEIGHT}_lce${STREAK_CE_WEIGHT}"
   export STAMP
   export STREAK_STAMP
 

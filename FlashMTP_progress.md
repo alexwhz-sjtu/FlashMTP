@@ -192,7 +192,7 @@ $$
 \right]
 $$
 
-该形式恒为非负，并且相对 $-\sum_m\exp(\cdot)$ 只多了常数 $\gamma$，所以优化方向等价：最小化它仍然是在最大化期望 streak score。
+实现中会对上述和式除以实际参与 streak 的前缀项数；完整块时该长度为 $B-1$（排除 anchor slot）。该形式恒为非负，并且相对 $-\sum_m\exp(\cdot)$ 只多了常数，优化方向等价：最小化它仍然是在最大化期望 streak score。
 
 ---
 **6. 混合loss**  
@@ -204,7 +204,7 @@ $$
 + \lambda_{\text{ce}}\mathcal{L}_{\text{CE}}
 $$
 
-$\mathcal{L}_{\text{CE}}$ 对块内除 anchor 外的每个有效位置单独计算平均 CE，不加位置权重，也不加置信度权重；主要目标仍由 $\mathcal{L}_{\text{conf-streak}}$ 控制。
+$\mathcal{L}_{\text{CE}}$ 对块内除 anchor 外的每个有效位置单独计算平均 CE，并同样除以实际参与 CE 的位置数（完整块为 $B-1$），不加位置权重，也不加置信度权重；主要目标仍由 $\mathcal{L}_{\text{conf-streak}}$ 控制。
 
 目标：在固定 $p$ 下拉高与目标续写一致的 **长 streak**，而非只对齐首 token。
 
