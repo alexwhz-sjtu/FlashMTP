@@ -185,9 +185,10 @@ class FlashMTPStreakModel(nn.Module):
         prefix_valid = valid_tail.cumprod(dim=-1)
         prefix_log = (lp_tail * valid_tail).cumsum(dim=-1)
         streak_score = prefix_log.exp() * prefix_valid
-        denom_streak = prefix_valid.sum() + 1e-6
-        # Positive form averaged over supervised prefix positions (normally B - 1).
-        loss_streak = (prefix_valid - streak_score).sum() / denom_streak
+        block_has_streak = (prefix_valid.sum(dim=-1) > 0).float()
+        valid_block_count = block_has_streak.sum() + 1e-6
+        # Positive form averaged over valid blocks, not over B - 1 positions.
+        loss_streak = (prefix_valid - streak_score).sum() / valid_block_count
 
         if self.ce_aux_weight > 0:
             logits_blk = logits.view(bsz, n, bs, v)

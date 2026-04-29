@@ -112,7 +112,7 @@ v33_export_paths_for_dt() {
   fi
 
   STAMP="v33_${DT}_nlayers${NUM_DRAFT_LAYERS}_bs${BLOCK_SIZE}_samples${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_maxlen${MAX_LENGTH}_kl_${KL_WEIGHT}_epm${NUM_EPOCHS_MDLM}_eps${NUM_EPOCHS_STREAK}"
-  STREAK_STAMP="${STAMP}_lst${STREAK_WEIGHT}_lce${STREAK_CE_WEIGHT}"
+  STREAK_STAMP="${STAMP}_wst${STREAK_WEIGHT}_wce${STREAK_CE_WEIGHT}"
   export STAMP
   export STREAK_STAMP
 

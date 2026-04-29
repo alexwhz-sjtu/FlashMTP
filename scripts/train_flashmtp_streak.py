@@ -181,8 +181,6 @@ def main():
                         "train/loss": lf.item(),
                         "train/streak_loss": sf.item(),
                         "train/ce_loss": cf.item(),
-                        "train/streak_weight": args.streak_weight,
-                        "train/streak_ce_weight": args.streak_ce_weight,
                         "train/acc": af.item(),
                         "train/lr": optimizer.get_learning_rate(),
                     },
