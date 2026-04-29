@@ -1,5 +1,5 @@
 # coding=utf-8
-"""FlashMTP v3.3 Phase-2: streak surrogate; loss ≈ −mean_blocks ∑_{m≥1} exp(∑_{j≤m} w_j log q_j)."""
+"""FlashMTP v3.3 Phase-2: positive confidence-aware streak surrogate."""
 
 
 from typing import Tuple
@@ -17,7 +17,11 @@ from specforge.core.flashmtp import CHS_LEN_PER_BLOCK, create_flashmtp_block_mas
 
 
 class FlashMTPStreakModel(nn.Module):
-    """块首为真实 token 嵌入、块内其余为 [MASK]；最小化 −∑_m exp(cum_m)（与 MDLM 一致：anchor 不监督、推理对齐）。"""
+    """块首为真实 token 嵌入、块内其余为 [MASK]。
+
+    Streak 项用 count - score 写成正数形式，等价于最大化 streak score；
+    confidence 权重只缩放 streak 梯度。CE_aux 是逐位置平均 CE，不做位置/置信度调权。
+    """
 
     def __init__(
         self,
@@ -29,6 +33,8 @@ class FlashMTPStreakModel(nn.Module):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         log_prob_min: float = -40.0,
+        streak_weight: float = 1.0,
+        ce_aux_weight: float = 0.0,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -39,6 +45,8 @@ class FlashMTPStreakModel(nn.Module):
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.log_prob_min = log_prob_min
+        self.streak_weight = streak_weight
+        self.ce_aux_weight = ce_aux_weight
 
     def _sample_anchor_positions(
         self,
@@ -101,7 +109,7 @@ class FlashMTPStreakModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states,
         loss_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
@@ -155,9 +163,9 @@ class FlashMTPStreakModel(nn.Module):
             .clamp(min=self.log_prob_min)
             .view(bsz, n, bs)
         )
-        # 块内仅 pos_in_block>0 参与 streak/acc；m=0 对应块首，不参与外层 sum（避免 exp(0) 常数项）。
+        # 块内仅 pos_in_block>0 参与 streak/CE/acc；m=0 对应块首，不参与外层 sum。
         pos_in_block_ok = (label_offsets > 0).float()
-        w = (
+        valid_pos = (
             block_keep_mask.unsqueeze(-1)
             .expand(-1, -1, bs)
             .float()
@@ -165,15 +173,45 @@ class FlashMTPStreakModel(nn.Module):
             * (lm_g > 0.5).float()
             * pos_in_block_ok
         )
-        weighted_lp = lp * w
-        # streak：对 m≥1 累加 exp(cum[m])；cum 在 j=0 处已为 0，故从索引 1 起求和。
-        cum = weighted_lp.cumsum(dim=-1)
-        streak_sum = cum.exp()[..., 1:].sum(dim=-1)
-        loss = -streak_sum.mean()
+
+        # confidence-aware straight-through log-prob:
+        # forward(lp_tilde) == lp, backward(d lp_tilde / d lp) == conf_weight.
+        conf = lp.detach().exp()
+        conf_weight = torch.sigmoid(-10.0 * (conf - 0.6))
+        lp_tilde = lp.detach() + conf_weight * (lp - lp.detach())
+
+        lp_tail = lp_tilde[..., 1:]
+        valid_tail = valid_pos[..., 1:]
+        prefix_valid = valid_tail.cumprod(dim=-1)
+        prefix_log = (lp_tail * valid_tail).cumsum(dim=-1)
+        streak_score = prefix_log.exp() * prefix_valid
+        block_has_streak = (prefix_valid.sum(dim=-1) > 0).float()
+        valid_block_count = block_has_streak.sum() + 1e-6
+        # Positive form: count - score differs from -score by a constant.
+        loss_streak = (prefix_valid - streak_score).sum() / valid_block_count
+
+        if self.ce_aux_weight > 0:
+            logits_blk = logits.view(bsz, n, bs, v)
+            ce = F.cross_entropy(
+                logits_blk.float().reshape(-1, v),
+                target_ids.reshape(-1),
+                reduction="none",
+            ).reshape(bsz, n, bs)
+            denom_ce = valid_pos.sum() + 1e-6
+            loss_ce = (ce * valid_pos).sum() / denom_ce
+        else:
+            loss_ce = torch.zeros((), device=device, dtype=loss_streak.dtype)
+
+        loss_total = self.streak_weight * loss_streak + self.ce_aux_weight * loss_ce
 
         with torch.no_grad():
             pred = torch.argmax(log_probs, dim=-1).view(bsz, n, bs)
-            correct = (pred == target_ids) & (w > 0.5)
-            acc = correct.sum().float() / (w > 0.5).sum().float().clamp(min=1.0)
+            correct = (pred == target_ids) & (valid_pos > 0.5)
+            acc = correct.sum().float() / (valid_pos > 0.5).sum().float().clamp(min=1.0)
 
-        return loss, acc
+        return (
+            loss_total,
+            acc,
+            loss_streak.detach(),
+            loss_ce.detach(),
+        )

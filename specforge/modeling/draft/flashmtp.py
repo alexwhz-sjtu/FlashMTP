@@ -316,13 +316,13 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         super().__init__(config)
         self.config = config
         flashmtp_config = _merged_flashmtp_config(config)
-        nsrc = int(
+        num_chs = int(
             flashmtp_config.get(
                 "num_chs_source_tokens",
                 getattr(config, "num_target_layers", 0) + 1,
             )
         )
-        self.num_chs_source_tokens = nsrc
+        self.num_chs_source_tokens = num_chs
         chs_fusion_layer_idx = int(
             flashmtp_config.get("chs_fusion_layer_idx", 0)
         )
@@ -334,7 +334,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         )
         self.chs_fusion = CHSQueryFusion(
             config,
-            nsrc,
+            num_chs,
             chs_fusion_layer_idx=chs_fusion_layer_idx,
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

@@ -44,6 +44,18 @@ def parse_args():
         help="Phase-1 MDLM checkpoint dir (epoch_*_step_*). If unset, train from random init.",
     )
     g.add_argument("--log-prob-min", type=float, default=-40.0)
+    g.add_argument(
+        "--streak-weight",
+        type=float,
+        default=1.0,
+        help="正数 conf-streak loss 系数；通常作为主 loss。",
+    )
+    g.add_argument(
+        "--streak-ce-weight",
+        type=float,
+        default=0.0,
+        help="块内除 anchor 外的逐位置平均 CE 系数；0 关闭。",
+    )
     return p.parse_args()
 
 
@@ -82,8 +94,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
     )
 
-    # 前向核心（FlashMTPStreakModel）：推测块整段视为 [MASK]；用目标隐状态建轨迹，
-    # 最大化 streak 代理目标（对块内 log q 的累加与再指数化，在有效锚点、loss_mask 内）。
+    # 前向核心：块首 clean，其余 [MASK]；conf-streak 是主项，CE_aux 是不调权逐位置辅助项。
     wrapper = FlashMTPStreakModel(
         draft_model=draft_model,
         target_lm_head=target_components.lm_head,
@@ -93,6 +104,8 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         log_prob_min=args.log_prob_min,
+        streak_weight=args.streak_weight,
+        ce_aux_weight=args.streak_ce_weight,
     )
     wrapper = FSDP(
         wrapper,
@@ -142,8 +155,8 @@ def main():
             to = target_model.generate_flashmtp_data(input_ids, attention_mask, loss_mask)
             hidden_states = tuple(h.cuda() for h in to.hidden_states)
 
-            # 草案 streak 前向：损失为 streak 目标的负向（越高越好 → loss 越小）。
-            loss, acc = wrapper(
+            # 总损失 = streak_weight * conf-streak + streak_ce_weight * CE_aux。
+            loss, acc, loss_streak, loss_ce = wrapper(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
@@ -153,15 +166,32 @@ def main():
                 optimizer.step()
 
             if global_step % args.log_interval == 0:
-                lf, af = loss.detach().clone(), acc.detach().clone()
+                lf = loss.detach().clone()
+                af = acc.detach().clone()
+                sf = loss_streak.detach().clone()
+                cf = loss_ce.detach().clone()
                 dist.all_reduce(lf)
                 dist.all_reduce(af)
-                lf, af = lf / dist.get_world_size(), af / dist.get_world_size()
+                dist.all_reduce(sf)
+                dist.all_reduce(cf)
+                ws = float(dist.get_world_size())
+                lf, af, sf, cf = lf / ws, af / ws, sf / ws, cf / ws
                 tracker.log(
-                    {"train/loss": lf.item(), "train/acc": af.item(), "train/lr": optimizer.get_learning_rate()},
+                    {
+                        "train/loss": lf.item(),
+                        "train/streak_loss": sf.item(),
+                        "train/ce_loss": cf.item(),
+                        "train/streak_weight": args.streak_weight,
+                        "train/streak_ce_weight": args.streak_ce_weight,
+                        "train/acc": af.item(),
+                        "train/lr": optimizer.get_learning_rate(),
+                    },
                     step=global_step,
                 )
-                print_on_rank0(f"step {global_step} loss={lf.item():.4f} acc={af.item():.4f}")
+                print_on_rank0(
+                    f"step {global_step} loss={lf.item():.4f} streak={sf.item():.4f} "
+                    f"ce={cf.item():.4f} acc={af.item():.4f}"
+                )
 
             if dist.get_rank() == 0:
                 dt = time.time() - last_t

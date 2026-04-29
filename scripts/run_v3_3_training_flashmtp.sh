@@ -52,7 +52,15 @@ if [[ -z "$last" || ! -d "$last" ]]; then
 fi
 export FLASHMTP_V33_INIT_CKPT="$last"
 
-echo "==> Phase 2: Streak (init $FLASHMTP_V33_INIT_CKPT)"
+STREAK_FROM_SCRATCH="${STREAK_FROM_SCRATCH:-0}"
+STREAK_CE_WEIGHT="${STREAK_CE_WEIGHT:-0}"
+STREAK_INIT_ARGS=()
+if [[ "${STREAK_FROM_SCRATCH}" == "1" ]]; then
+  echo "==> Phase 2: Streak（STREAK_FROM_SCRATCH=1，不加载 MDLM 权重）"
+else
+  echo "==> Phase 2: Streak (init $FLASHMTP_V33_INIT_CKPT)"
+  STREAK_INIT_ARGS=(--init-ckpt "$FLASHMTP_V33_INIT_CKPT")
+fi
 unset WANDB_RUN_NAME WANDB_RUN_ID || true
 v33_wandb_defaults streak
 v33_common_py_args streak
@@ -70,7 +78,8 @@ unset V33_MASTER_PORT_OVERRIDE
   --output-dir "$FLASHMTP_V33_STREAK_OUT" \
   --cache-dir "$CACHE_ROOT/streak_process" \
   --learning-rate "$LEARNING_RATE_STREAK" \
-  --init-ckpt "$FLASHMTP_V33_INIT_CKPT" \
+  --streak-ce-weight "$STREAK_CE_WEIGHT" \
+  "${STREAK_INIT_ARGS[@]}" \
   "${V33_PY_EXTRA[@]}"
 
 echo "完成。Streak 模型目录: $FLASHMTP_V33_STREAK_OUT"
