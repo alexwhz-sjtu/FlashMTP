@@ -19,7 +19,7 @@ def kl_to_teacher(
     teacher_logits: torch.Tensor,
     kl_topk: int,
 ) -> torch.Tensor:
-    """KL(teacher || student) averaged over leading dimensions. If kl_topk in (0, V), restrict to teacher top-k."""
+    """KL(teacher‖student)，对 batch 维做 batchmean；kl_topk∈(0,V) 时只在教师 top-k 子空间上算，省显存。"""
     s = student_logits.float()
     t = teacher_logits.float()
     v = s.size(-1)
@@ -53,7 +53,7 @@ class FlashMTPMDLMModel(nn.Module):
         block_size: int = 16,
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
-        mask_ratio_min: float = 0.5,
+        mask_ratio_min: float = 0.1,
         mask_ratio_max: float = 1.0,
         kl_weight: float = 0.0,
         kl_topk: int = 0,
@@ -79,6 +79,7 @@ class FlashMTPMDLMModel(nn.Module):
         loss_mask: torch.Tensor,
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 在可监督前缀内随机抽锚点起点；每个起点标定一块 [p, p+bs)；输出 anchors 与块级有效 mask。
         bs = self.block_size
         bsz = loss_mask.shape[0]
         max_anchor = max(seq_len - bs, 0)
@@ -119,6 +120,7 @@ class FlashMTPMDLMModel(nn.Module):
         loss_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns (noise_embeddings (B, N*bs, H), ce_mask (B, N, bs) bool)."""
+        # 每块独立采样掩码率；仅对 loss_mask 内位置可置 MASK；若某行无掩码则强制掩 1 个（保证 CE 有监督）。
         bsz, seq_len = input_ids.shape
         n = anchor_positions.shape[1]
         bs = self.block_size
@@ -168,6 +170,7 @@ class FlashMTPMDLMModel(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
+        # 1) 锚点 + 块内随机 MASK → 噪声嵌入；2) 锚点前一位置的各层 hidden 经 stack 作为 CHS/Pivot 条件。
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
             seq_len, loss_mask, device
         )
@@ -193,6 +196,7 @@ class FlashMTPMDLMModel(nn.Module):
             attention_mask=flashmtp_attn_mask,
         )
         logits = self.lm_head(output_hidden)
+        # CE：仅 ce_mask ∧ 序列边界 ∧ loss_mask 处，对真 token_id 做交叉熵；可选在相同位置上对 teacher_logits 加 KL。
         label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
         valid_label_mask = label_indices < seq_len
@@ -207,7 +211,14 @@ class FlashMTPMDLMModel(nn.Module):
             2,
             safe_label_indices,
         )
-        w = ce_mask.float() * valid_label_mask.float() * (lm_g > 0.5).float()
+        # 块内仅 pos_in_block>0 参与 CE/KL/acc（排除块首，与 pivot 后第一候选位对齐）。
+        pos_in_block_ok = (label_offsets > 0).float()
+        w = (
+            ce_mask.float()
+            * valid_label_mask.float()
+            * (lm_g > 0.5).float()
+            * pos_in_block_ok
+        )
         w_flat = w.view(-1)
         flat_logits = logits.view(-1, logits.size(-1))
         flat_targets = target_ids.view(-1)
@@ -216,6 +227,7 @@ class FlashMTPMDLMModel(nn.Module):
         loss_ce = (ce * w_flat).sum() / denom
 
         loss_kl = torch.zeros((), device=device, dtype=loss_ce.dtype)
+        # 教师 logits 按「全序列」位置 gather 到块内，与 logits 展平后对齐，仅在 w 为真处平均 KL。
         if self.kl_weight > 0 and teacher_logits is not None and w_flat.sum() > 0:
             li = safe_label_indices.reshape(bsz, -1)
             v = teacher_logits.size(-1)

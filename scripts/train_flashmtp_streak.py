@@ -82,6 +82,8 @@ def main():
         trust_remote_code=args.trust_remote_code,
     )
 
+    # 前向核心（FlashMTPStreakModel）：推测块整段视为 [MASK]；用目标隐状态建轨迹，
+    # 最大化 streak 代理目标（对块内 log q 的累加与再指数化，在有效锚点、loss_mask 内）。
     wrapper = FlashMTPStreakModel(
         draft_model=draft_model,
         target_lm_head=target_components.lm_head,
@@ -136,9 +138,11 @@ def main():
             attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
 
+            # 目标侧：提供与 MDLM 相同的各层 hidden；Streak 不经过 CE/KL，不读 teacher_logits。
             to = target_model.generate_flashmtp_data(input_ids, attention_mask, loss_mask)
             hidden_states = tuple(h.cuda() for h in to.hidden_states)
 
+            # 草案 streak 前向：损失为 streak 目标的负向（越高越好 → loss 越小）。
             loss, acc = wrapper(
                 input_ids=input_ids,
                 hidden_states=hidden_states,

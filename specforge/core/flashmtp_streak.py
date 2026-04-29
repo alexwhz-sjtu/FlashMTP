@@ -45,6 +45,7 @@ class FlashMTPStreakModel(nn.Module):
         loss_mask: torch.Tensor,
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 与 MDLM 相同：在可监督区间内随机抽 N 个块起点，每个块长度 bs。
         bs = self.block_size
         bsz = loss_mask.shape[0]
         max_anchor = max(seq_len - bs, 0)
@@ -78,6 +79,7 @@ class FlashMTPStreakModel(nn.Module):
         return (anchor_positions.unsqueeze(-1) + offsets).view(bsz, -1)
 
     def _all_mask_embed(self, anchor_positions: torch.Tensor):
+        # 阶段二：整段推测块在输入侧全部用 [MASK] 的 embedding，不包含随机掩码。
         bsz, n = anchor_positions.shape
         bs = self.block_size
         device = anchor_positions.device
@@ -110,6 +112,7 @@ class FlashMTPStreakModel(nn.Module):
         target_hidden = stack_hidden_states_for_positions(
             hidden_states, context_positions
         )
+        # 草案全 MASK 前向 → logits；真标签为块内原 token，监督权重同 MDLM（块有效 ∧ 边界 ∧ loss_mask）。
         output_hidden = self.draft_model(
             position_ids=draft_position_ids,
             noise_embedding=noise_embedding,
@@ -136,6 +139,7 @@ class FlashMTPStreakModel(nn.Module):
         )
         n = anchor_positions.size(1)
         bs = self.block_size
+        # 各位置对真 token 的 log q；先在 (B, N*bs) 维 gather 再 reshape，与 target_ids 对齐。
         flat_tgt = target_ids.reshape(bsz, n * bs).unsqueeze(-1)
         lp = (
             log_probs.gather(-1, flat_tgt)
@@ -143,16 +147,20 @@ class FlashMTPStreakModel(nn.Module):
             .clamp(min=self.log_prob_min)
             .view(bsz, n, bs)
         )
+        # 块内仅 pos_in_block>0 参与 streak/acc；m=0 对应块首，不参与外层 sum（避免 exp(0) 常数项）。
+        pos_in_block_ok = (label_offsets > 0).float()
         w = (
             block_keep_mask.unsqueeze(-1)
             .expand(-1, -1, bs)
             .float()
             * valid_label_mask.float()
             * (lm_g > 0.5).float()
+            * pos_in_block_ok
         )
         weighted_lp = lp * w
+        # streak：对 m≥1 累加 exp(cum[m])；cum 在 j=0 处已为 0，故从索引 1 起求和。
         cum = weighted_lp.cumsum(dim=-1)
-        streak_sum = cum.exp().sum(dim=-1)
+        streak_sum = cum.exp()[..., 1:].sum(dim=-1)
         loss = -streak_sum.mean()
 
         with torch.no_grad():

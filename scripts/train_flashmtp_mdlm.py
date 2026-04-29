@@ -85,6 +85,8 @@ def main():
         print_on_rank0("WARN: KL needs HF target logits; disabling KL for non-hf backend.")
         args.kl_weight = 0.0
 
+    # 前向核心（实现在 FlashMTPMDLMModel）：按 anchor 切块 → 块内随机掩码可监督位置 →
+    # 草案用目标隐状态做 CHS/Pivot；掩码位上 CE 拟合真 token，可选对 HF teacher_logits 做 KL。
     wrapper = FlashMTPMDLMModel(
         draft_model=draft_model,
         target_lm_head=target_components.lm_head,
@@ -143,10 +145,12 @@ def main():
             attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
 
+            # 目标侧：同一批序列上取各层 hidden（供草案融合）及可选 teacher_logits（供 KL）。
             to = target_model.generate_flashmtp_data(input_ids, attention_mask, loss_mask)
             hidden_states = tuple(h.cuda() for h in to.hidden_states)
             tlog = to.teacher_logits.cuda() if to.teacher_logits is not None else None
 
+            # 草案前向 + 块内掩码 CE（与可选 KL）；loss_mask 限定监督区域。
             loss, acc = wrapper(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
