@@ -24,10 +24,11 @@ from .sglang_backend import SGLangRunner
 
 @dataclass
 class FlashMTPTargetOutput:
-    hidden_states: torch.Tensor  # [batch, seq_len, hidden_size]
+    hidden_states: torch.Tensor  # tuple or stacked; per-layer (B, T, H)
     input_ids: torch.Tensor  # [batch, seq_len]
     attention_mask: torch.Tensor  # [batch, seq_len]
     loss_mask: torch.Tensor  # [batch, seq_len]
+    teacher_logits: Optional[torch.Tensor] = None  # (B, T, V) when available (HF backend)
 
 
 class FlashMTPTargetModel(ABC):
@@ -234,6 +235,7 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            teacher_logits=None,
         )
 
 
@@ -287,6 +289,7 @@ class HFFlashMTPTargetModel(FlashMTPTargetModel):
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            teacher_logits=outputs.logits,
         )
 
 

@@ -33,6 +33,7 @@ from specforge.modeling.target.flashmtp_target_model import (
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
+from specforge.flashmtp_train_utils import _align_draft_config_layer_depth
 from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
 
 
@@ -176,13 +177,14 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
 
     if args.draft_config_path:
         draft_config = AutoConfig.from_pretrained(args.draft_config_path)
+        _align_draft_config_layer_depth(draft_config, int(draft_config.num_hidden_layers))
         print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
     else:
         target_config = AutoConfig.from_pretrained(args.target_model_path)
         draft_config = AutoConfig.from_pretrained(args.target_model_path)
-        draft_config.num_hidden_layers = args.num_draft_layers
         draft_config.block_size = args.block_size
         draft_config.num_target_layers = target_config.num_hidden_layers
+        _align_draft_config_layer_depth(draft_config, args.num_draft_layers)
         print_on_rank0("Auto-generated draft config from target model")
 
     if not hasattr(draft_config, "flashmtp_config") or draft_config.flashmtp_config is None:
