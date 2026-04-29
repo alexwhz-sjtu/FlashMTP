@@ -120,7 +120,8 @@ class FlashMTPMDLMModel(nn.Module):
         loss_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns (noise_embeddings (B, N*bs, H), ce_mask (B, N, bs) bool)."""
-        # 每块独立采样掩码率；仅对 loss_mask 内位置可置 MASK；若某行无掩码则强制掩 1 个（保证 CE 有监督）。
+        # 每块独立采样掩码率；仅 loss_mask 内且非块首（anchor token，offset>0）可置 MASK；
+        # 若某行在可掩位置上仍全未掩，则随机强制掩 1 处（保证该行 CE 有监督）。
         bsz, seq_len = input_ids.shape
         n = anchor_positions.shape[1]
         bs = self.block_size
@@ -135,7 +136,8 @@ class FlashMTPMDLMModel(nn.Module):
             loss_mask.unsqueeze(1).expand(-1, n, -1), 2, block_idx
         )
         valid_block = block_keep_mask.view(bsz, n, 1).expand(-1, -1, bs)
-        can_mask = (lm > 0.5) & valid_block
+        pos_maskable = offsets > 0
+        can_mask = (lm > 0.5) & valid_block & pos_maskable
         ratio = torch.empty(bsz, n, 1, device=device).uniform_(
             self.mask_ratio_min, self.mask_ratio_max
         )

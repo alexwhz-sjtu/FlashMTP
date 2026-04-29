@@ -17,6 +17,7 @@
 * Contextual Pivot (上下文枢轴)：目标模型最新的融合hidden sstates，它是连接过去（全量历史）与未来（生成块）的支点。
 * hs：hidden states的简称。hs可以是任意层的输出hs
 * 训练数据：我的训练数据全部是目标大模型生成的响应，这样可以对齐。
+* anchor token：训练时随机采样的位置上的token，训练输入为，预测anchortoken的hs（即pivot），拼接ancho token（clean的）在拼接上B-1个noise embedding。
 
 ### 掩码离散扩散语言模型
 ---
@@ -158,6 +159,8 @@ $$
 - $q_j$ 为草案在位置 $j$ 的概率；并行下联合取 $\prod_j q_j(\cdot|p)$。
 
 目标：在固定 $p$ 下拉高与目标续写一致的 **长 streak**，而非只对齐首 token。
+
+> **实现（与上节 clarification 对齐）**：块内序列下标从块起点起算时，**第一个 slot 不参与** streak 与 MDLM 监督；代码用 `pos_in_block>0` 掩码，且 streak 外层对 $\exp(\mathrm{cum}_m)$ 从块内第二槽对应的前缀（$m\ge 1$）起求和，避免仅将首槽 $\log q$ 置零仍残留 $\exp(0)$ 常数项。
 
 ---
 

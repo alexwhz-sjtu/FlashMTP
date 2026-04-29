@@ -1,5 +1,6 @@
 # coding=utf-8
-"""FlashMTP v3.3 Phase-2: streak surrogate (maximize sum_m prod_{j<=m} q_j(x_j|p))."""
+"""FlashMTP v3.3 Phase-2: streak surrogate; loss ≈ −mean_blocks ∑_{m≥1} exp(∑_{j≤m} w_j log q_j)."""
+
 
 from typing import Tuple
 
@@ -16,7 +17,7 @@ from specforge.core.flashmtp import CHS_LEN_PER_BLOCK, create_flashmtp_block_mas
 
 
 class FlashMTPStreakModel(nn.Module):
-    """All-[MASK] draft block; loss = -sum_m exp(sum_{j<=m} log q_j(x_j))."""
+    """块首为真实 token 嵌入、块内其余为 [MASK]；最小化 −∑_m exp(cum_m)（与 MDLM 一致：anchor 不监督、推理对齐）。"""
 
     def __init__(
         self,
@@ -78,15 +79,22 @@ class FlashMTPStreakModel(nn.Module):
         offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
         return (anchor_positions.unsqueeze(-1) + offsets).view(bsz, -1)
 
-    def _all_mask_embed(self, anchor_positions: torch.Tensor):
-        # 阶段二：整段推测块在输入侧全部用 [MASK] 的 embedding，不包含随机掩码。
+    def _noise_embed_for_streak(
+        self, input_ids: torch.Tensor, anchor_positions: torch.Tensor
+    ) -> torch.Tensor:
+        # 与训练/推理约定一致：块内第一位（anchor token）用真 token 嵌入，其余槽位为 [MASK]。
         bsz, n = anchor_positions.shape
         bs = self.block_size
-        device = anchor_positions.device
-        noise_ids = torch.full(
-            (bsz, n * bs), self.mask_token_id, dtype=torch.long, device=device
+        device = input_ids.device
+        row = torch.arange(bsz, device=device, dtype=torch.long).unsqueeze(1).expand(
+            -1, n
         )
-        return self.embed_tokens(noise_ids)
+        anchor_tok = input_ids[row, anchor_positions]
+        noise_ids = torch.full(
+            (bsz, n, bs), self.mask_token_id, dtype=torch.long, device=device
+        )
+        noise_ids[:, :, 0] = anchor_tok
+        return self.embed_tokens(noise_ids.view(bsz, n * bs))
 
     def forward(
         self,
@@ -99,7 +107,7 @@ class FlashMTPStreakModel(nn.Module):
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
             seq_len, loss_mask, device
         )
-        noise_embedding = self._all_mask_embed(anchor_positions)
+        noise_embedding = self._noise_embed_for_streak(input_ids, anchor_positions)
         draft_position_ids = self._create_position_ids(anchor_positions)
         flashmtp_attn_mask = create_flashmtp_block_mask(
             anchor_positions=anchor_positions,
@@ -112,7 +120,7 @@ class FlashMTPStreakModel(nn.Module):
         target_hidden = stack_hidden_states_for_positions(
             hidden_states, context_positions
         )
-        # 草案全 MASK 前向 → logits；真标签为块内原 token，监督权重同 MDLM（块有效 ∧ 边界 ∧ loss_mask）。
+        # 草案：块首 clean 嵌入 + 后续 [MASK]；标签与 streak 仍仅 pos_in_block>0。
         output_hidden = self.draft_model(
             position_ids=draft_position_ids,
             noise_embedding=noise_embedding,
