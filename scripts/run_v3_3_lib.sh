@@ -51,11 +51,11 @@ v33_export_common_training_env() {
   export NNODES NODE_RANK MASTER_ADDR MASTER_PORT
 
   # --- Epoch：MDLM / Streak 可分开设；未设则回落到 NUM_EPOCHS ---
-  NUM_EPOCHS_MDLM=18
+  NUM_EPOCHS_MDLM=12
   NUM_EPOCHS_STREAK=6
   NUM_EPOCHS="${NUM_EPOCHS:-6}"
   MAX_LENGTH="${MAX_LENGTH:-4096}"
-  DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}" # 仅用于默认 jsonl / CACHE_ROOT 路径拼接
+  DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-400000}" # 仅用于默认 jsonl / CACHE_ROOT 路径拼接
 
   ENABLE_THINKING="${ENABLE_THINKING:-on}"         # 默认训练集路径里的 think_on / think_off
   NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"       # 草案 Transformer 层数
@@ -77,7 +77,7 @@ v33_export_common_training_env() {
   # KL_*：草案 logits 相对目标模型 teacher_logits 的 KL（HF 且 forward 带 logits 时才有 teacher）。
   # KL_WEIGHT=0 关闭；>0 时与 CE 加权；KL_TOPK=0 为全词表 KL，>0 时在 teacher 的 top-k 子空间上做 KL（省算力、近似蒸馏）。
   KL_WEIGHT="${KL_WEIGHT:-0.2}"
-  KL_TOPK="${KL_TOPK:-0}"
+  KL_TOPK="${KL_TOPK:-500}"
   SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"   # 步数；过大则几乎只有 epoch 结束才存 checkpoint
   LOG_INTERVAL="${LOG_INTERVAL:-50}"
 
@@ -108,7 +108,7 @@ v33_export_paths_for_dt() {
     CACHE_ROOT="${CACHE_ROOT:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
   fi
 
-  STAMP="v33_${DT}_nlayers${NUM_DRAFT_LAYERS}_bs${BLOCK_SIZE}_samples${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_maxlen${MAX_LENGTH}_epm${NUM_EPOCHS_MDLM}_eps${NUM_EPOCHS_STREAK}"
+  STAMP="v33_${DT}_nlayers${NUM_DRAFT_LAYERS}_bs${BLOCK_SIZE}_samples${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_maxlen${MAX_LENGTH}_kl_${KL_WEIGHT}_epm${NUM_EPOCHS_MDLM}_eps${NUM_EPOCHS_STREAK}"
   export STAMP
 
   export FLASHMTP_TARGET="${FLASHMTP_TARGET:-$TARGET_MODEL}"
@@ -155,7 +155,7 @@ v33_wandb_defaults() {
   fi
   export WANDB_PROJECT="${WANDB_PROJECT:-flashmtp_v3.3}"
   export WANDB_DIR="${WANDB_DIR:-./wandb}"
-  local _suffix="_n${NNODES}r${NODE_RANK}"
+  local _suffix="_n${NNODES}"
   case "$phase" in
     mdlm)
       if [[ -z "${WANDB_RUN_NAME:-}" ]]; then

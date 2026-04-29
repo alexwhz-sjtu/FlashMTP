@@ -201,3 +201,5 @@ wandb/
 .DS_Store
 
 log.txt
+
+whz_mtp_logs/
