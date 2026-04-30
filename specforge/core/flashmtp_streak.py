@@ -244,13 +244,20 @@ class FlashMTPStreakModel(nn.Module):
         relative_streak = prefix_log.exp() * prefix_valid
         block_has_streak = (prefix_valid.sum(dim=-1) > 0).float()
         valid_block_count = block_has_streak.sum() + 1e-6
-        
+
         # Zero means the relative streak sum reaches the valid prefix count.
         streak_sum = relative_streak.sum(dim=-1).clamp_min(1e-12)
         target_streak = prefix_valid.sum(dim=-1).clamp_min(1.0)
+
+        # log sum
         loss_streak = (
             (target_streak.log() - streak_sum.log()) * block_has_streak
         ).sum() / valid_block_count
+
+        # sum
+        # loss_streak = (
+        #     (target_streak - streak_sum) * block_has_streak
+        # ).sum() / valid_block_count
 
         if self.ce_aux_weight > 0:
             logits_blk = logits.view(bsz, n, bs, v)
