@@ -24,7 +24,7 @@ v33_export_paths_for_dt || exit $?
 
 export FLASHMTP_V33_INIT_CKPT="${FLASHMTP_V33_INIT_CKPT:-/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.4/cache/models/FlashMTP_v1.4_sample_400000_think_on_qwen3_8b_maxlen4096_epochs12_nnodes4}"
 
-STREAK_FROM_SCRATCH="${STREAK_FROM_SCRATCH:-0}"
+STREAK_FROM_SCRATCH="${STREAK_FROM_SCRATCH:-1}"
 STREAK_WEIGHT="${STREAK_WEIGHT:-1.0}"
 STREAK_CE_WEIGHT="${STREAK_CE_WEIGHT:-0.2}"
 STREAK_INIT_ARGS=()
