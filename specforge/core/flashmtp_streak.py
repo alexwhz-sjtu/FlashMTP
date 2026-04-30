@@ -1,8 +1,8 @@
 # coding=utf-8
-"""FlashMTP v3.3 Phase-2: positive confidence-aware streak surrogate."""
+"""FlashMTP v3.3 Phase-2: log-smoothed relative streak surrogate."""
 
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -19,8 +19,8 @@ from specforge.core.flashmtp import CHS_LEN_PER_BLOCK, create_flashmtp_block_mas
 class FlashMTPStreakModel(nn.Module):
     """块首为真实 token 嵌入、块内其余为 [MASK]。
 
-    Streak 项用 count - score 写成正数形式，等价于最大化 streak score；
-    confidence 权重只缩放 streak 梯度。CE_aux 是逐位置平均 CE，不做位置/置信度调权。
+    Streak 项使用 Log-Smoothed Relative Streak Loss：用教师 target 概率给每个位置设锚点，
+    再在相对概率上做 streak 累乘。CE_aux 是逐位置平均 CE，不做位置/置信度调权。
     """
 
     def __init__(
@@ -104,11 +104,54 @@ class FlashMTPStreakModel(nn.Module):
         noise_ids[:, :, 0] = anchor_tok
         return self.embed_tokens(noise_ids.view(bsz, n * bs))
 
+    @torch.no_grad()
+    def _teacher_target_probs(
+        self,
+        hidden_states,
+        teacher_logits: Optional[torch.Tensor],
+        teacher_context_indices: torch.Tensor,
+        target_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """返回教师在 target token 上的概率 p_j，形状为 (B, N, bs)。"""
+        bsz, n, bs = target_ids.shape
+        if teacher_logits is not None:
+            v = teacher_logits.size(-1)
+            te_blk = torch.gather(
+                teacher_logits.float(),
+                1,
+                teacher_context_indices.reshape(bsz, -1)
+                .unsqueeze(-1)
+                .expand(-1, -1, v),
+            )
+            te_log_probs = F.log_softmax(te_blk, dim=-1)
+        else:
+            if isinstance(hidden_states, torch.Tensor) and hidden_states.dim() == 4:
+                final_hidden = hidden_states[:, :, -1, :]
+            elif isinstance(hidden_states, torch.Tensor):
+                final_hidden = hidden_states
+            else:
+                final_hidden = hidden_states[-1]
+            h = torch.gather(
+                final_hidden,
+                1,
+                teacher_context_indices.reshape(bsz, -1)
+                .unsqueeze(-1)
+                .expand(-1, -1, final_hidden.size(-1)),
+            )
+            te_log_probs = F.log_softmax(self.lm_head(h).float(), dim=-1)
+        return (
+            te_log_probs.gather(-1, target_ids.reshape(bsz, -1).unsqueeze(-1))
+            .squeeze(-1)
+            .exp()
+            .view(bsz, n, bs)
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
         hidden_states,
         loss_mask: torch.Tensor,
+        teacher_logits: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -174,21 +217,31 @@ class FlashMTPStreakModel(nn.Module):
             * pos_in_block_ok
         )
 
-        # confidence-aware straight-through log-prob:
-        # forward(lp_tilde) == lp, backward(d lp_tilde / d lp) == conf_weight.
-        conf = lp.detach().exp()
-        conf_weight = torch.sigmoid(-10.0 * (conf - 0.6))
-        lp_tilde = lp.detach() + conf_weight * (lp - lp.detach())
+        teacher_p = self._teacher_target_probs(
+            hidden_states=hidden_states,
+            teacher_logits=teacher_logits,
+            teacher_context_indices=(safe_label_indices - 1).clamp(min=0),
+            target_ids=target_ids,
+        )
+        target_anchor = torch.maximum(
+            torch.full_like(teacher_p, 0.5), teacher_p
+        ).clamp_min(1e-12)
 
-        lp_tail = lp_tilde[..., 1:]
+        # LS-RSL: rho=q/T; phi(rho)=rho when rho<1, else 1+log(rho).
+        # Work in log-space for stable prefix products.
+        log_rho = lp - target_anchor.log()
+        log_phi = torch.where(log_rho < 0, log_rho, torch.log1p(log_rho))
+
+        lp_tail = log_phi[..., 1:]
         valid_tail = valid_pos[..., 1:]
         prefix_valid = valid_tail.cumprod(dim=-1)
         prefix_log = (lp_tail * valid_tail).cumsum(dim=-1)
-        streak_score = prefix_log.exp() * prefix_valid
+        relative_streak = prefix_log.exp() * prefix_valid
         block_has_streak = (prefix_valid.sum(dim=-1) > 0).float()
         valid_block_count = block_has_streak.sum() + 1e-6
-        # Positive form averaged over valid blocks, not over B - 1 positions.
-        loss_streak = (prefix_valid - streak_score).sum() / valid_block_count
+        # Average per valid block, not over B - 1 positions.
+        streak_sum = relative_streak.sum(dim=-1).clamp_min(1e-12)
+        loss_streak = (-streak_sum.log() * block_has_streak).sum() / valid_block_count
 
         if self.ce_aux_weight > 0:
             logits_blk = logits.view(bsz, n, bs, v)

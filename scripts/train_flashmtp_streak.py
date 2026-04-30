@@ -48,7 +48,7 @@ def parse_args():
         "--streak-weight",
         type=float,
         default=1.0,
-        help="正数 conf-streak loss 系数；通常作为主 loss。",
+        help="LS-RSL streak loss 系数；通常作为主 loss。",
     )
     g.add_argument(
         "--streak-ce-weight",
@@ -94,7 +94,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
     )
 
-    # 前向核心：块首 clean，其余 [MASK]；conf-streak 是主项，CE_aux 是不调权逐位置辅助项。
+    # 前向核心：块首 clean，其余 [MASK]；LS-RSL streak 是主项，CE_aux 是不调权逐位置辅助项。
     wrapper = FlashMTPStreakModel(
         draft_model=draft_model,
         target_lm_head=target_components.lm_head,
@@ -151,15 +151,17 @@ def main():
             attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
 
-            # 目标侧：提供与 MDLM 相同的各层 hidden；Streak 不经过 CE/KL，不读 teacher_logits。
+            # 目标侧：提供各层 hidden；若后端返回 teacher_logits，则用于 LS-RSL 的目标锚点。
             to = target_model.generate_flashmtp_data(input_ids, attention_mask, loss_mask)
             hidden_states = tuple(h.cuda() for h in to.hidden_states)
+            tlog = to.teacher_logits.cuda() if to.teacher_logits is not None else None
 
-            # 总损失 = streak_weight * conf-streak + streak_ce_weight * CE_aux。
+            # 总损失 = streak_weight * LS-RSL + streak_ce_weight * CE_aux。
             loss, acc, loss_streak, loss_ce = wrapper(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
+                teacher_logits=tlog,
             )
             (loss / args.accumulation_steps).backward()
             if global_step % args.accumulation_steps == 0:

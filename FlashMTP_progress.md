@@ -160,7 +160,8 @@ $$
 
 ---
 
-**6. 梯度权重调整**
+**6. 梯度权重调整**  
+方法1:  
 ***问题：前缀长项都包含 q1、q2 ... ，所以前面位置天然拿到更多梯度。***
 - 相比于把 $q_1$ 从0.8提升到0.9，不如把 $q_4$ 从0.1提升到0.3。
 - 为缓解位置偏置，在保留上述 streak 前向目标不变的基础上，对所有参与监督的位置加入 **confidence-aware gradient reweighting**：只缩放每个位置从 streak loss 获得的梯度，不把置信度权重并入接受概率乘积本身。这样 streak 仍表示长接受段质量，但梯度预算会从已高置信度位置转向低置信度位置。
@@ -194,8 +195,31 @@ $$
 
 实现中对上述和式按有效 block 数取平均，不再除以块内 $B-1$ 个前缀项；因此完整块时该项保留接收长度求和尺度。该形式恒为非负，并且相对 $-\sum_m\exp(\cdot)$ 只多了常数，优化方向等价：最小化它仍然是在最大化期望 streak score。
 
+方法2:  
+
+我们将原始的 Streak Loss 改造为 Log-Smoothed Relative Streak Loss (LS-RSL)。
+
+**A. 目标锚点 (Target Anchoring)**
+
+首先定义每个位置的置信度门槛 $T_j$，防止被大模型的低置信度“带歪”：$$T_j = \max(0.5, p_j)$$  
+其中 $p_j$ 是教师模型在 target token 上的概率。
+
+**B. 相对概率映射 (Relative Mapping)**  
+
+定义当前草稿模型的相对置信度 $\rho_j = q_j / T_j$。为了实现“达标后降权但不截断”，我们使用一个分段平滑函数 $\phi(\rho_j)$：  
+
+$$\phi(\rho_j) =
+\begin{cases} 
+\rho_j & \text{if } \rho_j < 1 \\
+1 + \log(\rho_j) & \text{if } \rho_j \ge 1
+\end{cases}$$
+
+**C. 修改后的 Streak Loss**
+
+将 $\phi(\rho_j)$ 代入累乘项，构建期望相对长度：$$\mathcal{L} = -\log \left( \sum_{m=1}^{\gamma} \prod_{j=1}^{m} \phi(\rho_j) \right)$$
+
 ---
-**6. 混合loss**  
+**7. 混合loss**  
 从头训练时，总 loss 采用逐位置 CE 辅助项打底：
 
 $$
