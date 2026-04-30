@@ -88,7 +88,7 @@ v33_export_common_training_env() {
   LEARNING_RATE_MDLM="${LEARNING_RATE_MDLM:-6e-4}"
   LEARNING_RATE_STREAK="${LEARNING_RATE_STREAK:-6e-4}"     # Streak 阶段通常可略低于 MDLM
   STREAK_WEIGHT="${STREAK_WEIGHT:-1.0}"                    # conf-streak 主 loss 系数
-  STREAK_CE_WEIGHT="${STREAK_CE_WEIGHT:-0.4}"              # 逐位置 CE 辅助项系数
+  STREAK_CE_WEIGHT="${STREAK_CE_WEIGHT:-0.1}"              # 逐位置 CE 辅助项系数
 
   export NUM_EPOCHS NUM_EPOCHS_MDLM NUM_EPOCHS_STREAK MAX_LENGTH DATA_NUM_SAMPLES ENABLE_THINKING NUM_DRAFT_LAYERS BLOCK_SIZE NUM_ANCHORS
   export BATCH_SIZE ACCUMULATION_STEPS TP_SIZE DIST_TIMEOUT CHAT_TEMPLATE REPORT_TO
@@ -162,11 +162,12 @@ v33_wandb_defaults() {
   export WANDB_DIR="${WANDB_DIR:-./wandb}"
   local _time_tag="${WANDB_RUN_TIME_TAG:-$(date +%Y%m%d_%H%M%S)}"
   export WANDB_RUN_TIME_TAG="$_time_tag"
+  local _name_suffix="_t${_time_tag}"
   local _suffix="_n${NNODES}_t${_time_tag}"
   case "$phase" in
     mdlm)
       if [[ -z "${WANDB_RUN_NAME:-}" ]]; then
-        export WANDB_RUN_NAME="v33_${DT}_mdlm_${STAMP}"
+        export WANDB_RUN_NAME="v33_${DT}_mdlm_${STAMP}${_name_suffix}"
       fi
       if [[ -z "${WANDB_RUN_ID:-}" ]]; then
         export WANDB_RUN_ID="v33_${DT}_mdlm_${STAMP}${_suffix}"
@@ -174,7 +175,7 @@ v33_wandb_defaults() {
       ;;
     streak)
       if [[ -z "${WANDB_RUN_NAME:-}" ]]; then
-        export WANDB_RUN_NAME="v33_${DT}_streak_${STREAK_STAMP:-$STAMP}"
+        export WANDB_RUN_NAME="v33_${DT}_streak_${STREAK_STAMP:-$STAMP}${_name_suffix}"
       fi
       if [[ -z "${WANDB_RUN_ID:-}" ]]; then
         export WANDB_RUN_ID="v33_${DT}_streak_${STREAK_STAMP:-$STAMP}${_suffix}"
