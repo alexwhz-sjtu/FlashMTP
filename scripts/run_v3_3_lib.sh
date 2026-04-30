@@ -160,7 +160,9 @@ v33_wandb_defaults() {
   fi
   export WANDB_PROJECT="${WANDB_PROJECT:-flashmtp_v3.3}"
   export WANDB_DIR="${WANDB_DIR:-./wandb}"
-  local _suffix="_n${NNODES}"
+  local _time_tag="${WANDB_RUN_TIME_TAG:-$(date +%Y%m%d_%H%M%S)}"
+  export WANDB_RUN_TIME_TAG="$_time_tag"
+  local _suffix="_n${NNODES}_t${_time_tag}"
   case "$phase" in
     mdlm)
       if [[ -z "${WANDB_RUN_NAME:-}" ]]; then
