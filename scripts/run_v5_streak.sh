@@ -16,7 +16,7 @@ cd "$ROOT"
 export PYTHONPATH="${ROOT}${PYTHONPATH:+:$PYTHONPATH}"
 
 # shellcheck source=run_v3_3_lib.sh
-source "$ROOT/scripts/run_v3_3_lib.sh"
+source "$ROOT/scripts/run_v5_lib.sh"
 v33_parse_cli "$@" || exit $?
 set +u
 v33_export_common_training_env || exit $?

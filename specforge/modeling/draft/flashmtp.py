@@ -122,6 +122,120 @@ class CHSQueryFusion(nn.Module):
         return self.out_norm(out)
 
 
+def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> list[int]:
+    if num_draft_layers == 1:
+        return [num_target_layers // 2]
+    start = 1
+    end = num_target_layers - 3
+    span = end - start
+    return [
+        int(round(start + (i * span) / (num_draft_layers - 1)))
+        for i in range(num_draft_layers)
+    ]
+
+
+class TargetHistoryFCFusion(nn.Module):
+    """Fuse selected target layers at every history position with feature concat + FC."""
+
+    def __init__(
+        self,
+        config: Qwen3Config,
+        target_layer_ids: Sequence[int],
+        num_target_layers: int,
+    ):
+        super().__init__()
+        self.target_layer_ids = list(target_layer_ids)
+        self.num_target_layers = int(num_target_layers)
+        self.fc = nn.Linear(
+            len(self.target_layer_ids) * config.hidden_size,
+            config.hidden_size,
+            bias=False,
+        )
+        self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def _select_from_stacked(self, hidden_states: torch.Tensor) -> list[torch.Tensor]:
+        s = hidden_states.size(2)
+        if s == self.num_target_layers + 1:
+            offset = 1
+        elif s == self.num_target_layers:
+            offset = 0
+        else:
+            max_id = max(self.target_layer_ids)
+            offset = 1 if max_id + 1 < s else 0
+        return [hidden_states[:, :, layer_id + offset, :] for layer_id in self.target_layer_ids]
+
+    def forward(
+        self, hidden_states: Union[Sequence[torch.Tensor], torch.Tensor]
+    ) -> torch.Tensor:
+        if isinstance(hidden_states, torch.Tensor) and hidden_states.dim() == 4:
+            selected = self._select_from_stacked(hidden_states)
+        elif isinstance(hidden_states, torch.Tensor):
+            raise ValueError("Expected tuple of (B, T, H) or stacked (B, T, S, H).")
+        else:
+            # HF returns [embedding, layer_0, ..., layer_{L-1}].
+            selected = [hidden_states[layer_id + 1] for layer_id in self.target_layer_ids]
+        return self.hidden_norm(self.fc(torch.cat(selected, dim=-1)))
+
+
+class PivotHistoryCrossAttention(nn.Module):
+    """Single-head RoPE cross-attention: pivot at a-1 attends fused history 0..a-2."""
+
+    def __init__(self, config: Qwen3Config):
+        super().__init__()
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.scaling = self.head_dim**-0.5
+        self.q_proj = nn.Linear(config.hidden_size, self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(config.hidden_size, self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(config.hidden_size, self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.head_dim, config.hidden_size, bias=config.attention_bias)
+        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen3RotaryEmbedding(config)
+        self.out_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    @staticmethod
+    def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        return (x * cos) + (rotate_half(x) * sin)
+
+    def forward(
+        self,
+        fused_history: torch.Tensor,
+        pivot_positions: torch.Tensor,
+        target_attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        bsz, seq_len, _ = fused_history.shape
+        n_blocks = pivot_positions.size(1)
+        device = fused_history.device
+        safe_pivot_positions = pivot_positions.clamp(min=0, max=seq_len - 1)
+        batch_idx = torch.arange(bsz, device=device)[:, None].expand(bsz, n_blocks)
+        pivot = fused_history[batch_idx, safe_pivot_positions]
+
+        q = self.q_norm(self.q_proj(pivot))
+        k = self.k_norm(self.k_proj(fused_history))
+        v = self.v_proj(fused_history)
+
+        q_cos, q_sin = self.rotary_emb(q, safe_pivot_positions)
+        key_positions = torch.arange(seq_len, device=device, dtype=torch.long).view(1, -1)
+        key_positions = key_positions.expand(bsz, -1)
+        k_cos, k_sin = self.rotary_emb(k, key_positions)
+        q = self._apply_rope(q, q_cos, q_sin)
+        k = self._apply_rope(k, k_cos, k_sin)
+
+        scores = torch.einsum("bnd,btd->bnt", q.float(), k.float()) * self.scaling
+        key_pos = torch.arange(seq_len, device=device).view(1, 1, -1)
+        valid_keys = key_pos < safe_pivot_positions.unsqueeze(-1)
+        if target_attention_mask is not None:
+            valid_keys = valid_keys & (target_attention_mask[:, None, :seq_len] > 0)
+        has_history = valid_keys.any(dim=-1, keepdim=True)
+        scores = scores.masked_fill(~valid_keys, torch.finfo(scores.dtype).min)
+        probs = torch.softmax(scores, dim=-1)
+        probs = torch.where(has_history, probs, torch.zeros_like(probs))
+        attn_out = torch.einsum("bnt,btd->bnd", probs.to(v.dtype), v)
+        return self.out_norm(pivot + self.o_proj(attn_out))
+
+
 class Qwen3FlashMTPAttention(nn.Module):
     """Non-causal self-attn: K/V = context + draft, full RoPE on k."""
 
@@ -296,6 +410,23 @@ def extract_stacked_chs(
     return torch.stack(out, dim=2)
 
 
+def append_hidden_states(
+    history: Union[Sequence[torch.Tensor], torch.Tensor],
+    new_hidden: Union[Sequence[torch.Tensor], torch.Tensor],
+    keep_len: int,
+) -> Union[tuple[torch.Tensor, ...], torch.Tensor]:
+    if isinstance(history, torch.Tensor):
+        if not isinstance(new_hidden, torch.Tensor):
+            raise ValueError("Cannot append tuple hidden states to stacked history.")
+        return torch.cat([history, new_hidden[:, :keep_len]], dim=1)
+    if isinstance(new_hidden, torch.Tensor):
+        raise ValueError("Cannot append stacked hidden states to tuple history.")
+    return tuple(
+        torch.cat([old, new[:, :keep_len]], dim=1)
+        for old, new in zip(history, new_hidden)
+    )
+
+
 def _merged_flashmtp_config(config: Qwen3Config) -> dict:
     """Train 写入 flashmtp_config；部分 checkpoint 仅存 dflashconfig，需合并。"""
     fc = getattr(config, "flashmtp_config", None) or {}
@@ -316,35 +447,34 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         super().__init__(config)
         self.config = config
         flashmtp_config = _merged_flashmtp_config(config)
-        num_chs = int(
-            flashmtp_config.get(
-                "num_chs_source_tokens",
-                getattr(config, "num_target_layers", 0) + 1,
+        num_target_layers = int(getattr(config, "num_target_layers", 0))
+        target_layer_ids = flashmtp_config.get("target_layer_ids", None)
+        if target_layer_ids is None:
+            target_layer_ids = build_target_layer_ids(
+                num_target_layers,
+                int(getattr(config, "num_hidden_layers", 1)),
             )
-        )
-        self.num_chs_source_tokens = num_chs
-        chs_fusion_layer_idx = int(
-            flashmtp_config.get("chs_fusion_layer_idx", 0)
-        )
+        self.target_layer_ids = list(target_layer_ids)
         self.layers = nn.ModuleList(
             [
                 Qwen3FlashMTPDecoderLayer(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.chs_fusion = CHSQueryFusion(
+        self.history_fusion = TargetHistoryFCFusion(
             config,
-            num_chs,
-            chs_fusion_layer_idx=chs_fusion_layer_idx,
+            self.target_layer_ids,
+            num_target_layers,
         )
+        self.pivot_cross_attn = PivotHistoryCrossAttention(config)
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
         print_on_rank0(
-            "FlashMTP: num_chs_source_tokens="
-            f"{self.num_chs_source_tokens} (embed+layers), "
-            "CHS fusion=depth self-attn, readout=last layer slot"
+            "FlashMTP v5: target_layer_ids="
+            f"{self.target_layer_ids}, fusion=feature-fc, "
+            "pivot cross-attn=single-head RoPE history"
         )
         self.post_init()
 
@@ -354,6 +484,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         noise_embedding: Optional[torch.Tensor] = None,
         target_hidden: Optional[torch.Tensor] = None,
+        target_attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
         **kwargs,
@@ -361,8 +492,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         hidden_states = noise_embedding
         if target_hidden is None:
             raise ValueError("target_hidden is required.")
-        # (B, N, S, H) before fusion
-        target_hidden = self.chs_fusion(target_hidden)
         # RoPE must cover K/V = [context | draft]. Previously only `hidden_states` (draft)
         # was used, so cos/sin length did not match concat(k_ctx, k_noise) in attention.
         bs = self.block_size
@@ -372,13 +501,19 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 f"Draft sequence length {dlen} must be divisible by block_size {bs}."
             )
         n_blocks = dlen // bs
+        # Block i draft starts at position_ids[:, i * bs] (= anchor i); CHS uses anchor-1.
+        first_of_block = position_ids[:, ::bs]
+        ctx_position_ids = (first_of_block - 1).clamp(min=0)
+        fused_history = self.history_fusion(target_hidden)
+        target_hidden = self.pivot_cross_attn(
+            fused_history=fused_history,
+            pivot_positions=ctx_position_ids,
+            target_attention_mask=target_attention_mask,
+        )
         if target_hidden.size(1) != n_blocks:
             raise ValueError(
                 f"Fused target_hidden len {target_hidden.size(1)} != num_blocks {n_blocks}."
             )
-        # Block i draft starts at position_ids[:, i * bs] (= anchor i); CHS uses anchor-1.
-        first_of_block = position_ids[:, ::bs]
-        ctx_position_ids = (first_of_block - 1).clamp(min=0)
         pos_full = torch.cat([ctx_position_ids, position_ids], dim=1)
         h_full = torch.cat([target_hidden, hidden_states], dim=1)
         position_embeddings = self.rotary_emb(h_full, pos_full)
@@ -439,9 +574,10 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
             output.logits, temperature
         )
-        pre_idx = (num_input_tokens - 1) * torch.ones(1, 1, device=dev, dtype=torch.long)
-        pre_idx = pre_idx.clamp(min=0)
-        target_hidden = extract_stacked_chs(output.hidden_states, pre_idx)
+        target_hidden = output.hidden_states
+        target_attention_mask = torch.ones(
+            (1, num_input_tokens), dtype=torch.long, device=dev
+        )
 
         start = input_ids.shape[1]
         while start < max_length:
@@ -455,6 +591,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             draft_logits = target.lm_head(
                 self(
                     target_hidden=target_hidden,
+                    target_attention_mask=target_attention_mask,
                     noise_embedding=noise_embedding,
                     position_ids=block_position_ids_for_draft,
                     past_key_values=None,
@@ -491,13 +628,24 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             ]
             start += acceptance_length + 1
             past_key_values_target.crop(start)
-            # 下一块的 CHS 对应新 anchor 的前一位置：即本步 target 块内最后采纳位置（与训练 context=anchor-1 对齐）
-            hs_len = output.hidden_states[0].shape[1]
-            last_chunk_idx = min(int(acceptance_length), hs_len - 1)
-            last_chunk_idx = max(last_chunk_idx, 0)
-            target_hidden = extract_stacked_chs(
+            # 只追加 seed + accepted draft token 的 hidden；拒绝后采样出的下一 anchor
+            # 尚未经过 target forward，不能作为下一步 pivot 的历史。
+            keep_hidden_len = int(acceptance_length) + 1
+            target_hidden = append_hidden_states(
+                target_hidden,
                 output.hidden_states,
-                torch.tensor([[last_chunk_idx]], device=dev, dtype=torch.long),
+                keep_hidden_len,
+            )
+            target_attention_mask = torch.cat(
+                [
+                    target_attention_mask,
+                    torch.ones(
+                        (1, keep_hidden_len),
+                        dtype=target_attention_mask.dtype,
+                        device=dev,
+                    ),
+                ],
+                dim=1,
             )
             if stop_token_ids is not None and any(
                 stop_token_id in output_ids[:, num_input_tokens:]

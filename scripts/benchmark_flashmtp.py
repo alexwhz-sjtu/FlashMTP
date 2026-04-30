@@ -30,7 +30,7 @@ import distributed as dist  # noqa: E402
 
 from specforge.modeling.draft.flashmtp import (  # noqa: E402
     FlashMTPDraftModel,
-    extract_stacked_chs,
+    append_hidden_states,
     sample,
 )
 
@@ -182,9 +182,10 @@ def flashmtp_spec_generate(
     output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
         output.logits, temperature
     )
-    pre_idx = (num_input_tokens - 1) * torch.ones(1, 1, device=dev, dtype=torch.long)
-    pre_idx = pre_idx.clamp(min=0)
-    target_hidden = extract_stacked_chs(output.hidden_states, pre_idx)
+    target_hidden = output.hidden_states
+    target_attention_mask = torch.ones(
+        (1, num_input_tokens), dtype=torch.long, device=dev
+    )
     time_to_first_token = cuda_time() - prefill_start
 
     decode_start = cuda_time()
@@ -200,6 +201,7 @@ def flashmtp_spec_generate(
         draft_logits = target.lm_head(
             draft(
                 target_hidden=target_hidden,
+                target_attention_mask=target_attention_mask,
                 noise_embedding=noise_embedding,
                 position_ids=block_position_ids_for_draft,
                 past_key_values=None,
@@ -234,12 +236,22 @@ def flashmtp_spec_generate(
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
         start += acceptance_length + 1
         past_key_values_target.crop(start)
-        hs_len = output.hidden_states[0].shape[1]
-        last_chunk_idx = min(int(acceptance_length), hs_len - 1)
-        last_chunk_idx = max(last_chunk_idx, 0)
-        target_hidden = extract_stacked_chs(
+        keep_hidden_len = int(acceptance_length) + 1
+        target_hidden = append_hidden_states(
+            target_hidden,
             output.hidden_states,
-            torch.tensor([[last_chunk_idx]], device=dev, dtype=torch.long),
+            keep_hidden_len,
+        )
+        target_attention_mask = torch.cat(
+            [
+                target_attention_mask,
+                torch.ones(
+                    (1, keep_hidden_len),
+                    dtype=target_attention_mask.dtype,
+                    device=dev,
+                ),
+            ],
+            dim=1,
         )
         if stop_token_ids is not None and any(
             stop_token_id in output_ids[:, num_input_tokens:]

@@ -111,7 +111,7 @@ v33_export_paths_for_dt() {
     CACHE_ROOT="${CACHE_ROOT:-./cache/data/regen_data/nemotron_40000}"
   fi
 
-  STAMP="v33_${DT}_nlayers${NUM_DRAFT_LAYERS}_bs${BLOCK_SIZE}_samples${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_maxlen${MAX_LENGTH}_kl_${KL_WEIGHT}_epm${NUM_EPOCHS_MDLM}_eps${NUM_EPOCHS_STREAK}"
+  STAMP="v5_${DT}_nlayers${NUM_DRAFT_LAYERS}_bs${BLOCK_SIZE}_samples${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_maxlen${MAX_LENGTH}_kl_${KL_WEIGHT}_epm${NUM_EPOCHS_MDLM}_eps${NUM_EPOCHS_STREAK}"
   STREAK_STAMP="${STAMP}_wst${STREAK_WEIGHT}_wce${STREAK_CE_WEIGHT}"
   export STAMP
   export STREAK_STAMP
@@ -158,7 +158,7 @@ v33_wandb_defaults() {
   if [ "${REPORT_TO}" != "wandb" ]; then
     return 0
   fi
-  export WANDB_PROJECT="${WANDB_PROJECT:-flashmtp_v3.3}"
+  export WANDB_PROJECT="${WANDB_PROJECT:-flashmtp_v5}"
   export WANDB_DIR="${WANDB_DIR:-./wandb}"
   local _time_tag="${WANDB_RUN_TIME_TAG:-$(date +%Y%m%d_%H%M%S)}"
   export WANDB_RUN_TIME_TAG="$_time_tag"
@@ -167,18 +167,18 @@ v33_wandb_defaults() {
   case "$phase" in
     mdlm)
       if [[ -z "${WANDB_RUN_NAME:-}" ]]; then
-        export WANDB_RUN_NAME="v33_${DT}_mdlm_${STAMP}${_name_suffix}"
+        export WANDB_RUN_NAME="v5_${DT}_mdlm_${STAMP}${_name_suffix}"
       fi
       if [[ -z "${WANDB_RUN_ID:-}" ]]; then
-        export WANDB_RUN_ID="v33_${DT}_mdlm_${STAMP}${_suffix}"
+        export WANDB_RUN_ID="v5_${DT}_mdlm_${STAMP}${_suffix}"
       fi
       ;;
     streak)
       if [[ -z "${WANDB_RUN_NAME:-}" ]]; then
-        export WANDB_RUN_NAME="v33_${DT}_streak_${STREAK_STAMP:-$STAMP}${_name_suffix}"
+        export WANDB_RUN_NAME="v5_${DT}_streak_${STREAK_STAMP:-$STAMP}${_name_suffix}"
       fi
       if [[ -z "${WANDB_RUN_ID:-}" ]]; then
-        export WANDB_RUN_ID="v33_${DT}_streak_${STREAK_STAMP:-$STAMP}${_suffix}"
+        export WANDB_RUN_ID="v5_${DT}_streak_${STREAK_STAMP:-$STAMP}${_suffix}"
       fi
       ;;
     *)
@@ -196,7 +196,7 @@ v33_common_py_args() {
     mdlm) _ne="$NUM_EPOCHS_MDLM" ;;
     streak) _ne="$NUM_EPOCHS_STREAK" ;;
     *)
-      echo "v33_common_py_args: phase 须为 mdlm / streak， got: $phase" >&2
+      echo "v5_common_py_args: phase 须为 mdlm / streak， got: $phase" >&2
       return 1
       ;;
   esac

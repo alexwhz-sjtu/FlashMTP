@@ -153,6 +153,7 @@ def main():
             # 草案前向 + 块内掩码 CE（与可选 KL）；loss_mask 限定监督区域。
             loss, acc = wrapper(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
                 teacher_logits=tlog,

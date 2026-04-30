@@ -18,7 +18,7 @@ from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import get_dp_group
-from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
+from specforge.modeling.draft.flashmtp import FlashMTPDraftModel, build_target_layer_ids
 from specforge.modeling.target.flashmtp_target_model import (
     FlashMTPTargetModel,
     get_flashmtp_target_model,
@@ -147,9 +147,14 @@ def build_models(args: Any) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         raise NotImplementedError("Use --chs-concat-mode feature for FlashMTP v3.3.")
 
     target_cfg = AutoConfig.from_pretrained(args.target_model_path)
-    n_chs_default = target_cfg.num_hidden_layers + 1
-    n_chs = int(draft_config.flashmtp_config.get("num_chs_source_tokens", n_chs_default))
-    draft_config.flashmtp_config["num_chs_source_tokens"] = n_chs
+    draft_config.num_target_layers = target_cfg.num_hidden_layers
+    target_layer_ids = draft_config.flashmtp_config.get("target_layer_ids", None)
+    if target_layer_ids is None:
+        target_layer_ids = build_target_layer_ids(
+            target_cfg.num_hidden_layers,
+            args.num_draft_layers,
+        )
+    draft_config.flashmtp_config["target_layer_ids"] = list(target_layer_ids)
     draft_config.flashmtp_config["chs_fusion_layer_idx"] = args.chs_fusion_layer_idx
     draft_config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
     draft_config._attn_implementation = args.attention_backend
@@ -158,7 +163,7 @@ def build_models(args: Any) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     target_model.set_capture_layers(list(range(target_cfg.num_hidden_layers + 1)))
     print_on_rank0(
         f"Draft: layers={draft_config.num_hidden_layers}, block={draft_config.block_size}, "
-        f"chs_tokens={n_chs}"
+        f"target_layer_ids={list(target_layer_ids)}"
     )
     return target_model, draft_model
 

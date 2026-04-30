@@ -10,7 +10,6 @@ import torch.nn.functional as F
 
 from specforge.modeling.draft.flashmtp import (
     FlashMTPDraftModel,
-    stack_hidden_states_for_positions,
 )
 
 from specforge.core.flashmtp import CHS_LEN_PER_BLOCK, create_flashmtp_block_mask
@@ -149,6 +148,7 @@ class FlashMTPStreakModel(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
         hidden_states,
         loss_mask: torch.Tensor,
         teacher_logits: Optional[torch.Tensor] = None,
@@ -167,15 +167,12 @@ class FlashMTPStreakModel(nn.Module):
             block_size=self.block_size,
             device=device,
         )
-        context_positions = (anchor_positions - 1).clamp(min=0)
-        target_hidden = stack_hidden_states_for_positions(
-            hidden_states, context_positions
-        )
         # 草案：块首 clean 嵌入 + 后续 [MASK]；标签与 streak 仍仅 pos_in_block>0。
         output_hidden = self.draft_model(
             position_ids=draft_position_ids,
             noise_embedding=noise_embedding,
-            target_hidden=target_hidden,
+            target_hidden=hidden_states,
+            target_attention_mask=attention_mask,
             attention_mask=flashmtp_attn_mask,
         )
         logits = self.lm_head(output_hidden)

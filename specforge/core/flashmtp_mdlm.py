@@ -9,7 +9,6 @@ import torch.nn.functional as F
 
 from specforge.modeling.draft.flashmtp import (
     FlashMTPDraftModel,
-    stack_hidden_states_for_positions,
 )
 
 from specforge.core.flashmtp import CHS_LEN_PER_BLOCK, create_flashmtp_block_mask
@@ -166,13 +165,15 @@ class FlashMTPMDLMModel(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
         hidden_states,
         loss_mask: torch.Tensor,
         teacher_logits: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
-        # 1) 锚点 + 块内随机 MASK → 噪声嵌入；2) 锚点前一位置的各层 hidden 经 stack 作为 CHS/Pivot 条件。
+        # 1) 锚点 + 块内随机 MASK → 噪声嵌入；
+        # 2) v5 直接传完整历史 hidden，draft 内部用 pivot attend pivot 之前的融合历史。
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
             seq_len, loss_mask, device
         )
@@ -187,14 +188,11 @@ class FlashMTPMDLMModel(nn.Module):
             block_size=self.block_size,
             device=device,
         )
-        context_positions = (anchor_positions - 1).clamp(min=0)
-        target_hidden = stack_hidden_states_for_positions(
-            hidden_states, context_positions
-        )
         output_hidden = self.draft_model(
             position_ids=draft_position_ids,
             noise_embedding=noise_embedding,
-            target_hidden=target_hidden,
+            target_hidden=hidden_states,
+            target_attention_mask=attention_mask,
             attention_mask=flashmtp_attn_mask,
         )
         logits = self.lm_head(output_hidden)

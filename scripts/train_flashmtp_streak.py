@@ -159,6 +159,7 @@ def main():
             # 总损失 = streak_weight * LS-RSL + streak_ce_weight * CE_aux。
             loss, acc, loss_streak, loss_ce = wrapper(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
                 teacher_logits=tlog,
