@@ -230,7 +230,12 @@ class FlashMTPStreakModel(nn.Module):
         # LS-RSL: rho=q/T; phi(rho)=rho when rho<1, else 1+log(rho).
         # Work in log-space for stable prefix products.
         log_rho = lp - target_anchor.log()
-        log_phi = torch.where(log_rho < 0, log_rho, torch.log1p(log_rho))
+        high_conf_alpha = 0.5
+        log_phi = torch.where(
+            log_rho < 0,
+            log_rho,
+            torch.log1p(high_conf_alpha * log_rho.clamp_min(0.0)),
+        )
 
         lp_tail = log_phi[..., 1:]
         valid_tail = valid_pos[..., 1:]
@@ -239,6 +244,7 @@ class FlashMTPStreakModel(nn.Module):
         relative_streak = prefix_log.exp() * prefix_valid
         block_has_streak = (prefix_valid.sum(dim=-1) > 0).float()
         valid_block_count = block_has_streak.sum() + 1e-6
+        
         # Zero means the relative streak sum reaches the valid prefix count.
         streak_sum = relative_streak.sum(dim=-1).clamp_min(1e-12)
         target_streak = prefix_valid.sum(dim=-1).clamp_min(1.0)
