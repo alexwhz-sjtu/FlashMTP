@@ -1,4 +1,10 @@
-from typing import Callable, List, Optional, Sequence, Union
+import json
+import math
+import os
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, List, Optional, Sequence, Union
 
 import torch
 from torch import nn
@@ -30,6 +36,130 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     logits = logits / temperature
     probs = torch.softmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
+
+
+def decode_single_token_for_log(tokenizer, token_id: int) -> str:
+    if tokenizer is None:
+        return ""
+    try:
+        return tokenizer.decode([token_id], skip_special_tokens=False)
+    except Exception:
+        return ""
+
+
+def append_draft_block_topk_jsonl(
+    draft_logits: torch.Tensor,
+    tokenizer,
+    out_file: Any,
+    *,
+    temperature: float,
+    topk: int,
+    decode_step: int,
+    acceptance_length: int,
+    last_accepted_token: str = "",
+    draft_sampled_ids: Optional[torch.Tensor] = None,
+    anchor_token_id: Optional[int] = None,
+) -> None:
+    """Write one JSONL record with draft top-k probabilities for a verify step."""
+    if out_file is None or tokenizer is None:
+        return
+    logits = draft_logits.float().squeeze(0)
+    temp = float(temperature)
+    probs = torch.softmax(logits / temp, dim=-1) if temp > 0 else torch.softmax(logits, dim=-1)
+    k = min(max(1, int(topk)), probs.shape[-1])
+    vals, indices = probs.topk(k, dim=-1)
+
+    positions = []
+    for pos in range(vals.shape[0]):
+        p_row = probs[pos]
+        entropy_nats = float(-(p_row * p_row.clamp_min(1e-30).log()).sum().item())
+        entries = []
+        for j in range(k):
+            tid = int(indices[pos, j].item())
+            prob = float(vals[pos, j].item())
+            entries.append(
+                {
+                    "token_id": tid,
+                    "prob": round(prob, 6),
+                    "token": decode_single_token_for_log(tokenizer, tid),
+                }
+            )
+        payload: dict[str, Any] = {
+            "position": pos + 1,
+            "topk": entries,
+            "entropy_nats": round(entropy_nats, 6),
+            "entropy_bits": round(entropy_nats / math.log(2.0), 6),
+        }
+        if draft_sampled_ids is not None:
+            ds = draft_sampled_ids
+            sel_tid = int(ds[0, pos].item()) if ds.dim() == 2 else int(ds[pos].item())
+            payload["selected_token_id"] = sel_tid
+            payload["selected_prob"] = round(float(p_row[sel_tid].item()), 6)
+            payload["selected_token"] = decode_single_token_for_log(tokenizer, sel_tid)
+        positions.append(payload)
+
+    row: dict[str, Any] = {
+        "decode_step": int(decode_step),
+        "acceptance_length": int(acceptance_length),
+        "tokens_committed_from_block": int(acceptance_length) + 1,
+        "last_accepted_token": last_accepted_token,
+        "positions": positions,
+    }
+    if anchor_token_id is not None:
+        row["anchor_token_id"] = int(anchor_token_id)
+        row["anchor_token"] = decode_single_token_for_log(tokenizer, int(anchor_token_id))
+    out_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+    out_file.flush()
+
+
+class SpecDebugRecorder:
+    """Small JSONL recorder for FlashMTP speculative decoding traces."""
+
+    def __init__(self, debug_dir: Optional[str], tokenizer=None):
+        self.tokenizer = tokenizer
+        self.debug_path = self._resolve_debug_dir(debug_dir)
+        self._run_file: Optional[Path] = None
+        self._steps: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _resolve_debug_dir(debug_dir: Optional[str]) -> Optional[Path]:
+        debug_dir = debug_dir or os.environ.get("FLASHMTP_DEBUG_DIR")
+        if not debug_dir:
+            return None
+        path = Path(debug_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def token_ids_from_tensor(self, tensor: torch.Tensor) -> list[int]:
+        if self.debug_path is None:
+            return []
+        return [int(x) for x in tensor.detach().flatten().cpu().tolist()]
+
+    def start_run(self, **metadata: Any) -> None:
+        if self.debug_path is None:
+            return
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        self._run_file = self.debug_path / f"flashmtp_spec_generate_{timestamp}.jsonl"
+        self._append({"event": "start", **metadata})
+
+    def record_prefill(self, **payload: Any) -> None:
+        self._append({"event": "prefill", **payload})
+
+    def add_step(self, **payload: Any) -> None:
+        self._steps.append(payload)
+        self._append({"event": "step", **payload})
+
+    def dump(self, **summary: Any) -> Optional[str]:
+        if self.debug_path is None:
+            return None
+        self._append({"event": "summary", "steps": self._steps, **summary})
+        return str(self._run_file) if self._run_file is not None else None
+
+    def _append(self, payload: dict[str, Any]) -> None:
+        if self._run_file is None:
+            return
+        with self._run_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -395,6 +525,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             )
         return self.norm(hidden_states)
 
+    def get_last_decode_stats(self) -> dict:
+        return getattr(self, "_last_decode_stats", {})
+
     @torch.inference_mode()
     def spec_generate(
         self,
@@ -403,14 +536,26 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         max_new_tokens: int,
         stop_token_ids: list[int],
         temperature: float,
+        tokenizer=None,
+        debug_dir: Optional[str] = None,
+        draft_topk_file=None,
+        draft_topk: int = 5,
         accept_lengths_out: Optional[List[int]] = None,
     ):
         self.eval()
+        self._last_decode_stats = {
+            "accept_lengths": [],
+            "target_total_time": 0.0,
+            "draft_total_time": 0.0,
+            "steps": 0,
+            "debug_file": None,
+        }
         if self.mask_token_id is None:
             raise ValueError(
                 "mask_token_id is None: set config.flashmtp_config['mask_token_id'] "
                 "or config.dflashconfig['mask_token_id'] (training checkpoint)."
             )
+        debug_recorder = SpecDebugRecorder(debug_dir=debug_dir, tokenizer=tokenizer)
         dev = input_ids.device
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
@@ -424,6 +569,14 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         )
         position_ids = torch.arange(output_ids.shape[1], device=dev).unsqueeze(0)
 
+        debug_recorder.start_run(
+            temperature=float(temperature),
+            block_size=int(block_size),
+            num_input_tokens=int(num_input_tokens),
+            max_new_tokens=int(max_new_tokens),
+            prompt_token_ids=debug_recorder.token_ids_from_tensor(input_ids),
+        )
+
         past_key_values_target = DynamicCache()
         # 与训练一致：每个投机块单独一次 draft 前向，不用 KV cache（训练为整段 N*bs 单次前向）
         output = target(
@@ -436,22 +589,37 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         )
 
         output_ids[:, :num_input_tokens] = input_ids
-        output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
-            output.logits, temperature
+        first_sampled_ids = sample(output.logits, temperature)
+        output_ids[:, num_input_tokens : num_input_tokens + 1] = first_sampled_ids
+        debug_recorder.record_prefill(
+            first_sampled_token_ids=debug_recorder.token_ids_from_tensor(
+                first_sampled_ids
+            )
         )
         pre_idx = (num_input_tokens - 1) * torch.ones(1, 1, device=dev, dtype=torch.long)
         pre_idx = pre_idx.clamp(min=0)
         target_hidden = extract_stacked_chs(output.hidden_states, pre_idx)
 
+        acceptance_lengths: list[int] = []
+        target_total_time = 0.0
+        draft_total_time = 0.0
+        steps = 0
         start = input_ids.shape[1]
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
             noise_embedding = target.model.embed_tokens(block_output_ids)
+            context_token_ids = debug_recorder.token_ids_from_tensor(
+                output_ids[:, :start]
+            )
+            block_seed_token_ids = debug_recorder.token_ids_from_tensor(
+                block_output_ids[:, :1]
+            )
             # 与 OnlineFlashMTPModel._create_position_ids 一致：块内为 [anchor, anchor+1, ...]
             block_position_ids_for_draft = position_ids[
                 :, start : start + block_size
             ]
+            draft_start_time = time.time()
             draft_logits = target.lm_head(
                 self(
                     target_hidden=target_hidden,
@@ -462,8 +630,11 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                     is_causal=False,
                 )[:, -block_size + 1 :, :]
             )
-            block_output_ids[:, 1:] = sample(draft_logits)
+            draft_total_time += time.time() - draft_start_time
+            draft_sampled_ids = sample(draft_logits)
+            block_output_ids[:, 1:] = draft_sampled_ids
 
+            target_start_time = time.time()
             output = target(
                 block_output_ids,
                 position_ids=block_position_ids,
@@ -471,6 +642,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 use_cache=True,
                 output_hidden_states=True,
             )
+            target_total_time += time.time() - target_start_time
 
             posterior = sample(output.logits, temperature)
             acceptance_length = (
@@ -481,8 +653,50 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             )
             # 与 DFlash/eval 一致：连续接受的 draft 位置数 + 块首 seed，记为一步的「接收长度」
             accept_len_report = int(acceptance_length) + 1
+            acceptance_lengths.append(accept_len_report)
             if accept_lengths_out is not None:
                 accept_lengths_out.append(accept_len_report)
+            if draft_topk_file is not None:
+                last_accepted_token = ""
+                if tokenizer is not None:
+                    last_token_id = int(block_output_ids[0, acceptance_length].item())
+                    last_accepted_token = decode_single_token_for_log(
+                        tokenizer, last_token_id
+                    )
+                append_draft_block_topk_jsonl(
+                    draft_logits,
+                    tokenizer,
+                    draft_topk_file,
+                    temperature=temperature,
+                    topk=draft_topk,
+                    decode_step=steps + 1,
+                    acceptance_length=int(acceptance_length),
+                    last_accepted_token=last_accepted_token,
+                    draft_sampled_ids=draft_sampled_ids,
+                    anchor_token_id=int(block_output_ids[0, 0].item()),
+                )
+            posterior_token_ids = debug_recorder.token_ids_from_tensor(posterior)
+            accepted_token_ids = debug_recorder.token_ids_from_tensor(
+                block_output_ids[:, : acceptance_length + 1]
+            )
+            replacement_token_id = int(posterior[0, acceptance_length].item())
+            debug_recorder.add_step(
+                step=steps + 1,
+                start=int(start),
+                block_size=int(block_size),
+                context_token_ids=context_token_ids,
+                block_seed_token_ids=block_seed_token_ids,
+                block_position_ids=debug_recorder.token_ids_from_tensor(
+                    block_position_ids
+                ),
+                draft_sampled_token_ids=debug_recorder.token_ids_from_tensor(
+                    draft_sampled_ids
+                ),
+                posterior_token_ids=posterior_token_ids,
+                acceptance_length=int(acceptance_length),
+                accepted_token_ids=accepted_token_ids,
+                replacement_token_id=replacement_token_id,
+            )
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
                 :, : acceptance_length + 1
             ]
@@ -499,6 +713,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 output.hidden_states,
                 torch.tensor([[last_chunk_idx]], device=dev, dtype=torch.long),
             )
+            steps += 1
             if stop_token_ids is not None and any(
                 stop_token_id in output_ids[:, num_input_tokens:]
                 for stop_token_id in stop_token_ids
@@ -515,5 +730,20 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 output_ids = output_ids[
                     :, : num_input_tokens + stop_token_indices[0] + 1
                 ]
+
+        debug_file = debug_recorder.dump(
+            final_output_token_ids=debug_recorder.token_ids_from_tensor(output_ids),
+            accept_lengths=acceptance_lengths,
+            target_total_time=target_total_time,
+            draft_total_time=draft_total_time,
+            steps=steps,
+        )
+        self._last_decode_stats = {
+            "accept_lengths": acceptance_lengths,
+            "target_total_time": target_total_time,
+            "draft_total_time": draft_total_time,
+            "steps": steps,
+            "debug_file": debug_file,
+        }
 
         return output_ids
