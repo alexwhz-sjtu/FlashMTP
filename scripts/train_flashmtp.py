@@ -25,7 +25,7 @@ from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.flashmtp import OnlineFlashMTPModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
-from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
+from specforge.modeling.draft.flashmtp import FlashMTPDraftModel, build_target_layer_ids
 from specforge.modeling.target.flashmtp_target_model import (
     FlashMTPTargetModel,
     get_flashmtp_target_model,
@@ -199,13 +199,20 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     n_chs = int(
         draft_config.flashmtp_config.get("num_chs_source_tokens", n_chs_default)
     )
+    target_layer_ids = draft_config.flashmtp_config.get(
+        "target_layer_ids",
+        build_target_layer_ids(target_cfg.num_hidden_layers, 5),
+    )
     draft_config.flashmtp_config["num_chs_source_tokens"] = n_chs
     draft_config.flashmtp_config["chs_fusion_layer_idx"] = args.chs_fusion_layer_idx
     draft_config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
+    draft_config.flashmtp_config["chs_fusion_type"] = "attempt2_history_cross_attention"
+    draft_config.flashmtp_config["target_layer_ids"] = target_layer_ids
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
     print_on_rank0(f"CHS concat mode: {args.chs_concat_mode}")
+    print_on_rank0(f"Attempt2 target_layer_ids: {target_layer_ids}")
 
     draft_model = FlashMTPDraftModel(draft_config).cuda().to(torch.bfloat16)
 
@@ -217,7 +224,7 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     print_on_rank0(
         f"Draft config: block_size={draft_config.block_size}, "
         f"num_hidden_layers={draft_config.num_hidden_layers}, "
-        f"num_chs_source_tokens={n_chs} (embed + {target_cfg.num_hidden_layers} layers)"
+        f"target_layer_ids={target_layer_ids}"
     )
     print_on_rank0(
         f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}"

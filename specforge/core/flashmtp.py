@@ -9,7 +9,6 @@ import torch.nn.functional as F
 
 from specforge.modeling.draft.flashmtp import (
     FlashMTPDraftModel,
-    stack_hidden_states_for_positions,
 )
 
 try:
@@ -206,14 +205,11 @@ class OnlineFlashMTPModel(nn.Module):
 
         # Anchor at p: use target states at p-1 (context for position p)
         context_positions = (anchor_positions - 1).clamp(min=0)
-        target_hidden = stack_hidden_states_for_positions(
-            hidden_states, context_positions
-        )
-
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
-            target_hidden=target_hidden,
+            target_hidden=hidden_states,
+            context_positions=context_positions,
             attention_mask=flashmtp_attn_mask,
         )
 

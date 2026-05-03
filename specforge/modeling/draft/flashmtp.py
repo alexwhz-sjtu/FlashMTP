@@ -1,3 +1,4 @@
+import math
 from typing import Callable, List, Optional, Sequence, Union
 
 import torch
@@ -70,6 +71,124 @@ def stack_hidden_states_for_positions(
         )
         out.append(g)
     return torch.stack(out, dim=2)
+
+
+def build_target_layer_ids(num_target_layers: int, num_layers: int = 5) -> list[int]:
+    """DFlash-style evenly spaced target layers, excluding very early/final layers."""
+    if num_layers <= 1:
+        return [num_target_layers // 2]
+    start = 1
+    end = max(start, num_target_layers - 3)
+    span = end - start
+    return [
+        int(round(start + (i * span) / (num_layers - 1)))
+        for i in range(num_layers)
+    ]
+
+
+def _sinusoidal_position_embedding(
+    position_ids: torch.Tensor,
+    dim: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Create deterministic absolute position features for arbitrary position ids."""
+    half_dim = dim // 2
+    inv_freq = torch.exp(
+        torch.arange(0, half_dim, device=position_ids.device, dtype=torch.float32)
+        * (-math.log(10000.0) / max(half_dim, 1))
+    )
+    angles = position_ids.float().unsqueeze(-1) * inv_freq
+    emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+    if dim % 2 == 1:
+        emb = torch.nn.functional.pad(emb, (0, 1))
+    return emb.to(dtype=dtype)
+
+
+def _select_and_concat_target_layers(
+    hidden_states: Union[Sequence[torch.Tensor], torch.Tensor],
+    layer_ids: Sequence[int],
+) -> torch.Tensor:
+    """Select target decoder layers and concatenate on feature dim."""
+    if isinstance(hidden_states, torch.Tensor):
+        if hidden_states.dim() == 4:
+            selected_states = [hidden_states[:, :, i, :] for i in layer_ids]
+        elif hidden_states.dim() == 3:
+            return hidden_states
+        else:
+            raise ValueError("Expected hidden_states tensor with dim 3 or 4.")
+    else:
+        offset = 1  # HF hidden_states[0] is embedding output; layers start at 1.
+        selected_states = [hidden_states[layer_id + offset] for layer_id in layer_ids]
+    return torch.cat(selected_states, dim=-1)
+
+
+class CHSHistoryCrossAttentionFusion(nn.Module):
+    """Attempt 2 CHS: DFlash-style layer concat + one-head history cross-attn.
+
+    For every sampled anchor p, query is the fused HS at p-1 and keys/values are the
+    fused HS of all positions <= p-1. Absolute sinusoidal position features encode the
+    natural history order before the one-head cross-attention.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3Config,
+        target_layer_ids: Sequence[int],
+    ):
+        super().__init__()
+        self.target_layer_ids = list(target_layer_ids)
+        d = config.hidden_size
+        self.fc = nn.Linear(len(self.target_layer_ids) * d, d, bias=False)
+        self.hidden_norm = Qwen3RMSNorm(d, eps=config.rms_norm_eps)
+        self.q_proj = nn.Linear(d, d, bias=config.attention_bias)
+        self.k_proj = nn.Linear(d, d, bias=config.attention_bias)
+        self.v_proj = nn.Linear(d, d, bias=config.attention_bias)
+        self.o_proj = nn.Linear(d, d, bias=config.attention_bias)
+        self.q_norm = Qwen3RMSNorm(d, eps=config.rms_norm_eps)
+        self.k_norm = Qwen3RMSNorm(d, eps=config.rms_norm_eps)
+        self.out_norm = Qwen3RMSNorm(d, eps=config.rms_norm_eps)
+        self.attention_dropout = config.attention_dropout
+        self.scaling = d**-0.5
+
+    def forward(
+        self,
+        hidden_states: Union[Sequence[torch.Tensor], torch.Tensor],
+        context_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        fused_history = self.hidden_norm(
+            self.fc(_select_and_concat_target_layers(hidden_states, self.target_layer_ids))
+        )
+        bsz, seq_len, dim = fused_history.shape
+        n = context_positions.size(1)
+        safe_context_positions = context_positions.clamp(0, seq_len - 1)
+
+        batch_idx = torch.arange(bsz, device=fused_history.device)[:, None].expand(bsz, n)
+        query_states = fused_history[batch_idx, safe_context_positions, :]
+
+        history_pos = torch.arange(seq_len, device=fused_history.device).view(1, seq_len)
+        history_pos_emb = _sinusoidal_position_embedding(
+            history_pos.expand(bsz, -1), dim, fused_history.dtype
+        )
+        query_pos_emb = _sinusoidal_position_embedding(
+            safe_context_positions, dim, fused_history.dtype
+        )
+
+        positioned_history = fused_history + history_pos_emb
+        positioned_query = query_states + query_pos_emb
+
+        q = self.q_norm(self.q_proj(positioned_query))
+        k = self.k_norm(self.k_proj(positioned_history))
+        v = self.v_proj(fused_history)
+
+        attn_scores = torch.einsum("bnd,btd->bnt", q, k) * self.scaling
+        history_mask = history_pos <= safe_context_positions.unsqueeze(-1)
+        attn_scores = attn_scores.masked_fill(~history_mask, torch.finfo(attn_scores.dtype).min)
+        attn_weights = torch.softmax(attn_scores.float(), dim=-1).to(dtype=attn_scores.dtype)
+        attn_weights = torch.dropout(
+            attn_weights, p=self.attention_dropout, train=self.training
+        )
+        attn_output = torch.einsum("bnt,btd->bnd", attn_weights, v)
+        return self.out_norm(query_states + self.o_proj(attn_output))
 
 
 class CHSQueryFusion(nn.Module):
@@ -316,6 +435,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         super().__init__(config)
         self.config = config
         flashmtp_config = _merged_flashmtp_config(config)
+        self.chs_fusion_type = flashmtp_config.get(
+            "chs_fusion_type", "attempt2_history_cross_attention"
+        )
         nsrc = int(
             flashmtp_config.get(
                 "num_chs_source_tokens",
@@ -332,20 +454,37 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.chs_fusion = CHSQueryFusion(
-            config,
-            nsrc,
-            chs_fusion_layer_idx=chs_fusion_layer_idx,
+        self.target_layer_ids = flashmtp_config.get(
+            "target_layer_ids",
+            build_target_layer_ids(getattr(config, "num_target_layers", 0), 5),
         )
+        if self.chs_fusion_type == "attempt2_history_cross_attention":
+            self.chs_fusion = CHSHistoryCrossAttentionFusion(
+                config,
+                target_layer_ids=self.target_layer_ids,
+            )
+        else:
+            self.chs_fusion = CHSQueryFusion(
+                config,
+                nsrc,
+                chs_fusion_layer_idx=chs_fusion_layer_idx,
+            )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
-        print_on_rank0(
-            "FlashMTP: num_chs_source_tokens="
-            f"{self.num_chs_source_tokens} (embed+layers), "
-            "CHS fusion=depth self-attn, readout=last layer slot"
-        )
+        if self.chs_fusion_type == "attempt2_history_cross_attention":
+            print_on_rank0(
+                "FlashMTP Attempt2: target_layer_ids="
+                f"{self.target_layer_ids}, CHS fusion=feature concat+FC "
+                "+ single-head history cross-attn"
+            )
+        else:
+            print_on_rank0(
+                "FlashMTP: num_chs_source_tokens="
+                f"{self.num_chs_source_tokens} (embed+layers), "
+                "CHS fusion=depth self-attn, readout=last layer slot"
+            )
         self.post_init()
 
     def forward(
@@ -354,6 +493,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         noise_embedding: Optional[torch.Tensor] = None,
         target_hidden: Optional[torch.Tensor] = None,
+        context_positions: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
         **kwargs,
@@ -361,10 +501,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         hidden_states = noise_embedding
         if target_hidden is None:
             raise ValueError("target_hidden is required.")
-        # (B, N, S, H) before fusion
-        target_hidden = self.chs_fusion(target_hidden)
-        # RoPE must cover K/V = [context | draft]. Previously only `hidden_states` (draft)
-        # was used, so cos/sin length did not match concat(k_ctx, k_noise) in attention.
         bs = self.block_size
         dlen = hidden_states.size(1)
         if dlen % bs != 0:
@@ -372,13 +508,23 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 f"Draft sequence length {dlen} must be divisible by block_size {bs}."
             )
         n_blocks = dlen // bs
+        first_of_block = position_ids[:, ::bs]
+        inferred_context_positions = (first_of_block - 1).clamp(min=0)
+        if context_positions is None:
+            context_positions = inferred_context_positions
+        if self.chs_fusion_type == "attempt2_history_cross_attention":
+            target_hidden = self.chs_fusion(target_hidden, context_positions)
+        else:
+            # (B, N, S, H) before fusion
+            target_hidden = self.chs_fusion(target_hidden)
+        # RoPE must cover K/V = [context | draft]. Previously only `hidden_states` (draft)
+        # was used, so cos/sin length did not match concat(k_ctx, k_noise) in attention.
         if target_hidden.size(1) != n_blocks:
             raise ValueError(
                 f"Fused target_hidden len {target_hidden.size(1)} != num_blocks {n_blocks}."
             )
         # Block i draft starts at position_ids[:, i * bs] (= anchor i); CHS uses anchor-1.
-        first_of_block = position_ids[:, ::bs]
-        ctx_position_ids = (first_of_block - 1).clamp(min=0)
+        ctx_position_ids = context_positions
         pos_full = torch.cat([ctx_position_ids, position_ids], dim=1)
         h_full = torch.cat([target_hidden, hidden_states], dim=1)
         position_embeddings = self.rotary_emb(h_full, pos_full)
