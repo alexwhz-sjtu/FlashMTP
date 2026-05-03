@@ -44,7 +44,7 @@ import json
 import os
 import random
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
 from tqdm import tqdm
@@ -223,6 +223,32 @@ def resolve_output_path(args):
     return os.path.join("./cache/data/regen_data", filename)
 
 
+def add_number_suffix_if_exists(file_path: str, related_file_path: Optional[str] = None) -> str:
+    """Return a non-existing file path by appending _1, _2, ... before the extension."""
+    if not os.path.exists(file_path) and (
+        related_file_path is None or not os.path.exists(related_file_path)
+    ):
+        return file_path
+
+    directory = os.path.dirname(file_path)
+    filename = os.path.basename(file_path)
+    stem, extension = os.path.splitext(filename)
+
+    suffix = 1
+    while True:
+        candidate = os.path.join(directory, f"{stem}_{suffix}{extension}")
+        candidate_related = (
+            candidate.replace(".jsonl", "_error.jsonl")
+            if related_file_path is not None
+            else None
+        )
+        if not os.path.exists(candidate) and (
+            candidate_related is None or not os.path.exists(candidate_related)
+        ):
+            return candidate
+        suffix += 1
+
+
 def compute_context_length(conversations: List[Dict[str, Any]]) -> int:
     """
     This is a rough estimate of the context length measured in untokenized
@@ -259,7 +285,6 @@ def build_query_kwargs(args, messages, max_tokens=None):
         query_kwargs["presence_penalty"] = args.repetition_penalty
 
     extra_body = {"chat_template_kwargs": {"enable_thinking": args.enable_thinking}}
-    print(f"Enable thinking: {args.enable_thinking}")
     
     if args.top_k is not None:
         extra_body["top_k"] = args.top_k
@@ -329,6 +354,12 @@ def main():
     # Resolve output file path (auto-generate if not explicitly provided)
     output_file_path = resolve_output_path(args)
     os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
+    error_file_path = output_file_path.replace(".jsonl", "_error.jsonl")
+    if not args.resume:
+        original_output_file_path = output_file_path
+        output_file_path = add_number_suffix_if_exists(output_file_path, error_file_path)
+        if output_file_path != original_output_file_path:
+            print(f"Output file exists, using: {output_file_path}")
     print(output_file_path)
 
     # Validate parameters
