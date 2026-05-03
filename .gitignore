@@ -203,3 +203,4 @@ wandb/
 log.txt
 
 whz_mtp_logs/
+model_answer/
