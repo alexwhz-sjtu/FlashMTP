@@ -20,8 +20,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 DT="${DT:-a800}"
-if [[ "$DT" != "qz" && "$DT" != "a800" ]]; then
-    echo "错误: --dt 须为 qz 或 a800"
+if [[ "$DT" != "qz" && "$DT" != "a800" && "$DT" != "h100" ]]; then
+    echo "错误: --dt 须为 qz、a800 或 h100"
     exit 1
 fi
 
@@ -63,9 +63,13 @@ if [ "$DT" = "qz" ]; then
     # export NNODES=2
     # export NODE_RANK=${RANK:-0}
     export WANDB_MODE=offline
-    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}_old/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
     OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
+elif [ "$DT" = "h100" ]; then
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-../training_data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
     OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
@@ -116,7 +120,7 @@ BUILD_DATASET_NUM_PROC="${BUILD_DATASET_NUM_PROC:-8}"
 echo "=========================================="
 echo "FlashMTP 训练启动脚本"
 echo "=========================================="
-echo "运行环境: --dt ${DT} (qz | a800)"
+echo "运行环境: --dt ${DT} (qz | a800 | h100)"
 echo "数据特征:"
 echo "  样本数量: ${DATA_NUM_SAMPLES}"
 echo "  思考模式: ${ENABLE_THINKING}"

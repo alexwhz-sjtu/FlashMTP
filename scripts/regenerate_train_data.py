@@ -1,6 +1,7 @@
 """
 This script will re-generate the dataset from target model,
 which better aligns the draft model with the target model’s output distribution.
+It accepts preformatted conversation JSONL, CodeAlpaca JSONL, and Orca Math parquet.
 
 Output files are organized by (dataset_name, enable_thinking, samples, model):
   cache/data/regen_data/{dataset}_think_{on|off}_samples_{count}_{model}_regen.jsonl
@@ -40,11 +41,12 @@ You can also explicitly specify the output path:
 """
 
 import argparse
+import importlib
 import json
 import os
 import random
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from openai import OpenAI
 from tqdm import tqdm
@@ -120,7 +122,10 @@ def parse_arguments():
     # data related arguments
     data_group = parser.add_argument_group("data")
     data_group.add_argument(
-        "--input-file-path", type=str, required=True, help="Path to the input file"
+        "--input-file-path",
+        type=str,
+        required=True,
+        help="Path to the input file (conversation JSONL, CodeAlpaca JSONL, or Orca Math parquet)",
     )
     data_group.add_argument(
         "--output-file-path", type=str, default=None,
@@ -172,6 +177,8 @@ def extract_samples_from_filename(input_file_path: str) -> str:
     """
     import re
     basename = os.path.basename(input_file_path)
+    if basename.endswith(".parquet"):
+        return "all"
     match = re.search(r'(\d+)', basename)
     return match.group(1) if match else "all"
 
@@ -186,7 +193,9 @@ def extract_dataset_name(input_file_path: str) -> str:
     basename = os.path.basename(input_file_path)
     # Remove extension and any _{number} suffix
     import re
-    name = re.sub(r'\.jsonl?$', '', basename)
+    name = re.sub(r'\.(jsonl?|parquet)$', '', basename)
+    if name.startswith("train-") and os.path.basename(os.path.dirname(input_file_path)):
+        name = os.path.basename(os.path.dirname(input_file_path))
     name = re.sub(r'_\d+$', '', name)
     return name
 
@@ -247,6 +256,84 @@ def add_number_suffix_if_exists(file_path: str, related_file_path: Optional[str]
         ):
             return candidate
         suffix += 1
+
+
+def clean_text(value: Any) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def normalize_codealpaca_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert CodeAlpaca instruction/input rows to the conversation schema."""
+    instruction = clean_text(record.get("instruction"))
+    input_text = clean_text(record.get("input"))
+    if not instruction:
+        raise ValueError("CodeAlpaca record is missing instruction")
+
+    if input_text:
+        user_content = f"{instruction}\n\nInput:\n{input_text}"
+    else:
+        user_content = instruction
+    return {"conversations": [{"role": "user", "content": user_content}]}
+
+
+def normalize_orca_math_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert Orca Math question/answer rows to the conversation schema."""
+    question = clean_text(record.get("question"))
+    if not question:
+        raise ValueError("Orca Math record is missing question")
+    return {"conversations": [{"role": "user", "content": question}]}
+
+
+def normalize_input_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize supported input dataset rows to the training conversation schema."""
+    if "conversations" in record:
+        return record
+    if "instruction" in record:
+        return normalize_codealpaca_record(record)
+    if "question" in record:
+        return normalize_orca_math_record(record)
+    raise ValueError(f"Unsupported input record fields: {sorted(record.keys())}")
+
+
+def iter_jsonl_records(input_file_path: str) -> Iterator[Dict[str, Any]]:
+    with open(input_file_path, "r") as input_file:
+        for line in input_file:
+            if not line.strip():
+                continue
+            yield normalize_input_record(json.loads(line))
+
+
+def iter_parquet_records(input_file_path: str) -> Iterator[Dict[str, Any]]:
+    try:
+        pq = importlib.import_module("pyarrow.parquet")
+    except ImportError as exc:
+        raise ImportError(
+            "Reading parquet input requires pyarrow. Install pyarrow or run in the project venv."
+        ) from exc
+
+    parquet_file = pq.ParquetFile(input_file_path)
+    for batch in parquet_file.iter_batches(batch_size=1024):
+        for row in batch.to_pylist():
+            yield normalize_input_record(row)
+
+
+def iter_input_records(input_file_path: str) -> Iterator[Dict[str, Any]]:
+    if input_file_path.endswith(".parquet"):
+        return iter_parquet_records(input_file_path)
+    return iter_jsonl_records(input_file_path)
+
+
+def count_input_records(input_file_path: str) -> int:
+    if input_file_path.endswith(".parquet"):
+        try:
+            pq = importlib.import_module("pyarrow.parquet")
+        except ImportError as exc:
+            raise ImportError(
+                "Reading parquet input requires pyarrow. Install pyarrow or run in the project venv."
+            ) from exc
+        return pq.ParquetFile(input_file_path).metadata.num_rows
+    with open(input_file_path, "r") as input_file:
+        return sum(1 for line in input_file if line.strip())
 
 
 def compute_context_length(conversations: List[Dict[str, Any]]) -> int:
@@ -379,7 +466,7 @@ def main():
     print(f"  Output file: {output_file_path}")
     print(f"  Resume mode: {args.resume}")
     print("-" * 50)
-    total_lines = sum(1 for _ in open(args.input_file_path))
+    total_records = count_input_records(args.input_file_path)
 
     skip_lines = 0
     error_file_path = output_file_path.replace(".jsonl", "_error.jsonl")
@@ -396,8 +483,8 @@ def main():
         print(f"  Skipping first {skip_lines} input samples")
         print("-" * 50)
 
-        if skip_lines >= total_lines:
-            print(f"All {total_lines} samples already processed. Nothing to do.")
+        if skip_lines >= total_records:
+            print(f"All {total_records} samples already processed. Nothing to do.")
             return
 
     # test all server addresses
@@ -441,7 +528,6 @@ def main():
 
     # Create progress bar
     with (
-        open(args.input_file_path, "r") as input_file,
         open(output_file_path, file_mode) as output_file_handle,
         open(error_file_path, file_mode) as error_file_handle,
     ):
@@ -451,23 +537,22 @@ def main():
         waiting_queue = {
             server_address: [] for server_address in valid_server_addresses
         }
-        pbar = tqdm(total=total_lines, desc="Processing", initial=skip_lines)
+        input_records = iter_input_records(args.input_file_path)
+        pbar = tqdm(total=total_records, desc="Processing", initial=skip_lines)
         start_server_index = 0
 
         if skip_lines > 0:
             print(f"Skipping {skip_lines} already processed samples...")
             for _ in range(skip_lines):
-                next(input_file, None)
+                next(input_records, None)
             print(f"Resuming from sample {skip_lines + 1}")
 
-        for line in input_file:
+        for data in input_records:
             if (
                 args.num_samples is not None
                 and success_samples + error_samples >= args.num_samples
             ):
                 break
-
-            data = json.loads(line.strip())
 
             # find server address with the least waiting requests
             server_address = valid_server_addresses[start_server_index]

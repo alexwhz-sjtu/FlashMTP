@@ -11,33 +11,37 @@ python ./scripts/parquet2jsonl.py \
 launch server:
 --------------------------------
 
+cd /data/wanghanzhen/Projects/MTP/NIPS26/FlashMTP
 source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=0 python3 -m sglang.launch_server \
-    --model ../models/Qwen/Qwen3.5-9B \
+    --model $WHZ_DIR/models/Qwen/Qwen3-8B \
     --cuda-graph-bs 1 2 4 8 16 32 64 128 \
     --dtype bfloat16 \
     --mem-frac=0.8 \
     --port 30011
 
+cd /data/wanghanzhen/Projects/MTP/NIPS26/FlashMTP
 source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=1 python3 -m sglang.launch_server \
-    --model ../models/Qwen/Qwen3.5-9B \
+    --model $WHZ_DIR/models/Qwen/Qwen3-8B \
     --cuda-graph-bs 1 2 4 8 16 32 64 128 \
     --dtype bfloat16 \
     --mem-frac=0.8 \
     --port 30012
 
+cd /data/wanghanzhen/Projects/MTP/NIPS26/FlashMTP
 source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=2 python3 -m sglang.launch_server \
-    --model ../models/Qwen/Qwen3.5-9B \
+    --model $WHZ_DIR/models/Qwen/Qwen3-8B \
     --cuda-graph-bs 1 2 4 8 16 32 64 128 \
     --dtype bfloat16 \
     --mem-frac=0.8 \
     --port 30013
 
+cd /data/wanghanzhen/Projects/MTP/NIPS26/FlashMTP
 source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=3 python3 -m sglang.launch_server \
-    --model ../models/Qwen/Qwen3.5-9B \
+    --model $WHZ_DIR/models/Qwen/Qwen3-8B \
     --cuda-graph-bs 1 2 4 8 16 32 64 128 \
     --dtype bfloat16 \
     --mem-frac=0.8 \
@@ -45,7 +49,7 @@ CUDA_VISIBLE_DEVICES=3 python3 -m sglang.launch_server \
 
 source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=4 python3 -m sglang.launch_server \
-    --model ../models/Qwen/Qwen3.5-9B \
+    --model ../models/Qwen/Qwen3-8B \
     --cuda-graph-bs 1 2 4 8 16 32 64 128 \
     --dtype bfloat16 \
     --mem-frac=0.8 \
@@ -53,7 +57,7 @@ CUDA_VISIBLE_DEVICES=4 python3 -m sglang.launch_server \
 
 source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=5 python3 -m sglang.launch_server \
-    --model ../models/Qwen/Qwen3.5-9B \
+    --model ../models/Qwen/Qwen3-8B \
     --cuda-graph-bs 1 2 4 8 16 32 64 128 \
     --dtype bfloat16 \
     --mem-frac=0.8 \
@@ -61,7 +65,7 @@ CUDA_VISIBLE_DEVICES=5 python3 -m sglang.launch_server \
 
 source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=6 python3 -m sglang.launch_server \
-    --model ../models/Qwen/Qwen3.5-9B \
+    --model ../models/Qwen/Qwen3-8B \
     --cuda-graph-bs 1 2 4 8 16 32 64 128 \
     --dtype bfloat16 \
     --mem-frac=0.8 \
@@ -69,7 +73,7 @@ CUDA_VISIBLE_DEVICES=6 python3 -m sglang.launch_server \
 
 source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server \
-    --model ../models/Qwen/Qwen3.5-9B \
+    --model ../models/Qwen/Qwen3-8B \
     --cuda-graph-bs 1 2 4 8 16 32 64 128 \
     --dtype bfloat16 \
     --mem-frac=0.8 \
@@ -89,7 +93,7 @@ python scripts/regenerate_train_data.py \
     --output-file-path ./cache/data/regen_data/nemotron_test/nemotron_think_on_samples_test_qwen3_8b_regen.jsonl\
 
 python scripts/regenerate_train_data.py \
-    --model ../models/Qwen/Qwen3.5-9B \
+    --model ../models/Qwen/Qwen3-8B \
     --concurrency 64 \
     --server-address localhost:30011 localhost:30012 localhost:30013 localhost:30014 localhost:30015 localhost:30016 localhost:30017 localhost:30018 \
     --temperature 0.0 \
@@ -109,7 +113,7 @@ python scripts/regenerate_train_data.py \
 
 
 python scripts/regenerate_train_data.py \
-    --model ../models/Qwen/Qwen3.5-9B \
+    --model ../models/Qwen/Qwen3-8B \
     --concurrency 64 \
     --server-address localhost:30001 \
     --temperature 0.0 \
@@ -117,3 +121,19 @@ python scripts/regenerate_train_data.py \
     --max-tokens 24000 \
     --enable-thinking \
     --output-file-path ./cache/data/regen_data/nemotron_test/nemotron_think_on_samples_test_qwen3.5_9b_regen.jsonl
+
+unset ALL_PROXY HTTP_PROXY HTTPS_PROXY all_proxy http_proxy https_proxy
+python scripts/regenerate_train_data.py \
+  --model $WHZ_DIR/models/Qwen/Qwen3-8B \
+  --concurrency 64 \
+  --max-tokens 10240 \
+  --temperature 0.0 \
+  --resume \
+  --server-address localhost:30011 localhost:30012 localhost:30013 localhost:30014 \
+  --input-file-path /data/wanghanzhen/datasets/AI-ModelScope/CodeAlpaca-20k/CodeAlpaca-20k.jsonl \
+  --output-file-path ../training_data/regen_data/codealpaca_20k/codealpace_think_off_samples_20k_qwen3_8b_regen.jsonl
+
+python scripts/regenerate_train_data.py \
+  --model $WHZ_DIR/models/Qwen/Qwen3-8B \
+  --server-address localhost:30000 \
+  --input-file-path /data/wanghanzhen/datasets/microsoft/orca-math-200k/train-00000-of-00001.parquet
