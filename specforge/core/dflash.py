@@ -64,7 +64,7 @@ def create_dflash_block_mask(
 
 
 class OnlineDFlashModel(nn.Module):
-    """DFlash online training wrapper with block-wise CE loss."""
+    """DFlash online training wrapper with CE + LS-RSL streak loss."""
 
     def __init__(
         self,
@@ -75,7 +75,10 @@ class OnlineDFlashModel(nn.Module):
         block_size: int = 16,
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
-        loss_decay_gamma: Optional[float] = None,
+        streak_weight: float = 1.0,
+        ce_weight: float = 1.0,
+        streak_decay_gamma: float = 7.0,
+        log_prob_min: float = -40.0,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -85,7 +88,10 @@ class OnlineDFlashModel(nn.Module):
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
-        self.loss_decay_gamma = loss_decay_gamma
+        self.streak_weight = streak_weight
+        self.ce_weight = ce_weight
+        self.streak_decay_gamma = streak_decay_gamma
+        self.log_prob_min = log_prob_min
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -186,7 +192,8 @@ class OnlineDFlashModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        teacher_logits: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Parallel block-wise training forward pass."""
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -221,6 +228,7 @@ class OnlineDFlashModel(nn.Module):
         )
 
         logits = self.lm_head(output_hidden)
+        vocab_size = logits.size(-1)
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
         label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
@@ -234,40 +242,90 @@ class OnlineDFlashModel(nn.Module):
             safe_label_indices,
         )
 
-        # --- Weight mask: block validity * bounds * exclude anchor (pos 0) * loss_mask ---
-        weight_mask = (
+        # --- Valid mask: block validity * bounds * exclude anchor (pos 0) * loss_mask ---
+        valid_pos = (
             block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
         )
-        weight_mask = weight_mask * valid_label_mask.float()
+        valid_pos = valid_pos * valid_label_mask.float()
 
         pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
-        weight_mask = weight_mask * (pos_in_block > 0).float()
+        valid_pos = valid_pos * (pos_in_block > 0).float()
 
         original_loss_mask_gathered = torch.gather(
             loss_mask.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
             2,
             safe_label_indices,
         )
-        weight_mask = weight_mask * original_loss_mask_gathered
+        valid_pos = valid_pos * original_loss_mask_gathered
 
-        binary_eval_mask = weight_mask.view(-1)
+        binary_eval_mask = valid_pos.view(-1)
 
-        # --- Loss decay: exp(-(k-1)/γ) so k=1 (1st prediction) gets weight 1.0 ---
-        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-            k = torch.arange(self.block_size, device=device).view(1, 1, -1)
-            decay_weights = torch.exp(
-                -(k - 1).clamp(min=0).float() / self.loss_decay_gamma
-            )
-            weight_mask = weight_mask * decay_weights
-
-        # --- Cross entropy ---
-        flat_logits = logits.view(-1, logits.size(-1))
+        # --- CE: average over valid supervised positions, without position weights. ---
+        flat_logits = logits.view(-1, vocab_size)
         flat_targets = target_ids.view(-1)
-        flat_weights = weight_mask.view(-1)
+        flat_valid = valid_pos.view(-1)
 
         loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-        valid_token_count = flat_weights.sum() + 1e-6
-        loss = (loss_per_token * flat_weights).sum() / valid_token_count
+        valid_token_count = flat_valid.sum() + 1e-6
+        loss_ce = (loss_per_token * flat_valid).sum() / valid_token_count
+
+        # --- LS-RSL streak loss from FlashMTP v3.3 method 2. ---
+        log_probs = F.log_softmax(logits.float().view(bsz, -1, vocab_size), dim=-1)
+        log_q = (
+            log_probs.gather(-1, target_ids.view(bsz, -1).unsqueeze(-1))
+            .squeeze(-1)
+            .clamp(min=self.log_prob_min)
+            .view(bsz, anchor_positions.size(1), self.block_size)
+        )
+
+        if teacher_logits is not None:
+            teacher_context_indices = (safe_label_indices - 1).clamp(min=0)
+            teacher_vocab_size = teacher_logits.size(-1)
+            teacher_block_logits = torch.gather(
+                teacher_logits.float(),
+                1,
+                teacher_context_indices.view(bsz, -1)
+                .unsqueeze(-1)
+                .expand(-1, -1, teacher_vocab_size),
+            )
+            teacher_log_probs = F.log_softmax(teacher_block_logits, dim=-1)
+            teacher_p = (
+                teacher_log_probs.gather(-1, target_ids.view(bsz, -1).unsqueeze(-1))
+                .squeeze(-1)
+                .exp()
+                .view(bsz, anchor_positions.size(1), self.block_size)
+            )
+        else:
+            teacher_p = torch.full_like(log_q, 0.5).exp().new_full(log_q.shape, 0.5)
+
+        target_anchor = torch.maximum(
+            torch.full_like(teacher_p, 0.5), teacher_p
+        ).clamp_min(1e-12)
+        log_rho = log_q - target_anchor.log()
+
+        gamma = max(self.block_size - 1, 1)
+        streak_positions = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        streak_weights = torch.exp(
+            -((gamma - streak_positions).clamp(min=0)).float()
+            / self.streak_decay_gamma
+        )
+        log_phi = torch.where(
+            log_rho < 0,
+            log_rho,
+            torch.log1p(streak_weights * log_rho.clamp_min(0.0)),
+        )
+
+        log_phi_tail = log_phi[..., 1:]
+        valid_tail = valid_pos[..., 1:]
+        prefix_valid = valid_tail.cumprod(dim=-1)
+        prefix_log = (log_phi_tail * valid_tail).cumsum(dim=-1)
+        relative_streak = prefix_log.exp() * prefix_valid
+        streak_sum = relative_streak.sum(dim=-1).clamp_min(1e-12)
+        block_has_streak = (prefix_valid.sum(dim=-1) > 0).float()
+        valid_block_count = block_has_streak.sum() + 1e-6
+        loss_streak = (-(streak_sum.log()) * block_has_streak).sum() / valid_block_count
+
+        loss = self.ce_weight * loss_ce + self.streak_weight * loss_streak
 
         # --- Accuracy ---
         with torch.no_grad():
@@ -276,4 +334,4 @@ class OnlineDFlashModel(nn.Module):
             actual_token_count = binary_eval_mask.sum() + 1e-6
             accuracy = correct.sum().float() / actual_token_count
 
-        return loss, accuracy
+        return loss, accuracy, loss_streak.detach(), loss_ce.detach()

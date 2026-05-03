@@ -32,7 +32,7 @@ class TrackerArgs:
         )
         # wandb-specific args
         parser.add_argument("--wandb-project", type=str, default=None)
-        parser.add_argument("--wandb-name", type=str, default=None)
+        parser.add_argument("--wandb-name", "--wandb-run-name", dest="wandb_name", type=str, default=None)
         parser.add_argument("--wandb-key", type=str, default=None, help="W&B API key.")
         parser.add_argument("--wandb-run-id", type=str, default=None, help="W&B run ID for resuming training.")
         # swanlab-specific args

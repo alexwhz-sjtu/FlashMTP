@@ -41,7 +41,31 @@ v5 的 cross-attention 约定：
 MDLM 和 Streak 的损失目标不变。修改集中在草稿模型的条件构造：
 
 - MDLM 仍然做块内随机 mask，监督 `pos_in_block > 0` 的 masked token。
-- Streak 仍然使用 LS-RSL 作为主目标，并可用 CE 辅助项。
+- Streak 仍然使用 LS-RSL 作为主目标，并可用 CE 辅助项。方法2中达标后的 log 平滑项加入位置相关权重：
+
+$$
+\phi_j(\rho_j)=
+\begin{cases}
+\rho_j, & \rho_j < 1, \\\\
+1+w_j\log(\rho_j), & \rho_j \ge 1,
+\end{cases}
+$$
+
+其中块内监督位置为 $j=1,2,\dots,\gamma$，反向使用 DFlash 风格的指数衰减，让越靠前的位置达标后权重越小：
+
+$$
+w_j=\exp\left(-\frac{\gamma-j}{7}\right)
+$$
+
+因此最后一个监督位置满足 $w_\gamma=1$，前面位置的达标后 log 梯度按指数减小：
+
+$$
+\frac{\partial \phi_j}{\partial \rho_j}
+=
+\frac{w_j}{\rho_j},
+\qquad \rho_j \ge 1.
+$$
+
 - 两者都不再只传单点 stacked hidden，而是传完整目标 hidden history 和 attention mask。
 
 这样 MDLM 和 Streak 共享同一个 v5 draft 条件路径，避免两阶段训练学到不同的信息接口。

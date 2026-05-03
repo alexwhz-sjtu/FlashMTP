@@ -77,8 +77,25 @@ def parse_args():
         "--loss-decay-gamma",
         type=float,
         default=None,
-        help="Gamma for exponential loss decay weighting (paper Eq.4). "
-        "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
+        help="Deprecated. DFlash now uses unweighted CE plus LS-RSL streak loss.",
+    )
+    model_group.add_argument(
+        "--streak-weight",
+        type=float,
+        default=1.0,
+        help="Weight for the LS-RSL streak loss.",
+    )
+    model_group.add_argument(
+        "--ce-weight",
+        type=float,
+        default=1.0,
+        help="Weight for the unweighted per-position CE loss.",
+    )
+    model_group.add_argument(
+        "--streak-decay-gamma",
+        type=float,
+        default=7.0,
+        help="Gamma for LS-RSL high-confidence position weights.",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -302,6 +319,8 @@ def record_metrics(
     args,
     loss: float,
     accuracy: float,
+    loss_streak: float,
+    loss_ce: float,
     global_step: int,
     tracker,
     optimizer,
@@ -314,10 +333,13 @@ def record_metrics(
         logdict["train/lr"] = optimizer.get_learning_rate()
 
     logdict[f"{mode}/loss"] = loss
+    logdict[f"{mode}/streak_loss"] = loss_streak
+    logdict[f"{mode}/ce_loss"] = loss_ce
     logdict[f"{mode}/accuracy"] = accuracy
 
     print_on_rank0(
-        f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}"
+        f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], "
+        f"Loss: {loss:.4f}, Streak: {loss_streak:.4f}, CE: {loss_ce:.4f}, Acc: {accuracy:.4f}"
     )
 
     tracker.log(logdict, step=global_step)
@@ -418,7 +440,9 @@ def main():
         mask_token_id=mask_token_id,
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
-        loss_decay_gamma=args.loss_decay_gamma,
+        streak_weight=args.streak_weight,
+        ce_weight=args.ce_weight,
+        streak_decay_gamma=args.streak_decay_gamma,
     )
 
     dflash_model = FSDP(
@@ -484,11 +508,17 @@ def main():
                 input_ids, attention_mask, loss_mask
             )
             hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
+            teacher_logits = (
+                target_output.teacher_logits.cuda()
+                if target_output.teacher_logits is not None
+                else None
+            )
 
-            loss, accuracy = dflash_model(
+            loss, accuracy, loss_streak, loss_ce = dflash_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
+                teacher_logits=teacher_logits,
             )
 
             (loss / args.accumulation_steps).backward()
@@ -499,15 +529,23 @@ def main():
             if global_step % args.log_interval == 0:
                 loss_log = loss.clone()
                 acc_log = accuracy.clone()
+                streak_log = loss_streak.clone()
+                ce_log = loss_ce.clone()
                 dist.all_reduce(loss_log)
                 dist.all_reduce(acc_log)
+                dist.all_reduce(streak_log)
+                dist.all_reduce(ce_log)
                 loss_log = loss_log / dist.get_world_size()
                 acc_log = acc_log / dist.get_world_size()
+                streak_log = streak_log / dist.get_world_size()
+                ce_log = ce_log / dist.get_world_size()
 
                 record_metrics(
                     args,
                     loss_log.item(),
                     acc_log.item(),
+                    streak_log.item(),
+                    ce_log.item(),
                     global_step,
                     tracker,
                     optimizer,
@@ -521,6 +559,8 @@ def main():
                 progress_bar.set_postfix(
                     {
                         "loss": f"{loss.item():.4f}",
+                        "streak": f"{loss_streak.item():.4f}",
+                        "ce": f"{loss_ce.item():.4f}",
                         "acc": f"{accuracy.item():.4f}",
                         "iter_time": f"{elapsed:.2f}s",
                     }

@@ -28,6 +28,7 @@ class DFlashTargetOutput:
     input_ids: torch.Tensor  # [batch, seq_len]
     attention_mask: torch.Tensor  # [batch, seq_len]
     loss_mask: torch.Tensor  # [batch, seq_len]
+    teacher_logits: Optional[torch.Tensor] = None  # [batch, seq_len, vocab]
 
 
 class DFlashTargetModel(ABC):
@@ -220,6 +221,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            teacher_logits=None,
         )
 
 
@@ -282,6 +284,7 @@ class HFDFlashTargetModel(DFlashTargetModel):
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            teacher_logits=outputs.logits,
         )
 
 
