@@ -1,5 +1,4 @@
 #!/bin/bash
-# FlashMTP 训练启动脚本（单目标 CE，无 DFlash++ 的 L_dflash/L_con 等多损失）
 
 set -e
 
@@ -16,6 +15,7 @@ cd "${PROJECT_DIR}"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --dt) DT="$2"; shift 2 ;;
+        --stage_head) STAGE_HEAD="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
@@ -45,10 +45,16 @@ CKPT_DIR="${CKPT_DIR:-}"
 # ========================================
 # 数据特征参数
 DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}"
-ENABLE_THINKING="${ENABLE_THINKING:-on}"
+ENABLE_THINKING="${ENABLE_THINKING:-off}"
 
 # 草稿层数：默认目录名/ WandB id/ run name 中均带 nlayers${NUM_DRAFT_LAYERS}
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
+BLOCK_SIZE="${BLOCK_SIZE:-16}"
+STAGE_HEAD="${STAGE_HEAD:-false}"
+if [[ "$STAGE_HEAD" != "true" && "$STAGE_HEAD" != "false" ]]; then
+    echo "错误: --stage_head 须为 true 或 false"
+    exit 1
+fi
 
 # ========================================
 # 默认参数（通常不需要修改）
@@ -64,15 +70,24 @@ if [ "$DT" = "qz" ]; then
     # export NODE_RANK=${RANK:-0}
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtpv6_qz_${CHS_CONCAT_MODE}_stagehead_${STAGE_HEAD}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 elif [ "$DT" = "h100" ]; then
-    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-../training_data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    DEFAULT_TRAIN_DATA_PATH="../training_data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl"
+    if [ -z "${TRAIN_DATA_PATH:-}" ] && [ ! -f "${DEFAULT_TRAIN_DATA_PATH}" ] && [ "${ENABLE_THINKING}" = "on" ]; then
+        FALLBACK_TRAIN_DATA_PATH="../training_data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_off_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl"
+        if [ -f "${FALLBACK_TRAIN_DATA_PATH}" ]; then
+            echo "警告: 未找到 h100 think_on 数据，自动切换到 think_off: ${FALLBACK_TRAIN_DATA_PATH}"
+            ENABLE_THINKING="off"
+            DEFAULT_TRAIN_DATA_PATH="${FALLBACK_TRAIN_DATA_PATH}"
+        fi
+    fi
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-${DEFAULT_TRAIN_DATA_PATH}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtpv6_h100_stagehead_${STAGE_HEAD}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtpv6_a800_stagehead_${STAGE_HEAD}_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
@@ -90,7 +105,6 @@ EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
 CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 
 # 模型参数
-BLOCK_SIZE="${BLOCK_SIZE:-12}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
 
@@ -101,11 +115,11 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-5000}"
 
 # Tracker 参数
 REPORT_TO="${REPORT_TO:-wandb}"
-WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training}"
+WANDB_PROJECT="${WANDB_PROJECT:-flashmtp_v6}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtpv6_${DT}_stagehead_${STAGE_HEAD}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-flashmtp_v6_${DT}_stagehead_${STAGE_HEAD}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_think_${ENABLE_THINKING}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}}"
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}"
@@ -136,6 +150,7 @@ echo "------------------------------------------"
 echo "模型配置:"
 echo "  草稿模型层数: ${NUM_DRAFT_LAYERS}"
 echo "  块大小: ${BLOCK_SIZE}"
+echo "  Stage Head: ${STAGE_HEAD} (true=stage0共享target且stage1+可训练; false=全部共享冻结target lm_head)"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
@@ -221,7 +236,7 @@ if [ "${REPORT_TO}" != "none" ]; then
         OPTIONAL_ARGS="${OPTIONAL_ARGS} --wandb-project ${WANDB_PROJECT}"
     fi
     if [ -n "${WANDB_RUN_NAME}" ]; then
-        OPTIONAL_ARGS="${OPTIONAL_ARGS} --wandb-run-name ${WANDB_RUN_NAME}"
+        OPTIONAL_ARGS="${OPTIONAL_ARGS} --wandb-name ${WANDB_RUN_NAME}"
     fi
     if [ -n "${WANDB_RUN_ID}" ]; then
         OPTIONAL_ARGS="${OPTIONAL_ARGS} --wandb-run-id ${WANDB_RUN_ID}"
@@ -238,6 +253,7 @@ EXIT_CODE=0
     --cache-dir ${CACHE_DIR} \
     --num-draft-layers ${NUM_DRAFT_LAYERS} \
     --block-size ${BLOCK_SIZE} \
+    --stage-head ${STAGE_HEAD} \
     --num-anchors ${NUM_ANCHORS} \
     --attention-backend ${ATTENTION_BACKEND} \
     --learning-rate ${LEARNING_RATE} \

@@ -3,7 +3,7 @@
 ## Background
 我现在在做一个投机解码的工作。
 
-**传统的投机解码**：草稿模型是自回归的太慢了。然而文字之间语义是连贯的，相关的，我的目标是进行词组的预测。词组之间是强相关的，因此我利用双向注意力，输入多个mask，希望一次预测多个token出来。
+**传统的投机解码**：草稿模型是自回归的太慢了。然而文字之间语义是连贯的，相关的，因此我可以利用双向注意力/扩散原理来进行少次（理想是1次）前向就生成一段长度的候选token。
 
 **KV cache抛弃**： 对于草稿模型，kvcache是冗余的。大模型***生成的最新的隐藏状态***应该是计算了所有历史信息，理论上是对前文的浓缩。因此我将这个作为上下文中枢（Contextual Pivot）可以只使用这个信息就可以预测后面一块内容。此外，大模型不同深度的层关注前文不同的信息，因此我会纳入所有层的hidden states，进行信息提取。
 
@@ -19,8 +19,10 @@
 * 训练数据：我的训练数据全部是目标大模型生成的响应，这样可以对齐。
 * anchor token：训练时随机采样的位置上的token，训练输入为，预测anchortoken的hs（即pivot），拼接ancho token（clean的）在拼接上B-1个noise embedding。
 
-### 掩码离散扩散语言模型
 ---
+
+### 掩码离散扩散语言模型
+
 - 前向过程（加噪/扩散）： 这是一个人为破坏数据的过程。给定一段文本，我们随机地将一些 Token 替换为特殊的 [MASK] 标签。随着步数 $t$ 的增加，掩码比例逐渐增大，直到 $t=T$ 时，文本变成纯粹的 [MASK] 序列。
 
 - 反向过程（去噪/生成）： 这是模型学习的任务。模型接收一个带有 [MASK] 的序列，目标是预测这些 [MASK] 位置原本的 Token。在推理阶段，我们可以从全 [MASK] 开始，通过一次或多次迭代，不断填补并修正这些位置。
@@ -33,8 +35,10 @@ MDLM 的训练本质上是一个多尺度的填空任务。
 
 - 预测与损失：将掩码序列输入模型，要求模型预测所有被掩码位置的原始 Token。损失函数：通常采用交叉熵损失（Cross-Entropy Loss）。
 
-### 连续扩散语言模型 LangFlow
 ---
+
+### 连续扩散语言模型 LangFlow
+
 嵌入空间扩散：将 Token 映射到连续的嵌入空间（Embedding Space）进行扩散 。这种方法能避免维度灾难，且更易于进行编辑和少步生成 。
 
 ### 基本原理：
@@ -47,26 +51,25 @@ $\sigma_t$：噪声水平（由噪声调度器控制）。它描述了如何将�
 2. 基于 Bregman 散度的流匹配   
 文章证明了在连续流模型中使用交叉熵（Cross-Entropy）的合法性。模型不再试图恢复具体的向量数值，而是通过当前带有噪声的向量 $z_t$，预测 Token 分布：$$\mathcal{L} = \mathbb{E}_{t, x_0, \epsilon} [ -\log p_\theta(x_0 \mid z_t) ]$$
 
-3. 信息均匀调度器 (Information-uniform Scheduler)：  
-作者认为文本在不同噪声水平下携带的信息量是不均匀的。调度器应该根据 对数信噪比（log-SNR） $\gamma$ 来设计。作者的目标是让时间步 $t$ 与模型能够还原的信息量（由互信息或交叉熵衡量）成线性关系。  
-Gumbel 调度器：作者发现信息增益的分布呈现出一种类似“先慢后快再慢”的特征，这与 Gumbel 分布 的累积分布函数（CDF）高度吻合。噪声水平 $\sigma_t$ 不再是简单的线性函数，而是通过一个受 Gumbel 分布启发的函数来计算：$$\gamma(t) = \text{Gumbel\_CDF}(t; \mu, \beta)$$其中 $\mu$ 和 $\beta$ 是可学习的参数。
-
 ### 训练与采样流程   
 1. 准备阶段特征提取：  
 首先通过一个预训练的嵌入层（或随机初始化后随模型训练）将输入的 Token 序列映射为连续向量 $\mathbf{X} \in \mathbb{R}^{L \times D}$。  
 噪声采样：为每个 batch 随机采样一个时间步 $t \in [0, 1]$，并根据调度器计算对应的噪声强度 $\sigma_t$。  
 2. 构造扰动输入加噪：根据公式 $z_t = (1-\sigma_t)x_0 + \sigma_t\epsilon$ 混合原始嵌入和高斯噪声。   
-  **Self-Conditioning**（关键细节）：在 50% 的训练迭代中，模型先进行一次前向传播得到预测值 $\hat{x}_0$。然后将 $\hat{x}_0$ 重新喂给模型作为额外的条件输入（Conditioning）。作用：这能极大地提升模型在生成时的稳定性和连贯性，是连续扩散模型追平自回归模型的“秘籍”。  
+  **Self-Conditioning**（关键细节）：在 50% 的训练迭代中，模型先进行一次前向传播得到预测值 $\hat{x}_0$。然后将 $\hat{x}_0$ 重新喂给模型作为额外的条件输入（Conditioning）。  
 3. 模型前向计算将扰动后的序列 $z_t$（以及可选的 self-conditioning 信息）输入 Transformer 编码器。模型输出每个位置在词表上的概率分布 $P(\mathbf{V} \mid z_t)$。  
-4. 损失计算与优化目标函数：直接计算预测分布与真实 Token 之间的 Cross-Entropy Loss。梯度更新：使用 AdamW 等优化器。由于是全并行计算，训练效率远高于自回归模型。
+4. 损失计算与优化目标函数：直接计算预测分布与真实 Token 之间的 Cross-Entropy Loss。
+
+---
 
 ### 相关工作：扩散投机解码 DFlash
 DFlash也利用了大模型的hs，但是他保留了kvcache。它间隔的选取了五层大模型的hs，再沿着特征维度拼接，用fc层降维，他的kvcache就是每个token位置对应的大模型的融合hs。推理时，他把所有位置融合hs注入到每层充当kvcache，拼接B个mask，一次前向预测B个token。
 
 训练时也是一次前向计算loss，越靠前的位置loss权重越大。
 
+---
 
-### 冲程蒸馏 Streak-Distillation
+### 冲程蒸馏 Streak-Distillation（与本项目对齐的说明）
 
 核心：**不显式逐点 KL**，而是最大化投机解码下的**期望接受 streak**；用教师轨迹上的联合质量连接「验证器按前缀接受」与「草案并行预测」。  
 本项目里草案仅以 **Pivot $p$** 为条件（无草案侧 KV）；验证仍按完整前文 + 已接受前缀。相对原文只是把 $Q_{\text{diff}}$ 的条件从前缀 $s$ 换成 $p$，细节见下文 v3.3。
@@ -132,7 +135,7 @@ hs的拼接降维使用fc，本质上对于不同层融合权重是固定的。�
 设块长 $\gamma$，草案采样 $x_{1:\gamma} \sim Q(\cdot \| p)$。记验证器在第 $m$ 步的（条件）接受概率为 $\alpha_m(\cdot)$，其自变量为 **验证前缀**（含真实上文与已接受草案）。自然推广为：
 
 $$
-\text{Tokens}_{\text{Draft}}(\gamma, p) = \mathbb{E}_{x_{1:\gamma} \sim Q(\cdot|p)} \left[ \sum_{m=1}^{\gamma} \prod_{j=1}^{m} \alpha_j\bigl(c \circ x_{1:j-1}\bigr) \right]
+\text{Accept}\_{\text{L}}(\gamma, p) = \mathbb{E}_{x_{1:\gamma} \sim Q(\cdot|p)} \left[ \sum_{m=1}^{\gamma} \prod_{j=1}^{m} \alpha_j\bigl(c \circ x_{1:j-1}\bigr) \right]
 $$
 
 其中 $c$ 为与 $p$ 对齐的验证前文；$\alpha_j$ 随已接受前缀变，$Q$ 侧条件固定为 $p$。
@@ -161,41 +164,7 @@ $$
 ---
 
 **6. 梯度权重调整**  
-方法1:  
-***问题：前缀长项都包含 q1、q2 ... ，所以前面位置天然拿到更多梯度。***
-- 相比于把 $q_1$ 从0.8提升到0.9，不如把 $q_4$ 从0.1提升到0.3。
-- 为缓解位置偏置，在保留上述 streak 前向目标不变的基础上，对所有参与监督的位置加入 **confidence-aware gradient reweighting**：只缩放每个位置从 streak loss 获得的梯度，不把置信度权重并入接受概率乘积本身。这样 streak 仍表示长接受段质量，但梯度预算会从已高置信度位置转向低置信度位置。
-- 令 $\mathrm{conf}_j = q_j(x_j|p;\theta)$ 表示当前位置对教师 token 的置信度，权重采用 sigmoid 非线性映射，$k=10$：
 
-$$
-w_j = \frac{1}{1+\exp\left(10\cdot(\mathrm{conf}_j-0.6)\right)}
-$$
-
-- $w_j$ 对所有块内监督位置生效；$\mathrm{conf}_j$ 高时 $w_j$ 小，当前位置继续被优化的梯度变弱；$\mathrm{conf}_j$ 低时 $w_j$ 大，当前位置自动获得更多修正。实现时 $w_j$ 作为 stop-gradient 的训练调度权重使用，避免模型通过权重分支本身改变目标。
-- 构造只改梯度的直通式 log-prob：
-
-$$
-\tilde{\ell}_j
-= \mathrm{sg}(\ell_j)
-  + \mathrm{sg}(w_j)\cdot\left(\ell_j-\mathrm{sg}(\ell_j)\right),
-\quad \ell_j=\log q_j(x_j|p;\theta)
-$$
-
-其中 $\mathrm{sg}(\cdot)$ 表示 stop-gradient。于是前向数值有 $\tilde{\ell}_j=\ell_j$，streak 分数仍是原始接受长度代理；反向时有 $\partial\tilde{\ell}_j/\partial\ell_j=w_j$，即每个位置从 streak loss 获得的梯度被置信度权重缩放：
-
-$$
-\mathcal{L}_{\text{conf-streak}}(\theta)
-= \mathbb{E}_{(p,c),x}\left[
-\sum_{m=1}^{\gamma}
-\left(
-1-\exp\left(\sum_{j=1}^{m}\tilde{\ell}_j\right)
-\right)
-\right]
-$$
-
-实现中对上述和式按有效 block 数取平均，不再除以块内 $B-1$ 个前缀项；因此完整块时该项保留接收长度求和尺度。该形式恒为非负，并且相对 $-\sum_m\exp(\cdot)$ 只多了常数，优化方向等价：最小化它仍然是在最大化期望 streak score。
-
-方法2:  
 
 我们将原始的 Streak Loss 改造为 Log-Smoothed Relative Streak Loss (LS-RSL)。
 
@@ -206,17 +175,34 @@ $$
 
 **B. 相对概率映射 (Relative Mapping)**  
 
-定义当前草稿模型的相对置信度 $\rho_j = q_j / T_j$。为了实现“达标后降权但不截断”，我们使用一个分段平滑函数 $\phi(\rho_j)$：  
+定义当前草稿模型的相对置信度 $\rho_j = q_j / T_j$。为了实现“达标后降权但不截断”，我们使用一个带位置权重的分段平滑函数 $\phi_j(\rho_j)$：  
 
-$$\phi(\rho_j) =
-\begin{cases} 
-\rho_j & \text{if } \rho_j < 1 \\
-1 + \log(\rho_j) & \text{if } \rho_j \ge 1
-\end{cases}$$
+$$
+\phi_j(\rho_j)=
+\begin{cases}
+\rho_j, & \rho_j < 1, \\\\
+1+w_j\log(\rho_j), & \rho_j \ge 1,
+\end{cases}
+$$
+
+其中块内监督位置为 $j=1,2,\dots,\gamma$。借鉴 DFlash 的指数位置衰减，但方向反过来，让越靠前的位置在达标后 log 梯度越小：
+
+$$
+w_j=\exp\left(-\frac{\gamma-j}{7}\right)
+$$
+
+因此最后一个监督位置满足 $w_\gamma=1$，前面位置的达标后梯度按指数减小：
+
+$$
+\frac{\partial \phi_j}{\partial \rho_j}
+=
+\frac{w_j}{\rho_j},
+\qquad \rho_j \ge 1.
+$$
 
 **C. 修改后的 Streak Loss**
 
-将 $\phi(\rho_j)$ 代入累乘项，构建期望相对长度：$$\mathcal{L} = -\log \left( \sum_{m=1}^{\gamma} \prod_{j=1}^{m} \phi(\rho_j) \right)$$
+将 $\phi_j(\rho_j)$ 代入累乘项，构建期望相对长度：$$\mathcal{L} = -\log \left( \sum_{m=1}^{\gamma} \prod_{j=1}^{m} \phi_j(\rho_j) \right)$$
 
 ---
 **7. 混合loss**  
@@ -242,7 +228,7 @@ $\mathcal{L}_{\text{CE}}$ 对块内除 anchor 外的每个有效位置单独计�
 我希望模型尽可能的利用我的pivot。我在思考使用LangFlow连续扩散原理进行草稿模型构建，之后再使用连续扩散模型的蒸馏方式。
 
 
-### v5
+### v5 （引入全量历史）
 
 我假设只有pivot信息实在太少，我在想进行让步。我现在至少证明了只用pivot hs是可以做到预测后面一块内容的，但是表现不稳定。而利用所有融合hs，效果也就比我好一些，证明是有冗余的。因此，我适量引入历史信息。
 
@@ -250,4 +236,53 @@ $\mathcal{L}_{\text{CE}}$ 对块内除 anchor 外的每个有效位置单独计�
 
 进入草稿模型前，我先用一个轻量的一层，单头的qwen3 cross-attention模块，用最后一个pivot hs去attend历史的hs，将自己的语义变得更丰富，更有未来信息。
 
-其他保持原样。
+### exp
+exp版本用来验证
+
+我保持只使用最新的pivot。同时不选择targethidden全部层，
+
+### v6 (不引入全量历史)
+背景与动机 (Background & Motivation)
+
+- 克服独立性瓶颈：现有的并行预测框架（如 MEDUSA）通过多个独立的预测头同时生成 Token，但各预测头之间缺乏语义关联，导致位置越靠后的 Token 预测准确率指数级下降。  
+
+- 模拟隐式自回归：在维持 LLM 推理受限于显存带宽（Memory-bandwidth-bound）这一现实的前提下，我们希望在不增加解码步骤的情况下，利用 Transformer 的深度来模拟自回归的决策过程。  
+
+- 增强块内语义连贯性：通过引入块状因果注意力，使模型能够在一个语义块内（如一个短语）进行双向建模，同时确保块与块之间维持严格的因果依赖。
+
+**深度递进式草稿模型（Deep Progressive Draft Model）**
+
+1. 模型架构形式化  
+假设主干模型（Backbone）的隐藏层维度为 $D$，Pivot 初始特征为 $H_0$。  
+草稿模型由 $N=5$ 层 Transformer Blocks 组成。  
+A. 结构参数定义输入长度：$B$ (你预设的总预测步长，例如 $2+2+4+4+4=16$)。  
+层级分配：  
+* Layer 1: 负责索引 $S_1 = [1, 2]$，其中，位置1为干净的anchortoken，切记不要计入loss。
+* Layer 2: 负责索引 $S_2 = [3, 4,]$ 
+* Layer 3-5: 分别负责后续各 4 个 Token。  
+其中，每层单独一个LM Heads ($M_i$): 将特征映射到词表大小 $V$。第一层lm_head固定为大模型的，之后的每层lm_head用大模型的lm_head初始化，但是可训练。 
+
+B. 前向计算流 (Forward Pass)  
+
+对于每一层 $i \in \{1, \dots, 5\}$，模型在单一的计算流中完成以下逻辑演进：
+
+1）块状因果特征演进 (Block-wise Causal Evolution):  
+$H_i = \text{TransformerLayer}_i(H_{i-1}, \text{Mask}_{block})$
+* 注意力掩码策略：不同于传统的逐位因果掩码，这里采用块状因果掩码。
+* 内部双向（Intra-block Bi-directional）：在每一层负责的索引范围 $S_i$ 内部，Token 之间是双向可见的，以充分捕获该语义块内的上下文关联。
+* 块间因果（Inter-block Causal）：当前块 $S_i$ 的位置 $j$ 可以看到之前所有块 $S_1, \dots, S_{i-1}$ 的所有特征，但严禁看到后续块 $S_{i+1}, \dots$ 的任何信息。这确保了语义的生成逻辑是单向流动的。
+
+
+2）局部块解码预测 (Local Block Decoding): 
+$$\hat{Y}_i = M_i(\hat{H}_i[S_i])$$ 
+精准解码：仅提取当前层负责的索引范围 $S_i$ 对应的隐藏状态进行 Logits 计算。逻辑闭环：由于第一层 $L_1$ 已经通过 $M_1$ 固化了 $S_1$ 的语义，当计算流到达 $L_2$ 时，块状注意力会将 $S_1$ 已经“确定”的特征传播给 $S_2$，从而让 $S_2$ 在预测时拥有实质上的语义引导，而非盲目并行。
+
+2. 训练流程形式化训练的目标是让每一层在“继承”前一层语义的基础上，准确预测其负责的 Token 块。  
+**A. 损失函数 (Multi-Stage Loss)**  
+总损失是各层局部损失的加权和：$$\mathcal{L}_{total} = \sum_{i=1}^{5} \Lambda_i \mathcal{L}_{CE}(\hat{Y}_i, Y_{target}[S_i])$$ $Y_{target}$ 是主干模型生成的真值（Ground Truth）或软标签（Soft Labels）。  $\Lambda_i$ 通常设置为随深度递减，暂定指数衰减
+$$
+\Lambda_i=\exp\left(-\frac{i-1}{\gamma}\right)
+$$，$\gamma$ 为层数，此处为5，因为越往后的位置不确定性越高。  
+
+**B.梯度传播**  
+$\hat{Y}_2$ 的梯度会回传给 Layer 2，并进一步通过残差连接和 Attention 回传给 Layer 1。这迫使 Layer 1 的输出 $H_1$ 必须包含足以支撑后续层预测 $S_2, S_3 \dots$ 的语义信息。因果约束：确保训练时开启 Causal Mask，防止第 5 层的预测信息在计算流中提前泄露给第一层。

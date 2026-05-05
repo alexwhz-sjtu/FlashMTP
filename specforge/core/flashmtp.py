@@ -42,8 +42,9 @@ def prepare_target_hidden(
     # 提取 anchor positions 对应的 hidden states
     # hidden_states[layer] shape: (B, seq_len, H)
     selected_states = []
-    for layer_id in target_layer_ids:
-        layer_hidden = hidden_states[layer_id]  # (B, seq_len, H)
+    use_captured_order = len(hidden_states) == len(target_layer_ids)
+    for capture_idx, layer_id in enumerate(target_layer_ids):
+        layer_hidden = hidden_states[capture_idx if use_captured_order else layer_id]
         # Gather: (B, N, H)
         layer_selected = torch.gather(
             layer_hidden,
@@ -59,14 +60,22 @@ def prepare_target_hidden(
         # 按特征维度拼接: (B, N, H*L)
         return torch.cat(selected_states, dim=-1)  # (B, N, H*L)
 
+def _stage_id_from_position(pos, stage_ranges):
+    stage_id = torch.zeros_like(pos)
+    for idx, (start, _end) in enumerate(stage_ranges):
+        stage_id = torch.where(pos >= start, torch.full_like(pos, idx), stage_id)
+    return stage_id
+
+
 def create_flashmtp_block_mask(
     anchor_positions: torch.Tensor,
     block_keep_mask: torch.Tensor,
     chs_len_per_block: int,
     block_size: int,
+    stage_ranges: list[tuple[int, int]],
     device: torch.device,
 ):
-    """Construct Flex Attention BlockMask for FlashMTP training with per-block CHS.
+    """Construct Flex Attention BlockMask for FlashMTP v6 progressive training.
 
     Args:
         anchor_positions: (B, N) tensor of anchor positions for each block
@@ -84,16 +93,16 @@ def create_flashmtp_block_mask(
         Q:  [Block_0 | Block_1 | ... | Block_{N-1}]
 
     Rules:
-      1. Block_i only sees CHS_i (its own context).
-         For seq mode: within CHS_i, only tokens < anchor_pos are visible.
-         For feature mode: CHS_i is a single token (always visible if valid).
-      2. Intra-block attention is bidirectional.
-      3. Different blocks are invisible to each other.
+      1. Block_i only sees CHS_i (its own pivot context).
+      2. Within a draft block, a query sees previous stages and its own stage.
+      3. Tokens inside the same stage are bidirectionally visible.
       4. Invalid blocks (block_keep_mask=False) see nothing.
     """
 
     def flashmtp_mask_mod(b, h, q_idx, kv_idx):
         q_block_id = q_idx // block_size
+        q_pos = q_idx % block_size
+        q_stage = _stage_id_from_position(q_pos, stage_ranges)
 
         # Total length of all CHS segments
         total_chs_len = N * chs_len_per_block
@@ -109,8 +118,9 @@ def create_flashmtp_block_mask(
         is_draft = kv_idx >= total_chs_len
         # Which block this draft kv belongs to
         kv_block_id = (kv_idx - total_chs_len) // block_size
-        # Block i only attends to Block i (bidirectional)
-        mask_draft = is_draft & (kv_block_id == q_block_id)
+        kv_pos = (kv_idx - total_chs_len) % block_size
+        kv_stage = _stage_id_from_position(kv_pos, stage_ranges)
+        mask_draft = is_draft & (kv_block_id == q_block_id) & (kv_stage <= q_stage)
 
         is_valid_block = block_keep_mask[b, q_block_id]
         return (mask_context | mask_draft) & is_valid_block
@@ -141,7 +151,7 @@ class OnlineFlashMTPModel(nn.Module):
     ):
         super().__init__()
         self.draft_model = draft_model
-        self.lm_head = target_lm_head
+        del target_lm_head
         self.embed_tokens = target_embed_tokens
         self.block_size = block_size
         self.mask_token_id = mask_token_id
@@ -150,6 +160,7 @@ class OnlineFlashMTPModel(nn.Module):
         self.loss_decay_gamma = loss_decay_gamma
         self.chs_concat_mode = chs_concat_mode
         self.draft_model.chs_concat_mode = chs_concat_mode
+        self.stage_ranges = draft_model.stage_ranges
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -271,36 +282,26 @@ class OnlineFlashMTPModel(nn.Module):
         noise_embedding = self._create_noise_embed(input_ids, anchor_positions,
                                                    block_keep_mask)
 
-        # we only use the clean bonus token's contextual hidden states(CHS)
-        context_position_ids = anchor_positions  # (bsz, n_blocks)
-
         draft_position_ids = self._create_position_ids(
             anchor_positions)  # (bsz, n_blocks * block_size)
 
-        # when concat in seq dim, we don't pose RoPE on CHS,
-        # so position_ids only includes noise_embedding positions starting from anchor position
-        if self.chs_concat_mode == "seq":
-            full_position_ids = draft_position_ids
-
-        # when concat in feature dim, we't pose RoPE on CHS,
-        # so position_ids only includes the one position before anchor position
-        else:  # feature concat
-            full_position_ids = torch.cat(
-                [context_position_ids, draft_position_ids],
-                dim=-1)  # (bsz, n_block:n_blocks * block_size)
+        full_position_ids = draft_position_ids
 
         # Determine CHS length per block based on concat mode
         # seq mode: each CHS_i has num_target_layers tokens
         # feature mode: each CHS_i has 1 token (features concatenated)
-        num_target_layers = getattr(self.draft_model.config,
-                                    "num_target_layers", 1)
-        chs_len_per_block = num_target_layers if self.chs_concat_mode == "seq" else 1
+        chs_len_per_block = (
+            len(self.draft_model.target_layer_ids)
+            if self.chs_concat_mode == "seq"
+            else 1
+        )
 
         flashmtp_attn_mask = create_flashmtp_block_mask(
             anchor_positions=anchor_positions,
             block_keep_mask=block_keep_mask,
             chs_len_per_block=chs_len_per_block,
             block_size=self.block_size,
+            stage_ranges=self.stage_ranges,
             device=device,
         )
 
@@ -313,14 +314,13 @@ class OnlineFlashMTPModel(nn.Module):
         # print(f"full_position_ids shape: {full_position_ids.shape}")
         # print(f"noise_embedding shape: {noise_embedding.shape}")
 
-        output_hidden = self.draft_model(
+        draft_output = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=target_hidden,
             attention_mask=flashmtp_attn_mask,
         )
-
-        logits = self.lm_head(output_hidden)
+        logits = draft_output["logits"]
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
         label_offsets = torch.arange(0, self.block_size,
@@ -351,31 +351,42 @@ class OnlineFlashMTPModel(nn.Module):
         )
         weight_mask = weight_mask * original_loss_mask_gathered
 
-        binary_eval_mask = weight_mask.view(-1)
+        # --- Multi-stage CE: each draft layer supervises only its assigned block slice. ---
+        logits_by_block = logits.view(
+            bsz, anchor_positions.size(1), self.block_size, logits.size(-1)
+        )
+        loss = logits.sum() * 0.0
+        for stage_idx, (start, end) in enumerate(self.stage_ranges):
+            stage_logits = logits_by_block[:, :, start:end, :].reshape(
+                -1, logits.size(-1)
+            )
+            stage_targets = target_ids[:, :, start:end].reshape(-1)
+            stage_weights = weight_mask[:, :, start:end].reshape(-1)
+            stage_token_count = stage_weights.sum()
+            if stage_token_count.item() <= 0:
+                continue
 
-        # --- Loss decay: exp(-(k-1)/γ) so k=1 (1st prediction) gets weight 1.0 ---
-        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-            k = torch.arange(self.block_size, device=device).view(1, 1, -1)
-            decay_weights = torch.exp(-(k - 1).clamp(min=0).float() /
-                                      self.loss_decay_gamma)
-            weight_mask = weight_mask * decay_weights
-
-        # --- Cross entropy ---
-        flat_logits = logits.view(-1, logits.size(-1))
-        flat_targets = target_ids.view(-1)
-        flat_weights = weight_mask.view(-1)
-
-        loss_per_token = F.cross_entropy(flat_logits,
-                                         flat_targets,
-                                         reduction="none")
-        valid_token_count = flat_weights.sum() + 1e-6
-        loss = (loss_per_token * flat_weights).sum() / valid_token_count
+            stage_ce = F.cross_entropy(
+                stage_logits, stage_targets, reduction="none"
+            )
+            stage_loss = (stage_ce * stage_weights).sum() / (stage_token_count + 1e-6)
+            if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+                stage_weight = torch.exp(
+                    torch.tensor(
+                        -stage_idx / self.loss_decay_gamma,
+                        device=device,
+                        dtype=stage_loss.dtype,
+                    )
+                )
+            else:
+                stage_weight = torch.ones((), device=device, dtype=stage_loss.dtype)
+            loss = loss + stage_weight * stage_loss
 
         # --- Accuracy ---
         with torch.no_grad():
-            pred_ids = torch.argmax(flat_logits, dim=-1)
-            correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
-            actual_token_count = binary_eval_mask.sum() + 1e-6
+            pred_ids = torch.argmax(logits_by_block, dim=-1)
+            correct = (pred_ids == target_ids) & (weight_mask > 0.5)
+            actual_token_count = weight_mask.sum() + 1e-6
             accuracy = correct.sum().float() / actual_token_count
 
         return loss, accuracy

@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
 
-from specforge.utils import print_with_rank
+from specforge.utils import print_on_rank0
 
 _DEVICE_MESH = None
 _TP_DEVICE_MESH = None
@@ -75,7 +75,6 @@ def init_distributed(
     dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
     local_rank = dist.get_rank() % torch.cuda.device_count()
     torch.cuda.set_device(local_rank)
-    print_with_rank(f"bind to device {local_rank}")
 
     world_size = dist.get_world_size()
     dp_size = world_size // tp_size
@@ -99,7 +98,12 @@ def init_distributed(
     )
     set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, dist.get_rank(), world_size)
 
-    print_with_rank(f"device mesh: {device_mesh}")
+    print_on_rank0(
+        f"Distributed initialized: world_size={world_size}, tp_size={tp_size}, "
+        f"dp_size={dp_size}, draft_dp_size={draft_dp_size}, "
+        f"sp_ulysses_size={sp_ulysses_size}, sp_ring_size={sp_ring_size}"
+    )
+    print_on_rank0(f"device mesh: {device_mesh}")
     tp_group = device_mesh.get_group("tp")
     dp_group = device_mesh.get_group("dp")
 

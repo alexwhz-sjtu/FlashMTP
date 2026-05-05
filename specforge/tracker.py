@@ -137,7 +137,7 @@ class WandbTracker(Tracker):
             }
             if hasattr(args, "wandb_run_id") and args.wandb_run_id:
                 init_kwargs["id"] = args.wandb_run_id
-                init_kwargs["resume"] = "must"
+                init_kwargs["resume"] = "allow"
             wandb.init(**init_kwargs)
             self.is_initialized = True
 

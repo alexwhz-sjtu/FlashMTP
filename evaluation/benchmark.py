@@ -83,14 +83,20 @@ def flashmtp_generate(
         block_position_ids = position_ids[:, start : start + block_size]
         if block_size > 1:
             noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_logits = target.lm_head(model(
+            draft_attn_mask = model.build_inference_attention_mask(
+                batch_size=block_output_ids.shape[0],
+                ctx_len=target_hidden.shape[1],
+                device=block_output_ids.device,
+            )
+            draft_logits = model(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
                 position_ids=position_ids[:, start : start + block_size],
                 past_key_values=None,
                 use_cache=False,
                 is_causal=False,
-            )[:, -block_size+1:, :])
+                attention_mask=draft_attn_mask,
+            )["logits"][:, 1:block_size, :]
             block_output_ids[:, 1:] = sample(draft_logits)
             if draft_prefill:
                 draft_prefill = False
@@ -191,8 +197,15 @@ def main() -> None:
         # attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
         dtype=torch.bfloat16,
     ).to(device).eval()
+    if not draft_model.use_stage_heads:
+        draft_model.set_shared_stage_lm_head(target.lm_head)
 
-    block_size = args.block_size if args.block_size is not None else draft_model.block_size
+    if args.block_size is not None and args.block_size != draft_model.block_size:
+        raise ValueError(
+            "FlashMTP v6 checkpoints carry fixed progressive stage ranges; "
+            f"--block-size must match draft_model.block_size={draft_model.block_size}."
+        )
+    block_size = draft_model.block_size
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     dataset = load_and_process_dataset(args.dataset)

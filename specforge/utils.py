@@ -56,8 +56,12 @@ def print_with_rank(message):
         logger.info(f"non-distributed: {message}")
 
 
+def is_rank0():
+    return not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
+
+
 def print_args_with_dots(args):
-    if dist.get_rank() == 0:
+    if is_rank0():
         args_dict = vars(args)
         max_key_length = max(len(key) for key in args_dict.keys())
         total_width = 50
@@ -72,7 +76,8 @@ def print_args_with_dots(args):
 
 
 def print_on_rank0(message):
-    logger.info(message)
+    if is_rank0():
+        logger.info(message)
 
 
 
@@ -207,7 +212,7 @@ def save_draft_model_config(config_dict: dict, output_path: str):
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(config_dict, f, indent=2, ensure_ascii=False)
 
-    print(f"Draft model config saved to: {output_path}")
+    print_on_rank0(f"Draft model config saved to: {output_path}")
 
 
 def create_draft_config_from_target(
@@ -232,7 +237,7 @@ def create_draft_config_from_target(
     rank = dist.get_rank()
 
     if rank == 0:
-        print_with_rank(
+        print_on_rank0(
             "No draft model config provided, auto-generating from target model..."
         )
         config_dict = generate_draft_model_config(
@@ -257,7 +262,7 @@ def create_draft_config_from_target(
     # Save config
     if rank == 0:
         save_draft_model_config(config_dict, output_path)
-        print_with_rank(f"Auto-generated draft model config saved to: {output_path}")
+        print_on_rank0(f"Auto-generated draft model config saved to: {output_path}")
     dist.barrier()
 
     return output_path

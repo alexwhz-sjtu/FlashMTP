@@ -255,6 +255,8 @@ def main():
         dtype="auto",
         device_map="cuda:0"
     ).eval()
+    if not draft_model.use_stage_heads:
+        draft_model.set_shared_stage_lm_head(target_model.lm_head)
     
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
 

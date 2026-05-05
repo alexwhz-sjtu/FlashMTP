@@ -5,7 +5,6 @@ import torch
 from torch import nn
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
-from transformers.modeling_outputs import CausalLMOutputWithPast
 from ...utils import print_on_rank0
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
@@ -20,6 +19,14 @@ from transformers.models.qwen3.modeling_qwen3 import (
     rotate_half,
 )
 from typing_extensions import Tuple, Unpack
+
+try:
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    FLEX_ATTENTION_AVAILABLE = True
+except ImportError:
+    FLEX_ATTENTION_AVAILABLE = False
+    create_block_mask = None
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -42,15 +49,32 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> list[int]:
-    if num_draft_layers == 1:
-        return [num_target_layers // 2]
-    start = 1
-    end = num_target_layers - 3
-    span = end - start
-    return [
-        int(round(start + (i * span) / (num_draft_layers - 1)))
-        for i in range(num_draft_layers)
-    ]
+    del num_draft_layers
+    return list(range(1, num_target_layers, 2))
+
+
+def build_stage_ranges(block_size: int, num_draft_layers: int) -> list[tuple[int, int]]:
+    if block_size == 16 and num_draft_layers == 5:
+        return [(0, 2), (2, 4), (4, 8), (8, 12), (12, 16)]
+    if num_draft_layers <= 0:
+        raise ValueError("num_draft_layers must be positive.")
+    base = block_size // num_draft_layers
+    remainder = block_size % num_draft_layers
+    ranges = []
+    start = 0
+    for layer_idx in range(num_draft_layers):
+        width = base + (1 if layer_idx < remainder else 0)
+        end = start + width
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
+def _stage_id_from_position(pos, stage_ranges):
+    stage_id = torch.zeros_like(pos)
+    for idx, (start, _end) in enumerate(stage_ranges):
+        stage_id = torch.where(pos >= start, torch.full_like(pos, idx), stage_id)
+    return stage_id
 
 
 class Qwen3FlashMTPAttention(nn.Module):
@@ -255,7 +279,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         super().__init__(config)
         self.config = config
         flashmtp_config = getattr(config, "flashmtp_config", {}) or {}
-        self.chs_concat_mode = flashmtp_config.get("chs_concat_mode", "seq")
+        if not hasattr(config, "flashmtp_config") or config.flashmtp_config is None:
+            config.flashmtp_config = flashmtp_config
+        self.chs_concat_mode = flashmtp_config.get("chs_concat_mode", "feature")
         self.layers = nn.ModuleList(
             [
                 Qwen3FlashMTPDecoderLayer(config, layer_idx, self.chs_concat_mode)
@@ -270,8 +296,34 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.block_size = config.block_size
+        self.stage_ranges = [
+            tuple(stage_range)
+            for stage_range in flashmtp_config.get(
+                "stage_ranges",
+                build_stage_ranges(config.block_size, config.num_hidden_layers),
+            )
+        ]
+        if len(self.stage_ranges) != config.num_hidden_layers:
+            raise ValueError(
+                "flashmtp_config.stage_ranges must have one range per draft layer."
+            )
+        if self.stage_ranges[0][0] != 0 or self.stage_ranges[-1][1] != self.block_size:
+            raise ValueError("stage_ranges must cover the full draft block.")
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
         self._last_decode_stats = {}
+        stage_head_config = flashmtp_config.get("stage_head", True)
+        if isinstance(stage_head_config, str):
+            stage_head_config = stage_head_config.lower() in ("true", "1", "yes", "y", "on")
+        self.use_stage_heads = bool(stage_head_config)
+        self.config.flashmtp_config["stage_head"] = self.use_stage_heads
+        object.__setattr__(self, "_shared_stage_lm_head", None)
+        if self.use_stage_heads:
+            self.stage_lm_heads = nn.ModuleList(
+                [
+                    nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+                    for _ in range(max(config.num_hidden_layers - 1, 0))
+                ]
+            )
 
         # For seq concat mode: use Identity (no computation, no parameters)
         # For feature mode: use Linear projection and RMSNorm
@@ -288,11 +340,125 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             # maybe need norm
             self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         print_on_rank0(f"self.chs_concat_mode: {self.chs_concat_mode}")
+        print_on_rank0(f"FlashMTP stage_ranges: {self.stage_ranges}")
+        print_on_rank0(
+            "FlashMTP stage heads: "
+            + (
+                "stage0 shared target lm_head; stage1+ draft-owned heads"
+                if self.use_stage_heads
+                else "shared frozen target lm_head"
+            )
+        )
 
         self.post_init()
 
+    def initialize_stage_lm_heads(self, target_lm_head: nn.Module) -> None:
+        """Attach target head for stage0 and initialize trainable stage1+ heads."""
+        self.set_shared_stage_lm_head(target_lm_head)
+        if not self.use_stage_heads:
+            return
+
+        target_weight = target_lm_head.weight.detach()
+        for head in self.stage_lm_heads:
+            head.weight.data.copy_(
+                target_weight.to(device=head.weight.device, dtype=head.weight.dtype)
+            )
+        self.config.flashmtp_config["stage_ranges"] = [
+            list(stage_range) for stage_range in self.stage_ranges
+        ]
+
+    def set_shared_stage_lm_head(self, target_lm_head: nn.Module) -> None:
+        """Use target lm_head for all stages without registering it in this module."""
+        target_lm_head.eval()
+        target_lm_head.requires_grad_(False)
+        object.__setattr__(self, "_shared_stage_lm_head", target_lm_head)
+
     def get_last_decode_stats(self) -> dict:
         return dict(self._last_decode_stats)
+
+    def build_inference_attention_mask(
+        self, batch_size: int, ctx_len: int, device: torch.device
+    ):
+        if (
+            not FLEX_ATTENTION_AVAILABLE
+            or self.config._attn_implementation != "flex_attention"
+        ):
+            return None
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            q_pos = q_idx % self.block_size
+            q_stage = _stage_id_from_position(q_pos, self.stage_ranges)
+
+            is_context = kv_idx < ctx_len
+            is_draft = kv_idx >= ctx_len
+            kv_pos = (kv_idx - ctx_len) % self.block_size
+            kv_stage = _stage_id_from_position(kv_pos, self.stage_ranges)
+            return is_context | (is_draft & (kv_stage <= q_stage))
+
+        return create_block_mask(
+            mask_mod,
+            B=batch_size,
+            H=None,
+            Q_LEN=self.block_size,
+            KV_LEN=ctx_len + self.block_size,
+            device=device,
+        )
+
+    def _stage_logits_from_hidden(
+        self, hidden_states: torch.Tensor, stage_idx: int
+    ) -> torch.Tensor:
+        bsz, q_len, hidden_size = hidden_states.shape
+        if q_len % self.block_size != 0:
+            raise ValueError(
+                f"Draft sequence length {q_len} must be divisible by block_size={self.block_size}."
+            )
+        n_blocks = q_len // self.block_size
+        start, end = self.stage_ranges[stage_idx]
+        stage_hidden = hidden_states.view(bsz, n_blocks, self.block_size, hidden_size)[
+            :, :, start:end, :
+        ]
+        stage_hidden = stage_hidden.reshape(bsz, n_blocks * (end - start), hidden_size)
+        shared_head = self._shared_stage_lm_head
+        if stage_idx == 0 or not self.use_stage_heads:
+            if shared_head is None:
+                raise RuntimeError(
+                    "FlashMTPDraftModel needs a shared target lm_head for stage0. "
+                    "Call set_shared_stage_lm_head() before forward/spec_generate."
+                )
+            return shared_head(stage_hidden)
+
+        if stage_idx - 1 >= len(self.stage_lm_heads):
+            raise RuntimeError(
+                f"Missing draft-owned lm_head for stage {stage_idx}. "
+                f"Expected {len(self.stage_ranges) - 1} trainable heads, got "
+                f"{len(self.stage_lm_heads)}."
+            )
+        return self.stage_lm_heads[stage_idx - 1](stage_hidden)
+
+    def _scatter_stage_logits(
+        self,
+        stage_logits: list[torch.Tensor],
+        bsz: int,
+        n_blocks: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        full_logits = torch.empty(
+            bsz,
+            n_blocks,
+            self.block_size,
+            self.config.vocab_size,
+            device=device,
+            dtype=dtype,
+        )
+        for stage_idx, logits in enumerate(stage_logits):
+            start, end = self.stage_ranges[stage_idx]
+            full_logits[:, :, start:end, :] = logits.view(
+                bsz, n_blocks, end - start, self.config.vocab_size
+            )
+        return full_logits.view(
+            bsz, n_blocks * self.block_size, self.config.vocab_size
+        )
 
     def forward(
         self,
@@ -303,13 +469,15 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
         **kwargs,
-    ) -> CausalLMOutputWithPast:
+    ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
         
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         # position_embeddings = self.rotary_emb(torch.cat([target_hidden, hidden_states], dim=1), position_ids)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        for layer in self.layers:
+        stage_logits = []
+        stage_hidden_states = []
+        for stage_idx, layer in enumerate(self.layers):
             hidden_states = layer(
                 hidden_states=hidden_states,
                 target_hidden=target_hidden,
@@ -320,7 +488,27 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-        return self.norm(hidden_states)
+            norm_hidden_states = self.norm(hidden_states)
+            stage_hidden_states.append(norm_hidden_states)
+            stage_logits.append(
+                self._stage_logits_from_hidden(norm_hidden_states, stage_idx)
+            )
+
+        bsz, q_len = hidden_states.shape[:2]
+        n_blocks = q_len // self.block_size
+        logits = self._scatter_stage_logits(
+            stage_logits,
+            bsz=bsz,
+            n_blocks=n_blocks,
+            device=hidden_states.device,
+            dtype=stage_logits[0].dtype,
+        )
+        return {
+            "logits": logits,
+            "stage_logits": stage_logits,
+            "hidden_states": stage_hidden_states,
+            "last_hidden_state": stage_hidden_states[-1],
+        }
 
     @torch.inference_mode()
     def spec_generate(
@@ -332,6 +520,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         temperature: float,
     ):
         self.eval()
+        if not self.use_stage_heads:
+            self.set_shared_stage_lm_head(target.lm_head)
         self._last_decode_stats = {
             "accept_lengths": [],
             "target_total_time": 0.0,
@@ -391,16 +581,20 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)
             draft_start = time.perf_counter()
-            draft_logits = target.lm_head(
-                self(
-                    target_hidden=target_hidden,
-                    noise_embedding=noise_embedding,
-                    position_ids=position_ids[:, start : start + block_size],
-                    past_key_values=None,
-                    use_cache=False,
-                    is_causal=False,
-                )[:, -block_size + 1 :, :]
+            draft_attn_mask = self.build_inference_attention_mask(
+                batch_size=block_output_ids.shape[0],
+                ctx_len=target_hidden.shape[1],
+                device=block_output_ids.device,
             )
+            draft_logits = self(
+                target_hidden=target_hidden,
+                noise_embedding=noise_embedding,
+                position_ids=position_ids[:, start : start + block_size],
+                past_key_values=None,
+                use_cache=False,
+                is_causal=False,
+                attention_mask=draft_attn_mask,
+            )["logits"][:, 1:block_size, :]
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)
             self._last_decode_stats["draft_total_time"] += time.perf_counter() - draft_start

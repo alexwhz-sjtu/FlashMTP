@@ -10,6 +10,8 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
 
+from specforge.utils import print_on_rank0
+
 
 class TargetEmbeddingsAndHead(nn.Module):
     """
@@ -60,7 +62,9 @@ class TargetEmbeddingsAndHead(nn.Module):
                     allow_patterns=["*.json", "*.safetensors", "*.bin", "*.model"],
                 )
             except Exception as e:
-                print(f"Warning: Snapshot download failed or path check failed: {e}")
+                print_on_rank0(
+                    f"Warning: Snapshot download failed or path check failed: {e}"
+                )
 
         # 3. Handle Weight Tying
         tie_weights = getattr(config, "tie_word_embeddings", False)
@@ -98,7 +102,7 @@ class TargetEmbeddingsAndHead(nn.Module):
                 if lm_head_key in weight_map:
                     files_to_load[lm_head_key] = weight_map[lm_head_key]
                 else:
-                    print(
+                    print_on_rank0(
                         f"Warning: {lm_head_key} not found. Ensure model doesn't use tied weights manually."
                     )
         else:
@@ -127,7 +131,7 @@ class TargetEmbeddingsAndHead(nn.Module):
             loaded_keys.update(keys)
 
         if tie_weights:
-            print(
+            print_on_rank0(
                 "Weight tying detected: Sharing weights between Embeddings and LM Head."
             )
             self.lm_head.weight = self.embed_tokens.weight
@@ -135,7 +139,7 @@ class TargetEmbeddingsAndHead(nn.Module):
         if embed_key not in loaded_keys:
             raise RuntimeError("Failed to load embeddings.")
         if not tie_weights and lm_head_key not in loaded_keys:
-            print(
+            print_on_rank0(
                 "Warning: LM Head weights were not found (and tie_weights is False). Head is random."
             )
 
@@ -147,7 +151,9 @@ class TargetEmbeddingsAndHead(nn.Module):
         target_head_key: str,
     ):
         """Helper to load specific keys from a file"""
-        print(f"Loading {keys_to_extract} from {os.path.basename(file_path)}...")
+        print_on_rank0(
+            f"Loading {keys_to_extract} from {os.path.basename(file_path)}..."
+        )
 
         state_dict_part = {}
 
@@ -157,7 +163,7 @@ class TargetEmbeddingsAndHead(nn.Module):
                     if k in f.keys():
                         state_dict_part[k] = f.get_tensor(k)
         else:
-            print(
+            print_on_rank0(
                 f"Warning: Loading .bin file {os.path.basename(file_path)} into RAM. Convert to safetensors for efficiency."
             )
             full_state = torch.load(file_path, map_location="cpu")
@@ -170,11 +176,11 @@ class TargetEmbeddingsAndHead(nn.Module):
         for k, tensor in state_dict_part.items():
             if k == target_embed_key:
                 self.embed_tokens.weight.data.copy_(tensor)
-                print(" -> Loaded Embeddings")
+                print_on_rank0(" -> Loaded Embeddings")
             elif k == target_head_key:
                 if tensor.shape == self.lm_head.weight.data.shape:
                     self.lm_head.weight.data.copy_(tensor)
-                    print(" -> Loaded LM Head")
+                    print_on_rank0(" -> Loaded LM Head")
                 else:
                     raise RuntimeError(
                         f"Shape mismatch for {k}. Expected {self.lm_head.weight.shape}, got {tensor.shape}"

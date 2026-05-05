@@ -33,7 +33,18 @@ from specforge.modeling.target.flashmtp_target_model import (
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
-from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
+from specforge.utils import get_last_checkpoint, print_on_rank0
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in ("true", "1", "yes", "y", "on"):
+        return True
+    if value in ("false", "0", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError("Expected a boolean value: true/false.")
 
 
 def parse_args():
@@ -50,7 +61,16 @@ def parse_args():
     )
     model_group.add_argument("--draft-config-path", type=str, default=None)
     model_group.add_argument("--block-size", type=int, default=16)
-    model_group.add_argument("--num-draft-layers", type=int, default=1)
+    model_group.add_argument("--num-draft-layers", type=int, default=5)
+    model_group.add_argument(
+        "--stage-head",
+        type=str2bool,
+        default=True,
+        help=(
+            "true: share frozen target lm_head for stage0 and train draft-owned "
+            "stage1+ heads; false: share the frozen target lm_head for all stages."
+        ),
+    )
     model_group.add_argument(
         "--mask-token-id",
         type=int,
@@ -76,9 +96,9 @@ def parse_args():
     model_group.add_argument(
         "--loss-decay-gamma",
         type=float,
-        default=None,
+        default=5,
         help="Gamma for exponential loss decay weighting (paper Eq.4). "
-        "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
+        "Default: 5 for FlashMTP v6. Use <=0 to disable.",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -173,6 +193,7 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         draft_config.flashmtp_config = {}
         
     draft_config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
+    draft_config.flashmtp_config["stage_head"] = args.stage_head
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
@@ -184,7 +205,8 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     print_on_rank0(
         f"Draft config: block_size={draft_config.block_size}, "
         f"num_hidden_layers={draft_config.num_hidden_layers}, "
-        f"num_target_layers={draft_config.num_target_layers}"
+        f"num_target_layers={draft_config.num_target_layers}, "
+        f"stage_head={args.stage_head}"
     )
     print_on_rank0(
         f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}"
@@ -342,7 +364,7 @@ def main():
     set_seed(args.seed)
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
-    print_with_rank("Initialized distributed")
+    print_on_rank0("Initialized distributed")
 
     target_model, draft_model = build_models(args)
 
@@ -401,6 +423,10 @@ def main():
     draft_model.config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
     draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
     draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
+    draft_model.config.flashmtp_config["stage_head"] = draft_model.use_stage_heads
+    draft_model.config.flashmtp_config["stage_ranges"] = [
+        list(stage_range) for stage_range in draft_model.stage_ranges
+    ]
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
@@ -417,6 +443,19 @@ def main():
         device="cuda",
         trust_remote_code=args.trust_remote_code,
     )
+    draft_model.set_shared_stage_lm_head(target_components.lm_head)
+    if draft_model.use_stage_heads and draft_model_last_checkpoint is None:
+        draft_model.initialize_stage_lm_heads(target_components.lm_head)
+        print_on_rank0(
+            "Initialized FlashMTP trainable stage1+ heads from target lm_head; "
+            "stage0 shares frozen target lm_head"
+        )
+    elif draft_model.use_stage_heads:
+        print_on_rank0(
+            "Loaded FlashMTP stage1+ heads from checkpoint; stage0 shares frozen target lm_head"
+        )
+    else:
+        print_on_rank0("Using shared frozen target lm_head for all FlashMTP stages")
 
     flashmtp_model = OnlineFlashMTPModel(
         draft_model=draft_model,
@@ -439,7 +478,7 @@ def main():
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
     )
-    print_with_rank("Initialized FSDP")
+    print_on_rank0("Initialized FSDP")
 
     optimizer = BF16Optimizer(
         draft_model,
