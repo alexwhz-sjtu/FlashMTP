@@ -54,8 +54,8 @@ NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 # ========================================
 # 主要数据集参数
 # ========================================
-DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-}"
-ENABLE_THINKING="${ENABLE_THINKING:-on}"
+DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}"
+ENABLE_THINKING="${ENABLE_THINKING:-off}"
 
 # ========================================
 # 默认参数（通常不需要修改）
@@ -64,14 +64,12 @@ TP_SIZE="${TP_SIZE:-1}"
 DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
 
 if [ "$DT" = "qz" ]; then
-    DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-400000}"
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
     OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/dflash_lsrsl_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_nnodes${NNODES}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 else
-    DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}"
-    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/data/wanghanzhen/Projects/MTP/NIPS26/training_data/regen_data/nemotron_400000/nemotron_think_off_samples_400000_qwen3_8b_regen.jsonl}"
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/data/wanghanzhen/Projects/MTP/NIPS26/training_data/regen_data/nemotron_40000/nemotron_think_off_samples_40000_qwen3_8b_regen.jsonl}"
     OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/dflash_lsrsl_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 fi
