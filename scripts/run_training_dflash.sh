@@ -50,7 +50,7 @@ NUM_EPOCHS="${NUM_EPOCHS:-12}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
-PRETRAINED_DRAFT_MODEL_PATH="${PRETRAINED_DRAFT_MODEL_PATH:-/data/wanghanzhen/models/z-lab/Qwen3-8B-DFlash-b16}"
+PRETRAINED_DRAFT_MODEL_PATH="${PRETRAINED_DRAFT_MODEL_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/z-lab/Qwen3-8B-DFlash-b16}"
 if [ "${PRETRAINED_DRAFT_MODEL_PATH}" = "none" ]; then
     PRETRAINED_DRAFT_MODEL_PATH=""
 fi
@@ -58,7 +58,7 @@ fi
 # ========================================
 # 主要数据集参数
 # ========================================
-DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}"
+DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-400000}"
 ENABLE_THINKING="${ENABLE_THINKING:-off}"
 
 # ========================================
@@ -70,7 +70,7 @@ DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
 if [ "$DT" = "qz" ]; then
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/dflash_lsrsl_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_nnodes${NNODES}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/dflash_lsrsl_post_sample_${DATA_NUM_SAMPLES}_beta_${STREAK_SATURATION_BETA}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_nnodes${NNODES}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/data/wanghanzhen/Projects/MTP/NIPS26/training_data/regen_data/nemotron_40000/nemotron_think_off_samples_40000_qwen3_8b_regen.jsonl}"
@@ -85,7 +85,7 @@ CKPT_DIR="${CKPT_DIR:-}"
 # 训练参数
 BATCH_SIZE="${BATCH_SIZE:-1}"
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
-LEARNING_RATE="${LEARNING_RATE:-6e-4}"
+LEARNING_RATE="${LEARNING_RATE:-4e-4}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
@@ -110,7 +110,7 @@ REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-exp}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
-WANDB_RUN_ID="${WANDB_RUN_ID:-dflash_lsrsl_beta_${STREAK_SATURATION_BETA}_${DATA_NUM_SAMPLES}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-dflash_lsrsl_post_beta_${STREAK_SATURATION_BETA}_${DATA_NUM_SAMPLES}}"
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}"
