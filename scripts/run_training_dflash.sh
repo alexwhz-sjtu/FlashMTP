@@ -50,6 +50,10 @@ NUM_EPOCHS="${NUM_EPOCHS:-12}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
+PRETRAINED_DRAFT_MODEL_PATH="${PRETRAINED_DRAFT_MODEL_PATH:-/data/wanghanzhen/models/z-lab/Qwen3-8B-DFlash-b16}"
+if [ "${PRETRAINED_DRAFT_MODEL_PATH}" = "none" ]; then
+    PRETRAINED_DRAFT_MODEL_PATH=""
+fi
 
 # ========================================
 # 主要数据集参数
@@ -136,6 +140,7 @@ echo "模型配置:"
 echo "  草稿模型层数: ${NUM_DRAFT_LAYERS}"
 echo "  块大小: ${BLOCK_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
+echo "  后训练初始权重: ${PRETRAINED_DRAFT_MODEL_PATH:-无}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Streak loss权重: ${STREAK_WEIGHT}"
 echo "  CE loss权重: ${CE_WEIGHT}"
@@ -180,6 +185,11 @@ if [ "${OUTPUT_DIR}" != "${original_output_dir}" ]; then
     echo "警告: 输出目录 ${original_output_dir} 已存在且非空，自动切换到: ${OUTPUT_DIR}"
 fi
 
+if [ -n "${PRETRAINED_DRAFT_MODEL_PATH}" ] && [ ! -d "${PRETRAINED_DRAFT_MODEL_PATH}" ]; then
+    echo "错误: 后训练初始权重目录不存在: ${PRETRAINED_DRAFT_MODEL_PATH}" >&2
+    exit 1
+fi
+
 # 创建输出目录
 mkdir -p ${OUTPUT_DIR}
 mkdir -p ${CACHE_DIR}
@@ -219,6 +229,10 @@ fi
 
 if [ -n "${CKPT_DIR}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --ckpt-dir ${CKPT_DIR}"
+fi
+
+if [ -n "${PRETRAINED_DRAFT_MODEL_PATH}" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --pretrained-draft-model-path ${PRETRAINED_DRAFT_MODEL_PATH}"
 fi
 
 if [ "${REPORT_TO}" != "none" ]; then

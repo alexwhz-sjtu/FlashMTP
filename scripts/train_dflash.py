@@ -49,6 +49,13 @@ def parse_args():
         help="Backend for target model: 'sglang' (service) or 'hf' (local)",
     )
     model_group.add_argument("--draft-config-path", type=str, default=None)
+    model_group.add_argument(
+        "--pretrained-draft-model-path",
+        type=str,
+        default=None,
+        help="Initialize draft model weights from an existing DFlash checkpoint/model. "
+        "Optimizer and scheduler still start fresh unless --resume/--ckpt-dir is used.",
+    )
     model_group.add_argument("--block-size", type=int, default=16)
     model_group.add_argument("--num-draft-layers", type=int, default=1)
     model_group.add_argument(
@@ -181,7 +188,28 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         **target_model_kwargs,
     )
 
-    if args.draft_config_path:
+    if args.pretrained_draft_model_path:
+        if not os.path.isdir(args.pretrained_draft_model_path):
+            raise ValueError(
+                f"Pretrained draft model path {args.pretrained_draft_model_path} "
+                "is not a valid directory."
+            )
+        draft_config = AutoConfig.from_pretrained(args.pretrained_draft_model_path)
+        draft_config._attn_implementation = args.attention_backend
+        draft_model = DFlashDraftModel.from_pretrained(
+            args.pretrained_draft_model_path,
+            config=draft_config,
+            torch_dtype=torch.bfloat16,
+        ).cuda().to(torch.bfloat16)
+        print_on_rank0(
+            f"Loaded pretrained draft model from {args.pretrained_draft_model_path}"
+        )
+        if args.draft_config_path:
+            print_on_rank0(
+                "--draft-config-path is ignored because --pretrained-draft-model-path "
+                "provides the draft config."
+            )
+    elif args.draft_config_path:
         draft_config = AutoConfig.from_pretrained(args.draft_config_path)
         print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
     else:
@@ -198,7 +226,8 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
-    draft_model = DFlashDraftModel(draft_config).cuda().to(torch.bfloat16)
+    if not args.pretrained_draft_model_path:
+        draft_model = DFlashDraftModel(draft_config).cuda().to(torch.bfloat16)
 
     target_model.set_capture_layers(draft_model.target_layer_ids)
 
