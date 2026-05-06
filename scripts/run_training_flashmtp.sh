@@ -35,6 +35,7 @@ NUM_EPOCHS="${NUM_EPOCHS:-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
+BLOCK_SIZE="${BLOCK_SIZE:-16}"
 
 # 恢复训练
 RESUME="${RESUME:-}"
@@ -68,7 +69,7 @@ if [ "$DT" = "qz" ]; then
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 elif [ "$DT" = "h100" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-../training_data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_exp_h100_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
@@ -90,9 +91,8 @@ EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
 CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 
 # 模型参数
-BLOCK_SIZE="${BLOCK_SIZE:-12}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
-LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
+LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-16}"
 
 # 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
@@ -101,11 +101,11 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-5000}"
 
 # Tracker 参数
 REPORT_TO="${REPORT_TO:-wandb}"
-WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training}"
+WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-exp}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_exp_${DT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_exp_${DT}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}}"
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}"
@@ -166,21 +166,23 @@ fi
 echo "=========================================="
 echo ""
 
-# 如果输出目录已存在，自动添加数字后缀
-original_output_dir="${OUTPUT_DIR}"
-suffix=1
-while [ -d "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null)" ]; do
-    OUTPUT_DIR="${original_output_dir}_${suffix}"
-    suffix=$((suffix + 1))
-done
-if [ "${OUTPUT_DIR}" != "${original_output_dir}" ]; then
-    echo "警告: 输出目录 ${original_output_dir} 已存在且非空，自动切换到: ${OUTPUT_DIR}"
+# 如果输出目录已存在，非 resume 时自动添加数字后缀
+if [ "${RESUME}" != "true" ] && [ "${RESUME}" != "1" ]; then
+    original_output_dir="${OUTPUT_DIR}"
+    suffix=1
+    while [ -d "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null)" ]; do
+        OUTPUT_DIR="${original_output_dir}_${suffix}"
+        suffix=$((suffix + 1))
+    done
+    if [ "${OUTPUT_DIR}" != "${original_output_dir}" ]; then
+        echo "警告: 输出目录 ${original_output_dir} 已存在且非空，自动切换到: ${OUTPUT_DIR}"
+    fi
 fi
 
 # 创建输出目录
-mkdir -p ${OUTPUT_DIR}
-mkdir -p ${CACHE_DIR}
-mkdir -p ${WANDB_DIR}
+mkdir -p "${OUTPUT_DIR}"
+mkdir -p "${CACHE_DIR}"
+mkdir -p "${WANDB_DIR}"
 
 # ========================================
 # 训练
@@ -207,7 +209,7 @@ if [ -n "${IS_PREFORMATTED}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --is-preformatted"
 fi
 
-if [ -n "${RESUME}" ]; then
+if [ "${RESUME}" = "true" ] || [ "${RESUME}" = "1" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --resume"
 fi
 

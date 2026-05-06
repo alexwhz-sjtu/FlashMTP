@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
+from specforge.modeling.draft.flashmtp import FlashMTPDraftModel, flashmtp_slot_group
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -69,20 +69,27 @@ def create_flashmtp_block_mask(
         device: torch device
 
     Layout:
-        KV: [CHS_0 | CHS_1 | ... | CHS_{N-1} | Block_0 | Block_1 | ... | Block_{N-1}]
+        KV: [CHS_0 | ... | CHS_{N-1} | Clean_0, Mask_0 | Clean_1, Mask_1 | ...]
             - Each CHS_i has length chs_len_per_block
-            - Each Block_i has length block_size
-        Q:  [Block_0 | Block_1 | ... | Block_{N-1}]
+            - Each Clean_i and Mask_i has length block_size
+        Q:  [Clean_0, Mask_0 | Clean_1, Mask_1 | ...]
 
     Rules:
       1. Block_i only sees CHS_i (its own feature-concat context token).
-      2. Intra-block attention is bidirectional.
-      3. Different blocks are invisible to each other.
-      4. Invalid blocks (block_keep_mask=False) see nothing.
+      2. Clean queries only see previous/current clean semantic groups.
+      3. Mask queries see previous clean groups and the current mask group.
+      4. Tokens inside the same predicted mask group are bidirectional.
+      5. Different sampled training blocks are invisible to each other.
+      6. Invalid blocks (block_keep_mask=False) see nothing.
     """
 
     def flashmtp_mask_mod(b, h, q_idx, kv_idx):
-        q_block_id = q_idx // block_size
+        stream_block_size = 2 * block_size
+        q_block_id = q_idx // stream_block_size
+        q_stream_offset = q_idx % stream_block_size
+        q_is_mask = q_stream_offset >= block_size
+        q_slot = q_stream_offset % block_size
+        q_group = flashmtp_slot_group(q_slot)
 
         # Total length of all CHS segments
         total_chs_len = N * chs_len_per_block
@@ -97,16 +104,27 @@ def create_flashmtp_block_mask(
         # Check if kv_idx falls within the draft block region
         is_draft = kv_idx >= total_chs_len
         # Which block this draft kv belongs to
-        kv_block_id = (kv_idx - total_chs_len) // block_size
-        # Block i only attends to Block i (bidirectional)
-        mask_draft = is_draft & (kv_block_id == q_block_id)
+        draft_kv_idx = kv_idx - total_chs_len
+        kv_block_id = draft_kv_idx // stream_block_size
+        kv_stream_offset = draft_kv_idx % stream_block_size
+        kv_is_mask = kv_stream_offset >= block_size
+        kv_slot = kv_stream_offset % block_size
+        kv_group = flashmtp_slot_group(kv_slot)
+
+        same_block = kv_block_id == q_block_id
+        clean_query_visible = (~q_is_mask) & (~kv_is_mask) & (kv_group <= q_group)
+        mask_query_visible = q_is_mask & (
+            ((~kv_is_mask) & (kv_group < q_group))
+            | (kv_is_mask & (kv_group == q_group))
+        )
+        mask_draft = is_draft & same_block & (clean_query_visible | mask_query_visible)
 
         is_valid_block = block_keep_mask[b, q_block_id]
         return (mask_context | mask_draft) & is_valid_block
 
     B, N = anchor_positions.shape
-    Q_LEN = N * block_size
-    KV_LEN = N * chs_len_per_block + N * block_size
+    Q_LEN = N * 2 * block_size
+    KV_LEN = N * chs_len_per_block + N * 2 * block_size
 
     return create_block_mask(
         flashmtp_mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device
@@ -204,13 +222,19 @@ class OnlineFlashMTPModel(nn.Module):
         noise_input_ids[is_block_start] = input_ids[is_block_start]
         return noise_input_ids
 
-    def _create_position_ids(self,
-                             anchor_positions: torch.Tensor) -> torch.Tensor:
+    def _create_position_ids(
+            self,
+            anchor_positions: torch.Tensor,
+            repeat_streams: int = 1) -> torch.Tensor:
         """Create absolute position IDs for parallel draft blocks."""
         bsz, n_blocks = anchor_positions.shape
         device = anchor_positions.device
         offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
         pos_ids = anchor_positions.unsqueeze(-1) + offsets
+        if repeat_streams > 1:
+            pos_ids = pos_ids.unsqueeze(2).expand(
+                -1, -1, repeat_streams, -1
+            ).reshape(bsz, n_blocks, repeat_streams * self.block_size)
         return pos_ids.view(bsz, -1)
 
     def _create_noise_embed(self, input_ids, anchor_positions,
@@ -220,35 +244,35 @@ class OnlineFlashMTPModel(nn.Module):
         bs = self.block_size
         device = input_ids.device
 
-        noise_ids = torch.full((bsz, n * bs),
-                               self.mask_token_id,
-                               dtype=torch.long,
-                               device=device)
+        offsets = torch.arange(bs, device=device).view(1, 1, -1)
+        clean_indices = anchor_positions.unsqueeze(-1) + offsets
+        valid_clean_mask = clean_indices < seq_len
+        safe_clean_indices = clean_indices.clamp(max=seq_len - 1)
 
-        block_starts = torch.arange(n, device=device) * bs
-        block_starts = block_starts.unsqueeze(0).expand(bsz, -1)
-
-        valid_anchor_positions = anchor_positions.clamp(0, seq_len - 1)
-        anchor_tokens = torch.gather(input_ids, 1, valid_anchor_positions)
-
-        flat_batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(
-            bsz, n)
-
-        # substitute the anchor position with label token (bonus token in inference)
-        noise_ids[flat_batch_idx, block_starts] = torch.where(
-            block_keep_mask,
-            anchor_tokens,
-            torch.tensor(self.mask_token_id, dtype=torch.long, device=device),
+        clean_ids = torch.gather(
+            input_ids.unsqueeze(1).expand(-1, n, -1),
+            2,
+            safe_clean_indices,
+        )
+        clean_ids = torch.where(
+            valid_clean_mask & block_keep_mask.unsqueeze(-1),
+            clean_ids,
+            torch.full_like(clean_ids, self.mask_token_id),
         )
 
-        return self.embed_tokens(noise_ids)
+        mask_ids = torch.full_like(clean_ids, self.mask_token_id)
+        draft_ids = torch.cat([clean_ids, mask_ids], dim=-1).reshape(
+            bsz, n * 2 * bs
+        )
+
+        return self.embed_tokens(draft_ids)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Parallel block-wise training forward pass."""
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -264,12 +288,14 @@ class OnlineFlashMTPModel(nn.Module):
         context_position_ids = (anchor_positions - 1).clamp(min=0)  # (bsz, n_blocks)
 
         draft_position_ids = self._create_position_ids(
-            anchor_positions)  # (bsz, n_blocks * block_size)
+            anchor_positions,
+            repeat_streams=2,
+        )  # (bsz, n_blocks * 2 * block_size)
 
         full_position_ids = torch.cat(
             [context_position_ids, draft_position_ids],
             dim=-1,
-        )  # (bsz, n_blocks + n_blocks * block_size)
+        )  # (bsz, n_blocks + n_blocks * 2 * block_size)
 
         flashmtp_attn_mask = create_flashmtp_block_mask(
             anchor_positions=anchor_positions,
@@ -294,7 +320,13 @@ class OnlineFlashMTPModel(nn.Module):
             attention_mask=flashmtp_attn_mask,
         )
 
-        logits = self.lm_head(output_hidden)
+        stream_hidden = output_hidden.reshape(
+            bsz, anchor_positions.size(1), 2, self.block_size, -1
+        )
+        mask_hidden = stream_hidden[:, :, 1, :, :].reshape(
+            bsz, anchor_positions.size(1) * self.block_size, -1
+        )
+        logits = self.lm_head(mask_hidden)
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
         label_offsets = torch.arange(0, self.block_size,
@@ -352,4 +384,26 @@ class OnlineFlashMTPModel(nn.Module):
             actual_token_count = binary_eval_mask.sum() + 1e-6
             accuracy = correct.sum().float() / actual_token_count
 
-        return loss, accuracy
+            pred_ids_by_block = logits.argmax(dim=-1).view(
+                bsz, anchor_positions.size(1), self.block_size
+            )
+            correct_by_block = pred_ids_by_block == target_ids
+            valid_by_block = binary_eval_mask.view(
+                bsz, anchor_positions.size(1), self.block_size
+            ) > 0.5
+            prefix_correct = (
+                correct_by_block[:, :, 1:] & valid_by_block[:, :, 1:]
+            ).cumprod(dim=-1)
+            prefix_lengths = prefix_correct.sum(dim=-1).float() + 1.0
+            valid_blocks = block_keep_mask & valid_by_block[:, :, 1:].any(dim=-1)
+            prefix_denominators = valid_by_block[:, :, 1:].sum(dim=-1).float() + 1.0
+            prefix_ratios = prefix_lengths / prefix_denominators.clamp(min=1.0)
+            prefix_accuracy = (
+                prefix_ratios[valid_blocks].mean()
+                if valid_blocks.any()
+                else torch.zeros((), device=device)
+            )
+
+        metrics = {"prefix_accuracy": prefix_accuracy.detach()}
+
+        return loss, accuracy, metrics

@@ -80,7 +80,6 @@ def parse_args():
         help="Gamma for exponential loss decay weighting (paper Eq.4). "
         "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
     )
-
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
@@ -309,6 +308,7 @@ def record_metrics(
     optimizer,
     train_dataloader=None,
     mode: str = "train",
+    extra_metrics: Optional[dict] = None,
 ) -> None:
     logdict = {}
 
@@ -317,6 +317,9 @@ def record_metrics(
 
     logdict[f"{mode}/loss"] = loss
     logdict[f"{mode}/accuracy"] = accuracy
+    if extra_metrics:
+        for key, value in extra_metrics.items():
+            logdict[f"{mode}/{key}"] = value
 
     print_on_rank0(
         f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}"
@@ -357,10 +360,13 @@ def main():
             )
 
     if args.resume and os.path.isdir(args.output_dir):
-        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(
-            args.output_dir, prefix=r"epoch_\d+_step"
-        )
-        print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
+        if draft_model_last_checkpoint is not None:
+            print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+        else:
+            print_on_rank0(
+                f"No checkpoint found under {args.output_dir}; starting from scratch."
+            )
 
     resume_state = None
     if draft_model_last_checkpoint:
@@ -495,7 +501,7 @@ def main():
             hidden_states = tuple(h.cuda() for h in target_output.hidden_states)
             # hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 
-            loss, accuracy = flashmtp_model(
+            loss, accuracy, metrics = flashmtp_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
@@ -509,10 +515,21 @@ def main():
             if global_step % args.log_interval == 0:
                 loss_log = loss.clone()
                 acc_log = accuracy.clone()
+                metric_logs = {
+                    key: value.clone()
+                    for key, value in metrics.items()
+                    if torch.is_tensor(value)
+                }
                 dist.all_reduce(loss_log)
                 dist.all_reduce(acc_log)
+                for value in metric_logs.values():
+                    dist.all_reduce(value)
                 loss_log = loss_log / dist.get_world_size()
                 acc_log = acc_log / dist.get_world_size()
+                metric_logs = {
+                    key: (value / dist.get_world_size()).item()
+                    for key, value in metric_logs.items()
+                }
 
                 record_metrics(
                     args,
@@ -523,6 +540,7 @@ def main():
                     optimizer,
                     train_dataloader,
                     mode="train",
+                    extra_metrics=metric_logs,
                 )
 
             if dist.get_rank() == 0:

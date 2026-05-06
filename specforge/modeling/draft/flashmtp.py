@@ -21,6 +21,14 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
+try:
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    FLEX_ATTENTION_AVAILABLE = True
+except ImportError:
+    FLEX_ATTENTION_AVAILABLE = False
+    create_block_mask = None
+
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     if temperature < 1e-5:
@@ -56,6 +64,81 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> lis
         int(round(start + (i * span) / (num_draft_layers - 1)))
         for i in range(num_draft_layers)
     ]
+
+
+def flashmtp_slot_group(slot):
+    """Map slots to FlashMTP semantic groups: anchor, 1, 2, then chunks of 4."""
+    if not torch.is_tensor(slot):
+        slot = torch.as_tensor(slot)
+    return torch.where(
+        slot <= 1,
+        slot,
+        torch.where(slot < 4, torch.full_like(slot, 2), 3 + (slot - 4) // 4),
+    )
+
+
+def build_flashmtp_prediction_groups(block_size: int) -> list[tuple[int, int]]:
+    """Return prediction groups over draft slots: [1], [2,3], [4..7], ..."""
+    groups = []
+    start = 1
+    group_size = 1
+    while start < block_size:
+        end = min(block_size, start + group_size)
+        groups.append((start, end))
+        start = end
+        group_size = 2 if group_size == 1 else 4
+    return groups
+
+
+def create_flashmtp_single_block_mask(
+    batch_size: int,
+    block_size: int,
+    device: torch.device,
+    attention_backend: str,
+) -> Optional[torch.Tensor]:
+    """Build inference mask for one pivot plus one FlashMTP draft block.
+
+    KV layout: [Pivot | anchor, draft slots...]
+    Q layout:  [anchor, draft slots...]
+
+    Pivot is visible to all draft slots. Draft slots follow block-causal
+    semantic groups: anchor, [1], [2,3], [4..7], ...
+    """
+    q_len = block_size
+    kv_len = block_size + 1
+
+    if attention_backend == "flex_attention":
+        if not FLEX_ATTENTION_AVAILABLE:
+            raise ImportError("flex_attention is required for FlashMTP BlockMask.")
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            is_context = kv_idx == 0
+            kv_slot = kv_idx - 1
+            q_group = flashmtp_slot_group(q_idx)
+            kv_group = flashmtp_slot_group(kv_slot)
+            same_or_previous_group = kv_group <= q_group
+            return is_context | ((kv_idx > 0) & same_or_previous_group)
+
+        return create_block_mask(
+            mask_mod,
+            B=batch_size,
+            H=None,
+            Q_LEN=q_len,
+            KV_LEN=kv_len,
+            device=device,
+        )
+
+    q_slots = torch.arange(q_len, device=device).view(q_len, 1)
+    kv_slots = torch.arange(kv_len, device=device).view(1, kv_len) - 1
+    q_groups = flashmtp_slot_group(q_slots)
+    kv_groups = flashmtp_slot_group(kv_slots.clamp(min=0))
+    visible = (kv_slots < 0) | (kv_groups <= q_groups)
+    mask = torch.zeros(
+        (batch_size, 1, q_len, kv_len),
+        device=device,
+        dtype=torch.float32,
+    )
+    return mask.masked_fill(~visible.view(1, 1, q_len, kv_len), torch.finfo(torch.float32).min)
 
 
 class Qwen3FlashMTPAttention(nn.Module):
@@ -265,6 +348,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
     def get_last_decode_stats(self) -> dict:
         return dict(self._last_decode_stats)
 
+    def fuse_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
+        return self.hidden_norm(self.fc(target_hidden))
+
     def forward(
         self,
         position_ids: torch.LongTensor,
@@ -275,9 +361,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         use_cache: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
-        
         hidden_states = noise_embedding
-        target_hidden = self.hidden_norm(self.fc(target_hidden))
+        target_hidden = self.fuse_target_hidden(target_hidden)
         # position_embeddings = self.rotary_emb(torch.cat([target_hidden, hidden_states], dim=1), position_ids)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
@@ -313,6 +398,12 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         max_length = num_input_tokens + max_new_tokens
 
         block_size = self.block_size
+        if self.mask_token_id is None:
+            raise ValueError(
+                "FlashMTPDraftModel.mask_token_id is None. Load a checkpoint with "
+                "flashmtp_config['mask_token_id'] or set draft_model.mask_token_id "
+                "before calling spec_generate()."
+            )
         output_ids = torch.full(
             (1, max_length + block_size),
             self.mask_token_id,
@@ -354,27 +445,41 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         # Decode stage
         acceptance_lengths = []
         start = input_ids.shape[1]
+        prediction_groups = build_flashmtp_prediction_groups(block_size)
+        draft_attention_mask = create_flashmtp_single_block_mask(
+            batch_size=input_ids.shape[0],
+            block_size=block_size,
+            device=target.device,
+            attention_backend=self.config._attn_implementation,
+        )
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
-            noise_embedding = target.model.embed_tokens(block_output_ids)
-            if target.device.type == "cuda":
-                torch.cuda.synchronize(target.device)
-            draft_start = time.perf_counter()
-            draft_logits = target.lm_head(
-                self(
+            for group_start, group_end in prediction_groups:
+                noise_embedding = target.model.embed_tokens(block_output_ids)
+                if target.device.type == "cuda":
+                    torch.cuda.synchronize(target.device)
+                draft_start = time.perf_counter()
+                draft_hidden = self(
                     target_hidden=target_hidden,
                     noise_embedding=noise_embedding,
                     position_ids=position_ids[:, start - 1 : start + block_size],
+                    attention_mask=draft_attention_mask,
                     past_key_values=None,
                     use_cache=False,
                     is_causal=False,
-                )[:, -block_size + 1 :, :]
-            )
-            if target.device.type == "cuda":
-                torch.cuda.synchronize(target.device)
-            self._last_decode_stats["draft_total_time"] += time.perf_counter() - draft_start
-            block_output_ids[:, 1:] = sample(draft_logits)
+                )
+                draft_logits = target.lm_head(
+                    draft_hidden[:, group_start:group_end, :]
+                )
+                if target.device.type == "cuda":
+                    torch.cuda.synchronize(target.device)
+                self._last_decode_stats["draft_total_time"] += (
+                    time.perf_counter() - draft_start
+                )
+                block_output_ids[:, group_start:group_end] = sample(
+                    draft_logits, temperature
+                )
 
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)

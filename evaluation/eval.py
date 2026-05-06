@@ -14,6 +14,18 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
 
+
+def resolve_mask_token_id(draft_model: FlashMTPDraftModel, tokenizer: AutoTokenizer) -> int:
+    mask_token_id = draft_model.mask_token_id
+    if mask_token_id is None:
+        mask_token_id = tokenizer.mask_token_id
+    if mask_token_id is None:
+        raise ValueError(
+            "mask_token_id is None. Please use a FlashMTP checkpoint whose config "
+            "contains flashmtp_config['mask_token_id'], or a tokenizer with mask_token_id."
+        )
+    return int(mask_token_id)
+
 def load_mtbench101_questions(question_file, begin=None, end=None):
     """Load questions from mtbench101.jsonl format"""
     questions = []
@@ -213,6 +225,7 @@ def main():
     parser.add_argument("--output-dir", type=str, default="./model_answer")
     parser.add_argument("--debug-dir", type=str, default="./train/debug")
     parser.add_argument("--debug", type=bool, default=False)
+    parser.add_argument("--trust-remote-code", action="store_true")
     
     parser.add_argument("--thinking", type=bool, default=False)
     args = parser.parse_args()
@@ -247,16 +260,24 @@ def main():
     draft_model = FlashMTPDraftModel.from_pretrained(
         args.draft_model_path,
         torch_dtype="auto",
-        device_map="cuda:0"
+        device_map="cuda:0",
+        trust_remote_code=args.trust_remote_code,
     ).eval()
     
     target_model = AutoModelForCausalLM.from_pretrained(
         args.target_model_path,
-        dtype="auto",
-        device_map="cuda:0"
+        torch_dtype="auto",
+        device_map="cuda:0",
+        trust_remote_code=args.trust_remote_code,
     ).eval()
     
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.target_model_path,
+        trust_remote_code=args.trust_remote_code,
+    )
+    mask_token_id = resolve_mask_token_id(draft_model, tokenizer)
+    draft_model.mask_token_id = mask_token_id
+    draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
 
     questions = load_mtbench101_questions(args.question_file, begin=args.begin, end=args.end)
     

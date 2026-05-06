@@ -10,14 +10,13 @@ import numpy as np
 import torch
 from rich import print
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
-from specforge.modeling.draft.flashmtp import extract_latest_context_feature, sample
+from specforge.modeling.draft.flashmtp import FlashMTPDraftModel, sample
 
 from evaluation import distributed as dist
 from evaluation.utils import load_and_process_dataset
@@ -38,114 +37,46 @@ def resolve_mask_token_id(draft_model: FlashMTPDraftModel, tokenizer: AutoTokeni
     return int(mask_token_id)
 
 @torch.inference_mode()
-def flashmtp_generate(
-    model: FlashMTPDraftModel,
+def target_generate(
     target: AutoModelForCausalLM,
     input_ids: torch.Tensor,
-    mask_token_id: int,
     max_new_tokens: int,
-    block_size: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
 ) -> SimpleNamespace:
+    target.eval()
     num_input_tokens = input_ids.shape[1]
-    max_length = num_input_tokens + max_new_tokens
 
-    output_ids = torch.full(
-        (1, max_length + block_size),
-        mask_token_id,
-        dtype=torch.long,
-        device=model.device,
-    )
-    position_ids = torch.arange(output_ids.shape[1], device=model.device).unsqueeze(0)
-    past_key_values_target = DynamicCache()
-
-    # Prefill stage
     prefill_start = cuda_time()
     output = target(
         input_ids,
-        position_ids=position_ids[:, :num_input_tokens],
-        past_key_values=past_key_values_target,
         use_cache=True,
         logits_to_keep=1,
-        output_hidden_states=True if block_size > 1 else False,
     )
-
-    output_ids[:, :num_input_tokens] = input_ids
-    output_ids[:, num_input_tokens:num_input_tokens+1] = sample(output.logits, temperature)
-    if block_size > 1:
-        target_hidden = extract_latest_context_feature(
-            output.hidden_states,
-            model.target_layer_ids,
-            token_index=-1,
-        )
-
+    next_token = sample(output.logits, temperature)
     time_to_first_token = cuda_time() - prefill_start
 
-    # Decode stage
     decode_start = cuda_time()
-    start = input_ids.shape[1]
-    acceptance_lengths = []
-    draft_prefill = True
-
-    while start < max_length:
-        block_output_ids = output_ids[:, start : start + block_size].clone()
-        block_position_ids = position_ids[:, start : start + block_size]
-        if block_size > 1:
-            noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_logits = target.lm_head(model(
-                target_hidden=target_hidden,
-                noise_embedding=noise_embedding,
-                position_ids=position_ids[:, start - 1 : start + block_size],
-                past_key_values=None,
-                use_cache=False,
-                is_causal=False,
-            )[:, -block_size+1:, :])
-            block_output_ids[:, 1:] = sample(draft_logits)
-            if draft_prefill:
-                draft_prefill = False
-                decode_start = cuda_time()
-
-        output = target(
-            block_output_ids,
-            position_ids=block_position_ids,
-            past_key_values=past_key_values_target,
-            use_cache=True,
-            output_hidden_states=True if block_size > 1 else False,
-        )
-
-        posterior = sample(output.logits, temperature)
-        acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
-        output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
-        output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
-
-        acceptance_lengths.append(acceptance_length+1)
-        start += acceptance_length + 1
-        past_key_values_target.crop(start)
-        if block_size > 1:
-            pivot_index = min(acceptance_length, output.hidden_states[0].shape[1] - 1)
-            target_hidden = extract_latest_context_feature(
-                output.hidden_states,
-                model.target_layer_ids,
-                token_index=pivot_index,
-            )
-        
-        if stop_token_ids is not None and any(
-            stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
-        ):
+    generated = [next_token]
+    past_key_values = output.past_key_values
+    while len(generated) < max_new_tokens:
+        if stop_token_ids is not None and int(generated[-1].item()) in stop_token_ids:
             break
+        output = target(
+            generated[-1],
+            past_key_values=past_key_values,
+            use_cache=True,
+            logits_to_keep=1,
+        )
+        past_key_values = output.past_key_values
+        generated.append(sample(output.logits, temperature))
 
-    output_ids = output_ids[:, :max_length]
-    output_ids = output_ids[:, output_ids[0] != mask_token_id]
-    if stop_token_ids is not None:
-        stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
-        stop_token_indices = torch.isin(output_ids[0][num_input_tokens:], stop_token_ids).nonzero(as_tuple=True)[0]
-        if stop_token_indices.numel() > 0:
-            output_ids = output_ids[:, : num_input_tokens + stop_token_indices[0] + 1]
+    generated_ids = torch.cat(generated, dim=1)
+    output_ids = torch.cat([input_ids, generated_ids], dim=1)
 
     num_output_tokens = output_ids.shape[1] - num_input_tokens
     total_decode_time = cuda_time() - decode_start
-    time_per_output_token = total_decode_time / num_output_tokens
+    time_per_output_token = total_decode_time / max(num_output_tokens, 1)
 
     return SimpleNamespace(
         output_ids=output_ids,
@@ -153,20 +84,61 @@ def flashmtp_generate(
         num_output_tokens=num_output_tokens,
         time_to_first_token=time_to_first_token,
         time_per_output_token=time_per_output_token,
-        acceptance_lengths=acceptance_lengths,
+        acceptance_lengths=[1] * num_output_tokens,
+        target_total_time=time_to_first_token + total_decode_time,
+        draft_total_time=0.0,
+        steps=num_output_tokens,
+    )
+
+
+@torch.inference_mode()
+def flashmtp_generate(
+    model: FlashMTPDraftModel,
+    target: AutoModelForCausalLM,
+    input_ids: torch.Tensor,
+    max_new_tokens: int,
+    stop_token_ids: list[int],
+    temperature: float = 0.0,
+) -> SimpleNamespace:
+    start_time = cuda_time()
+    output_ids = model.spec_generate(
+        target=target,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        stop_token_ids=stop_token_ids,
+        temperature=temperature,
+    )
+    total_time = cuda_time() - start_time
+    stats = model.get_last_decode_stats()
+    num_input_tokens = input_ids.shape[1]
+    num_output_tokens = output_ids.shape[1] - num_input_tokens
+    timed_total = stats.get("target_total_time", 0.0) + stats.get("draft_total_time", 0.0)
+    time_per_output_token = (timed_total or total_time) / max(num_output_tokens, 1)
+
+    return SimpleNamespace(
+        output_ids=output_ids,
+        num_input_tokens=num_input_tokens,
+        num_output_tokens=num_output_tokens,
+        time_to_first_token=0.0,
+        time_per_output_token=time_per_output_token,
+        acceptance_lengths=stats.get("accept_lengths", []),
+        target_total_time=stats.get("target_total_time", 0.0),
+        draft_total_time=stats.get("draft_total_time", 0.0),
+        steps=stats.get("steps", 0),
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-name-or-path", type=str, default='/data/wanghanzhen/models/Qwen/Qwen3-8B')
-    parser.add_argument("--draft-name-or-path", type=str, default='/data/wanghanzhen/Projects/MTP/NIPS26/FlashMTP/cache/models/flashmtp_feature_sample_400000_think_on_qwen3_8b_maxlen4096')
+    parser.add_argument("--model-name-or-path", "--target-model-path", type=str, default='/data/wanghanzhen/models/Qwen/Qwen3-8B')
+    parser.add_argument("--draft-name-or-path", "--draft-model-path", type=str, required=True)
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--max-samples", type=int, default=100)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--think", action="store_true")
+    parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()
 
     random.seed(0)
@@ -188,24 +160,30 @@ def main() -> None:
             logger.warning("flash_attn is not installed. Falling back to torch.sdpa. The speedup will be lower.")
             return False
 
-    installed_flash_attn = has_flash_attn()
+    has_flash_attn()
 
     target = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         # attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=args.trust_remote_code,
     ).to(device).eval()
 
     draft_model = FlashMTPDraftModel.from_pretrained(
         args.draft_name_or_path,
         # attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=args.trust_remote_code,
     ).to(device).eval()
 
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
+    draft_model.block_size = block_size
+    draft_model.config.block_size = block_size
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code)
     mask_token_id = resolve_mask_token_id(draft_model, tokenizer)
+    draft_model.mask_token_id = mask_token_id
+    draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
     stop_token_ids = [token_id for token_id in [tokenizer.eos_token_id] if token_id is not None]
     dataset = load_and_process_dataset(args.dataset)
 
@@ -224,18 +202,22 @@ def main() -> None:
             input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
 
             response = {}
-            for bs in [1, block_size]:
-                response[bs] = flashmtp_generate(
-                    model=draft_model,
-                    target=target,
-                    input_ids=input_ids,
-                    mask_token_id=mask_token_id,
-                    max_new_tokens=args.max_new_tokens,
-                    block_size=bs,
-                    stop_token_ids=stop_token_ids,
-                    temperature=args.temperature,
-                )
-            
+            response[1] = target_generate(
+                target=target,
+                input_ids=input_ids,
+                max_new_tokens=args.max_new_tokens,
+                stop_token_ids=stop_token_ids,
+                temperature=args.temperature,
+            )
+            response[block_size] = flashmtp_generate(
+                model=draft_model,
+                target=target,
+                input_ids=input_ids,
+                max_new_tokens=args.max_new_tokens,
+                stop_token_ids=stop_token_ids,
+                temperature=args.temperature,
+            )
+
             spec_response = response[block_size]
             generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens:]
             output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -243,7 +225,11 @@ def main() -> None:
             acceptance_lengths_text = ", ".join(
                 [f"{position}:{length}" for position, length in enumerate(spec_response.acceptance_lengths)]
             )
-            avg_acceptance_length = np.mean(spec_response.acceptance_lengths)
+            avg_acceptance_length = (
+                float(np.mean(spec_response.acceptance_lengths))
+                if spec_response.acceptance_lengths
+                else 0.0
+            )
             print(f"\n[Sample {idx} | Turn {turn_index}] Response:\n{output_text}")
             print(
                 f"[Sample {idx} | Turn {turn_index}] Acceptance lengths (position:length): "
@@ -269,11 +255,19 @@ def main() -> None:
     ) / sum(r[block_size].num_output_tokens for r in responses)
     print(f"Decoding speedup: {t1 / tb:.2f}")
 
-    tau = np.mean([np.mean(r[block_size].acceptance_lengths) for r in responses])
+    mean_acceptance_values = [
+        np.mean(r[block_size].acceptance_lengths)
+        for r in responses
+        if r[block_size].acceptance_lengths
+    ]
+    tau = float(np.mean(mean_acceptance_values)) if mean_acceptance_values else 0.0
     print(f"Average Acceptance length: {tau:.2f}")
 
     acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
-    histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
+    histogram = [
+        acceptance_lengths.count(b) / len(acceptance_lengths)
+        for b in range(block_size + 1)
+    ] if acceptance_lengths else [0.0 for _ in range(block_size + 1)]
     print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
 
     total_elapsed_time = cuda_time() - benchmark_start
