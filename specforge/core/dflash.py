@@ -78,6 +78,7 @@ class OnlineDFlashModel(nn.Module):
         streak_weight: float = 1.0,
         ce_weight: float = 1.0,
         streak_decay_gamma: float = 7.0,
+        streak_saturation_beta: float = 2.0,
         log_prob_min: float = -40.0,
     ):
         super().__init__()
@@ -91,6 +92,7 @@ class OnlineDFlashModel(nn.Module):
         self.streak_weight = streak_weight
         self.ce_weight = ce_weight
         self.streak_decay_gamma = streak_decay_gamma
+        self.streak_saturation_beta = streak_saturation_beta
         self.log_prob_min = log_prob_min
 
         self._cached_block_mask: Optional[BlockMask] = None
@@ -309,10 +311,15 @@ class OnlineDFlashModel(nn.Module):
             -((gamma - streak_positions).clamp(min=0)).float()
             / self.streak_decay_gamma
         )
+        beta = max(self.streak_saturation_beta, 1e-6)
+        positive_log_rho = log_rho.clamp_min(0.0)
+        saturated_phi = 1.0 + (streak_weights / beta) * (
+            1.0 - torch.exp(-beta * positive_log_rho)
+        )
         log_phi = torch.where(
             log_rho < 0,
             log_rho,
-            torch.log1p(streak_weights * log_rho.clamp_min(0.0)),
+            saturated_phi.clamp_min(1e-12).log(),
         )
 
         log_phi_tail = log_phi[..., 1:]

@@ -97,6 +97,12 @@ def parse_args():
         default=7.0,
         help="Gamma for LS-RSL high-confidence position weights.",
     )
+    model_group.add_argument(
+        "--streak-saturation-beta",
+        type=float,
+        default=2.0,
+        help="Beta for the exponential saturation branch when rho >= 1.",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -443,6 +449,7 @@ def main():
         streak_weight=args.streak_weight,
         ce_weight=args.ce_weight,
         streak_decay_gamma=args.streak_decay_gamma,
+        streak_saturation_beta=args.streak_saturation_beta,
     )
 
     dflash_model = FSDP(

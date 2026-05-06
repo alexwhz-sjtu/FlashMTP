@@ -94,6 +94,7 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 STREAK_WEIGHT="${STREAK_WEIGHT:-1.0}"
 CE_WEIGHT="${CE_WEIGHT:-0.2}"
 STREAK_DECAY_GAMMA="${STREAK_DECAY_GAMMA:-7.0}"
+STREAK_SATURATION_BETA="${STREAK_SATURATION_BETA:-4.0}"
 
 # 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
@@ -105,7 +106,7 @@ REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-exp}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
-WANDB_RUN_ID="${WANDB_RUN_ID:-dflash_lsrsl_${DATA_NUM_SAMPLES}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-dflash_lsrsl_beta_${STREAK_SATURATION_BETA}_${DATA_NUM_SAMPLES}}"
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}"
@@ -139,6 +140,7 @@ echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Streak loss权重: ${STREAK_WEIGHT}"
 echo "  CE loss权重: ${CE_WEIGHT}"
 echo "  Streak达标后衰减Gamma: ${STREAK_DECAY_GAMMA}"
+echo "  Streak达标后饱和Beta: ${STREAK_SATURATION_BETA}"
 echo "------------------------------------------"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
@@ -247,6 +249,7 @@ EXIT_CODE=0
     --streak-weight ${STREAK_WEIGHT} \
     --ce-weight ${CE_WEIGHT} \
     --streak-decay-gamma ${STREAK_DECAY_GAMMA} \
+    --streak-saturation-beta ${STREAK_SATURATION_BETA} \
     --learning-rate ${LEARNING_RATE} \
     --warmup-ratio ${WARMUP_RATIO} \
     --num-epochs ${NUM_EPOCHS} \

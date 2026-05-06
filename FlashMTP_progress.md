@@ -236,6 +236,9 @@ $\mathcal{L}_{\text{CE}}$ 对块内除 anchor 外的每个有效位置单独计�
 
 进入草稿模型前，我先用一个轻量的一层，单头的qwen3 cross-attention模块，用最后一个pivot hs去attend历史的hs，将自己的语义变得更丰富，更有未来信息。
 
+v5 dflash：将loss变为相对概率，和原来对比看效果
+
+
 ### exp
 exp版本用来验证
 
