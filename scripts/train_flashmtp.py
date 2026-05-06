@@ -107,7 +107,7 @@ def parse_args():
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
-    dataset_group.add_argument("--chs-concat-mode", type=str, default="feature")
+    dataset_group.add_argument("--chs-concat-mode", type=str, default="feature", choices=["feature"])
     dataset_group.add_argument(
         "--build-dataset-num-proc",
         type=int,

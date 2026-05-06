@@ -22,7 +22,7 @@ def prepare_target_hidden(
     hidden_states: tuple[torch.Tensor],  # (num_layers,)[(B, seq_len, H)]
     anchor_positions: torch.Tensor,  # (B, N)
     target_layer_ids: list[int],
-    chs_concat_mode: str = "seq",
+    chs_concat_mode: str = "feature",
 ) -> torch.Tensor:
     """Convert full hidden states to CHS format for FlashMTP.
 
@@ -30,12 +30,13 @@ def prepare_target_hidden(
         hidden_states: All layers' hidden states from target model
         anchor_positions: Anchor positions for each block
         target_layer_ids: List of layer IDs to extract
-        chs_concat_mode: "seq" or "feature"
+        chs_concat_mode: "feature"
 
     Returns:
-        - seq mode: (B, N*L, H) - L layers concatenated along sequence dim
         - feature mode: (B, N, H*L) - L layers concatenated along feature dim
     """
+    if chs_concat_mode != "feature":
+        raise ValueError("FlashMTP v6 only supports chs_concat_mode='feature'.")
     # 获取位置 p-1 的 hidden states (用来预测位置 p)
     context_positions = (anchor_positions - 1).clamp(min=0)  # (B, N)
 
@@ -53,12 +54,8 @@ def prepare_target_hidden(
         )
         selected_states.append(layer_selected)
 
-    if chs_concat_mode == "seq":
-        # 按序列维度拼接: (B, N*L, H)
-        return torch.cat(selected_states, dim=1)  # (B, N*L, H)
-    else:  # feature mode
-        # 按特征维度拼接: (B, N, H*L)
-        return torch.cat(selected_states, dim=-1)  # (B, N, H*L)
+    # 按特征维度拼接: (B, N, H*L)
+    return torch.cat(selected_states, dim=-1)  # (B, N, H*L)
 
 def _stage_id_from_position(pos, stage_ranges):
     stage_id = torch.zeros_like(pos)
@@ -147,7 +144,7 @@ class OnlineFlashMTPModel(nn.Module):
             attention_backend: str = "flex_attention",
             num_anchors: int = 512,
             loss_decay_gamma: Optional[float] = None,
-            chs_concat_mode: str = "seq",  # "seq" or "feature"
+            chs_concat_mode: str = "feature",
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -158,6 +155,8 @@ class OnlineFlashMTPModel(nn.Module):
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
+        if chs_concat_mode != "feature":
+            raise ValueError("FlashMTP v6 only supports chs_concat_mode='feature'.")
         self.chs_concat_mode = chs_concat_mode
         self.draft_model.chs_concat_mode = chs_concat_mode
         self.stage_ranges = draft_model.stage_ranges
@@ -287,14 +286,7 @@ class OnlineFlashMTPModel(nn.Module):
 
         full_position_ids = draft_position_ids
 
-        # Determine CHS length per block based on concat mode
-        # seq mode: each CHS_i has num_target_layers tokens
-        # feature mode: each CHS_i has 1 token (features concatenated)
-        chs_len_per_block = (
-            len(self.draft_model.target_layer_ids)
-            if self.chs_concat_mode == "seq"
-            else 1
-        )
+        chs_len_per_block = 1
 
         flashmtp_attn_mask = create_flashmtp_block_mask(
             anchor_positions=anchor_positions,
@@ -318,6 +310,7 @@ class OnlineFlashMTPModel(nn.Module):
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=target_hidden,
+            anchor_position=anchor_positions,
             attention_mask=flashmtp_attn_mask,
         )
         logits = draft_output["logits"]

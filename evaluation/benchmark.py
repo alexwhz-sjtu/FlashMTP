@@ -92,6 +92,7 @@ def flashmtp_generate(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
                 position_ids=position_ids[:, start : start + block_size],
+                anchor_position=position_ids[:, start : start + 1],
                 past_key_values=None,
                 use_cache=False,
                 is_causal=False,
@@ -157,7 +158,7 @@ def flashmtp_generate(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name-or-path", type=str, default='/data/wanghanzhen/models/Qwen/Qwen3-8B')
-    parser.add_argument("--draft-name-or-path", type=str, default='/data/wanghanzhen/Projects/MTP/NIPS26/FlashMTP/cache/models/flashmtp_feature_sample_400000_think_on_qwen3_8b_maxlen4096')
+    parser.add_argument("--draft-name-or-path", type=str, default='/data/wanghanzhen/Projects/MTP/NIPS26/FlashMTP_v6/cache/models/flashmtpv6_h100_stagehead_false_sample_40000_think_off_nlayers5_block_16_maxlen4096_epochs6/epoch_6_step_29844')
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--max-samples", type=int, default=None)

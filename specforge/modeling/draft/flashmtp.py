@@ -48,6 +48,12 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+def apply_rotary_pos_emb_to_k(k, cos, sin, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    return (k * cos) + (rotate_half(k) * sin)
+
+
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> list[int]:
     del num_draft_layers
     return list(range(1, num_target_layers, 2))
@@ -128,6 +134,7 @@ class Qwen3FlashMTPAttention(nn.Module):
         hidden_states: torch.Tensor,
         target_hidden: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        context_position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
@@ -152,15 +159,13 @@ class Qwen3FlashMTPAttention(nn.Module):
         v = v.transpose(1, 2)
 
         cos, sin = position_embeddings
-        
-        # Only apply RoPE to draft tokens; CHS slots stay un-rotated.
-        if self.chs_concat_mode in ("seq", "feature"):
-            k_ctx_part = k[:, :, :ctx_len, :]  
-            k_noise_part = k[:, :, ctx_len:, :]   
-            q, k_noise_part = apply_rotary_pos_emb(q, k_noise_part, cos, sin)
-            k = torch.cat([k_ctx_part, k_noise_part], dim=2)
-        else:
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        context_cos, context_sin = context_position_embeddings
+
+        k_ctx_part = k[:, :, :ctx_len, :]
+        k_noise_part = k[:, :, ctx_len:, :]
+        q, k_noise_part = apply_rotary_pos_emb(q, k_noise_part, cos, sin)
+        k_ctx_part = apply_rotary_pos_emb_to_k(k_ctx_part, context_cos, context_sin)
+        k = torch.cat([k_ctx_part, k_noise_part], dim=2)
 
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -209,6 +214,9 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
+        context_position_embeddings: Optional[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -225,6 +233,7 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            context_position_embeddings=context_position_embeddings,
             **kwargs,
         )[0]
         hidden_states = residual + hidden_states
@@ -257,17 +266,16 @@ def extract_latest_context_feature(
     """Extract latest token hidden states from specified layers.
 
     Returns:
-        - seq mode: (B, L, H)
         - feature mode: (B, 1, H*L)
     """
+    if chs_concat_mode != "feature":
+        raise ValueError("FlashMTP v6 only supports chs_concat_mode='feature'.")
     offset = 1
     selected_states = []
     for layer_id in layer_ids:
         layer_hidden = hidden_states[layer_id + offset]
         selected_states.append(layer_hidden[:, token_index, :].unsqueeze(1))
 
-    if chs_concat_mode == "seq":
-        return torch.cat(selected_states, dim=1)
     return torch.cat(selected_states, dim=-1)
 
 
@@ -282,6 +290,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         if not hasattr(config, "flashmtp_config") or config.flashmtp_config is None:
             config.flashmtp_config = flashmtp_config
         self.chs_concat_mode = flashmtp_config.get("chs_concat_mode", "feature")
+        if self.chs_concat_mode != "feature":
+            raise ValueError("FlashMTP v6 only supports chs_concat_mode='feature'.")
+        self.config.flashmtp_config["chs_concat_mode"] = "feature"
         self.layers = nn.ModuleList(
             [
                 Qwen3FlashMTPDecoderLayer(config, layer_idx, self.chs_concat_mode)
@@ -325,20 +336,12 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 ]
             )
 
-        # For seq concat mode: use Identity (no computation, no parameters)
-        # For feature mode: use Linear projection and RMSNorm
-        if self.chs_concat_mode == "feature":
-            self.fc = nn.Linear(
-                len(self.target_layer_ids) * config.hidden_size,
-                config.hidden_size,
-                bias=False,
-            )
-            self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        else:
-            self.fc = nn.Identity()
-            # self.hidden_norm = nn.Identity()
-            # maybe need norm
-            self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fc = nn.Linear(
+            len(self.target_layer_ids) * config.hidden_size,
+            config.hidden_size,
+            bias=False,
+        )
+        self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         print_on_rank0(f"self.chs_concat_mode: {self.chs_concat_mode}")
         print_on_rank0(f"FlashMTP stage_ranges: {self.stage_ranges}")
         print_on_rank0(
@@ -466,6 +469,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         noise_embedding: Optional[torch.Tensor] = None,
         target_hidden: Optional[torch.Tensor] = None,
+        anchor_position: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
         **kwargs,
@@ -473,8 +477,13 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
-        # position_embeddings = self.rotary_emb(torch.cat([target_hidden, hidden_states], dim=1), position_ids)
+        if anchor_position is None:
+            raise ValueError("anchor_position is required to apply RoPE to CHS.")
+        context_position_ids = (anchor_position - 1).clamp(min=0)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        context_position_embeddings = self.rotary_emb(
+            target_hidden, context_position_ids
+        )
         stage_logits = []
         stage_hidden_states = []
         for stage_idx, layer in enumerate(self.layers):
@@ -486,6 +495,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
+                context_position_embeddings=context_position_embeddings,
                 **kwargs,
             )
             norm_hidden_states = self.norm(hidden_states)
@@ -590,6 +600,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
                 position_ids=position_ids[:, start : start + block_size],
+                anchor_position=position_ids[:, start : start + 1],
                 past_key_values=None,
                 use_cache=False,
                 is_causal=False,
