@@ -34,7 +34,8 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
-NUM_ANCHORS="${NUM_ANCHORS:-512}"
+NUM_ANCHORS="${NUM_ANCHORS:-2048}"
+ANCHOR_CHUNK_SIZE="${ANCHOR_CHUNK_SIZE:-512}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 
 # 恢复训练
@@ -50,6 +51,7 @@ ENABLE_THINKING="${ENABLE_THINKING:-off}"
 
 # 草稿层数：默认目录名/ WandB id/ run name 中均带 nlayers${NUM_DRAFT_LAYERS}
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
+
 
 # ========================================
 # 默认参数（通常不需要修改）
@@ -92,7 +94,7 @@ CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 
 # 模型参数
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
-LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-16}"
+LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
 
 # 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
@@ -108,7 +110,7 @@ WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_exp_${DT}_nlayers${NUM_DRAFT_LAYERS}_bloc
 WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_exp_${DT}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}}"
 
 # 数据参数
-CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}"
+CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen}"
 IS_PREFORMATTED="${IS_PREFORMATTED:-}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
 BUILD_DATASET_NUM_PROC="${BUILD_DATASET_NUM_PROC:-8}"
@@ -137,6 +139,7 @@ echo "模型配置:"
 echo "  草稿模型层数: ${NUM_DRAFT_LAYERS}"
 echo "  块大小: ${BLOCK_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
+echo "  Anchor chunk大小: ${ANCHOR_CHUNK_SIZE:-0} (0表示关闭)"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
 echo "------------------------------------------"
@@ -241,6 +244,7 @@ EXIT_CODE=0
     --num-draft-layers ${NUM_DRAFT_LAYERS} \
     --block-size ${BLOCK_SIZE} \
     --num-anchors ${NUM_ANCHORS} \
+    --anchor-chunk-size ${ANCHOR_CHUNK_SIZE} \
     --attention-backend ${ATTENTION_BACKEND} \
     --learning-rate ${LEARNING_RATE} \
     --warmup-ratio ${WARMUP_RATIO} \

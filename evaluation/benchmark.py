@@ -131,12 +131,12 @@ def flashmtp_generate(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name-or-path", "--target-model-path", type=str, default='/data/wanghanzhen/models/Qwen/Qwen3-8B')
-    parser.add_argument("--draft-name-or-path", "--draft-model-path", type=str, required=True)
+    parser.add_argument("--draft-name-or-path", "--draft-model-path", type=str, default='/data/wanghanzhen/Projects/MTP/NIPS26/FlashMTP_exp/cache/models/flashmtp_exp_h100_sample_40000_think_off_nlayers5_block_16_maxlen4096_epochs6/epoch_6_step_29844')
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--dataset", type=str, required=True)
-    parser.add_argument("--max-samples", type=int, default=100)
+    parser.add_argument("--max-samples", type=int, default=10)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
-    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--think", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()
@@ -165,14 +165,14 @@ def main() -> None:
     target = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         # attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         trust_remote_code=args.trust_remote_code,
     ).to(device).eval()
 
     draft_model = FlashMTPDraftModel.from_pretrained(
         args.draft_name_or_path,
         # attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         trust_remote_code=args.trust_remote_code,
     ).to(device).eval()
 

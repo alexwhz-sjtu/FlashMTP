@@ -74,6 +74,15 @@ def parse_args():
         help="Number of anchor positions per sequence",
     )
     model_group.add_argument(
+        "--anchor-chunk-size",
+        type=int,
+        default=0,
+        help=(
+            "Process anchors in chunks of this size to reduce activation/logit peak "
+            "memory. 0 disables anchor chunking."
+        ),
+    )
+    model_group.add_argument(
         "--loss-decay-gamma",
         type=float,
         default=None,
@@ -501,13 +510,80 @@ def main():
             hidden_states = tuple(h.cuda() for h in target_output.hidden_states)
             # hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 
-            loss, accuracy, metrics = flashmtp_model(
-                input_ids=input_ids,
-                hidden_states=hidden_states,
-                loss_mask=loss_mask,
+            use_anchor_chunking = (
+                args.anchor_chunk_size > 0
+                and args.anchor_chunk_size < args.num_anchors
             )
+            if use_anchor_chunking:
+                with torch.no_grad():
+                    anchor_positions, block_keep_mask = (
+                        flashmtp_model.module._sample_anchor_positions(
+                            input_ids.size(1), loss_mask, input_ids.device
+                        )
+                    )
+                    total_valid_token_count = (
+                        flashmtp_model.module.compute_valid_token_count(
+                            input_ids.size(1),
+                            loss_mask,
+                            anchor_positions,
+                            block_keep_mask,
+                        )
+                    )
 
-            (loss / args.accumulation_steps).backward()
+                total_loss_numerator = torch.zeros((), device=input_ids.device)
+                total_correct_count = torch.zeros((), device=input_ids.device)
+                total_actual_token_count = torch.zeros((), device=input_ids.device)
+                total_prefix_sum = torch.zeros((), device=input_ids.device)
+                total_prefix_count = torch.zeros((), device=input_ids.device)
+
+                for anchor_start in range(
+                    0, anchor_positions.size(1), args.anchor_chunk_size
+                ):
+                    anchor_end = min(
+                        anchor_start + args.anchor_chunk_size,
+                        anchor_positions.size(1),
+                    )
+                    chunk_anchor_positions = anchor_positions[:, anchor_start:anchor_end]
+                    chunk_block_keep_mask = block_keep_mask[:, anchor_start:anchor_end]
+
+                    chunk_loss, _, chunk_metrics = flashmtp_model(
+                        input_ids=input_ids,
+                        hidden_states=hidden_states,
+                        loss_mask=loss_mask,
+                        anchor_positions=chunk_anchor_positions,
+                        block_keep_mask=chunk_block_keep_mask,
+                    )
+
+                    chunk_valid_token_count = chunk_metrics["valid_token_count"]
+                    chunk_loss_numerator = chunk_loss * chunk_valid_token_count
+                    (
+                        chunk_loss_numerator
+                        / total_valid_token_count
+                        / args.accumulation_steps
+                    ).backward()
+
+                    total_loss_numerator += chunk_metrics["loss_numerator"]
+                    total_correct_count += chunk_metrics["correct_count"]
+                    total_actual_token_count += chunk_metrics["actual_token_count"]
+                    total_prefix_sum += chunk_metrics["prefix_sum"]
+                    total_prefix_count += chunk_metrics["prefix_count"]
+
+                loss = total_loss_numerator / total_valid_token_count.detach()
+                accuracy = (
+                    total_correct_count / total_actual_token_count.clamp(min=1.0)
+                )
+                metrics = {
+                    "prefix_accuracy": total_prefix_sum
+                    / total_prefix_count.clamp(min=1.0)
+                }
+            else:
+                loss, accuracy, metrics = flashmtp_model(
+                    input_ids=input_ids,
+                    hidden_states=hidden_states,
+                    loss_mask=loss_mask,
+                )
+
+                (loss / args.accumulation_steps).backward()
 
             if global_step % args.accumulation_steps == 0:
                 optimizer.step()

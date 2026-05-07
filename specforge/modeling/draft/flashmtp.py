@@ -95,6 +95,7 @@ def create_flashmtp_single_block_mask(
     block_size: int,
     device: torch.device,
     attention_backend: str,
+    dtype: torch.dtype = torch.float32,
 ) -> Optional[torch.Tensor]:
     """Build inference mask for one pivot plus one FlashMTP draft block.
 
@@ -136,9 +137,9 @@ def create_flashmtp_single_block_mask(
     mask = torch.zeros(
         (batch_size, 1, q_len, kv_len),
         device=device,
-        dtype=torch.float32,
+        dtype=dtype,
     )
-    return mask.masked_fill(~visible.view(1, 1, q_len, kv_len), torch.finfo(torch.float32).min)
+    return mask.masked_fill(~visible.view(1, 1, q_len, kv_len), torch.finfo(dtype).min)
 
 
 class Qwen3FlashMTPAttention(nn.Module):
@@ -451,6 +452,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             block_size=block_size,
             device=target.device,
             attention_backend=self.config._attn_implementation,
+            dtype=next(self.parameters()).dtype,
         )
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()

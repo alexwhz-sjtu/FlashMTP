@@ -199,6 +199,43 @@ class OnlineFlashMTPModel(nn.Module):
 
         return anchors, keep_mask
 
+    def compute_valid_token_count(
+            self,
+            seq_len: int,
+            loss_mask: torch.Tensor,
+            anchor_positions: torch.Tensor,
+            block_keep_mask: torch.Tensor) -> torch.Tensor:
+        """Return the CE denominator for a set of anchors without building logits."""
+        device = loss_mask.device
+        label_offsets = torch.arange(0, self.block_size,
+                                     device=device).view(1, 1, -1)
+        label_indices = anchor_positions.unsqueeze(-1) + label_offsets
+        valid_label_mask = label_indices < seq_len
+        safe_label_indices = label_indices.clamp(max=seq_len - 1)
+
+        weight_mask = (block_keep_mask.unsqueeze(-1).expand(
+            -1, -1, self.block_size).float())
+        weight_mask = weight_mask * valid_label_mask.float()
+
+        pos_in_block = torch.arange(self.block_size,
+                                    device=device).view(1, 1, -1)
+        weight_mask = weight_mask * (pos_in_block > 0).float()
+
+        original_loss_mask_gathered = torch.gather(
+            loss_mask.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
+            2,
+            safe_label_indices,
+        )
+        weight_mask = weight_mask * original_loss_mask_gathered
+
+        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+            k = torch.arange(self.block_size, device=device).view(1, 1, -1)
+            decay_weights = torch.exp(-(k - 1).clamp(min=0).float() /
+                                      self.loss_decay_gamma)
+            weight_mask = weight_mask * decay_weights
+
+        return weight_mask.view(-1).sum() + 1e-6
+
     def prepare_noise_input(
             self,
             input_ids: torch.Tensor,
@@ -272,14 +309,16 @@ class OnlineFlashMTPModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        anchor_positions: Optional[torch.Tensor] = None,
+        block_keep_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Parallel block-wise training forward pass."""
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        # TODO: keep_mask meaning: Valid anchor position
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device)
+        if anchor_positions is None or block_keep_mask is None:
+            anchor_positions, block_keep_mask = self._sample_anchor_positions(
+                seq_len, loss_mask, device)
 
         noise_embedding = self._create_noise_embed(input_ids, anchor_positions,
                                                    block_keep_mask)
@@ -382,6 +421,7 @@ class OnlineFlashMTPModel(nn.Module):
             pred_ids = torch.argmax(flat_logits, dim=-1)
             correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
             actual_token_count = binary_eval_mask.sum() + 1e-6
+            correct_count = correct.sum().float()
             accuracy = correct.sum().float() / actual_token_count
 
             pred_ids_by_block = logits.argmax(dim=-1).view(
@@ -398,12 +438,22 @@ class OnlineFlashMTPModel(nn.Module):
             valid_blocks = block_keep_mask & valid_by_block[:, :, 1:].any(dim=-1)
             prefix_denominators = valid_by_block[:, :, 1:].sum(dim=-1).float() + 1.0
             prefix_ratios = prefix_lengths / prefix_denominators.clamp(min=1.0)
-            prefix_accuracy = (
-                prefix_ratios[valid_blocks].mean()
+            prefix_count = valid_blocks.sum().float()
+            prefix_sum = (
+                prefix_ratios[valid_blocks].sum()
                 if valid_blocks.any()
                 else torch.zeros((), device=device)
             )
+            prefix_accuracy = prefix_sum / prefix_count.clamp(min=1.0)
 
-        metrics = {"prefix_accuracy": prefix_accuracy.detach()}
+        metrics = {
+            "prefix_accuracy": prefix_accuracy.detach(),
+            "loss_numerator": (loss_per_token * flat_weights).sum().detach(),
+            "valid_token_count": valid_token_count.detach(),
+            "correct_count": correct_count.detach(),
+            "actual_token_count": actual_token_count.detach(),
+            "prefix_sum": prefix_sum.detach(),
+            "prefix_count": prefix_count.detach(),
+        }
 
         return loss, accuracy, metrics
