@@ -611,7 +611,7 @@ def main():
                     total_correct_count / total_actual_token_count.clamp(min=1.0)
                 )
                 metrics = {
-                    "prefix_accuracy": total_prefix_sum
+                    "prefix_length": total_prefix_sum
                     / total_prefix_count.clamp(min=1.0)
                 }
             else:

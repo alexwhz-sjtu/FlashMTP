@@ -21,23 +21,127 @@ DFlash也利用了大模型的hs，但是他保留了kvcache。它间隔的选�
 
 训练时也是一次前向计算loss，越靠前的位置loss权重越大。
 
-### exp version
+## Exp Version
 
-背景与动机 (Background & Motivation)
+### 1. 目标与动机
 
-- 克服独立性瓶颈：现有的并行预测框架（如 MEDUSA）通过多个独立的预测头同时生成 Token，但各预测头之间缺乏语义关联，后面的头无法看见前面的头，导致位置越靠后的 Token 预测准确率指数级下降。  
+exp version 的目标是在“不为草稿模型维护完整历史 KV cache”的前提下，提高块内并行预测的相关性与可训练性。
 
-- 语义块并行预测：在具有相似语义的块内，预测难度较低，可以利用双向注意力进行一次前向，并行预测。
+已有并行预测方法常把未来多个 token 交给相互独立的预测头，这会带来一个明显问题：后面位置无法利用前面位置的预测信息，越靠后的 token 越难预测。FlashMTP exp 的思路是把未来 token 按语义块组织起来，让同一块内的 token 可以双向交互，同时让不同语义块之间保持从左到右的因果顺序。
 
-- 增强块内语义连贯性：通过引入块状因果注意力，使模型能够在一个语义块内（如一个短语）进行双向建模，同时确保块与块之间维持严格的因果依赖。
+因此，exp version 不是简单地一次预测 `B-1` 个互相独立的 mask，而是把一个长度为 `B` 的 draft block 拆成多个语义组，按组逐步补全：
 
-模型架构
+- slot 0：anchor token，已知。
+- slot 1：第一预测组，单 token。
+- slot 2-3：第二预测组，两个 token。
+- slot 4-7、8-11、...：后续预测组，每组四个 token。
 
-使用n层transformer（n：1~3），他的输入为pivot hs，anchortoken，B-1个mask。
+组内 token 可以互相可见；组间只允许看见更早的组。
 
-之后，我进行多部迭代，每步迭代并行预测出一些token块（块符合从左到右顺序）。由于achortoken之后的token比较难而且很关键，因此我第一步只预测他一个。之后，第二部，我预测后面两个，在之后，每步我预测4个。每步预测出来的token都要解码，然后再当作输入拼接到已知条件后。其中，pivot，anchor token各自看作长度为1的块，即他们不能看到后面的token。之后每步预测的token当作一个块，他们可以看见前面的token，块内互相可见，但不能看到后面的块。
+### 2. 上下文表示：Contextual Pivot
 
-在训练和推理时，按照上面的块因果，构造mask进行块内并行训练。
+训练和推理都使用目标模型的 hidden states 作为历史上下文压缩表示。
 
-hidden states融合方式保持现有flashmtp方法。
+对每个 anchor 位置 `a`，草稿模型使用目标模型在 `a-1` 位置的 hidden states 作为 contextual pivot。实现中会等间隔选择若干目标模型层。
 
+然后把这些层在同一位置的 hidden states 沿 feature 维拼接，再经过草稿模型中的 `fc + RMSNorm` 降维到 draft hidden size。
+
+当前 exp version 固定使用 feature concat，CHS 作为草稿 attention 的上下文 KV token，并且使用 `anchor-1` 的 position id 参与 RoPE。
+
+### 3. 草稿输入结构
+
+对每个采样到的 anchor，训练时构造两条 draft stream：
+
+```text
+KV layout:
+[CHS_i | Clean_i[0:B] | Mask_i[0:B]]
+
+Q layout:
+[Clean_i[0:B] | Mask_i[0:B]]
+```
+
+其中：
+
+- `CHS_i` 是 anchor `i` 对应的 contextual pivot。
+- `Clean_i[k]` 是真实 token `input_ids[anchor+k]` 的 embedding；越界或无效 block 会替换为 mask token。
+- `Mask_i[k]` 全部是 mask token embedding，是真正用于预测的位置。
+- 输出 hidden 会 reshape 成 `(batch, anchors, 2, block_size, hidden)`，只取 mask stream 送入 target `lm_head` 计算 logits。
+
+因此，训练不是只输入 `anchor token + B-1 masks`。当前实现输入的是完整 clean stream 加完整 mask stream。clean stream 提供块内可见的真实条件，mask stream 负责学习对应位置的并行预测。
+
+推理时没有 clean/mask 双流。推理主入口 `FlashMTPDraftModel.spec_generate()` 使用一个单 block：
+
+```text
+KV layout: [Pivot | anchor, draft slots...]
+Q layout:  [anchor, draft slots...]
+```
+
+推理按预测组迭代：每次用当前已经填好的 `block_output_ids` 重新 embedding，预测当前组的 token，并把预测结果写回 block，再进入下一组。
+
+### 4. 块因果注意力
+
+核心 mask 由 `flashmtp_slot_group()` 定义语义组：
+
+```text
+slot 0 -> group 0      anchor
+slot 1 -> group 1      first token
+slot 2-3 -> group 2    two-token group
+slot >=4 -> group 3 + floor((slot-4)/4)
+```
+
+训练时的 visibility 规则：
+
+- 每个 sampled block 只能看自己的 CHS，不能看其他 anchor 的 CHS。
+- 不同 sampled training blocks 之间完全不可见。
+- clean query 只能看同一 block 内更早或当前语义组的 clean tokens。
+- mask query 可以看更早语义组的 clean tokens，以及当前语义组内的 mask tokens。
+- 当前语义组内的 mask tokens 彼此双向可见。
+- padding 出来的无效 anchor 由 `block_keep_mask=False` 屏蔽，不参与 attention 和 loss。
+
+推理时的 visibility 规则更直接：
+
+- pivot 对所有 draft slots 可见。
+- draft slot 只能看见更早或当前语义组的 draft slots。
+- 当前语义组内 token 双向可见。
+- 后续语义组不可见。
+
+这保证了训练和推理都遵循同一组语义块顺序：`anchor -> 1 -> 2 -> 4 -> 4 -> ...`。
+
+### 5. 训练目标与 anchor 采样
+
+随机采样anchor token，预测后面B个token。loss计算时anchor token不计入。并且投机解码中，必须保证靠前的token正确，因此，再token-level基础上引入位置降权，越靠后的token loss权重降低。
+
+指标包括 token accuracy 和 `prefix_accuracy`。`prefix_accuracy` 衡量一个 block 从 slot 1 开始连续预测正确的前缀比例，更接近 speculative decoding 中 acceptance length 的训练代理指标。
+
+### 7. 推理流程
+
+推理仍使用目标模型做 prefill 和 verification：
+
+1. 目标模型对 prompt prefill，产生第一个 token 和最新 hidden states。
+2. 从目标 hidden states 中抽取 contextual pivot。
+3. 草稿模型按预测组 `[1] -> [2,3] -> [4..]` 依次补全一个 block。
+4. 目标模型一次验证整个 block。
+5. 根据 target posterior 计算 acceptance length。
+6. 接受前缀写入输出，未接受处写入 target posterior token。
+7. 裁剪 target KV cache 到已接受长度，并用目标模型在 pivot 位置的新 hidden states 更新 contextual pivot。
+
+草稿模型不维护完整历史 KV cache；历史信息仍然通过目标模型的最新 fused hidden states 注入。
+
+### 8. 当前实现边界
+
+- 当前 exp version 的 hidden states 融合方式固定为 feature concat + FC 降维。
+- 当前 contextual pivot 是单位置 `anchor-1` / latest accepted pivot，不是多位置 sink/window。
+- 当前训练使用 clean/mask 双流；推理使用按语义组逐步填充的单流 block。
+- `anchor_chunk_size` 只改变显存与 backward 分块方式，不改变训练目标。
+
+### Extra. Anchor Chunking
+
+当 `--anchor-chunk-size > 0` 且小于 `num_anchors` 时，训练不会一次处理所有 anchors，而是：
+
+1. 本卡先采样完整 anchor set。
+2. 通过 `align_anchor_count_across_ranks()` 把不同 rank 的 anchor 数 padding 到相同长度，保证所有 rank 有相同 chunk 数。
+3. 预先计算本地所有 anchors 的 `total_valid_token_count`。
+4. 按 `anchor_chunk_size` 分块 forward/backward。
+5. 每个 chunk 的 loss numerator 除以全 anchor 的 denominator 后 backward。
+
+这样多次 chunk backward 的梯度等价于一次处理所有 anchors 的 token-weighted loss，但显存峰值更低。注意这里不会在不同 GPU 之间共享 anchors；跨 rank 只做长度对齐和日志 all-reduce。

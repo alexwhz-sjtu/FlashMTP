@@ -436,18 +436,16 @@ class OnlineFlashMTPModel(nn.Module):
             ).cumprod(dim=-1)
             prefix_lengths = prefix_correct.sum(dim=-1).float() + 1.0
             valid_blocks = block_keep_mask & valid_by_block[:, :, 1:].any(dim=-1)
-            prefix_denominators = valid_by_block[:, :, 1:].sum(dim=-1).float() + 1.0
-            prefix_ratios = prefix_lengths / prefix_denominators.clamp(min=1.0)
             prefix_count = valid_blocks.sum().float()
             prefix_sum = (
-                prefix_ratios[valid_blocks].sum()
+                prefix_lengths[valid_blocks].sum()
                 if valid_blocks.any()
                 else torch.zeros((), device=device)
             )
-            prefix_accuracy = prefix_sum / prefix_count.clamp(min=1.0)
+            prefix_length = prefix_sum / prefix_count.clamp(min=1.0)
 
         metrics = {
-            "prefix_accuracy": prefix_accuracy.detach(),
+            "prefix_length": prefix_length.detach(),
             "loss_numerator": (loss_per_token * flat_weights).sum().detach(),
             "valid_token_count": valid_token_count.detach(),
             "correct_count": correct_count.detach(),
