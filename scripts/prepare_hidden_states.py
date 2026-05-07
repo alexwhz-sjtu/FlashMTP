@@ -60,6 +60,7 @@ from specforge.distributed import (
 from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
 from specforge.utils import (
     print_args_with_dots,
+    print_on_rank0,
     print_with_rank,
     rank_0_priority,
     safe_conversations_generator,
@@ -633,7 +634,7 @@ def main():
 
     # Preprocess on complete, un-sharded dataset
     with rank_0_priority():
-        print_with_rank("Main process is building the dataset cache...")
+        print_on_rank0("Main process is building the dataset cache...")
         eagle3_dataset = build_eagle3_dataset(
             dataset=dataset,
             tokenizer=tokenizer,
@@ -646,7 +647,7 @@ def main():
             processor=processor,
             num_proc=args.build_dataset_num_proc,
         )
-    print_with_rank(f"Dataset prepared with {len(eagle3_dataset)} samples.")
+    print_on_rank0(f"Dataset prepared with {len(eagle3_dataset)} samples.")
 
     # Create DP-sharded dataloader
     data_loader = prepare_dp_dataloaders(
@@ -658,7 +659,7 @@ def main():
         is_vlm=args.is_vlm,
     )
 
-    print_with_rank(
+    print_on_rank0(
         f"DataLoader created for DP Rank {dist.get_rank(get_dp_group())}. "
         f"Number of batches: {len(data_loader)}"
     )
@@ -679,7 +680,7 @@ def main():
     else:
         start_idx = dp_rank * samples_per_dp + remainder
 
-    print_with_rank(
+    print_on_rank0(
         f"DP Rank {dp_rank} will process {samples_per_dp} samples, "
         f"starting from index {start_idx}"
     )
@@ -708,7 +709,7 @@ def main():
 
     finally:
         # The finally block ensures destroy_distributed is always called
-        print_with_rank("All hidden states generated or job finished.")
+        print_print_on_rank0with_rank("All hidden states generated or job finished.")
         destroy_distributed()
 
 

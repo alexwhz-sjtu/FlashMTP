@@ -337,6 +337,41 @@ def record_metrics(
     tracker.log(logdict, step=global_step)
 
 
+def align_anchor_count_across_ranks(
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pad local anchor tensors so every rank runs the same number of chunks."""
+    local_n = torch.tensor(
+        anchor_positions.size(1),
+        device=anchor_positions.device,
+        dtype=torch.long,
+    )
+    global_n = local_n.clone()
+    dist.all_reduce(global_n, op=dist.ReduceOp.MAX)
+
+    pad_n = int(global_n.item()) - int(local_n.item())
+    if pad_n <= 0:
+        return anchor_positions, block_keep_mask
+
+    anchor_pad = torch.zeros(
+        anchor_positions.size(0),
+        pad_n,
+        dtype=anchor_positions.dtype,
+        device=anchor_positions.device,
+    )
+    keep_pad = torch.zeros(
+        block_keep_mask.size(0),
+        pad_n,
+        dtype=block_keep_mask.dtype,
+        device=block_keep_mask.device,
+    )
+    return (
+        torch.cat([anchor_positions, anchor_pad], dim=1),
+        torch.cat([block_keep_mask, keep_pad], dim=1),
+    )
+
+
 def main():
 
     logging.basicConfig(
@@ -520,6 +555,9 @@ def main():
                         flashmtp_model.module._sample_anchor_positions(
                             input_ids.size(1), loss_mask, input_ids.device
                         )
+                    )
+                    anchor_positions, block_keep_mask = align_anchor_count_across_ranks(
+                        anchor_positions, block_keep_mask
                     )
                     total_valid_token_count = (
                         flashmtp_model.module.compute_valid_token_count(
