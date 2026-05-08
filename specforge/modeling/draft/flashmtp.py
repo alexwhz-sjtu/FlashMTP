@@ -32,6 +32,12 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
 
 
+def cuda_time(device: torch.device) -> float:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return time.perf_counter()
+
+
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
@@ -410,14 +416,19 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.eval()
         self._last_decode_stats = {
             "accept_lengths": [],
+            "target_prefill_time": 0.0,
+            "target_decode_time": 0.0,
             "target_total_time": 0.0,
             "draft_total_time": 0.0,
+            "total_time": 0.0,
             "steps": 0,
+            "context_tokens": self.context_size,
         }
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
 
         block_size = self.block_size
+        self._last_decode_stats["accepted_tokens"] = 0
         output_ids = torch.full(
             (1, max_length + block_size),
             self.mask_token_id,
@@ -431,9 +442,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         past_key_values_target = DynamicCache()
 
         # Prefill stage
-        if target.device.type == "cuda":
-            torch.cuda.synchronize(target.device)
-        target_start = time.perf_counter()
         output = target(
             input_ids,
             position_ids=position_ids[:, :num_input_tokens],
@@ -442,127 +450,118 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             logits_to_keep=1,
             output_hidden_states=True,
         )
-        if target.device.type == "cuda":
-            torch.cuda.synchronize(target.device)
-        self._last_decode_stats["target_total_time"] += time.perf_counter() - target_start
 
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
             output.logits, temperature
         )
-        prefill_positions = torch.arange(
-            num_input_tokens, device=input_ids.device, dtype=torch.long
-        ).unsqueeze(0)
-        fused_hidden_history = extract_context_features_at_positions(
-            output.hidden_states,
-            self.target_layer_ids,
-            prefill_positions,
-        )
-        target_hidden = build_v51_context_feature(
-            fused_hidden_history,
-            pivot_position=num_input_tokens - 1,
-            context_size=self.context_size,
-            pivot_window_size=self.pivot_window_size,
-        )
         context_position_ids = build_v51_context_position_ids(
-            seq_len=fused_hidden_history.shape[1],
+            seq_len=num_input_tokens,
             pivot_position=num_input_tokens - 1,
             device=input_ids.device,
             context_size=self.context_size,
             pivot_window_size=self.pivot_window_size,
         )
+        target_hidden = extract_context_features_at_positions(
+            output.hidden_states,
+            self.target_layer_ids,
+            context_position_ids,
+        )
+        sink_hidden = target_hidden[:, : self.context_size - self.pivot_window_size, :]
+        rolling_window_hidden = target_hidden[
+            :, self.context_size - self.pivot_window_size :, :
+        ]
 
         # Decode stage
         start = input_ids.shape[1]
+        decode_start = cuda_time(target.device)
         while start < max_length:
-            block_output_ids = output_ids[:, start : start + block_size].clone()
-            block_position_ids = position_ids[:, start : start + block_size]
-            noise_embedding = target.model.embed_tokens(block_output_ids)
-            if target.device.type == "cuda":
-                torch.cuda.synchronize(target.device)
-            draft_start = time.perf_counter()
-            draft_logits = target.lm_head(
-                self(
+            step_start = start
+            current_block_size = min(block_size, max_length - start)
+            block_output_ids = output_ids[
+                :, start : start + current_block_size
+            ].clone()
+            verify_size = current_block_size
+            if current_block_size > 1:
+                noise_embedding = target.model.embed_tokens(block_output_ids)
+                draft_hidden = self(
                     target_hidden=target_hidden,
                     context_position_ids=context_position_ids,
                     noise_embedding=noise_embedding,
-                    position_ids=position_ids[:, start : start + block_size],
+                    position_ids=position_ids[:, start : start + current_block_size],
                     past_key_values=None,
                     use_cache=False,
                     is_causal=False,
-                )[:, -block_size + 1 :, :]
-            )
-            if target.device.type == "cuda":
-                torch.cuda.synchronize(target.device)
-            self._last_decode_stats["draft_total_time"] += time.perf_counter() - draft_start
-            block_output_ids[:, 1:] = sample(draft_logits)
+                )
+                draft_logits = target.lm_head(draft_hidden[:, 1:verify_size, :])
+                block_output_ids[:, 1:verify_size] = sample(draft_logits)
 
-            if target.device.type == "cuda":
-                torch.cuda.synchronize(target.device)
-            target_start = time.perf_counter()
+            verify_output_ids = block_output_ids[:, :verify_size]
+            verify_position_ids = position_ids[:, start : start + verify_size]
             output = target(
-                block_output_ids,
-                position_ids=block_position_ids,
+                verify_output_ids,
+                position_ids=verify_position_ids,
                 past_key_values=past_key_values_target,
                 use_cache=True,
                 output_hidden_states=True,
             )
-            if target.device.type == "cuda":
-                torch.cuda.synchronize(target.device)
-            self._last_decode_stats["target_total_time"] += time.perf_counter() - target_start
 
             posterior = sample(output.logits, temperature)
-            acceptance_length = (
-                (block_output_ids[:, 1:] == posterior[:, :-1])
-                .cumprod(dim=1)
-                .sum(dim=1)[0]
-                .item()
-            )
-            output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
+            if verify_size > 1:
+                acceptance_length = (
+                    (verify_output_ids[:, 1:] == posterior[:, :-1])
+                    .cumprod(dim=1)
+                    .sum(dim=1)[0]
+                    .item()
+                )
+            else:
+                acceptance_length = 0
+            output_ids[:, start : start + acceptance_length + 1] = verify_output_ids[
                 :, : acceptance_length + 1
             ]
             output_ids[:, start + acceptance_length + 1] = posterior[
                 :, acceptance_length
             ]
             start += acceptance_length + 1
+            self._last_decode_stats["accepted_tokens"] += acceptance_length + 1
             past_key_values_target.crop(start)
 
             accepted_count = acceptance_length + 1
-            block_hidden_positions = torch.arange(
-                output.hidden_states[0].shape[1],
+            accepted_positions = torch.arange(
+                accepted_count,
                 device=input_ids.device,
                 dtype=torch.long,
             ).unsqueeze(0)
-            fused_block_hidden = extract_context_features_at_positions(
+            accepted_hidden = extract_context_features_at_positions(
                 output.hidden_states,
                 self.target_layer_ids,
-                block_hidden_positions,
+                accepted_positions,
             )
-            fused_hidden_history = torch.cat(
-                [fused_hidden_history, fused_block_hidden[:, :accepted_count, :]],
-                dim=1,
-            )
-            target_hidden = build_v51_context_feature(
-                fused_hidden_history,
-                pivot_position=start - 1,
-                context_size=self.context_size,
-                pivot_window_size=self.pivot_window_size,
-            )
+            rolling_window_hidden = torch.cat(
+                [rolling_window_hidden, accepted_hidden], dim=1
+            )[:, -self.pivot_window_size :, :]
             context_position_ids = build_v51_context_position_ids(
-                seq_len=fused_hidden_history.shape[1],
+                seq_len=start,
                 pivot_position=start - 1,
                 device=input_ids.device,
                 context_size=self.context_size,
                 pivot_window_size=self.pivot_window_size,
             )
+            target_hidden = torch.cat([sink_hidden, rolling_window_hidden], dim=1)
             self._last_decode_stats["accept_lengths"].append(acceptance_length + 1)
             self._last_decode_stats["steps"] += 1
             if stop_token_ids is not None and any(
-                stop_token_id in output_ids[:, num_input_tokens:]
+                stop_token_id in output_ids[:, step_start:start]
                 for stop_token_id in stop_token_ids
             ):
                 break
-        output_ids = output_ids[:, :max_length]
+
+        decode_time = cuda_time(target.device) - decode_start
+        self._last_decode_stats["target_decode_time"] = decode_time
+        self._last_decode_stats["target_total_time"] = decode_time
+        self._last_decode_stats["total_time"] = decode_time
+
+        output_ids = output_ids[:, :start]
         output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
         if stop_token_ids is not None:
             stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)

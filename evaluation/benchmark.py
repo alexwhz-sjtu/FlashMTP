@@ -1,4 +1,5 @@
 import argparse
+import json
 import random
 import sys
 import time
@@ -21,6 +22,62 @@ from specforge.modeling.draft.flashmtp import sample
 
 from evaluation import distributed as dist
 from evaluation.utils import load_and_process_dataset
+
+DATASET_PATH_FILE = Path(__file__).resolve().with_name("dataset_path.json")
+
+
+def resolve_dataset_path(dataset_name: str) -> str:
+    if not DATASET_PATH_FILE.is_file():
+        return dataset_name
+
+    with DATASET_PATH_FILE.open("r", encoding="utf-8") as f:
+        dataset_paths = json.load(f)
+
+    if not isinstance(dataset_paths, dict):
+        raise ValueError(f"{DATASET_PATH_FILE} must contain a JSON object")
+
+    return dataset_paths.get(dataset_name, dataset_name)
+
+
+def load_benchmark_dataset(dataset_name: str):
+    dataset_name = resolve_dataset_path(dataset_name)
+    dataset_path = Path(dataset_name)
+    if dataset_path.is_file() and dataset_path.suffix == ".jsonl":
+        instances = []
+        with dataset_path.open("r", encoding="utf-8") as f:
+            for line_number, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+
+                data = json.loads(line)
+                if "input" not in data:
+                    raise ValueError(
+                        f"Missing 'input' field in {dataset_path} at line {line_number}"
+                    )
+                if "context" not in data:
+                    raise ValueError(
+                        f"Missing 'context' field in {dataset_path} at line {line_number}"
+                    )
+                prompt = f"{data['context']}\nQuestion: {data['input']}"
+                instances.append({"turns": [prompt]})
+        return instances
+
+    return load_and_process_dataset(dataset_name)
+
+
+def select_max_samples(dataset, max_samples: int | None):
+    if max_samples is None or len(dataset) <= max_samples:
+        return dataset
+
+    if hasattr(dataset, "shuffle") and hasattr(dataset, "select"):
+        return dataset.shuffle(seed=0).select(range(max_samples))
+
+    indices = list(range(len(dataset)))
+    rng = random.Random(0)
+    rng.shuffle(indices)
+    return [dataset[i] for i in indices[:max_samples]]
+
 
 def cuda_time() -> float:
     torch.cuda.synchronize()
@@ -104,7 +161,6 @@ def flashmtp_generate(
     original_block_size = model.block_size
     model.block_size = block_size
     try:
-        generate_start = cuda_time()
         output_ids = model.spec_generate(
             target=target,
             input_ids=input_ids,
@@ -112,15 +168,15 @@ def flashmtp_generate(
             stop_token_ids=stop_token_ids,
             temperature=temperature,
         )
-        total_time = cuda_time() - generate_start
     finally:
         model.block_size = original_block_size
 
     stats = model.get_last_decode_stats()
     num_input_tokens = input_ids.shape[1]
     num_output_tokens = output_ids.shape[1] - num_input_tokens
-    measured_decode_time = stats.get("target_total_time", 0.0) + stats.get(
-        "draft_total_time", 0.0
+    measured_decode_time = stats.get(
+        "total_time",
+        stats.get("target_total_time", 0.0) + stats.get("draft_total_time", 0.0),
     )
     time_per_output_token = measured_decode_time / max(num_output_tokens, 1)
 
@@ -131,16 +187,19 @@ def flashmtp_generate(
         time_to_first_token=0.0,
         time_per_output_token=time_per_output_token,
         acceptance_lengths=stats.get("accept_lengths", []),
-        target_total_time=stats.get("target_total_time", 0.0),
+        target_prefill_time=0.0,
+        target_decode_time=measured_decode_time,
+        target_total_time=measured_decode_time,
         draft_total_time=stats.get("draft_total_time", 0.0),
-        total_time=total_time,
+        accepted_tokens=stats.get("accepted_tokens", 0),
+        total_time=measured_decode_time,
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name-or-path", type=str, default='/data/wanghanzhen/models/Qwen/Qwen3-8B')
-    parser.add_argument("--draft-name-or-path", type=str, default='/data/wanghanzhen/Projects/MTP/NIPS26/FlashMTP_v5.1/cache/models/flashmtp_v5.1_h100_sample_40000_think_off_nlayers5_block__maxlen4096_epochs6/epoch_6_step_29844')
+    parser.add_argument("--draft-name-or-path", type=str, default='/data/wanghanzhen/Projects/MTP/NIPS26/FlashMTP_v5.1/cache/models/flashmtp_v5.1_fix_h100_sample_40000_think_off_nlayers5_block_16_maxlen4096_epochs6/epoch_6_step_29844')
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--max-samples", type=int, default=10)
@@ -168,26 +227,25 @@ def main() -> None:
             return False
 
     installed_flash_attn = has_flash_attn()
+    print(f"flash attention installed: {installed_flash_attn}")
 
     target = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
-        # attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
+        attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
         dtype=torch.bfloat16,
     ).to(device).eval()
 
     draft_model = FlashMTPDraftModel.from_pretrained(
         args.draft_name_or_path,
-        # attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
+        attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
         dtype=torch.bfloat16,
     ).to(device).eval()
 
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-    dataset = load_and_process_dataset(args.dataset)
-
-    if args.max_samples is not None and len(dataset) > args.max_samples:
-        dataset = dataset.shuffle(seed=0).select(range(args.max_samples))
+    dataset = load_benchmark_dataset(args.dataset)
+    dataset = select_max_samples(dataset, args.max_samples)
 
     benchmark_start = cuda_time()
     responses = []
@@ -199,6 +257,10 @@ def main() -> None:
             messages.append({"role": "user", "content": user_content})
             input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
             input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
+            print(
+                f"\n[Sample {idx} | Turn {turn_index}] Input length: "
+                f"{input_ids.shape[1]} tokens ({len(user_content)} chars)"
+            )
 
             response = {}
             response[1] = target_generate(
@@ -227,6 +289,15 @@ def main() -> None:
             )
             avg_acceptance_length = np.mean(spec_response.acceptance_lengths)
             print(f"\n[Sample {idx} | Turn {turn_index}] Response:\n{output_text}")
+            print(
+                f"[Sample {idx} | Turn {turn_index}] Decode timing: "
+                f"baseline={response[1].time_per_output_token:.6f}s/token, "
+                f"flashmtp_total={spec_response.time_per_output_token:.6f}s/token"
+            )
+            print(
+                f"[Sample {idx} | Turn {turn_index}] Token stats: "
+                f"accepted={spec_response.accepted_tokens}"
+            )
             print(
                 f"[Sample {idx} | Turn {turn_index}] Acceptance lengths (position:length): "
                 f"{acceptance_lengths_text}"
