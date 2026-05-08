@@ -137,3 +137,9 @@ python scripts/regenerate_train_data.py \
   --model $WHZ_DIR/models/Qwen/Qwen3-8B \
   --server-address localhost:30000 \
   --input-file-path /data/wanghanzhen/datasets/microsoft/orca-math-200k/train-00000-of-00001.parquet
+
+cd /inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP_v5.1 && \
+mkdir -p whz_mtp_logs && \
+export NUM_DRAFT_LAYERS=5 && \
+bash scripts/run_training_flashmtp.sh --dt qz \
+  > "whz_mtp_logs/train_flashmtp_qz_dist_$(date +%Y%m%d_%H%M%S).log" 2>&1
