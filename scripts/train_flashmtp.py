@@ -89,6 +89,18 @@ def parse_args():
         help="Gamma for exponential loss decay weighting (paper Eq.4). "
         "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
     )
+    model_group.add_argument(
+        "--kl-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight for target-distribution KL loss. 0 disables KL.",
+    )
+    model_group.add_argument(
+        "--kl-top-k",
+        type=int,
+        default=0,
+        help="Use target top-k tokens for KL. 0 computes full-vocab KL.",
+    )
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
@@ -477,6 +489,8 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
+        kl_loss_weight=args.kl_loss_weight,
+        kl_top_k=args.kl_top_k,
         chs_concat_mode="feature",
     )
 
@@ -573,6 +587,8 @@ def main():
                 total_actual_token_count = torch.zeros((), device=input_ids.device)
                 total_prefix_sum = torch.zeros((), device=input_ids.device)
                 total_prefix_count = torch.zeros((), device=input_ids.device)
+                total_ce_loss_numerator = torch.zeros((), device=input_ids.device)
+                total_kl_loss_numerator = torch.zeros((), device=input_ids.device)
 
                 for anchor_start in range(
                     0, anchor_positions.size(1), args.anchor_chunk_size
@@ -605,6 +621,8 @@ def main():
                     total_actual_token_count += chunk_metrics["actual_token_count"]
                     total_prefix_sum += chunk_metrics["prefix_sum"]
                     total_prefix_count += chunk_metrics["prefix_count"]
+                    total_ce_loss_numerator += chunk_metrics["ce_loss_numerator"]
+                    total_kl_loss_numerator += chunk_metrics["kl_loss_numerator"]
 
                 loss = total_loss_numerator / total_valid_token_count.detach()
                 accuracy = (
@@ -612,7 +630,11 @@ def main():
                 )
                 metrics = {
                     "prefix_length": total_prefix_sum
-                    / total_prefix_count.clamp(min=1.0)
+                    / total_prefix_count.clamp(min=1.0),
+                    "ce_loss": total_ce_loss_numerator
+                    / total_valid_token_count.clamp(min=1e-6),
+                    "kl_loss": total_kl_loss_numerator
+                    / total_valid_token_count.clamp(min=1e-6),
                 }
             else:
                 loss, accuracy, metrics = flashmtp_model(

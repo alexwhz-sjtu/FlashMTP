@@ -144,6 +144,8 @@ class OnlineFlashMTPModel(nn.Module):
             attention_backend: str = "flex_attention",
             num_anchors: int = 512,
             loss_decay_gamma: Optional[float] = None,
+            kl_loss_weight: float = 0.0,
+            kl_top_k: int = 0,
             chs_concat_mode: str = "feature",
     ):
         super().__init__()
@@ -155,6 +157,8 @@ class OnlineFlashMTPModel(nn.Module):
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
+        self.kl_loss_weight = kl_loss_weight
+        self.kl_top_k = kl_top_k
         self.chs_concat_mode = "feature"
         self.draft_model.chs_concat_mode = "feature"
 
@@ -414,7 +418,60 @@ class OnlineFlashMTPModel(nn.Module):
                                          flat_targets,
                                          reduction="none")
         valid_token_count = flat_weights.sum() + 1e-6
-        loss = (loss_per_token * flat_weights).sum() / valid_token_count
+        ce_loss_numerator = (loss_per_token * flat_weights).sum()
+        ce_loss = ce_loss_numerator / valid_token_count
+
+        kl_loss_numerator = torch.zeros((), device=device, dtype=logits.dtype)
+        if self.kl_loss_weight > 0:
+            if not isinstance(hidden_states, (tuple, list)):
+                raise ValueError(
+                    "KL loss requires full target hidden_states as a tuple/list so "
+                    "the final target layer can be projected with lm_head."
+                )
+            teacher_positions = (label_indices - 1).clamp(min=0)
+            safe_teacher_positions = teacher_positions.clamp(max=seq_len - 1)
+            target_final_hidden = hidden_states[-1]
+            teacher_hidden = torch.gather(
+                target_final_hidden.unsqueeze(1).expand(
+                    -1, anchor_positions.size(1), -1, -1
+                ),
+                2,
+                safe_teacher_positions.unsqueeze(-1).expand(
+                    -1, -1, -1, target_final_hidden.size(-1)
+                ),
+            )
+            teacher_logits = self.lm_head(
+                teacher_hidden.reshape(-1, teacher_hidden.size(-1))
+            ).detach()
+            draft_log_probs = F.log_softmax(flat_logits.float(), dim=-1)
+
+            if self.kl_top_k is not None and self.kl_top_k > 0:
+                top_k = min(self.kl_top_k, teacher_logits.size(-1))
+                teacher_top_logits, teacher_top_ids = torch.topk(
+                    teacher_logits.float(), k=top_k, dim=-1
+                )
+                teacher_top_probs = F.softmax(teacher_top_logits, dim=-1)
+                draft_top_log_probs = torch.gather(
+                    draft_log_probs, dim=-1, index=teacher_top_ids
+                )
+                teacher_top_log_probs = torch.log(
+                    teacher_top_probs.clamp_min(1e-12)
+                )
+                kl_per_token = (
+                    teacher_top_probs * (teacher_top_log_probs - draft_top_log_probs)
+                ).sum(dim=-1)
+            else:
+                teacher_log_probs = F.log_softmax(teacher_logits.float(), dim=-1)
+                teacher_probs = teacher_log_probs.exp()
+                kl_per_token = (
+                    teacher_probs * (teacher_log_probs - draft_log_probs)
+                ).sum(dim=-1)
+
+            kl_loss_numerator = (kl_per_token.to(flat_weights.dtype) * flat_weights).sum()
+
+        kl_loss = kl_loss_numerator / valid_token_count
+        loss_numerator = ce_loss_numerator + self.kl_loss_weight * kl_loss_numerator
+        loss = loss_numerator / valid_token_count
 
         # --- Accuracy ---
         with torch.no_grad():
@@ -446,7 +503,11 @@ class OnlineFlashMTPModel(nn.Module):
 
         metrics = {
             "prefix_length": prefix_length.detach(),
-            "loss_numerator": (loss_per_token * flat_weights).sum().detach(),
+            "loss_numerator": loss_numerator.detach(),
+            "ce_loss": ce_loss.detach(),
+            "kl_loss": kl_loss.detach(),
+            "ce_loss_numerator": ce_loss_numerator.detach(),
+            "kl_loss_numerator": kl_loss_numerator.detach(),
             "valid_token_count": valid_token_count.detach(),
             "correct_count": correct_count.detach(),
             "actual_token_count": actual_token_count.detach(),

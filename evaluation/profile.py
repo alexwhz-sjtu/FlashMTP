@@ -95,18 +95,22 @@ def target_generate(
 def flashmtp_generate(
     model: FlashMTPDraftModel,
     target: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
     input_ids: torch.Tensor,
     max_new_tokens: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
+    profile_top_k: int = 5,
 ) -> SimpleNamespace:
     start_time = cuda_time()
-    output_ids = model.spec_generate(
+    output_ids = model.spec_generate_with_profile(
         target=target,
+        tokenizer=tokenizer,
         input_ids=input_ids,
         max_new_tokens=max_new_tokens,
         stop_token_ids=stop_token_ids,
         temperature=temperature,
+        top_k=profile_top_k,
     )
     total_time = cuda_time() - start_time
     stats = model.get_last_decode_stats()
@@ -137,6 +141,12 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=10)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--profile-top-k",
+        type=int,
+        default=5,
+        help="Print top-k draft token candidates for each profiled prediction slot.",
+    )
     parser.add_argument("--think", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()
@@ -212,10 +222,12 @@ def main() -> None:
             response[block_size] = flashmtp_generate(
                 model=draft_model,
                 target=target,
+                tokenizer=tokenizer,
                 input_ids=input_ids,
                 max_new_tokens=args.max_new_tokens,
                 stop_token_ids=stop_token_ids,
                 temperature=args.temperature,
+                profile_top_k=args.profile_top_k,
             )
 
             spec_response = response[block_size]

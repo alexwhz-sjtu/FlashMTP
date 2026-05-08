@@ -352,6 +352,33 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
     def fuse_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         return self.hidden_norm(self.fc(target_hidden))
 
+    @staticmethod
+    def _format_token_topk(
+        logits: torch.Tensor,
+        tokenizer,
+        top_k: int,
+    ) -> list[dict]:
+        probs = torch.softmax(logits.float(), dim=-1)
+        top_k = max(int(top_k), 1)
+        top_probs, top_ids = torch.topk(probs, k=min(top_k, probs.shape[-1]), dim=-1)
+        entries = []
+        for token_id, prob in zip(top_ids.tolist(), top_probs.tolist()):
+            entries.append(
+                {
+                    "id": int(token_id),
+                    "token": tokenizer.decode([int(token_id)]),
+                    "confidence": float(prob),
+                }
+            )
+        return entries
+
+    @staticmethod
+    def _format_token_list(token_ids: torch.Tensor, tokenizer) -> list[dict]:
+        return [
+            {"id": int(token_id), "token": tokenizer.decode([int(token_id)])}
+            for token_id in token_ids.view(-1).tolist()
+        ]
+
     def forward(
         self,
         position_ids: torch.LongTensor,
@@ -378,6 +405,202 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 **kwargs,
             )
         return self.norm(hidden_states)
+
+    @torch.inference_mode()
+    def spec_generate_with_profile(
+        self,
+        target: nn.Module,
+        tokenizer,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int,
+        stop_token_ids: list[int],
+        temperature: float,
+        top_k: int = 5,
+        print_fn=print,
+    ):
+        """Profiled speculative generation with per-step token confidences."""
+        self.eval()
+        self._last_decode_stats = {
+            "accept_lengths": [],
+            "target_total_time": 0.0,
+            "draft_total_time": 0.0,
+            "steps": 0,
+        }
+        num_input_tokens = input_ids.shape[1]
+        max_length = num_input_tokens + max_new_tokens
+
+        block_size = self.block_size
+        if self.mask_token_id is None:
+            raise ValueError(
+                "FlashMTPDraftModel.mask_token_id is None. Load a checkpoint with "
+                "flashmtp_config['mask_token_id'] or set draft_model.mask_token_id "
+                "before calling spec_generate_with_profile()."
+            )
+        output_ids = torch.full(
+            (1, max_length + block_size),
+            self.mask_token_id,
+            dtype=torch.long,
+            device=target.device,
+        )
+        position_ids = torch.arange(
+            output_ids.shape[1], device=target.device
+        ).unsqueeze(0)
+
+        past_key_values_target = DynamicCache()
+
+        if target.device.type == "cuda":
+            torch.cuda.synchronize(target.device)
+        target_start = time.perf_counter()
+        output = target(
+            input_ids,
+            position_ids=position_ids[:, :num_input_tokens],
+            past_key_values=past_key_values_target,
+            use_cache=True,
+            logits_to_keep=1,
+            output_hidden_states=True,
+        )
+        if target.device.type == "cuda":
+            torch.cuda.synchronize(target.device)
+        self._last_decode_stats["target_total_time"] += time.perf_counter() - target_start
+
+        output_ids[:, :num_input_tokens] = input_ids
+        output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
+            output.logits, temperature
+        )
+        anchor_token = output_ids[:, num_input_tokens : num_input_tokens + 1]
+        print_fn(
+            f"\n[Prefill anchor] pos={num_input_tokens} "
+            f"token={self._format_token_list(anchor_token[0], tokenizer)}"
+        )
+
+        target_hidden = extract_latest_context_feature(
+            output.hidden_states,
+            self.target_layer_ids,
+            token_index=-1,
+        )
+
+        start = input_ids.shape[1]
+        prediction_groups = build_flashmtp_prediction_groups(block_size)
+        draft_attention_mask = create_flashmtp_single_block_mask(
+            batch_size=input_ids.shape[0],
+            block_size=block_size,
+            device=target.device,
+            attention_backend=self.config._attn_implementation,
+            dtype=next(self.parameters()).dtype,
+        )
+        while start < max_length:
+            print_fn(f"\n[Spec step {self._last_decode_stats['steps']}] start={start}")
+            block_output_ids = output_ids[:, start : start + block_size].clone()
+            block_position_ids = position_ids[:, start : start + block_size]
+            for group_start, group_end in prediction_groups:
+                noise_embedding = target.model.embed_tokens(block_output_ids)
+                if target.device.type == "cuda":
+                    torch.cuda.synchronize(target.device)
+                draft_start = time.perf_counter()
+                draft_hidden = self(
+                    target_hidden=target_hidden,
+                    noise_embedding=noise_embedding,
+                    position_ids=position_ids[:, start - 1 : start + block_size],
+                    attention_mask=draft_attention_mask,
+                    past_key_values=None,
+                    use_cache=False,
+                    is_causal=False,
+                )
+                draft_logits = target.lm_head(
+                    draft_hidden[:, group_start:group_end, :]
+                )
+                if target.device.type == "cuda":
+                    torch.cuda.synchronize(target.device)
+                self._last_decode_stats["draft_total_time"] += (
+                    time.perf_counter() - draft_start
+                )
+
+                for offset, slot in enumerate(range(group_start, group_end)):
+                    topk_entries = self._format_token_topk(
+                        draft_logits[0, offset], tokenizer, top_k
+                    )
+                    print_fn(
+                        f"  [Draft slot {slot} | abs_pos={start + slot}] "
+                        f"top{top_k}={topk_entries}"
+                    )
+
+                block_output_ids[:, group_start:group_end] = sample(
+                    draft_logits, temperature
+                )
+
+            if target.device.type == "cuda":
+                torch.cuda.synchronize(target.device)
+            target_start = time.perf_counter()
+            output = target(
+                block_output_ids,
+                position_ids=block_position_ids,
+                past_key_values=past_key_values_target,
+                use_cache=True,
+                output_hidden_states=True,
+            )
+            if target.device.type == "cuda":
+                torch.cuda.synchronize(target.device)
+            self._last_decode_stats["target_total_time"] += time.perf_counter() - target_start
+
+            posterior = sample(output.logits, temperature)
+            acceptance_length = (
+                (block_output_ids[:, 1:] == posterior[:, :-1])
+                .cumprod(dim=1)
+                .sum(dim=1)[0]
+                .item()
+            )
+            accepted_tokens = block_output_ids[:, : acceptance_length + 1]
+            print_fn(
+                f"  [Accept] length={acceptance_length + 1} "
+                f"tokens={self._format_token_list(accepted_tokens[0], tokenizer)}"
+            )
+
+            for target_pos in range(min(acceptance_length + 1, output.logits.shape[1])):
+                role = "accepted" if target_pos < acceptance_length else "correction"
+                target_token = posterior[:, target_pos : target_pos + 1]
+                target_top3 = self._format_token_topk(
+                    output.logits[0, target_pos], tokenizer, 3
+                )
+                print_fn(
+                    f"  [Target {role} pos={start + target_pos + 1}] "
+                    f"token={self._format_token_list(target_token[0], tokenizer)} "
+                    f"top3={target_top3}"
+                )
+
+            output_ids[:, start : start + acceptance_length + 1] = accepted_tokens
+            output_ids[:, start + acceptance_length + 1] = posterior[
+                :, acceptance_length
+            ]
+            start += acceptance_length + 1
+            past_key_values_target.crop(start)
+            pivot_index = min(
+                acceptance_length, output.hidden_states[0].shape[1] - 1
+            )
+            target_hidden = extract_latest_context_feature(
+                output.hidden_states,
+                self.target_layer_ids,
+                token_index=pivot_index,
+            )
+            self._last_decode_stats["accept_lengths"].append(acceptance_length + 1)
+            self._last_decode_stats["steps"] += 1
+            if stop_token_ids is not None and any(
+                stop_token_id in output_ids[:, num_input_tokens:]
+                for stop_token_id in stop_token_ids
+            ):
+                break
+        output_ids = output_ids[:, :max_length]
+        output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
+        if stop_token_ids is not None:
+            stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
+            stop_token_indices = torch.isin(
+                output_ids[0][num_input_tokens:], stop_token_ids
+            ).nonzero(as_tuple=True)[0]
+            if stop_token_indices.numel() > 0:
+                output_ids = output_ids[
+                    :, : num_input_tokens + stop_token_indices[0] + 1
+                ]
+
+        return output_ids
 
     @torch.inference_mode()
     def spec_generate(

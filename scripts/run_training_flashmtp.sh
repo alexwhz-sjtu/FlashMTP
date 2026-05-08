@@ -95,6 +95,8 @@ CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 # 模型参数
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
+KL_LOSS_WEIGHT="${KL_LOSS_WEIGHT:-0}"
+KL_TOP_K="${KL_TOP_K:-0}"
 
 # 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
@@ -142,6 +144,8 @@ echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Anchor chunk大小: ${ANCHOR_CHUNK_SIZE:-0} (0表示关闭)"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
+echo "  KL loss权重: ${KL_LOSS_WEIGHT} (0表示关闭)"
+echo "  KL top-k: ${KL_TOP_K} (0表示全词表)"
 echo "------------------------------------------"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
@@ -206,6 +210,14 @@ fi
 
 if [ -n "${LOSS_DECAY_GAMMA}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --loss-decay-gamma ${LOSS_DECAY_GAMMA}"
+fi
+
+if [ -n "${KL_LOSS_WEIGHT}" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --kl-loss-weight ${KL_LOSS_WEIGHT}"
+fi
+
+if [ -n "${KL_TOP_K}" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --kl-top-k ${KL_TOP_K}"
 fi
 
 if [ -n "${IS_PREFORMATTED}" ]; then
