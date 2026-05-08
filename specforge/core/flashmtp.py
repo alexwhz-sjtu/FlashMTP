@@ -18,46 +18,72 @@ except ImportError:
     BlockMask = None
     create_block_mask = None
 
+def build_v51_context_position_ids(
+    anchor_positions: torch.Tensor,  # (B, N)
+    seq_len: int,
+    context_size: int = 6,
+    pivot_window_size: int = 4,
+) -> torch.LongTensor:
+    """Build v5.1 context ids: [0, 1, anchor-4, anchor-3, anchor-2, anchor-1]."""
+    if context_size != pivot_window_size + 2:
+        raise ValueError("context_size must equal pivot_window_size + 2 for v5.1.")
+
+    bsz, n_blocks = anchor_positions.shape
+    device = anchor_positions.device
+
+    pivot_positions = (anchor_positions - 1).clamp(min=0)
+    sink_positions = torch.tensor([0, 1], device=device, dtype=anchor_positions.dtype)
+    sink_positions = sink_positions.clamp(max=max(seq_len - 1, 0))
+    sink_positions = sink_positions.view(1, 1, 2).expand(bsz, n_blocks, -1)
+
+    window_offsets = torch.arange(
+        -(pivot_window_size - 1), 1, device=device, dtype=anchor_positions.dtype
+    ).view(1, 1, pivot_window_size)
+    window_positions = (pivot_positions.unsqueeze(-1) + window_offsets).clamp(
+        min=0, max=max(seq_len - 1, 0)
+    )
+    context_positions = torch.cat([sink_positions, window_positions], dim=-1)
+    return context_positions.view(bsz, n_blocks * context_size)
+
+
 def prepare_target_hidden(
     hidden_states: tuple[torch.Tensor],  # (num_layers,)[(B, seq_len, H)]
     anchor_positions: torch.Tensor,  # (B, N)
     target_layer_ids: list[int],
-    chs_concat_mode: str = "seq",
+    chs_concat_mode: str = "feature",
+    context_size: int = 6,
+    pivot_window_size: int = 4,
 ) -> torch.Tensor:
-    """Convert full hidden states to CHS format for FlashMTP.
+    """Convert full hidden states to v5.1 feature-only CHS format.
 
-    Args:
-        hidden_states: All layers' hidden states from target model
-        anchor_positions: Anchor positions for each block
-        target_layer_ids: List of layer IDs to extract
-        chs_concat_mode: "seq" or "feature"
-
-    Returns:
-        - seq mode: (B, N*L, H) - L layers concatenated along sequence dim
-        - feature mode: (B, N, H*L) - L layers concatenated along feature dim
+    Each block uses six contextual positions:
+    [0, 1, anchor-4, anchor-3, anchor-2, anchor-1].
+    The selected target layers are concatenated along feature dim per position.
     """
-    # 获取位置 p-1 的 hidden states (用来预测位置 p)
-    context_positions = (anchor_positions - 1).clamp(min=0)  # (B, N)
+    if chs_concat_mode != "feature":
+        raise ValueError("FlashMTP v5.1 only supports chs_concat_mode='feature'.")
 
-    # 提取 anchor positions 对应的 hidden states
-    # hidden_states[layer] shape: (B, seq_len, H)
+    seq_len = hidden_states[0].shape[1]
+    flat_context_positions = build_v51_context_position_ids(
+        anchor_positions=anchor_positions,
+        seq_len=seq_len,
+        context_size=context_size,
+        pivot_window_size=pivot_window_size,
+    )
+
     selected_states = []
     for layer_id in target_layer_ids:
         layer_hidden = hidden_states[layer_id]  # (B, seq_len, H)
-        # Gather: (B, N, H)
         layer_selected = torch.gather(
             layer_hidden,
             dim=1,
-            index=context_positions.unsqueeze(-1).expand(-1, -1, layer_hidden.size(-1))
+            index=flat_context_positions.unsqueeze(-1).expand(
+                -1, -1, layer_hidden.size(-1)
+            ),
         )
         selected_states.append(layer_selected)
 
-    if chs_concat_mode == "seq":
-        # 按序列维度拼接: (B, N*L, H)
-        return torch.cat(selected_states, dim=1)  # (B, N*L, H)
-    else:  # feature mode
-        # 按特征维度拼接: (B, N, H*L)
-        return torch.cat(selected_states, dim=-1)  # (B, N, H*L)
+    return torch.cat(selected_states, dim=-1)
 
 def create_flashmtp_block_mask(
     anchor_positions: torch.Tensor,
@@ -71,9 +97,7 @@ def create_flashmtp_block_mask(
     Args:
         anchor_positions: (B, N) tensor of anchor positions for each block
         block_keep_mask: (B, N) boolean mask indicating valid blocks
-        chs_len_per_block: Number of tokens per CHS segment
-            - For seq concat mode: num_target_layers (L)
-            - For feature concat mode: 1
+        chs_len_per_block: Number of v5.1 context positions per block, fixed to 6
         block_size: Number of tokens per draft block
         device: torch device
 
@@ -84,9 +108,7 @@ def create_flashmtp_block_mask(
         Q:  [Block_0 | Block_1 | ... | Block_{N-1}]
 
     Rules:
-      1. Block_i only sees CHS_i (its own context).
-         For seq mode: within CHS_i, only tokens < anchor_pos are visible.
-         For feature mode: CHS_i is a single token (always visible if valid).
+      1. Block_i only sees its own v5.1 context positions.
       2. Intra-block attention is bidirectional.
       3. Different blocks are invisible to each other.
       4. Invalid blocks (block_keep_mask=False) see nothing.
@@ -137,7 +159,9 @@ class OnlineFlashMTPModel(nn.Module):
             attention_backend: str = "flex_attention",
             num_anchors: int = 512,
             loss_decay_gamma: Optional[float] = None,
-            chs_concat_mode: str = "seq",  # "seq" or "feature"
+            chs_concat_mode: str = "feature",
+            context_size: int = 6,
+            pivot_window_size: int = 4,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -148,7 +172,11 @@ class OnlineFlashMTPModel(nn.Module):
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
+        if chs_concat_mode != "feature":
+            raise ValueError("FlashMTP v5.1 only supports chs_concat_mode='feature'.")
         self.chs_concat_mode = chs_concat_mode
+        self.context_size = context_size
+        self.pivot_window_size = pivot_window_size
         self.draft_model.chs_concat_mode = chs_concat_mode
 
         self._cached_block_mask: Optional[BlockMask] = None
@@ -271,52 +299,33 @@ class OnlineFlashMTPModel(nn.Module):
         noise_embedding = self._create_noise_embed(input_ids, anchor_positions,
                                                    block_keep_mask)
 
-        # we only use the clean bonus token's contextual hidden states(CHS)
-        context_position_ids = anchor_positions  # (bsz, n_blocks)
-
         draft_position_ids = self._create_position_ids(
             anchor_positions)  # (bsz, n_blocks * block_size)
-
-        # when concat in seq dim, we don't pose RoPE on CHS,
-        # so position_ids only includes noise_embedding positions starting from anchor position
-        if self.chs_concat_mode == "seq":
-            full_position_ids = draft_position_ids
-
-        # when concat in feature dim, we't pose RoPE on CHS,
-        # so position_ids only includes the one position before anchor position
-        else:  # feature concat
-            full_position_ids = torch.cat(
-                [context_position_ids, draft_position_ids],
-                dim=-1)  # (bsz, n_block:n_blocks * block_size)
-
-        # Determine CHS length per block based on concat mode
-        # seq mode: each CHS_i has num_target_layers tokens
-        # feature mode: each CHS_i has 1 token (features concatenated)
-        num_target_layers = getattr(self.draft_model.config,
-                                    "num_target_layers", 1)
-        chs_len_per_block = num_target_layers if self.chs_concat_mode == "seq" else 1
+        full_position_ids = draft_position_ids
 
         flashmtp_attn_mask = create_flashmtp_block_mask(
             anchor_positions=anchor_positions,
             block_keep_mask=block_keep_mask,
-            chs_len_per_block=chs_len_per_block,
+            chs_len_per_block=self.context_size,
             block_size=self.block_size,
             device=device,
         )
 
-        # only use the hidden states from the target model at anchor positions (CHS) as input to the draft model
         target_hidden = prepare_target_hidden(
             hidden_states, anchor_positions, self.draft_model.target_layer_ids,
-            self.chs_concat_mode)
-
-        # print(f"target_hidden shape after prepare: {target_hidden.shape}")
-        # print(f"full_position_ids shape: {full_position_ids.shape}")
-        # print(f"noise_embedding shape: {noise_embedding.shape}")
+            self.chs_concat_mode, self.context_size, self.pivot_window_size)
+        context_position_ids = build_v51_context_position_ids(
+            anchor_positions=anchor_positions,
+            seq_len=seq_len,
+            context_size=self.context_size,
+            pivot_window_size=self.pivot_window_size,
+        )
 
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=target_hidden,
+            context_position_ids=context_position_ids,
             attention_mask=flashmtp_attn_mask,
         )
 
@@ -378,4 +387,18 @@ class OnlineFlashMTPModel(nn.Module):
             actual_token_count = binary_eval_mask.sum() + 1e-6
             accuracy = correct.sum().float() / actual_token_count
 
-        return loss, accuracy
+            block_pred_ids = pred_ids.view(bsz, anchor_positions.size(1), self.block_size)
+            block_correct = block_pred_ids == target_ids
+            valid_prefix_tokens = (
+                block_keep_mask.unsqueeze(-1)
+                & valid_label_mask
+                & (original_loss_mask_gathered > 0.5)
+            )
+            valid_prefix_tokens[:, :, 0] = block_keep_mask
+            prefix_matches = block_correct & valid_prefix_tokens
+            prefix_matches[:, :, 0] = block_keep_mask
+            prefix_lengths = prefix_matches.long().cumprod(dim=-1).sum(dim=-1).float()
+            valid_block_count = block_keep_mask.sum().float() + 1e-6
+            prefix_acc = (prefix_lengths * block_keep_mask.float()).sum() / valid_block_count
+
+        return loss, accuracy, prefix_acc

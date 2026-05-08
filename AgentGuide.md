@@ -30,7 +30,7 @@
   - 确认 `FlashMTPDraftModel.from_pretrained(...)` 能被 evaluation 脚本导入。
   - 确认 `spec_generate()` 的参数和 evaluation 调用一致。
   - 确认 evaluation 不再引用不存在的 DFlash 模块或旧路径。
-  - 能跑时，用很小的 `--max-samples` / `--end` 做 smoke test。
+
 
 ## 当前核心假设
 

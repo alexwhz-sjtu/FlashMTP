@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
-from specforge.modeling.draft.flashmtp import extract_latest_context_feature, sample
+from specforge.modeling.draft.flashmtp import sample
 
 from evaluation import distributed as dist
 from evaluation.utils import load_and_process_dataset
@@ -27,29 +27,20 @@ def cuda_time() -> float:
     return time.perf_counter()
 
 @torch.inference_mode()
-def flashmtp_generate(
-    model: FlashMTPDraftModel,
+def target_generate(
     target: AutoModelForCausalLM,
     input_ids: torch.Tensor,
-    mask_token_id: int,
     max_new_tokens: int,
-    block_size: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
 ) -> SimpleNamespace:
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
-
-    output_ids = torch.full(
-        (1, max_length + block_size),
-        mask_token_id,
-        dtype=torch.long,
-        device=model.device,
-    )
-    position_ids = torch.arange(output_ids.shape[1], device=model.device).unsqueeze(0)
+    output_ids = torch.empty((1, max_length), dtype=torch.long, device=input_ids.device)
+    output_ids[:, :num_input_tokens] = input_ids
+    position_ids = torch.arange(max_length, device=input_ids.device).unsqueeze(0)
     past_key_values_target = DynamicCache()
 
-    # Prefill stage
     prefill_start = cuda_time()
     output = target(
         input_ids,
@@ -57,86 +48,38 @@ def flashmtp_generate(
         past_key_values=past_key_values_target,
         use_cache=True,
         logits_to_keep=1,
-        output_hidden_states=True if block_size > 1 else False,
+        output_hidden_states=False,
     )
-
-    output_ids[:, :num_input_tokens] = input_ids
-    output_ids[:, num_input_tokens:num_input_tokens+1] = sample(output.logits, temperature)
-    if block_size > 1:
-        target_hidden = extract_latest_context_feature(
-            output.hidden_states,
-            model.target_layer_ids,
-            token_index=-1,
-            chs_concat_mode=model.chs_concat_mode,
-        )
-
+    next_token = sample(output.logits, temperature)
     time_to_first_token = cuda_time() - prefill_start
 
-    # Decode stage
     decode_start = cuda_time()
     start = input_ids.shape[1]
-    acceptance_lengths = []
-    draft_prefill = True
-
     while start < max_length:
-        block_output_ids = output_ids[:, start : start + block_size].clone()
-        block_position_ids = position_ids[:, start : start + block_size]
-        if block_size > 1:
-            noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_logits = target.lm_head(model(
-                target_hidden=target_hidden,
-                noise_embedding=noise_embedding,
-                position_ids=position_ids[:, start : start + block_size],
-                past_key_values=None,
-                use_cache=False,
-                is_causal=False,
-            )[:, -block_size+1:, :])
-            block_output_ids[:, 1:] = sample(draft_logits)
-            if draft_prefill:
-                draft_prefill = False
-                decode_start = cuda_time()
+        output_ids[:, start : start + 1] = next_token
+        start += 1
 
-        output = target(
-            block_output_ids,
-            position_ids=block_position_ids,
-            past_key_values=past_key_values_target,
-            use_cache=True,
-            output_hidden_states=True if block_size > 1 else False,
-        )
-
-        posterior = sample(output.logits, temperature)
-        acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
-        output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
-        output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
-
-        acceptance_lengths.append(acceptance_length+1)
-        start += acceptance_length + 1
-        past_key_values_target.crop(start)
-        if block_size > 1:
-            pivot_index = min(acceptance_length, output.hidden_states[0].shape[1] - 1)
-            target_hidden = extract_latest_context_feature(
-                output.hidden_states,
-                model.target_layer_ids,
-                token_index=pivot_index,
-                chs_concat_mode=model.chs_concat_mode,
-            )
-        
-        if stop_token_ids is not None and any(
-            stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
-        ):
+        if stop_token_ids is not None and next_token.item() in stop_token_ids:
+            break
+        if start >= max_length:
             break
 
-    output_ids = output_ids[:, :max_length]
-    output_ids = output_ids[:, output_ids[0] != mask_token_id]
-    if stop_token_ids is not None:
-        stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
-        stop_token_indices = torch.isin(output_ids[0][num_input_tokens:], stop_token_ids).nonzero(as_tuple=True)[0]
-        if stop_token_indices.numel() > 0:
-            output_ids = output_ids[:, : num_input_tokens + stop_token_indices[0] + 1]
+        token_position_ids = position_ids[:, start - 1 : start]
+        output = target(
+            next_token,
+            position_ids=token_position_ids,
+            past_key_values=past_key_values_target,
+            use_cache=True,
+            logits_to_keep=1,
+            output_hidden_states=False,
+        )
+        next_token = sample(output.logits, temperature)
+
+    output_ids = output_ids[:, :start]
 
     num_output_tokens = output_ids.shape[1] - num_input_tokens
     total_decode_time = cuda_time() - decode_start
-    time_per_output_token = total_decode_time / num_output_tokens
+    time_per_output_token = total_decode_time / max(num_output_tokens, 1)
 
     return SimpleNamespace(
         output_ids=output_ids,
@@ -144,17 +87,63 @@ def flashmtp_generate(
         num_output_tokens=num_output_tokens,
         time_to_first_token=time_to_first_token,
         time_per_output_token=time_per_output_token,
-        acceptance_lengths=acceptance_lengths,
+        acceptance_lengths=[1] * num_output_tokens,
+    )
+
+
+@torch.inference_mode()
+def flashmtp_generate(
+    model: FlashMTPDraftModel,
+    target: AutoModelForCausalLM,
+    input_ids: torch.Tensor,
+    max_new_tokens: int,
+    block_size: int,
+    stop_token_ids: list[int],
+    temperature: float = 0.0,
+) -> SimpleNamespace:
+    original_block_size = model.block_size
+    model.block_size = block_size
+    try:
+        generate_start = cuda_time()
+        output_ids = model.spec_generate(
+            target=target,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            stop_token_ids=stop_token_ids,
+            temperature=temperature,
+        )
+        total_time = cuda_time() - generate_start
+    finally:
+        model.block_size = original_block_size
+
+    stats = model.get_last_decode_stats()
+    num_input_tokens = input_ids.shape[1]
+    num_output_tokens = output_ids.shape[1] - num_input_tokens
+    measured_decode_time = stats.get("target_total_time", 0.0) + stats.get(
+        "draft_total_time", 0.0
+    )
+    time_per_output_token = measured_decode_time / max(num_output_tokens, 1)
+
+    return SimpleNamespace(
+        output_ids=output_ids,
+        num_input_tokens=num_input_tokens,
+        num_output_tokens=num_output_tokens,
+        time_to_first_token=0.0,
+        time_per_output_token=time_per_output_token,
+        acceptance_lengths=stats.get("accept_lengths", []),
+        target_total_time=stats.get("target_total_time", 0.0),
+        draft_total_time=stats.get("draft_total_time", 0.0),
+        total_time=total_time,
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name-or-path", type=str, default='/data/wanghanzhen/models/Qwen/Qwen3-8B')
-    parser.add_argument("--draft-name-or-path", type=str, default='/data/wanghanzhen/Projects/MTP/NIPS26/FlashMTP/cache/models/flashmtp_feature_sample_400000_think_on_qwen3_8b_maxlen4096')
+    parser.add_argument("--draft-name-or-path", type=str, default='/data/wanghanzhen/Projects/MTP/NIPS26/FlashMTP_v5.1/cache/models/flashmtp_v5.1_h100_sample_40000_think_off_nlayers5_block__maxlen4096_epochs6/epoch_6_step_29844')
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--dataset", type=str, required=True)
-    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--max-samples", type=int, default=10)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     args = parser.parse_args()
@@ -208,21 +197,26 @@ def main() -> None:
         messages = []
         for turn_index, user_content in enumerate(instance["turns"]):
             messages.append({"role": "user", "content": user_content})
-            input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
+            input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
             input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
 
             response = {}
-            for bs in [1, block_size]:
-                response[bs] = flashmtp_generate(
-                    model=draft_model,
-                    target=target,
-                    input_ids=input_ids,
-                    mask_token_id=draft_model.mask_token_id,
-                    max_new_tokens=args.max_new_tokens,
-                    block_size=bs,
-                    stop_token_ids=[tokenizer.eos_token_id],
-                    temperature=args.temperature,
-                )
+            response[1] = target_generate(
+                target=target,
+                input_ids=input_ids,
+                max_new_tokens=args.max_new_tokens,
+                stop_token_ids=[tokenizer.eos_token_id],
+                temperature=args.temperature,
+            )
+            response[block_size] = flashmtp_generate(
+                model=draft_model,
+                target=target,
+                input_ids=input_ids,
+                max_new_tokens=args.max_new_tokens,
+                block_size=block_size,
+                stop_token_ids=[tokenizer.eos_token_id],
+                temperature=args.temperature,
+            )
             
             spec_response = response[block_size]
             generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens:]

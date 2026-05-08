@@ -87,7 +87,13 @@ def parse_args():
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
-    dataset_group.add_argument("--chs-concat-mode", type=str, default="feature")
+    dataset_group.add_argument(
+        "--chs-concat-mode",
+        type=str,
+        default="feature",
+        choices=["feature"],
+        help="FlashMTP v5.1 uses feature-only CHS fusion.",
+    )
     dataset_group.add_argument(
         "--build-dataset-num-proc",
         type=int,
@@ -173,6 +179,8 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         draft_config.flashmtp_config = {}
         
     draft_config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
+    draft_config.flashmtp_config["context_size"] = 6
+    draft_config.flashmtp_config["pivot_window_size"] = 4
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
@@ -184,7 +192,9 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     print_on_rank0(
         f"Draft config: block_size={draft_config.block_size}, "
         f"num_hidden_layers={draft_config.num_hidden_layers}, "
-        f"num_target_layers={draft_config.num_target_layers}"
+        f"num_target_layers={draft_config.num_target_layers}, "
+        "v5.1_context=[0,1,pivot-3,pivot-2,pivot-1,pivot], "
+        f"target_layer_ids={draft_model.target_layer_ids}"
     )
     print_on_rank0(
         f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}"
@@ -304,6 +314,7 @@ def record_metrics(
     args,
     loss: float,
     accuracy: float,
+    prefix_acc: float,
     global_step: int,
     tracker,
     optimizer,
@@ -317,9 +328,12 @@ def record_metrics(
 
     logdict[f"{mode}/loss"] = loss
     logdict[f"{mode}/accuracy"] = accuracy
+    logdict[f"{mode}/prefix_acc"] = prefix_acc
 
     print_on_rank0(
-        f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}"
+        f"{mode.capitalize()} - Step {global_step} "
+        f"[{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], "
+        f"Loss: {loss:.4f}, Acc: {accuracy:.4f}, PrefixAcc: {prefix_acc:.4f}"
     )
 
     tracker.log(logdict, step=global_step)
@@ -399,6 +413,8 @@ def main():
     draft_model.mask_token_id = mask_token_id
     
     draft_model.config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
+    draft_model.config.flashmtp_config["context_size"] = 6
+    draft_model.config.flashmtp_config["pivot_window_size"] = 4
     draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
     draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
@@ -428,6 +444,8 @@ def main():
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
         chs_concat_mode=args.chs_concat_mode,
+        context_size=6,
+        pivot_window_size=4,
     )
 
     flashmtp_model = FSDP(
@@ -495,7 +513,7 @@ def main():
             hidden_states = tuple(h.cuda() for h in target_output.hidden_states)
             # hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 
-            loss, accuracy = flashmtp_model(
+            loss, accuracy, prefix_acc = flashmtp_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
@@ -509,15 +527,19 @@ def main():
             if global_step % args.log_interval == 0:
                 loss_log = loss.clone()
                 acc_log = accuracy.clone()
+                prefix_acc_log = prefix_acc.clone()
                 dist.all_reduce(loss_log)
                 dist.all_reduce(acc_log)
+                dist.all_reduce(prefix_acc_log)
                 loss_log = loss_log / dist.get_world_size()
                 acc_log = acc_log / dist.get_world_size()
+                prefix_acc_log = prefix_acc_log / dist.get_world_size()
 
                 record_metrics(
                     args,
                     loss_log.item(),
                     acc_log.item(),
+                    prefix_acc_log.item(),
                     global_step,
                     tracker,
                     optimizer,
@@ -532,6 +554,7 @@ def main():
                     {
                         "loss": f"{loss.item():.4f}",
                         "acc": f"{accuracy.item():.4f}",
+                        "prefix_acc": f"{prefix_acc.item():.2f}",
                         "iter_time": f"{elapsed:.2f}s",
                     }
                 )

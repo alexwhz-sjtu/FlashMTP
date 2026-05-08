@@ -36,21 +36,32 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_len = q.size(-2)
-    q_embed = (q * cos[..., -q_len:, :]) + (rotate_half(q) * sin[..., -q_len:, :])
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    k_len = k.size(-2)
+    q_cos = cos[..., -q_len:, :]
+    q_sin = sin[..., -q_len:, :]
+    k_cos = cos[..., -k_len:, :]
+    k_sin = sin[..., -k_len:, :]
+    q_embed = (q * q_cos) + (rotate_half(q) * q_sin)
+    k_embed = (k * k_cos) + (rotate_half(k) * k_sin)
     return q_embed, k_embed
 
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> list[int]:
-    if num_draft_layers == 1:
-        return [num_target_layers // 2]
-    start = 1
-    end = num_target_layers - 3
-    span = end - start
-    return [
-        int(round(start + (i * span) / (num_draft_layers - 1)))
-        for i in range(num_draft_layers)
+    """Select seven target layers evenly, always including first and last."""
+    del num_draft_layers
+    num_fusion_layers = 7
+    if num_target_layers < num_fusion_layers:
+        raise ValueError(
+            f"FlashMTP requires at least {num_fusion_layers} target layers, "
+            f"got {num_target_layers}."
+        )
+
+    last_layer_id = num_target_layers - 1
+    middle_layer_ids = [
+        int(round((i * last_layer_id) / (num_fusion_layers - 1)))
+        for i in range(1, num_fusion_layers - 1)
     ]
+    return [0, *middle_layer_ids, last_layer_id]
 
 
 class Qwen3FlashMTPAttention(nn.Module):
@@ -128,18 +139,28 @@ class Qwen3FlashMTPAttention(nn.Module):
         v = v.transpose(1, 2)
 
         cos, sin = position_embeddings
-        
-        # Only apply RoPE to draft tokens; CHS slots stay un-rotated.
-        if self.chs_concat_mode in ("seq", "feature"):
-            k_ctx_part = k[:, :, :ctx_len, :]  
-            k_noise_part = k[:, :, ctx_len:, :]   
-            q, k_noise_part = apply_rotary_pos_emb(q, k_noise_part, cos, sin)
-            k = torch.cat([k_ctx_part, k_noise_part], dim=2)
-        else:
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        raw_cos, raw_sin = cos, sin
+
+        # Query uses draft positions; keys use their own context/draft positions.
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        ctx_cos, draft_cos = cos[..., :ctx_len, :], cos[..., ctx_len:, :]
+        ctx_sin, draft_sin = sin[..., :ctx_len, :], sin[..., ctx_len:, :]
+        k_ctx_part = k[:, :, :ctx_len, :]
+        k_noise_part = k[:, :, ctx_len:, :]
+        q = (q * draft_cos) + (rotate_half(q) * draft_sin)
+        k_ctx_part = (k_ctx_part * ctx_cos) + (rotate_half(k_ctx_part) * ctx_sin)
+        k_noise_part = (k_noise_part * draft_cos) + (
+            rotate_half(k_noise_part) * draft_sin
+        )
+        k = torch.cat([k_ctx_part, k_noise_part], dim=2)
 
         if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            cache_kwargs = {
+                "sin": raw_sin,
+                "cos": raw_cos,
+                "cache_position": cache_position,
+            }
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
 
         attn_fn: Callable = eager_attention_forward
@@ -211,40 +232,80 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
-def extract_context_feature(
+def extract_context_features_at_positions(
     hidden_states: list[torch.Tensor],
     layer_ids: Optional[list[int]],
+    positions: torch.LongTensor,
 ) -> torch.Tensor:
-    """Extract hidden states from specified layer IDs."""
+    """Extract v5.1 feature-concat target hidden at explicit token positions."""
     offset = 1
-    selected_states = []
-    for layer_id in layer_ids:
-        selected_states.append(hidden_states[layer_id + offset])
-    target_hidden = torch.cat(selected_states, dim=-1)
-    return target_hidden
+    if positions.dim() == 1:
+        positions = positions.unsqueeze(0)
 
-
-def extract_latest_context_feature(
-    hidden_states: list[torch.Tensor],
-    layer_ids: Optional[list[int]],
-    token_index: int = -1,
-    chs_concat_mode: str = "feature",
-) -> torch.Tensor:
-    """Extract latest token hidden states from specified layers.
-
-    Returns:
-        - seq mode: (B, L, H)
-        - feature mode: (B, 1, H*L)
-    """
-    offset = 1
     selected_states = []
     for layer_id in layer_ids:
         layer_hidden = hidden_states[layer_id + offset]
-        selected_states.append(layer_hidden[:, token_index, :].unsqueeze(1))
-
-    if chs_concat_mode == "seq":
-        return torch.cat(selected_states, dim=1)
+        safe_positions = positions.to(layer_hidden.device).clamp(
+            min=0, max=layer_hidden.shape[1] - 1
+        )
+        layer_selected = torch.gather(
+            layer_hidden,
+            dim=1,
+            index=safe_positions.unsqueeze(-1).expand(
+                -1, -1, layer_hidden.shape[-1]
+            ),
+        )
+        selected_states.append(layer_selected)
     return torch.cat(selected_states, dim=-1)
+
+
+def build_v51_context_feature(
+    fused_hidden_history: torch.Tensor,
+    pivot_position: int,
+    context_size: int = 6,
+    pivot_window_size: int = 4,
+) -> torch.Tensor:
+    """Build [0, 1, pivot-3, pivot-2, pivot-1, pivot] context features."""
+    if context_size != pivot_window_size + 2:
+        raise ValueError("context_size must equal pivot_window_size + 2 for v5.1.")
+    seq_len = fused_hidden_history.shape[1]
+    if seq_len <= 0:
+        raise ValueError("fused_hidden_history must contain at least one token.")
+
+    positions = build_v51_context_position_ids(
+        seq_len=seq_len,
+        pivot_position=pivot_position,
+        device=fused_hidden_history.device,
+        context_size=context_size,
+        pivot_window_size=pivot_window_size,
+    ).squeeze(0)
+    return fused_hidden_history[:, positions, :]
+
+
+def build_v51_context_position_ids(
+    seq_len: int,
+    pivot_position: int,
+    device: torch.device,
+    context_size: int = 6,
+    pivot_window_size: int = 4,
+) -> torch.LongTensor:
+    """Build [0, 1, pivot-3, pivot-2, pivot-1, pivot] position ids."""
+    if context_size != pivot_window_size + 2:
+        raise ValueError("context_size must equal pivot_window_size + 2 for v5.1.")
+    if seq_len <= 0:
+        raise ValueError("seq_len must be positive for v5.1 context positions.")
+
+    sink_positions = torch.tensor([0, 1], device=device, dtype=torch.long)
+    window_positions = torch.arange(
+        pivot_position - pivot_window_size + 1,
+        pivot_position + 1,
+        device=device,
+        dtype=torch.long,
+    )
+    positions = torch.cat([sink_positions, window_positions]).clamp(
+        min=0, max=seq_len - 1
+    )
+    return positions.unsqueeze(0)
 
 
 class FlashMTPDraftModel(Qwen3PreTrainedModel):
@@ -255,39 +316,46 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         super().__init__(config)
         self.config = config
         flashmtp_config = getattr(config, "flashmtp_config", {}) or {}
-        self.chs_concat_mode = flashmtp_config.get("chs_concat_mode", "seq")
+        self.chs_concat_mode = flashmtp_config.get("chs_concat_mode", "feature")
+        if self.chs_concat_mode != "feature":
+            print_on_rank0(
+                "FlashMTP v5.1 only supports feature CHS; overriding "
+                f"chs_concat_mode={self.chs_concat_mode!r} to 'feature'."
+            )
+            self.chs_concat_mode = "feature"
+            flashmtp_config["chs_concat_mode"] = "feature"
+            config.flashmtp_config = flashmtp_config
         self.layers = nn.ModuleList(
             [
                 Qwen3FlashMTPDecoderLayer(config, layer_idx, self.chs_concat_mode)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        # target_layer_ids: list of layer indices to extract from target model
-        self.target_layer_ids = flashmtp_config.get(
-            "target_layer_ids",
-            build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
+        self.target_layer_ids = build_target_layer_ids(
+            config.num_target_layers, config.num_hidden_layers
         )
+        flashmtp_config["target_layer_ids"] = self.target_layer_ids
+        config.flashmtp_config = flashmtp_config
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
+        self.context_size = flashmtp_config.get("context_size", 6)
+        self.pivot_window_size = flashmtp_config.get("pivot_window_size", 4)
         self._last_decode_stats = {}
 
-        # For seq concat mode: use Identity (no computation, no parameters)
-        # For feature mode: use Linear projection and RMSNorm
-        if self.chs_concat_mode == "feature":
-            self.fc = nn.Linear(
-                len(self.target_layer_ids) * config.hidden_size,
-                config.hidden_size,
-                bias=False,
-            )
-            self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        else:
-            self.fc = nn.Identity()
-            # self.hidden_norm = nn.Identity()
-            # maybe need norm
-            self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        print_on_rank0(f"self.chs_concat_mode: {self.chs_concat_mode}")
+        self.fc = nn.Linear(
+            len(self.target_layer_ids) * config.hidden_size,
+            config.hidden_size,
+            bias=False,
+        )
+        self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        print_on_rank0(
+            f"self.chs_concat_mode: {self.chs_concat_mode}, "
+            f"context_size: {self.context_size}, "
+            f"pivot_window_size: {self.pivot_window_size}, "
+            f"target_layer_ids: {self.target_layer_ids}"
+        )
 
         self.post_init()
 
@@ -300,15 +368,23 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         noise_embedding: Optional[torch.Tensor] = None,
         target_hidden: Optional[torch.Tensor] = None,
+        context_position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
-        
+
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
-        # position_embeddings = self.rotary_emb(torch.cat([target_hidden, hidden_states], dim=1), position_ids)
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        if context_position_ids is None:
+            context_position_ids = torch.zeros(
+                target_hidden.shape[:2],
+                dtype=position_ids.dtype,
+                device=position_ids.device,
+            )
+        full_position_ids = torch.cat([context_position_ids, position_ids], dim=1)
+        full_hidden_states = torch.cat([target_hidden, hidden_states], dim=1)
+        position_embeddings = self.rotary_emb(full_hidden_states, full_position_ids)
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
@@ -374,15 +450,29 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
             output.logits, temperature
         )
-        target_hidden = extract_latest_context_feature(
+        prefill_positions = torch.arange(
+            num_input_tokens, device=input_ids.device, dtype=torch.long
+        ).unsqueeze(0)
+        fused_hidden_history = extract_context_features_at_positions(
             output.hidden_states,
             self.target_layer_ids,
-            token_index=-1,
-            chs_concat_mode=self.chs_concat_mode,
+            prefill_positions,
+        )
+        target_hidden = build_v51_context_feature(
+            fused_hidden_history,
+            pivot_position=num_input_tokens - 1,
+            context_size=self.context_size,
+            pivot_window_size=self.pivot_window_size,
+        )
+        context_position_ids = build_v51_context_position_ids(
+            seq_len=fused_hidden_history.shape[1],
+            pivot_position=num_input_tokens - 1,
+            device=input_ids.device,
+            context_size=self.context_size,
+            pivot_window_size=self.pivot_window_size,
         )
 
         # Decode stage
-        acceptance_lengths = []
         start = input_ids.shape[1]
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -394,6 +484,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             draft_logits = target.lm_head(
                 self(
                     target_hidden=target_hidden,
+                    context_position_ids=context_position_ids,
                     noise_embedding=noise_embedding,
                     position_ids=position_ids[:, start : start + block_size],
                     past_key_values=None,
@@ -435,16 +526,35 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             ]
             start += acceptance_length + 1
             past_key_values_target.crop(start)
-            pivot_index = min(
-                acceptance_length, output.hidden_states[0].shape[1] - 1
-            )
-            target_hidden = extract_latest_context_feature(
+
+            accepted_count = acceptance_length + 1
+            block_hidden_positions = torch.arange(
+                output.hidden_states[0].shape[1],
+                device=input_ids.device,
+                dtype=torch.long,
+            ).unsqueeze(0)
+            fused_block_hidden = extract_context_features_at_positions(
                 output.hidden_states,
                 self.target_layer_ids,
-                token_index=pivot_index,
-                chs_concat_mode=self.chs_concat_mode,
+                block_hidden_positions,
             )
-            acceptance_lengths.append(acceptance_length + 1)
+            fused_hidden_history = torch.cat(
+                [fused_hidden_history, fused_block_hidden[:, :accepted_count, :]],
+                dim=1,
+            )
+            target_hidden = build_v51_context_feature(
+                fused_hidden_history,
+                pivot_position=start - 1,
+                context_size=self.context_size,
+                pivot_window_size=self.pivot_window_size,
+            )
+            context_position_ids = build_v51_context_position_ids(
+                seq_len=fused_hidden_history.shape[1],
+                pivot_position=start - 1,
+                device=input_ids.device,
+                context_size=self.context_size,
+                pivot_window_size=self.pivot_window_size,
+            )
             self._last_decode_stats["accept_lengths"].append(acceptance_length + 1)
             self._last_decode_stats["steps"] += 1
             if stop_token_ids is not None and any(
