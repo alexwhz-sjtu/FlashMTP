@@ -168,6 +168,10 @@ echo "------------------------------------------"
 echo "分布式配置:"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 echo "  NPROC_PER_NODE: ${NPROC_PER_NODE}"
+echo "  NNODES: ${NNODES}"
+echo "  NODE_RANK: ${NODE_RANK}"
+echo "  MASTER_ADDR: ${MASTER_ADDR}"
+echo "  MASTER_PORT: ${MASTER_PORT}"
 echo "  TP_SIZE: ${TP_SIZE}"
 echo "------------------------------------------"
 echo "Tracker: ${REPORT_TO}"
@@ -207,7 +211,14 @@ echo "==> 开始训练 FlashMTP"
 echo ""
 
 # train_flashmtp.py 始终 init_distributed()，需 torchrun 提供 RANK/WORLD_SIZE/LOCAL_RANK
-LAUNCHER=(torchrun --nproc_per_node "${NPROC_PER_NODE}" --master_port "${MASTER_PORT}")
+LAUNCHER=(
+    torchrun
+    --nnodes "${NNODES}"
+    --node_rank "${NODE_RANK}"
+    --nproc_per_node "${NPROC_PER_NODE}"
+    --master_addr "${MASTER_ADDR}"
+    --master_port "${MASTER_PORT}"
+)
 
 # 构建可选参数
 OPTIONAL_ARGS=""

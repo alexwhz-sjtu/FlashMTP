@@ -1,6 +1,7 @@
 import argparse
 import json
 import random
+import re
 import sys
 import time
 from itertools import chain
@@ -25,6 +26,58 @@ from evaluation.utils import load_and_process_dataset
 
 DATASET_PATH_FILE = Path(__file__).resolve().with_name("dataset_path.json")
 
+INFINITEBENCH_PROMPTS = {
+    "passkey": "There is an important info hidden inside a lot of irrelevant text. Find it and memorize it. I will quiz you about the important information.\n\n{context}\n\n{input}\n\nThe pass key is",
+    "number_string": "There is an important info hidden inside a lot of irrelevant text. Find it. I will quiz you about the important information there.\n\n{context}\n\n{input}\n\nThe sequence of digits is",
+    "kv_retrieval": "Extract the value corresponding to the specified key in the JSON object below.\n\n{context}\n\n{input}",
+    "longbook_sum_eng": "Summarize the book below.\n\n{context}\n\nSummary:",
+    "longbook_choice_eng": "Read the book and answer the question.\n\n{context}\n\nQuestion: {question}\nA. {OPTION_A}\nB. {OPTION_B}\nC. {OPTION_C}\nD. {OPTION_D}\n\nThe letter of the correct answer is",
+    "longbook_qa_eng": "Read the book and answer the question. Be very concise in your answer.\n\n{context}\n\nQuestion: {question}\nAnswer:",
+    "longbook_qa_chn": "阅读以下书籍然后回答问题。\n\n{context}\n\n问题：{question}\n答案：",
+    "longdialogue_qa_eng": "Below is a dialogue script where one random occurrence of a character name is replaced with \"$$MASK$$\", and you should try to guess who that character is.\n\n{context}\n\nThe name that has been replaced with $$MASK$$ is likely",
+    "math_find": "{prefix}\n\n{context}\n\n{input}",
+    "math_calc": "Let us calculate the intermediate values of an expression.\n\nExpression: 1 + 3 + 4\nValues: [1, 4, 8]\n\nExpression: 8 - 3 + 2 - 4\nValues: [8, 5, 7, 3]\n\nExpression: {context}\nValues:",
+    "code_run": "There is a function called {func} in the following Python code.\n\n{context}\n\nPlease compute the exact value of {func_call}. The value of {func_call} is",
+    "code_debug": "Following is a Python code where exactly one of the functions/methods has a deliberate error that makes it crash.\n\n{context}\n\nOptions:\nA. {OPTION_A}\nB. {OPTION_B}\nC. {OPTION_C}\nD. {OPTION_D}\n\nThe correct option is:",
+}
+
+
+def infer_infinitebench_task(dataset_name: str, dataset_path: Path) -> str | None:
+    candidates = [dataset_name, dataset_path.stem]
+    for candidate in candidates:
+        if candidate in INFINITEBENCH_PROMPTS:
+            return candidate
+    return None
+
+
+def format_infinitebench_prompt(data: dict, task_name: str) -> str:
+    template = INFINITEBENCH_PROMPTS[task_name]
+    fields = {
+        "context": data["context"],
+        "input": data.get("input", ""),
+        "question": data.get("input", ""),
+    }
+
+    options = data.get("options") or []
+    for option_index, option_name in enumerate(["OPTION_A", "OPTION_B", "OPTION_C", "OPTION_D"]):
+        if option_index < len(options):
+            fields[option_name] = options[option_index]
+
+    if task_name == "math_find":
+        find_result = re.findall(r"The .+ of", data["input"])
+        if not find_result:
+            raise ValueError(f"Cannot infer math_find target from input: {data['input']}")
+        fields["prefix"] = f"What is {find_result[0].lower()[:-3]} in the following list?"
+
+    if task_name == "code_run":
+        find_result = re.findall(r"func_[0-9]+\(-?[0-9]+\)", data["input"])
+        if not find_result:
+            raise ValueError(f"Cannot infer code_run function call from input: {data['input']}")
+        fields["func_call"] = find_result[0]
+        fields["func"] = fields["func_call"].split("(")[0]
+
+    return template.format(**fields)
+
 
 def resolve_dataset_path(dataset_name: str) -> str:
     if not DATASET_PATH_FILE.is_file():
@@ -40,9 +93,11 @@ def resolve_dataset_path(dataset_name: str) -> str:
 
 
 def load_benchmark_dataset(dataset_name: str):
+    original_dataset_name = dataset_name
     dataset_name = resolve_dataset_path(dataset_name)
     dataset_path = Path(dataset_name)
     if dataset_path.is_file() and dataset_path.suffix == ".jsonl":
+        task_name = infer_infinitebench_task(original_dataset_name, dataset_path)
         instances = []
         with dataset_path.open("r", encoding="utf-8") as f:
             for line_number, line in enumerate(f, start=1):
@@ -59,7 +114,10 @@ def load_benchmark_dataset(dataset_name: str):
                     raise ValueError(
                         f"Missing 'context' field in {dataset_path} at line {line_number}"
                     )
-                prompt = f"{data['context']}\nQuestion: {data['input']}"
+                if task_name is not None:
+                    prompt = format_infinitebench_prompt(data, task_name)
+                else:
+                    prompt = f"{data['context']}\nQuestion: {data['input']}"
                 instances.append({"turns": [prompt]})
         return instances
 
