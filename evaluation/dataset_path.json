@@ -1,4 +1,5 @@
 {
+  "multi_news_e":"/data/wanghanzhen/datasets/LongBench/multi_news_e.jsonl",
   "2wikimqa_e": "/data/wanghanzhen/datasets/LongBench/2wikimqa_e.jsonl",
   "code_debug": "/data/wanghanzhen/downloads/InfiniteBench/data/code_debug.jsonl",
   "code_run": "/data/wanghanzhen/downloads/InfiniteBench/data/code_run.jsonl",
@@ -11,5 +12,7 @@
   "math_calc": "/data/wanghanzhen/downloads/InfiniteBench/data/math_calc.jsonl",
   "math_find": "/data/wanghanzhen/downloads/InfiniteBench/data/math_find.jsonl",
   "number_string": "/data/wanghanzhen/downloads/InfiniteBench/data/number_string.jsonl",
-  "passkey": "/data/wanghanzhen/downloads/InfiniteBench/data/passkey.jsonl"
+  "passkey": "/data/wanghanzhen/downloads/InfiniteBench/data/passkey.jsonl",
+  "longbench_v2": "/data/wanghanzhen/datasets/LongBench_v2/data_32k_64k.json"
 }
+ 
