@@ -7,7 +7,6 @@ from .dflash import (
 )
 from .flashmtp import (
     FlashMTPDraftModel,
-    build_v51_context_feature,
     build_target_layer_ids as build_flashmtp_target_layer_ids,
     extract_context_features_at_positions,
 )
@@ -20,7 +19,6 @@ __all__ = [
     "LlamaForCausalLMEagle3",
     "build_target_layer_ids",
     "build_flashmtp_target_layer_ids",
-    "build_v51_context_feature",
     "extract_context_feature",
     "extract_context_features_at_positions",
     "sample",
