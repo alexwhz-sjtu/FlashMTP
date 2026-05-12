@@ -80,7 +80,7 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
-CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
+CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/think_${ENABLE_THINKING}}"
 
 # 模型参数
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
