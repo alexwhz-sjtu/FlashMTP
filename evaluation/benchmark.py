@@ -42,6 +42,14 @@ INFINITEBENCH_PROMPTS = {
 }
 
 
+def format_longbench_v2_prompt(data: dict) -> str:
+    if "context" not in data:
+        raise ValueError("Missing 'context' field in LongBench_v2 item")
+    if "question" not in data:
+        raise ValueError("Missing 'question' field in LongBench_v2 item")
+    return f"{data['context']}\n\nQuestion: {data['question']}"
+
+
 def infer_infinitebench_task(dataset_name: str, dataset_path: Path) -> str | None:
     candidates = [dataset_name, dataset_path.stem]
     for candidate in candidates:
@@ -96,6 +104,17 @@ def load_benchmark_dataset(dataset_name: str):
     original_dataset_name = dataset_name
     dataset_name = resolve_dataset_path(dataset_name)
     dataset_path = Path(dataset_name)
+    if dataset_path.is_file() and dataset_path.suffix == ".json":
+        with dataset_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError(f"{dataset_path} must contain a JSON list")
+
+        if original_dataset_name.lower() == "longbench_v2" or dataset_path.parent.name.lower() == "longbench_v2":
+            return [{"turns": [format_longbench_v2_prompt(item)]} for item in data]
+
+        raise ValueError(f"Unsupported JSON dataset: {dataset_path}")
+
     if dataset_path.is_file() and dataset_path.suffix == ".jsonl":
         task_name = infer_infinitebench_task(original_dataset_name, dataset_path)
         instances = []
