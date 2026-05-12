@@ -282,6 +282,12 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=10)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--sink-num",
+        type=int,
+        default=None,
+        help="Override draft flashmtp_config sink_num for this run only (default: from checkpoint).",
+    )
     args = parser.parse_args()
 
     random.seed(0)
@@ -318,6 +324,23 @@ def main() -> None:
         dtype=torch.bfloat16,
     ).to(device).eval()
 
+    fcfg = getattr(draft_model.config, "flashmtp_config", None) or {}
+    eff_sink = fcfg.get("sink_num")
+    if args.sink_num is not None:
+        eff_sink = args.sink_num
+        if draft_model.config.flashmtp_config is None:
+            draft_model.config.flashmtp_config = {}
+        draft_model.config.flashmtp_config["sink_num"] = eff_sink
+        draft_model.sink_num = int(eff_sink)
+    if eff_sink is None:
+        raise ValueError(
+            "Checkpoint config.flashmtp_config must contain 'sink_num'. "
+            "Pass --sink-num to set it for this run."
+        )
+    logger.info(
+        f"FlashMTP draft: sink_num={draft_model.sink_num}, "
+        f"chs_len={draft_model.sink_num + 1}, block_size={draft_model.block_size}"
+    )
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)

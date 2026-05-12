@@ -21,6 +21,11 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
+from specforge.core.flashmtp_chs import (
+    build_chs_rope_position_ids,
+    build_draft_rope_position_ids,
+)
+
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     if temperature < 1e-5:
@@ -265,55 +270,6 @@ def extract_context_features_at_positions(
     return torch.cat(selected_states, dim=-1)
 
 
-def build_v51_context_feature(
-    fused_hidden_history: torch.Tensor,
-    pivot_position: int,
-    context_size: int = 6,
-    pivot_window_size: int = 4,
-) -> torch.Tensor:
-    """Build [0, 1, pivot-3, pivot-2, pivot-1, pivot] context features."""
-    if context_size != pivot_window_size + 2:
-        raise ValueError("context_size must equal pivot_window_size + 2 for v5.1.")
-    seq_len = fused_hidden_history.shape[1]
-    if seq_len <= 0:
-        raise ValueError("fused_hidden_history must contain at least one token.")
-
-    positions = build_v51_context_position_ids(
-        seq_len=seq_len,
-        pivot_position=pivot_position,
-        device=fused_hidden_history.device,
-        context_size=context_size,
-        pivot_window_size=pivot_window_size,
-    ).squeeze(0)
-    return fused_hidden_history[:, positions, :]
-
-
-def build_v51_context_position_ids(
-    seq_len: int,
-    pivot_position: int,
-    device: torch.device,
-    context_size: int = 6,
-    pivot_window_size: int = 4,
-) -> torch.LongTensor:
-    """Build [0, 1, pivot-3, pivot-2, pivot-1, pivot] position ids."""
-    if context_size != pivot_window_size + 2:
-        raise ValueError("context_size must equal pivot_window_size + 2 for v5.1.")
-    if seq_len <= 0:
-        raise ValueError("seq_len must be positive for v5.1 context positions.")
-
-    sink_positions = torch.tensor([0, 1], device=device, dtype=torch.long)
-    window_positions = torch.arange(
-        pivot_position - pivot_window_size + 1,
-        pivot_position + 1,
-        device=device,
-        dtype=torch.long,
-    )
-    positions = torch.cat([sink_positions, window_positions]).clamp(
-        min=0, max=seq_len - 1
-    )
-    return positions.unsqueeze(0)
-
-
 class FlashMTPDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3FlashMTPDecoderLayer"]
@@ -346,8 +302,13 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
-        self.context_size = flashmtp_config.get("context_size", 6)
-        self.pivot_window_size = flashmtp_config.get("pivot_window_size", 4)
+        if "sink_num" not in flashmtp_config:
+            raise ValueError(
+                "flashmtp_config must contain 'sink_num' (number of sequence-prefix "
+                "sink tokens). Old checkpoints with only context_size/pivot_window_size "
+                "are not compatible; retrain or add sink_num to config.json."
+            )
+        self.sink_num = int(flashmtp_config["sink_num"])
         self._last_decode_stats = {}
 
         self.fc = nn.Linear(
@@ -358,8 +319,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         print_on_rank0(
             f"self.chs_concat_mode: {self.chs_concat_mode}, "
-            f"context_size: {self.context_size}, "
-            f"pivot_window_size: {self.pivot_window_size}, "
+            f"sink_num: {self.sink_num}, chs_len: {self.sink_num + 1}, "
             f"target_layer_ids: {self.target_layer_ids}"
         )
 
@@ -422,7 +382,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             "draft_total_time": 0.0,
             "total_time": 0.0,
             "steps": 0,
-            "context_tokens": self.context_size,
+            "chs_len": self.sink_num + 1,
+            "sink_num": self.sink_num,
+            "context_tokens": self.sink_num + 1,
         }
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
@@ -455,22 +417,21 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
             output.logits, temperature
         )
-        context_position_ids = build_v51_context_position_ids(
-            seq_len=num_input_tokens,
-            pivot_position=num_input_tokens - 1,
-            device=input_ids.device,
-            context_size=self.context_size,
-            pivot_window_size=self.pivot_window_size,
-        )
+        dev = input_ids.device
+        smax = max(num_input_tokens - 1, 0)
+        sink_seq = torch.arange(self.sink_num, device=dev, dtype=torch.long).clamp(max=smax)
+        pivot_seq = torch.tensor([smax], device=dev, dtype=torch.long)
+        chs_gather = torch.cat([sink_seq, pivot_seq]).unsqueeze(0)
         target_hidden = extract_context_features_at_positions(
             output.hidden_states,
             self.target_layer_ids,
-            context_position_ids,
+            chs_gather,
         )
-        sink_hidden = target_hidden[:, : self.context_size - self.pivot_window_size, :]
-        rolling_window_hidden = target_hidden[
-            :, self.context_size - self.pivot_window_size :, :
-        ]
+        sink_hidden = target_hidden[:, : self.sink_num, :]
+        pivot_hidden = target_hidden[:, self.sink_num :, :]
+        context_position_ids = build_chs_rope_position_ids(
+            1, 1, self.sink_num, dev, torch.long
+        )
 
         # Decode stage
         start = input_ids.shape[1]
@@ -484,11 +445,15 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             verify_size = current_block_size
             if current_block_size > 1:
                 noise_embedding = target.model.embed_tokens(block_output_ids)
+                draft_rope_pos = build_draft_rope_position_ids(
+                    1, 1, current_block_size, self.sink_num, dev, torch.long
+                )
+                target_hidden = torch.cat([sink_hidden, pivot_hidden], dim=1)
                 draft_hidden = self(
                     target_hidden=target_hidden,
                     context_position_ids=context_position_ids,
                     noise_embedding=noise_embedding,
-                    position_ids=position_ids[:, start : start + current_block_size],
+                    position_ids=draft_rope_pos,
                     past_key_values=None,
                     use_cache=False,
                     is_causal=False,
@@ -526,28 +491,13 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             self._last_decode_stats["accepted_tokens"] += acceptance_length + 1
             past_key_values_target.crop(start)
 
-            accepted_count = acceptance_length + 1
-            accepted_positions = torch.arange(
-                accepted_count,
-                device=input_ids.device,
-                dtype=torch.long,
-            ).unsqueeze(0)
-            accepted_hidden = extract_context_features_at_positions(
+            pivot_rel = torch.tensor([[acceptance_length]], device=dev, dtype=torch.long)
+            pivot_hidden = extract_context_features_at_positions(
                 output.hidden_states,
                 self.target_layer_ids,
-                accepted_positions,
+                pivot_rel,
             )
-            rolling_window_hidden = torch.cat(
-                [rolling_window_hidden, accepted_hidden], dim=1
-            )[:, -self.pivot_window_size :, :]
-            context_position_ids = build_v51_context_position_ids(
-                seq_len=start,
-                pivot_position=start - 1,
-                device=input_ids.device,
-                context_size=self.context_size,
-                pivot_window_size=self.pivot_window_size,
-            )
-            target_hidden = torch.cat([sink_hidden, rolling_window_hidden], dim=1)
+
             self._last_decode_stats["accept_lengths"].append(acceptance_length + 1)
             self._last_decode_stats["steps"] += 1
             if stop_token_ids is not None and any(

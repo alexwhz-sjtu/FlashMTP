@@ -74,6 +74,12 @@ def parse_args():
         help="Number of anchor positions per sequence",
     )
     model_group.add_argument(
+        "--sink-num",
+        type=int,
+        default=4,
+        help="Number of sequence-prefix attention-sink tokens; CHS length is sink_num + 1 (pivot at anchor-1).",
+    )
+    model_group.add_argument(
         "--loss-decay-gamma",
         type=float,
         default=None,
@@ -179,8 +185,7 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         draft_config.flashmtp_config = {}
         
     draft_config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
-    draft_config.flashmtp_config["context_size"] = 6
-    draft_config.flashmtp_config["pivot_window_size"] = 4
+    draft_config.flashmtp_config["sink_num"] = args.sink_num
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
@@ -193,7 +198,8 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         f"Draft config: block_size={draft_config.block_size}, "
         f"num_hidden_layers={draft_config.num_hidden_layers}, "
         f"num_target_layers={draft_config.num_target_layers}, "
-        "v5.1_context=[0,1,pivot-3,pivot-2,pivot-1,pivot], "
+        f"CHS=sink_pos[0..{args.sink_num - 1}]+pivot(anchor-1); "
+        f"RoPE CHS ids 0..{args.sink_num}; draft ids {args.sink_num + 1}.., "
         f"target_layer_ids={draft_model.target_layer_ids}"
     )
     print_on_rank0(
@@ -413,8 +419,7 @@ def main():
     draft_model.mask_token_id = mask_token_id
     
     draft_model.config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
-    draft_model.config.flashmtp_config["context_size"] = 6
-    draft_model.config.flashmtp_config["pivot_window_size"] = 4
+    draft_model.config.flashmtp_config["sink_num"] = args.sink_num
     draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
     draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
@@ -444,8 +449,7 @@ def main():
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
         chs_concat_mode=args.chs_concat_mode,
-        context_size=6,
-        pivot_window_size=4,
+        sink_num=args.sink_num,
     )
 
     flashmtp_model = FSDP(
