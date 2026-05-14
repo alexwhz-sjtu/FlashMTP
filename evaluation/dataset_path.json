@@ -1,0 +1,18 @@
+{
+    "multi_news_e":"share/wanghanzhen/SpeculativeDecoding/NIPS26/dataset/LongBench/multi_news_e.jsonl",
+    "2wikimqa_e": "share/wanghanzhen/SpeculativeDecoding/NIPS26/dataset/LongBench/2wikimqa_e.jsonl",
+    "code_debug": "/data/wanghanzhen/downloads/InfiniteBench/data/code_debug.jsonl",
+    "code_run": "/data/wanghanzhen/downloads/InfiniteBench/data/code_run.jsonl",
+    "kv_retrieval": "/data/wanghanzhen/downloads/InfiniteBench/data/kv_retrieval.jsonl",
+    "longbook_choice_eng": "/data/wanghanzhen/downloads/InfiniteBench/data/longbook_choice_eng.jsonl",
+    "longbook_qa_chn": "/data/wanghanzhen/downloads/InfiniteBench/data/longbook_qa_chn.jsonl",
+    "longbook_qa_eng": "/data/wanghanzhen/downloads/InfiniteBench/data/longbook_qa_eng.jsonl",
+    "longbook_sum_eng": "/data/wanghanzhen/downloads/InfiniteBench/data/longbook_sum_eng.jsonl",
+    "longdialogue_qa_eng": "/data/wanghanzhen/downloads/InfiniteBench/data/longdialogue_qa_eng.jsonl",
+    "math_calc": "/data/wanghanzhen/downloads/InfiniteBench/data/math_calc.jsonl",
+    "math_find": "/data/wanghanzhen/downloads/InfiniteBench/data/math_find.jsonl",
+    "number_string": "/data/wanghanzhen/downloads/InfiniteBench/data/number_string.jsonl",
+    "passkey": "/data/wanghanzhen/downloads/InfiniteBench/data/passkey.jsonl",
+    "longbench_v2": "/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/datasets/longbench_v2/data_20k_40k.json"
+  }
+   
