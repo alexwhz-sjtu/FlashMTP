@@ -151,6 +151,35 @@ def parse_args():
     return parser.parse_args()
 
 
+def _sync_draft_layer_types_to_num_hidden_layers(draft_config) -> None:
+    """Match ``layer_types`` length to ``num_hidden_layers`` for draft checkpoints.
+
+    When the draft config is cloned from the target model, ``layer_types`` often
+    still lists every target layer. The draft stack indexes ``layer_types`` by
+    draft layer index (0 .. num_hidden_layers-1), and ``save_pretrained`` must
+    persist a list of that length.
+    """
+    n = getattr(draft_config, "num_hidden_layers", None)
+    if n is None or n <= 0:
+        return
+    lt = getattr(draft_config, "layer_types", None)
+    if lt is None:
+        return
+    seq = list(lt)
+    if len(seq) == n:
+        return
+    default_type = "full_attention"
+    if len(seq) > n:
+        seq = seq[:n]
+    else:
+        fill = seq[-1] if seq else default_type
+        seq = seq + [fill] * (n - len(seq))
+    if isinstance(lt, tuple):
+        draft_config.layer_types = tuple(seq)
+    else:
+        draft_config.layer_types = seq
+
+
 def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     """Build target model (backend wrapper) and draft model."""
     print_on_rank0(
@@ -180,6 +209,8 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         draft_config.block_size = args.block_size
         draft_config.num_target_layers = target_config.num_hidden_layers
         print_on_rank0("Auto-generated draft config from target model")
+
+    _sync_draft_layer_types_to_num_hidden_layers(draft_config)
 
     if not hasattr(draft_config, "flashmtp_config") or draft_config.flashmtp_config is None:
         draft_config.flashmtp_config = {}
@@ -297,6 +328,7 @@ def save_checkpoint(args, epoch, step, flashmtp_model, draft_model, optimizer):
                 os.path.join(save_dir, "training_state.pt"),
             )
 
+            _sync_draft_layer_types_to_num_hidden_layers(draft_model.config)
             draft_model.save_pretrained(save_dir, state_dict=draft_state_dict)
 
             modeling_src = os.path.join(
