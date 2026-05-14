@@ -56,7 +56,7 @@ CKPT_DIR="${CKPT_DIR:-}"
 # 主要数据集参数
 # ========================================
 # 数据特征参数
-DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}"
+DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-70000}"
 ENABLE_THINKING="${ENABLE_THINKING:-off}"
 
 # 草稿层数：默认目录名/ WandB id/ run name 中均带 nlayers${NUM_DRAFT_LAYERS}
@@ -80,11 +80,13 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
-CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/think_${ENABLE_THINKING}}"
+# CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/think_${ENABLE_THINKING}}"
+CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/mix_${DATA_NUM_SAMPLES}/think_${ENABLE_THINKING}}"
+
 
 # 模型参数
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
-SINK_NUM="${SINK_NUM:-4}"
+SINK_NUM="${SINK_NUM:-0}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
 
@@ -93,7 +95,8 @@ if [ "$DT" = "qz" ]; then
     # export NNODES=2
     # export NODE_RANK=${RANK:-0}
     export WANDB_MODE=offline
-    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+    # TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/mix_codealpaca_20k_nemotron_40k_orcamath_10k/merged_70k.jsonl}"
     OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v5.1.1_qz_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 elif [ "$DT" = "h100" ]; then
@@ -113,10 +116,10 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-5000}"
 
 # Tracker 参数
 REPORT_TO="${REPORT_TO:-wandb}"
-WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-exp}"
+WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-mix}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v5.1.1_fix_${DT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v5.1.1_mixed_${DT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}}"
 WANDB_RESUME="${WANDB_RESUME:-allow}"
 WANDB_NAME="${WANDB_RUN_NAME:-}"
 
