@@ -50,6 +50,33 @@ def format_longbench_v2_prompt(data: dict) -> str:
     return f"{data['context']}\n\nQuestion: {data['question']}"
 
 
+def is_swe_bench_style_json(data: list, dataset_path: Path, original_dataset_name: str) -> bool:
+    """SWE-bench Parquet export: list of dicts with string ``text`` (and usually ``instance_id``)."""
+    if not data or not isinstance(data[0], dict):
+        return False
+    row0 = data[0]
+    if "text" not in row0 or not isinstance(row0.get("text"), str):
+        return False
+    stem = dataset_path.stem.lower()
+    alias_stem = Path(str(original_dataset_name)).stem.lower()
+    explicit_name = stem.startswith("swe_bench") or alias_stem.startswith("swe_bench")
+    return explicit_name or "instance_id" in row0
+
+
+def load_swe_bench_json_instances(data: list, dataset_path: Path) -> list[dict]:
+    instances: list[dict] = []
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise ValueError(f"{dataset_path} index {index}: expected object, got {type(item)}")
+        if "text" not in item or item["text"] is None:
+            raise ValueError(f"Missing 'text' in {dataset_path} at index {index}")
+        text = item["text"]
+        if not isinstance(text, str):
+            text = str(text)
+        instances.append({"turns": [text]})
+    return instances
+
+
 def infer_infinitebench_task(dataset_name: str, dataset_path: Path) -> str | None:
     candidates = [dataset_name, dataset_path.stem]
     for candidate in candidates:
@@ -112,6 +139,9 @@ def load_benchmark_dataset(dataset_name: str):
 
         if original_dataset_name.lower() == "longbench_v2" or dataset_path.parent.name.lower() == "longbench_v2":
             return [{"turns": [format_longbench_v2_prompt(item)]} for item in data]
+
+        if is_swe_bench_style_json(data, dataset_path, original_dataset_name):
+            return load_swe_bench_json_instances(data, dataset_path)
 
         raise ValueError(f"Unsupported JSON dataset: {dataset_path}")
 

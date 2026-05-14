@@ -13,6 +13,7 @@
   "math_find": "/data/wanghanzhen/downloads/InfiniteBench/data/math_find.jsonl",
   "number_string": "/data/wanghanzhen/downloads/InfiniteBench/data/number_string.jsonl",
   "passkey": "/data/wanghanzhen/downloads/InfiniteBench/data/passkey.jsonl",
-  "longbench_v2": "/data/wanghanzhen/datasets/LongBench_v2/data_32k_64k.json"
+  "longbench_v2": "/data/wanghanzhen/datasets/LongBench_v2/data_32k_64k.json",
+  "swe_bench_20k_50k": "/data/wanghanzhen/datasets/SWE-bench/swe_bench_20k_50k.json"
 }
  
