@@ -234,17 +234,29 @@ def flashmtp_generate(
     block_size: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
+    decode: str = "oneshot",
 ) -> SimpleNamespace:
     original_block_size = model.block_size
     model.block_size = block_size
     try:
-        output_ids = model.spec_generate(
-            target=target,
-            input_ids=input_ids,
-            max_new_tokens=max_new_tokens,
-            stop_token_ids=stop_token_ids,
-            temperature=temperature,
-        )
+        if decode == "mdlm":
+            output_ids = model.spec_generate_mdlm(
+                target=target,
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                stop_token_ids=stop_token_ids,
+                temperature=temperature,
+            )
+        elif decode == "oneshot":
+            output_ids = model.spec_generate(
+                target=target,
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                stop_token_ids=stop_token_ids,
+                temperature=temperature,
+            )
+        else:
+            raise ValueError("decode must be 'oneshot' or 'mdlm'")
     finally:
         model.block_size = original_block_size
 
@@ -287,6 +299,14 @@ def main() -> None:
         type=int,
         default=None,
         help="Override draft flashmtp_config sink_num for this run only (default: from checkpoint).",
+    )
+    parser.add_argument(
+        "--flashmtp-decode",
+        type=str,
+        choices=("oneshot", "mdlm"),
+        default="oneshot",
+        help="Draft fill strategy: oneshot = one draft forward per block; "
+        "mdlm = confidence rounds 1+2+4+8 then tail fill (more draft forwards).",
     )
     args = parser.parse_args()
 
@@ -332,15 +352,18 @@ def main() -> None:
             draft_model.config.flashmtp_config = {}
         draft_model.config.flashmtp_config["sink_num"] = eff_sink
         draft_model.sink_num = int(eff_sink)
-    if eff_sink is None:
-        raise ValueError(
-            "Checkpoint config.flashmtp_config must contain 'sink_num'. "
-            "Pass --sink-num to set it for this run."
+    elif getattr(draft_model, "sink_num", None) is None:
+        draft_model.sink_num = eff_sink
+    if eff_sink is not None:
+        logger.info(
+            f"FlashMTP draft: sink_num={draft_model.sink_num}, "
+            f"block_size={draft_model.block_size}, decode={args.flashmtp_decode}"
         )
-    logger.info(
-        f"FlashMTP draft: sink_num={draft_model.sink_num}, "
-        f"chs_len={draft_model.sink_num + 1}, block_size={draft_model.block_size}"
-    )
+    else:
+        logger.info(
+            f"FlashMTP draft: no sink_num in config, "
+            f"block_size={draft_model.block_size}, decode={args.flashmtp_decode}"
+        )
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -378,6 +401,7 @@ def main() -> None:
                 block_size=block_size,
                 stop_token_ids=[tokenizer.eos_token_id],
                 temperature=args.temperature,
+                decode=args.flashmtp_decode,
             )
             
             spec_response = response[block_size]
@@ -389,10 +413,12 @@ def main() -> None:
             )
             avg_acceptance_length = np.mean(spec_response.acceptance_lengths)
             print(f"\n[Sample {idx} | Turn {turn_index}] Response:\n{output_text}")
+            dstats = draft_model.get_last_decode_stats()
             print(
                 f"[Sample {idx} | Turn {turn_index}] Decode timing: "
                 f"baseline={response[1].time_per_output_token:.6f}s/token, "
-                f"flashmtp_total={spec_response.time_per_output_token:.6f}s/token"
+                f"flashmtp_total={spec_response.time_per_output_token:.6f}s/token "
+                f"(decode={args.flashmtp_decode}, draft_forwards={dstats.get('draft_forwards', 0)})"
             )
             print(
                 f"[Sample {idx} | Turn {turn_index}] Token stats: "

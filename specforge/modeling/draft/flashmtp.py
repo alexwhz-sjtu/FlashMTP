@@ -1,3 +1,4 @@
+import time
 from typing import Callable, List, Optional, Sequence, Union
 
 import torch
@@ -20,6 +21,9 @@ from transformers.models.qwen3.modeling_qwen3 import (
     rotate_half,
 )
 from typing_extensions import Tuple, Unpack
+
+# MDLM-style block fill: unmask counts per draft round (covers block_size-1 when sum == 15).
+MDLM_CONFIDENCE_ROUND_COUNTS: Tuple[int, ...] = (1, 2, 4, 8)
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -341,12 +345,14 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
+        self.sink_num = flashmtp_config.get("sink_num", None)
         print_on_rank0(
             "FlashMTP: num_chs_source_tokens="
             f"{self.num_chs_source_tokens} (embed+layers), "
             "CHS fusion=depth self-attn, readout=last layer slot"
         )
         self.post_init()
+        self._last_decode_stats: dict = {}
 
     def forward(
         self,
@@ -395,27 +401,135 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             )
         return self.norm(hidden_states)
 
+    def get_last_decode_stats(self) -> dict:
+        return dict(self._last_decode_stats) if self._last_decode_stats else {
+            "accept_lengths": [],
+            "total_time": 0.0,
+            "target_total_time": 0.0,
+            "draft_total_time": 0.0,
+            "draft_forwards": 0,
+            "accepted_tokens": 0,
+        }
+
+    def _forward_block_draft_logits(
+        self,
+        target: nn.Module,
+        target_hidden: torch.Tensor,
+        block_output_ids: torch.LongTensor,
+        block_position_ids_for_draft: torch.LongTensor,
+    ) -> torch.Tensor:
+        noise_embedding = target.model.embed_tokens(block_output_ids)
+        hidden = self(
+            target_hidden=target_hidden,
+            noise_embedding=noise_embedding,
+            position_ids=block_position_ids_for_draft,
+            past_key_values=None,
+            use_cache=False,
+            is_causal=False,
+        )
+        return target.lm_head(hidden[:, -self.block_size + 1 :, :])
+
+    def _confidence_and_token_for_row(
+        self, row: torch.Tensor, temperature: float
+    ) -> tuple[float, torch.Tensor]:
+        if temperature < 1e-5:
+            tok = row.argmax(dim=-1)
+            conf = row.max().item()
+            return conf, tok
+        prob = torch.softmax(row / temperature, dim=-1)
+        tok = torch.multinomial(prob, num_samples=1).squeeze(-1)
+        conf = prob.max().item()
+        return conf, tok
+
+    def _fill_block_draft_mdlm_confidence(
+        self,
+        target: nn.Module,
+        target_hidden: torch.Tensor,
+        block_output_ids: torch.LongTensor,
+        block_position_ids_for_draft: torch.LongTensor,
+        temperature: float,
+        draft_forwards: list,
+        draft_time: list,
+    ) -> None:
+        """Iterative unmask: rounds unmask 1,2,4,8 positions by highest confidence; tail fill if needed."""
+        bs = self.block_size
+        masked = {p for p in range(1, bs)}
+        for k in MDLM_CONFIDENCE_ROUND_COUNTS:
+            if not masked:
+                break
+            take = min(k, len(masked))
+            if take <= 0:
+                break
+            t0 = time.perf_counter()
+            logits = self._forward_block_draft_logits(
+                target,
+                target_hidden,
+                block_output_ids,
+                block_position_ids_for_draft,
+            )
+            draft_time[0] += time.perf_counter() - t0
+            draft_forwards[0] += 1
+
+            scored: list[tuple[float, int, torch.Tensor]] = []
+            for pos in masked:
+                li = pos - 1
+                conf, tok = self._confidence_and_token_for_row(
+                    logits[0, li], temperature
+                )
+                scored.append((conf, pos, tok))
+            scored.sort(key=lambda x: -x[0])
+            for _, pos, tok in scored[:take]:
+                block_output_ids[0, pos] = tok
+                masked.discard(pos)
+
+        if masked:
+            t0 = time.perf_counter()
+            logits = self._forward_block_draft_logits(
+                target,
+                target_hidden,
+                block_output_ids,
+                block_position_ids_for_draft,
+            )
+            draft_time[0] += time.perf_counter() - t0
+            draft_forwards[0] += 1
+            for pos in list(masked):
+                li = pos - 1
+                row = logits[0, li : li + 1]
+                new_tok = sample(row.unsqueeze(0), temperature)
+                block_output_ids[0, pos] = new_tok.view(-1)[0]
+            masked.clear()
+
     @torch.inference_mode()
-    def spec_generate(
+    def _speculative_generate_impl(
         self,
         target: nn.Module,
         input_ids: torch.LongTensor,
         max_new_tokens: int,
         stop_token_ids: list[int],
         temperature: float,
-        accept_lengths_out: Optional[List[int]] = None,
-    ):
+        accept_lengths_out: Optional[List[int]],
+        draft_decode: str,
+    ) -> torch.Tensor:
         self.eval()
         if self.mask_token_id is None:
             raise ValueError(
                 "mask_token_id is None: set config.flashmtp_config['mask_token_id'] "
                 "or config.dflashconfig['mask_token_id'] (training checkpoint)."
             )
+        if draft_decode not in ("oneshot", "mdlm"):
+            raise ValueError("draft_decode must be 'oneshot' or 'mdlm'")
+
         dev = input_ids.device
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
-
         block_size = self.block_size
+
+        accept_buf: List[int] = [] if accept_lengths_out is None else accept_lengths_out
+        target_time = 0.0
+        draft_time = 0.0
+        draft_forwards = 0
+        gen_t0 = time.perf_counter()
+
         output_ids = torch.full(
             (1, max_length + block_size),
             self.mask_token_id,
@@ -423,9 +537,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             device=dev,
         )
         position_ids = torch.arange(output_ids.shape[1], device=dev).unsqueeze(0)
-
         past_key_values_target = DynamicCache()
-        # 与训练一致：每个投机块单独一次 draft 前向，不用 KV cache（训练为整段 N*bs 单次前向）
+
+        t0 = time.perf_counter()
         output = target(
             input_ids,
             position_ids=position_ids[:, :num_input_tokens],
@@ -434,6 +548,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             logits_to_keep=1,
             output_hidden_states=True,
         )
+        target_time += time.perf_counter() - t0
 
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
@@ -447,23 +562,37 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
-            noise_embedding = target.model.embed_tokens(block_output_ids)
-            # 与 OnlineFlashMTPModel._create_position_ids 一致：块内为 [anchor, anchor+1, ...]
             block_position_ids_for_draft = position_ids[
                 :, start : start + block_size
             ]
-            draft_logits = target.lm_head(
-                self(
-                    target_hidden=target_hidden,
-                    noise_embedding=noise_embedding,
-                    position_ids=block_position_ids_for_draft,
-                    past_key_values=None,
-                    use_cache=False,
-                    is_causal=False,
-                )[:, -block_size + 1 :, :]
-            )
-            block_output_ids[:, 1:] = sample(draft_logits)
 
+            dfw = [0]
+            dtw = [0.0]
+            if draft_decode == "mdlm":
+                self._fill_block_draft_mdlm_confidence(
+                    target,
+                    target_hidden,
+                    block_output_ids,
+                    block_position_ids_for_draft,
+                    temperature,
+                    dfw,
+                    dtw,
+                )
+                draft_forwards += dfw[0]
+                draft_time += dtw[0]
+            else:
+                t0 = time.perf_counter()
+                draft_logits = self._forward_block_draft_logits(
+                    target,
+                    target_hidden,
+                    block_output_ids,
+                    block_position_ids_for_draft,
+                )
+                draft_time += time.perf_counter() - t0
+                draft_forwards += 1
+                block_output_ids[:, 1:] = sample(draft_logits, temperature)
+
+            t0 = time.perf_counter()
             output = target(
                 block_output_ids,
                 position_ids=block_position_ids,
@@ -471,6 +600,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 use_cache=True,
                 output_hidden_states=True,
             )
+            target_time += time.perf_counter() - t0
 
             posterior = sample(output.logits, temperature)
             acceptance_length = (
@@ -479,10 +609,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 .sum(dim=1)[0]
                 .item()
             )
-            # 与 DFlash/eval 一致：连续接受的 draft 位置数 + 块首 seed，记为一步的「接收长度」
             accept_len_report = int(acceptance_length) + 1
-            if accept_lengths_out is not None:
-                accept_lengths_out.append(accept_len_report)
+            accept_buf.append(accept_len_report)
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
                 :, : acceptance_length + 1
             ]
@@ -491,7 +619,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             ]
             start += acceptance_length + 1
             past_key_values_target.crop(start)
-            # 下一块的 CHS 对应新 anchor 的前一位置：即本步 target 块内最后采纳位置（与训练 context=anchor-1 对齐）
             hs_len = output.hidden_states[0].shape[1]
             last_chunk_idx = min(int(acceptance_length), hs_len - 1)
             last_chunk_idx = max(last_chunk_idx, 0)
@@ -504,12 +631,23 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 for stop_token_id in stop_token_ids
             ):
                 break
+
+        total_elapsed = time.perf_counter() - gen_t0
+        self._last_decode_stats = {
+            "accept_lengths": list(accept_buf),
+            "total_time": total_elapsed,
+            "target_total_time": target_time,
+            "draft_total_time": draft_time,
+            "draft_forwards": draft_forwards,
+            "accepted_tokens": int(sum(accept_buf)) if accept_buf else 0,
+        }
+
         output_ids = output_ids[:, :max_length]
         output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
         if stop_token_ids is not None:
-            stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
+            stop_tensor = torch.tensor(stop_token_ids, device=output_ids.device)
             stop_token_indices = torch.isin(
-                output_ids[0][num_input_tokens:], stop_token_ids
+                output_ids[0][num_input_tokens:], stop_tensor
             ).nonzero(as_tuple=True)[0]
             if stop_token_indices.numel() > 0:
                 output_ids = output_ids[
@@ -517,3 +655,45 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 ]
 
         return output_ids
+
+    @torch.inference_mode()
+    def spec_generate_mdlm(
+        self,
+        target: nn.Module,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int,
+        stop_token_ids: list[int],
+        temperature: float,
+        accept_lengths_out: Optional[List[int]] = None,
+    ):
+        """Spec decode with MDLM-style draft: 4 confidence rounds (1,2,4,8) + tail fill, then target verify."""
+        return self._speculative_generate_impl(
+            target=target,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            stop_token_ids=stop_token_ids,
+            temperature=temperature,
+            accept_lengths_out=accept_lengths_out,
+            draft_decode="mdlm",
+        )
+
+    @torch.inference_mode()
+    def spec_generate(
+        self,
+        target: nn.Module,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int,
+        stop_token_ids: list[int],
+        temperature: float,
+        accept_lengths_out: Optional[List[int]] = None,
+    ):
+        """Spec decode: single draft forward fills the whole draft tail, then target verify."""
+        return self._speculative_generate_impl(
+            target=target,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            stop_token_ids=stop_token_ids,
+            temperature=temperature,
+            accept_lengths_out=accept_lengths_out,
+            draft_decode="oneshot",
+        )
