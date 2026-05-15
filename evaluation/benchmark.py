@@ -320,6 +320,8 @@ def main() -> None:
     dist.init()
     torch.cuda.set_device(dist.local_rank())
     device = torch.device(f"cuda:{dist.local_rank()}")
+    
+    print(f"Using draft model: {args.draft_name_or_path}")
 
     def has_flash_attn():
         try:
@@ -378,7 +380,7 @@ def main() -> None:
         messages = []
         for turn_index, user_content in enumerate(instance["turns"]):
             messages.append({"role": "user", "content": user_content})
-            input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
+            input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
             input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
             print(
                 f"\n[Sample {idx} | Turn {turn_index}] Input length: "

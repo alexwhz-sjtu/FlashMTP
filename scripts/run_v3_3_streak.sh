@@ -22,11 +22,11 @@ set +u
 v33_export_common_training_env || exit $?
 v33_export_paths_for_dt || exit $?
 
-export FLASHMTP_V33_INIT_CKPT="${FLASHMTP_V33_INIT_CKPT:-/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.4/cache/models/FlashMTP_v1.4_sample_400000_think_on_qwen3_8b_maxlen4096_epochs12_nnodes4}"
+export FLASHMTP_V33_INIT_CKPT="${FLASHMTP_V33_INIT_CKPT:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP_v3.3/cache/models/flashmtp_mdlm_v33_qz_nlayers5_bs16_samples40000_think_off_maxlen4096_kl_0.0_epm6_eps6/epoch_6_step_29844}"
 
-STREAK_FROM_SCRATCH="${STREAK_FROM_SCRATCH:-1}"
+STREAK_FROM_SCRATCH="${STREAK_FROM_SCRATCH:-0}"
 STREAK_WEIGHT="${STREAK_WEIGHT:-1.0}"
-STREAK_CE_WEIGHT="${STREAK_CE_WEIGHT:-0.2}"
+STREAK_CE_WEIGHT="${STREAK_CE_WEIGHT:-0.1}"
 STREAK_INIT_ARGS=()
 if [[ "${STREAK_FROM_SCRATCH}" == "1" ]]; then
   echo "Streak: STREAK_FROM_SCRATCH=1，不加载 --init-ckpt"

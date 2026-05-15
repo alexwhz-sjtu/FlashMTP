@@ -23,7 +23,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from typing_extensions import Tuple, Unpack
 
 # MDLM-style block fill: unmask counts per draft round (covers block_size-1 when sum == 15).
-MDLM_CONFIDENCE_ROUND_COUNTS: Tuple[int, ...] = (1, 2, 4, 8)
+MDLM_CONFIDENCE_ROUND_COUNTS: Tuple[int, ...] = (1, 2, 2,2,2, 6)
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
