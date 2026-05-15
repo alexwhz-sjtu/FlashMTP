@@ -51,13 +51,13 @@ v33_export_common_training_env() {
   export NNODES NODE_RANK MASTER_ADDR MASTER_PORT
 
   # --- Epoch：MDLM / Streak 可分开设；未设则回落到 NUM_EPOCHS ---
-  NUM_EPOCHS_MDLM=12
+  NUM_EPOCHS_MDLM=6
   NUM_EPOCHS_STREAK=6
   NUM_EPOCHS="${NUM_EPOCHS:-6}"
   MAX_LENGTH="${MAX_LENGTH:-4096}"
-  DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-400000}" # 仅用于默认 jsonl / CACHE_ROOT 路径拼接
+  DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}" # 仅用于默认 jsonl / CACHE_ROOT 路径拼接
 
-  ENABLE_THINKING="${ENABLE_THINKING:-on}"         # 默认训练集路径里的 think_on / think_off
+  ENABLE_THINKING="${ENABLE_THINKING:-off}"         # 默认训练集路径里的 think_on / think_off
   NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"       # 草案 Transformer 层数
   BLOCK_SIZE="${BLOCK_SIZE:-16}"                  # 每块推测 token 数，需与推理一致
   NUM_ANCHORS="${NUM_ANCHORS:-512}"               # 每条序列最多采样的锚点块数（上限还受序列长约束）
@@ -76,7 +76,7 @@ v33_export_common_training_env() {
   MASK_RATIO_MAX="${MASK_RATIO_MAX:-1.0}"
   # KL_*：草案 logits 相对目标模型 teacher_logits 的 KL（HF 且 forward 带 logits 时才有 teacher）。
   # KL_WEIGHT=0 关闭；>0 时与 CE 加权；KL_TOPK=0 为全词表 KL，>0 时在 teacher 的 top-k 子空间上做 KL（省算力、近似蒸馏）。
-  KL_WEIGHT="${KL_WEIGHT:-0.2}"
+  KL_WEIGHT="${KL_WEIGHT:-0.0}"
   KL_TOPK="${KL_TOPK:-500}"
   SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"   # 步数；过大则几乎只有 epoch 结束才存 checkpoint
   LOG_INTERVAL="${LOG_INTERVAL:-50}"

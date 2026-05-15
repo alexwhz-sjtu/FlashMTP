@@ -57,7 +57,7 @@ NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-7}"
 # 主要数据集参数
 # ========================================
 # 数据特征参数
-DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-400000}"
+DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}"
 ENABLE_THINKING="${ENABLE_THINKING:-on}"
 
 # ========================================
