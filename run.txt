@@ -144,3 +144,10 @@ mkdir -p whz_mtp_logs && \
 export NUM_DRAFT_LAYERS=5 DATA_NUM_SAMPLES=800000 NUM_EPOCHS=8 MAX_LENGTH=4096 && \
 bash scripts/run_training_flashmtp.sh --dt qz \
   > "whz_mtp_logs/train_flashmtp_qz_dist_$(date +%Y%m%d_%H%M%S).log" 2>&1
+
+cd /inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP_v5.1 && \
+mkdir -p whz_mtp_logs && \
+export NUM_DRAFT_LAYERS=5 DATA_NUM_SAMPLES=90000 NUM_EPOCHS=8 MAX_LENGTH=4096 && \
+export TRAIN_DATA_PATH=/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/mix_codealpaca_20k_nemotron_800k_orcamath_80k/merged_900k.jsonl && \
+bash scripts/run_training_flashmtp.sh --dt qz \
+  > "whz_mtp_logs/train_flashmtp_qz_dist_$(date +%Y%m%d_%H%M%S).log" 2>&1

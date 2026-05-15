@@ -319,6 +319,8 @@ def main() -> None:
         help="Override draft flashmtp_config sink_num for this run only (default: from checkpoint).",
     )
     args = parser.parse_args()
+    
+    dataset = load_benchmark_dataset(args.dataset)
 
     random.seed(0)
     np.random.seed(0)
@@ -374,7 +376,6 @@ def main() -> None:
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-    dataset = load_benchmark_dataset(args.dataset)
     dataset = select_max_samples(dataset, args.max_samples)
 
     benchmark_start = cuda_time()
