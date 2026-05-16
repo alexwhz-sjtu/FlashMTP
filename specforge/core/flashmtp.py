@@ -18,38 +18,50 @@ except ImportError:
     BlockMask = None
     create_block_mask = None
 
+def infer_hidden_states_embedding_offset(
+    hidden_states: tuple | list, num_transformer_layers: int
+) -> int:
+    """Return index offset so that transformer layer k is at hidden_states[k + offset].
+
+    Training HF path uses ``outputs.hidden_states[1:]`` (offset 0). Inference often passes
+    the full tuple including embeddings at index 0 (offset 1).
+    """
+    lt = len(hidden_states)
+    if lt == num_transformer_layers:
+        return 0
+    if lt == num_transformer_layers + 1:
+        return 1
+    # Fallback: assume embedding prefix if tuple is longer than layer count
+    return 1 if lt > num_transformer_layers else 0
+
+
 def prepare_target_hidden(
-    hidden_states: tuple[torch.Tensor],  # (num_layers,)[(B, seq_len, H)]
+    hidden_states: tuple[torch.Tensor],  # tuple of (B, seq_len, H) per layer (+ optional embed)
     anchor_positions: torch.Tensor,  # (B, N)
     target_layer_ids: list[int],
+    num_transformer_layers: int,
 ) -> torch.Tensor:
-    """Convert full hidden states to feature-concat CHS format for FlashMTP.
+    """Gather pivot hidden states for all selected transformer layers.
 
-    Args:
-        hidden_states: All layers' hidden states from target model
-        anchor_positions: Anchor positions for each block
-        target_layer_ids: List of layer IDs to extract
+    ``target_layer_ids`` are **0-based transformer layer indices** (shallow=0, deep=L-1).
 
     Returns:
-        (B, N, H*L) - L layers concatenated along feature dim
+        (B, N, S, H) with ``S = len(target_layer_ids)``, positions ``anchor-1`` per block.
     """
-    # 获取位置 p-1 的 hidden states (用来预测位置 p)
     context_positions = (anchor_positions - 1).clamp(min=0)  # (B, N)
-
-    # 提取 anchor positions 对应的 hidden states
-    # hidden_states[layer] shape: (B, seq_len, H)
-    selected_states = []
+    off = infer_hidden_states_embedding_offset(hidden_states, num_transformer_layers)
+    pieces: list[torch.Tensor] = []
     for layer_id in target_layer_ids:
-        layer_hidden = hidden_states[layer_id]  # (B, seq_len, H)
-        # Gather: (B, N, H)
+        layer_hidden = hidden_states[layer_id + off]
         layer_selected = torch.gather(
             layer_hidden,
             dim=1,
-            index=context_positions.unsqueeze(-1).expand(-1, -1, layer_hidden.size(-1))
+            index=context_positions.unsqueeze(-1).expand(
+                -1, -1, layer_hidden.size(-1)
+            ),
         )
-        selected_states.append(layer_selected)
-
-    return torch.cat(selected_states, dim=-1)  # (B, N, H*L)
+        pieces.append(layer_selected)
+    return torch.stack(pieces, dim=2)  # (B, N, S, H)
 
 def create_flashmtp_block_mask(
     anchor_positions: torch.Tensor,
@@ -246,7 +258,7 @@ class OnlineFlashMTPModel(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: tuple,
         loss_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Parallel block-wise training forward pass."""
@@ -261,37 +273,40 @@ class OnlineFlashMTPModel(nn.Module):
                                                    block_keep_mask)
 
         # CHS uses the target hidden at anchor-1, so its RoPE position is anchor-1.
-        context_position_ids = (anchor_positions - 1).clamp(min=0)  # (bsz, n_blocks)
-
         draft_position_ids = self._create_position_ids(
             anchor_positions)  # (bsz, n_blocks * block_size)
 
-        full_position_ids = torch.cat(
-            [context_position_ids, draft_position_ids],
-            dim=-1,
-        )  # (bsz, n_blocks + n_blocks * block_size)
+        chs = self.draft_model.chs_len_per_block
+        bsz, n_blk = anchor_positions.shape
+        ctx_base = (anchor_positions - 1).clamp(min=0)
+        ctx_pos_flat = ctx_base.unsqueeze(-1).expand(bsz, n_blk, chs).reshape(
+            bsz, n_blk * chs
+        )
+        full_rotary_position_ids = torch.cat(
+            [ctx_pos_flat, draft_position_ids], dim=-1
+        )
 
         flashmtp_attn_mask = create_flashmtp_block_mask(
             anchor_positions=anchor_positions,
             block_keep_mask=block_keep_mask,
-            chs_len_per_block=1,
+            chs_len_per_block=chs,
             block_size=self.block_size,
             device=device,
         )
 
-        # only use the hidden states from the target model at anchor positions (CHS) as input to the draft model
         target_hidden = prepare_target_hidden(
-            hidden_states, anchor_positions, self.draft_model.target_layer_ids)
-
-        # print(f"target_hidden shape after prepare: {target_hidden.shape}")
-        # print(f"full_position_ids shape: {full_position_ids.shape}")
-        # print(f"noise_embedding shape: {noise_embedding.shape}")
+            hidden_states,
+            anchor_positions,
+            self.draft_model.target_layer_ids,
+            self.draft_model.config.num_target_layers,
+        )
 
         output_hidden = self.draft_model(
-            position_ids=full_position_ids,
+            position_ids=draft_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=target_hidden,
             attention_mask=flashmtp_attn_mask,
+            rotary_position_ids=full_rotary_position_ids,
         )
 
         logits = self.lm_head(output_hidden)

@@ -74,6 +74,19 @@ def parse_args():
         help="Number of anchor positions per sequence",
     )
     model_group.add_argument(
+        "--pivot-fuse-mode",
+        type=str,
+        default="linear_fuse",
+        choices=["linear_fuse", "attention_fuse", "prefix_condition"],
+        help="How to fuse multi-layer teacher pivots (v1.1 ablation).",
+    )
+    model_group.add_argument(
+        "--num-middle-layers-n",
+        type=int,
+        default=0,
+        help="Middle teacher layers between first and last (total selected = 2 + N).",
+    )
+    model_group.add_argument(
         "--loss-decay-gamma",
         type=float,
         default=None,
@@ -173,6 +186,8 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         draft_config.flashmtp_config = {}
         
     draft_config.flashmtp_config["chs_concat_mode"] = "feature"
+    draft_config.flashmtp_config["pivot_fuse_mode"] = args.pivot_fuse_mode
+    draft_config.flashmtp_config["num_middle_layers_n"] = args.num_middle_layers_n
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
@@ -401,6 +416,8 @@ def main():
     draft_model.config.flashmtp_config["chs_concat_mode"] = "feature"
     draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
     draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
+    draft_model.config.flashmtp_config["pivot_fuse_mode"] = draft_model.pivot_fuse_mode
+    draft_model.config.flashmtp_config["num_middle_layers_n"] = draft_model.num_middle_layers_n
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)

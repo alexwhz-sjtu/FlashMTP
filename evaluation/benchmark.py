@@ -286,7 +286,7 @@ def main() -> None:
         "--sink-num",
         type=int,
         default=None,
-        help="Override draft flashmtp_config sink_num for this run only (default: from checkpoint).",
+        help="Optional legacy override; ignored if checkpoint has no sink_num.",
     )
     args = parser.parse_args()
 
@@ -325,21 +325,24 @@ def main() -> None:
     ).to(device).eval()
 
     fcfg = getattr(draft_model.config, "flashmtp_config", None) or {}
-    eff_sink = fcfg.get("sink_num")
-    if args.sink_num is not None:
+    if args.sink_num is not None and fcfg.get("sink_num") is not None:
         eff_sink = args.sink_num
         if draft_model.config.flashmtp_config is None:
             draft_model.config.flashmtp_config = {}
         draft_model.config.flashmtp_config["sink_num"] = eff_sink
-        draft_model.sink_num = int(eff_sink)
-    if eff_sink is None:
-        raise ValueError(
-            "Checkpoint config.flashmtp_config must contain 'sink_num'. "
-            "Pass --sink-num to set it for this run."
+        if hasattr(draft_model, "sink_num"):
+            draft_model.sink_num = int(eff_sink)
+        logger.info(f"Overriding sink_num={eff_sink} (legacy)")
+    if fcfg.get("sink_num") is not None and hasattr(draft_model, "sink_num"):
+        logger.info(
+            f"FlashMTP draft (legacy): sink_num={draft_model.sink_num}, "
+            f"block_size={draft_model.block_size}"
         )
     logger.info(
-        f"FlashMTP draft: sink_num={draft_model.sink_num}, "
-        f"chs_len={draft_model.sink_num + 1}, block_size={draft_model.block_size}"
+        f"FlashMTP draft: pivot_fuse_mode={getattr(draft_model, 'pivot_fuse_mode', fcfg.get('pivot_fuse_mode'))}, "
+        f"num_middle_layers_n={fcfg.get('num_middle_layers_n', 'n/a')}, "
+        f"target_layer_ids={getattr(draft_model, 'target_layer_ids', None)}, "
+        f"block_size={draft_model.block_size}"
     )
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
 

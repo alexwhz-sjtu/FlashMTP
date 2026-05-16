@@ -33,32 +33,6 @@ MDLM 的训练本质上是一个多尺度的填空任务。
 
 - 预测与损失：将掩码序列输入模型，要求模型预测所有被掩码位置的原始 Token。损失函数：通常采用交叉熵损失（Cross-Entropy Loss）。
 
-### 连续扩散语言模型 LangFlow
----
-嵌入空间扩散：将 Token 映射到连续的嵌入空间（Embedding Space）进行扩散 。这种方法能避免维度灾难，且更易于进行编辑和少步生成 。
-
-### 基本原理：
-
-1. 嵌入空间扩散 (Embedding-space Diffusion)：LangFlow 在连续向量空间进行加噪：$$z_t = (1 - \sigma_t) x_0 + \sigma_t \epsilon$$ 
-$x_0$：原始文本的嵌入向量（Embedding）。     
-$\epsilon$：高斯噪声 $\mathcal{N}(0, I)$。  
-$\sigma_t$：噪声水平（由噪声调度器控制）。它描述了如何将干净的词向量逐渐变模糊直到变成纯噪声的轨迹。
-
-2. 基于 Bregman 散度的流匹配   
-文章证明了在连续流模型中使用交叉熵（Cross-Entropy）的合法性。模型不再试图恢复具体的向量数值，而是通过当前带有噪声的向量 $z_t$，预测 Token 分布：$$\mathcal{L} = \mathbb{E}_{t, x_0, \epsilon} [ -\log p_\theta(x_0 \mid z_t) ]$$
-
-3. 信息均匀调度器 (Information-uniform Scheduler)：  
-作者认为文本在不同噪声水平下携带的信息量是不均匀的。调度器应该根据 对数信噪比（log-SNR） $\gamma$ 来设计。作者的目标是让时间步 $t$ 与模型能够还原的信息量（由互信息或交叉熵衡量）成线性关系。  
-Gumbel 调度器：作者发现信息增益的分布呈现出一种类似“先慢后快再慢”的特征，这与 Gumbel 分布 的累积分布函数（CDF）高度吻合。噪声水平 $\sigma_t$ 不再是简单的线性函数，而是通过一个受 Gumbel 分布启发的函数来计算：$$\gamma(t) = \text{Gumbel\_CDF}(t; \mu, \beta)$$其中 $\mu$ 和 $\beta$ 是可学习的参数。
-
-### 训练与采样流程   
-1. 准备阶段特征提取：  
-首先通过一个预训练的嵌入层（或随机初始化后随模型训练）将输入的 Token 序列映射为连续向量 $\mathbf{X} \in \mathbb{R}^{L \times D}$。  
-噪声采样：为每个 batch 随机采样一个时间步 $t \in [0, 1]$，并根据调度器计算对应的噪声强度 $\sigma_t$。  
-2. 构造扰动输入加噪：根据公式 $z_t = (1-\sigma_t)x_0 + \sigma_t\epsilon$ 混合原始嵌入和高斯噪声。   
-  **Self-Conditioning**（关键细节）：在 50% 的训练迭代中，模型先进行一次前向传播得到预测值 $\hat{x}_0$。然后将 $\hat{x}_0$ 重新喂给模型作为额外的条件输入（Conditioning）。作用：这能极大地提升模型在生成时的稳定性和连贯性，是连续扩散模型追平自回归模型的“秘籍”。  
-3. 模型前向计算将扰动后的序列 $z_t$（以及可选的 self-conditioning 信息）输入 Transformer 编码器。模型输出每个位置在词表上的概率分布 $P(\mathbf{V} \mid z_t)$。  
-4. 损失计算与优化目标函数：直接计算预测分布与真实 Token 之间的 Cross-Entropy Loss。梯度更新：使用 AdamW 等优化器。由于是全并行计算，训练效率远高于自回归模型。
 
 ### 相关工作：扩散投机解码 DFlash
 DFlash也利用了大模型的hs，但是他保留了kvcache。它间隔的选取了五层大模型的hs，再沿着特征维度拼接，用fc层降维，他的kvcache就是每个token位置对应的大模型的融合hs。推理时，他把所有位置融合hs注入到每层充当kvcache，拼接B个mask，一次前向预测B个token。

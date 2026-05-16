@@ -13,6 +13,6 @@
     "math_find": "/data/wanghanzhen/downloads/InfiniteBench/data/math_find.jsonl",
     "number_string": "/data/wanghanzhen/downloads/InfiniteBench/data/number_string.jsonl",
     "passkey": "/data/wanghanzhen/downloads/InfiniteBench/data/passkey.jsonl",
-    "longbench_v2": "/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/datasets/longbench_v2/data_20k_40k.json"
+    "longbench_v2": "/data/wanghanzhen/datasets/LongBench_v2/data_20k_40k.json"
   }
    

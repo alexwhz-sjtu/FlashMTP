@@ -11,7 +11,7 @@ class TrackerArgs:
     wandb_project: str = None
     wandb_name: str = None
     wandb_key: str = None
-    wandb_run_id: str = None  # 用于恢复训练
+    wandb_run_id: str = None  # 固定 run id：首次创建，已有则续写（wandb resume=allow）
     swanlab_project: str = None
     swanlab_name: str = None
     swanlab_key: str = None
@@ -34,7 +34,12 @@ class TrackerArgs:
         parser.add_argument("--wandb-project", type=str, default=None)
         parser.add_argument("--wandb-name", type=str, default=None)
         parser.add_argument("--wandb-key", type=str, default=None, help="W&B API key.")
-        parser.add_argument("--wandb-run-id", type=str, default=None, help="W&B run ID for resuming training.")
+        parser.add_argument(
+            "--wandb-run-id",
+            type=str,
+            default=None,
+            help="Fixed W&B run id: resume logging if that run exists, otherwise start a new run (resume=allow).",
+        )
         # swanlab-specific args
         parser.add_argument(
             "--swanlab-project",
