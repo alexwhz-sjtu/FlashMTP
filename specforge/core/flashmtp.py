@@ -386,10 +386,11 @@ class OnlineFlashMTPModel(nn.Module):
             for k in range(self.block_size):
                 pref_ok = pref_ok & match_bn[:, :, k]
                 prefix_len = prefix_len + pref_ok.float()
+            vb = block_keep_mask.float()
             den = vb.sum()
             prefix_acc = torch.where(
                 den > 0,
-                (prefix_len / float(self.block_size) * vb).sum() / den,
+                (prefix_len * vb).sum() / den,
                 torch.zeros((), device=device, dtype=torch.float32),
             )
 
