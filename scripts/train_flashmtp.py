@@ -152,6 +152,25 @@ def parse_args():
     return parser.parse_args()
 
 
+def _sync_config_layer_types_to_draft_depth(draft_config) -> None:
+    """Make ``layer_types`` length match ``num_hidden_layers`` for saved config / attention metadata."""
+    if not hasattr(draft_config, "num_hidden_layers") or draft_config.num_hidden_layers is None:
+        return
+    n = int(draft_config.num_hidden_layers)
+    lt = getattr(draft_config, "layer_types", None)
+    if lt is None:
+        draft_config.layer_types = ["full_attention"] * n
+        return
+    lt = list(lt)
+    if len(lt) == n:
+        return
+    if len(lt) > n:
+        draft_config.layer_types = lt[:n]
+    else:
+        fill = lt[-1] if lt else "full_attention"
+        draft_config.layer_types = lt + [fill] * (n - len(lt))
+
+
 def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     """Build target model (backend wrapper) and draft model."""
     print_on_rank0(
@@ -191,6 +210,8 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
+
+    _sync_config_layer_types_to_draft_depth(draft_config)
 
     draft_model = FlashMTPDraftModel(draft_config).cuda().to(torch.bfloat16)
 
