@@ -201,3 +201,6 @@ wandb/
 .DS_Store
 
 log.txt
+
+# Local scratch notebook (repo: scripts/train.ipynb)
+scripts/train.ipynb

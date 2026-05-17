@@ -260,7 +260,7 @@ class OnlineFlashMTPModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: tuple,
         loss_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Parallel block-wise training forward pass."""
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -367,4 +367,30 @@ class OnlineFlashMTPModel(nn.Module):
             actual_token_count = binary_eval_mask.sum() + 1e-6
             accuracy = correct.sum().float() / actual_token_count
 
-        return loss, accuracy
+            # --- prefix_acc: mean over valid blocks of (prefix_len / block_size) ---
+            # prefix_len = longest consecutive match from block position 0 (anchor) forward
+            pred_bn = pred_ids.view(bsz, anchor_positions.size(1), self.block_size)
+            tgt_bn = target_ids
+            eval_for_prefix = (
+                block_keep_mask.unsqueeze(-1).float()
+                * valid_label_mask.float()
+                * original_loss_mask_gathered.float()
+            )
+            match_bn = (pred_bn == tgt_bn) & (eval_for_prefix > 0.5)
+            pref_ok = torch.ones(
+                bsz, anchor_positions.size(1), dtype=torch.bool, device=device
+            )
+            prefix_len = torch.zeros(
+                bsz, anchor_positions.size(1), device=device, dtype=torch.float32
+            )
+            for k in range(self.block_size):
+                pref_ok = pref_ok & match_bn[:, :, k]
+                prefix_len = prefix_len + pref_ok.float()
+            den = vb.sum()
+            prefix_acc = torch.where(
+                den > 0,
+                (prefix_len / float(self.block_size) * vb).sum() / den,
+                torch.zeros((), device=device, dtype=torch.float32),
+            )
+
+        return loss, accuracy, prefix_acc

@@ -345,6 +345,7 @@ def record_metrics(
     optimizer,
     train_dataloader=None,
     mode: str = "train",
+    prefix_acc: float | None = None,
 ) -> None:
     logdict = {}
 
@@ -353,9 +354,14 @@ def record_metrics(
 
     logdict[f"{mode}/loss"] = loss
     logdict[f"{mode}/accuracy"] = accuracy
+    if prefix_acc is not None:
+        logdict[f"{mode}/prefix_acc"] = prefix_acc
 
+    extra = ""
+    if prefix_acc is not None:
+        extra = f", PrefixAcc: {prefix_acc:.4f}"
     print_on_rank0(
-        f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}"
+        f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}{extra}"
     )
 
     tracker.log(logdict, step=global_step)
@@ -533,7 +539,7 @@ def main():
             hidden_states = tuple(h.cuda() for h in target_output.hidden_states)
             # hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 
-            loss, accuracy = flashmtp_model(
+            loss, accuracy, prefix_acc = flashmtp_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
@@ -547,10 +553,13 @@ def main():
             if global_step % args.log_interval == 0:
                 loss_log = loss.clone()
                 acc_log = accuracy.clone()
+                pfx_log = prefix_acc.clone()
                 dist.all_reduce(loss_log)
                 dist.all_reduce(acc_log)
+                dist.all_reduce(pfx_log)
                 loss_log = loss_log / dist.get_world_size()
                 acc_log = acc_log / dist.get_world_size()
+                pfx_log = pfx_log / dist.get_world_size()
 
                 record_metrics(
                     args,
@@ -561,6 +570,7 @@ def main():
                     optimizer,
                     train_dataloader,
                     mode="train",
+                    prefix_acc=pfx_log.item(),
                 )
 
             if dist.get_rank() == 0:
@@ -570,6 +580,7 @@ def main():
                     {
                         "loss": f"{loss.item():.4f}",
                         "acc": f"{accuracy.item():.4f}",
+                        "pfx": f"{prefix_acc.item():.4f}",
                         "iter_time": f"{elapsed:.2f}s",
                     }
                 )
