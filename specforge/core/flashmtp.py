@@ -367,31 +367,27 @@ class OnlineFlashMTPModel(nn.Module):
             actual_token_count = binary_eval_mask.sum() + 1e-6
             accuracy = correct.sum().float() / actual_token_count
 
-            # --- prefix_acc: mean over valid blocks of (prefix_len / block_size) ---
-            # prefix_len = longest consecutive match from block position 0 (anchor) forward
-            pred_bn = pred_ids.view(bsz, anchor_positions.size(1), self.block_size)
-            tgt_bn = target_ids
-            eval_for_prefix = (
-                block_keep_mask.unsqueeze(-1).float()
-                * valid_label_mask.float()
-                * original_loss_mask_gathered.float()
+            # --- prefix metric (aligned with FlashMTP_exp): mean per-block acceptance length ---
+            # cumprod only on in-block indices 1: (exclude anchor); +1.0; average over blocks
+            # that are kept and have at least one valid speculative position.
+            pred_ids_by_block = logits.argmax(dim=-1).view(
+                bsz, anchor_positions.size(1), self.block_size
             )
-            match_bn = (pred_bn == tgt_bn) & (eval_for_prefix > 0.5)
-            pref_ok = torch.ones(
-                bsz, anchor_positions.size(1), dtype=torch.bool, device=device
+            correct_by_block = pred_ids_by_block == target_ids
+            valid_by_block = binary_eval_mask.view(
+                bsz, anchor_positions.size(1), self.block_size
+            ) > 0.5
+            prefix_correct = (
+                correct_by_block[:, :, 1:] & valid_by_block[:, :, 1:]
+            ).cumprod(dim=-1)
+            prefix_lengths = prefix_correct.sum(dim=-1).float() + 1.0
+            valid_blocks = block_keep_mask & valid_by_block[:, :, 1:].any(dim=-1)
+            prefix_count = valid_blocks.sum().float()
+            prefix_sum = (
+                prefix_lengths[valid_blocks].sum()
+                if valid_blocks.any()
+                else torch.zeros((), device=device, dtype=torch.float32)
             )
-            prefix_len = torch.zeros(
-                bsz, anchor_positions.size(1), device=device, dtype=torch.float32
-            )
-            for k in range(self.block_size):
-                pref_ok = pref_ok & match_bn[:, :, k]
-                prefix_len = prefix_len + pref_ok.float()
-            vb = block_keep_mask.float()
-            den = vb.sum()
-            prefix_acc = torch.where(
-                den > 0,
-                (prefix_len * vb).sum() / den,
-                torch.zeros((), device=device, dtype=torch.float32),
-            )
+            prefix_acc = prefix_sum / prefix_count.clamp(min=1.0)
 
         return loss, accuracy, prefix_acc
