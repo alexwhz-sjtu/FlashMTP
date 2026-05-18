@@ -204,4 +204,5 @@ log.txt
 
 # Local scratch notebook (repo: scripts/train.ipynb)
 scripts/train.ipynb
+evaluation/run_cmd.ipynb
 wandb_sync_daemon.py
