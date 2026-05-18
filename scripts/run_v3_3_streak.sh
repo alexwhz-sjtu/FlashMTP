@@ -22,9 +22,9 @@ set +u
 v33_export_common_training_env || exit $?
 v33_export_paths_for_dt || exit $?
 
-export FLASHMTP_V33_INIT_CKPT="${FLASHMTP_V33_INIT_CKPT:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP_v3.3/cache/models/flashmtp_mdlm_v33_qz_nlayers5_bs16_samples40000_think_off_maxlen4096_kl_0.0_epm6_eps6/epoch_6_step_29844}"
+export FLASHMTP_V33_INIT_CKPT="${FLASHMTP_V33_INIT_CKPT:-}"
 
-STREAK_FROM_SCRATCH="${STREAK_FROM_SCRATCH:-0}"
+STREAK_FROM_SCRATCH="${STREAK_FROM_SCRATCH:-1}"
 STREAK_WEIGHT="${STREAK_WEIGHT:-1.0}"
 STREAK_CE_WEIGHT="${STREAK_CE_WEIGHT:-0.1}"
 STREAK_INIT_ARGS=()

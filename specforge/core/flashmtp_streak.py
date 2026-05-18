@@ -20,7 +20,8 @@ class FlashMTPStreakModel(nn.Module):
     """块首为真实 token 嵌入、块内其余为 [MASK]。
 
     Streak 项使用 Log-Smoothed Relative Streak Loss：用教师 target 概率给每个位置设锚点，
-    再在相对概率上做 streak 累乘。CE_aux 是逐位置平均 CE，不做位置/置信度调权。
+    再在相对概率上做 streak 累乘。当学生对真标签的概率已超过锚点 T=max(0.5,p_teacher) 时，
+    对 streak 项 ∂loss/∂lp 为 0（不再通过 log_phi 回传）。CE_aux 若开启仍可对该位置施梯度。
     """
 
     def __init__(
@@ -227,15 +228,13 @@ class FlashMTPStreakModel(nn.Module):
             torch.full_like(teacher_p, 0.5), teacher_p
         ).clamp_min(1e-12)
 
-        # LS-RSL: rho=q/T; phi(rho)=rho when rho<1, else 1+log(rho).
-        # Work in log-space for stable prefix products.
+        # LS-RSL: log_rho = log(q/T), T = max(0.5, p_teacher(y*)).
+        # log_rho <= 0: log_phi = log_rho（对 lp 梯度为 1）。
+        # log_rho > 0: 前向仍用 log1p 平滑值，但 detach，使 streak 对 lp 梯度为 0（更激进）。
         log_rho = lp - target_anchor.log()
         high_conf_alpha = 0.5
-        log_phi = torch.where(
-            log_rho < 0,
-            log_rho,
-            torch.log1p(high_conf_alpha * log_rho.clamp_min(0.0)),
-        )
+        pos_value = torch.log1p(high_conf_alpha * log_rho.clamp_min(0.0))
+        log_phi = torch.where(log_rho <= 0, log_rho, pos_value.detach())
 
         lp_tail = log_phi[..., 1:]
         valid_tail = valid_pos[..., 1:]

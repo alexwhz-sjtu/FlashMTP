@@ -23,8 +23,8 @@ v33_parse_cli() {
   if [[ "$seen_dt" -eq 0 ]]; then
     DT="${DT:-a800}"
   fi
-  if [[ "$DT" != "qz" && "$DT" != "a800" ]]; then
-    echo "错误: --dt 须为 qz 或 a800" >&2
+  if [[ "$DT" != "qz" && "$DT" != "a800" && "$DT" != "h100" ]]; then
+    echo "错误: --dt 须为 qz 或 a800 或 h100" >&2
     return 1
   fi
   export DT
@@ -52,8 +52,8 @@ v33_export_common_training_env() {
 
   # --- Epoch：MDLM / Streak 可分开设；未设则回落到 NUM_EPOCHS ---
   NUM_EPOCHS_MDLM=6
-  NUM_EPOCHS_STREAK=6
-  NUM_EPOCHS="${NUM_EPOCHS:-6}"
+  NUM_EPOCHS_STREAK=12
+  NUM_EPOCHS="${NUM_EPOCHS:-12}"
   MAX_LENGTH="${MAX_LENGTH:-4096}"
   DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}" # 仅用于默认 jsonl / CACHE_ROOT 路径拼接
 
@@ -66,7 +66,7 @@ v33_export_common_training_env() {
   ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
   TP_SIZE="${TP_SIZE:-1}"                         # 目标模型张量并行（HF 后端时用）
   DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
-  CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}" # 与预处理 / loss_mask 规则一致
+  CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen}" # 与预处理 / loss_mask 规则一致
   REPORT_TO="${REPORT_TO:-wandb}"                 # none | wandb 等，见 specforge.tracker
 
   # --- MDLM 阶段专用（仅 train_flashmtp_mdlm.py）---
@@ -103,6 +103,11 @@ v33_export_paths_for_dt() {
     export WANDB_MODE="${WANDB_MODE:-offline}"
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
+    CACHE_ROOT="${CACHE_ROOT:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
+  elif [ "$DT" = "h100" ]; then
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-../training_data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v3.3_h100_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
     CACHE_ROOT="${CACHE_ROOT:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
   else
     export DATA_NUM_SAMPLES=40000
@@ -158,7 +163,7 @@ v33_wandb_defaults() {
   if [ "${REPORT_TO}" != "wandb" ]; then
     return 0
   fi
-  export WANDB_PROJECT="${WANDB_PROJECT:-flashmtp_v3.3}"
+  export WANDB_PROJECT="${WANDB_PROJECT:-flashmtp_training_exp}"
   export WANDB_DIR="${WANDB_DIR:-./wandb}"
   local _time_tag="${WANDB_RUN_TIME_TAG:-$(date +%Y%m%d_%H%M%S)}"
   export WANDB_RUN_TIME_TAG="$_time_tag"
