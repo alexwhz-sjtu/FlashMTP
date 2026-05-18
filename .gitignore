@@ -203,3 +203,5 @@ wandb/
 log.txt
 
 whz_mtp_logs/
+log/
+evaluation/run_cmd.ipynb

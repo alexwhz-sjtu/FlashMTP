@@ -180,7 +180,7 @@ class OnlineFlashMTPModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
@@ -274,4 +274,26 @@ class OnlineFlashMTPModel(nn.Module):
             actual_token_count = binary_eval_mask.sum() + 1e-6
             accuracy = correct.sum().float() / actual_token_count
 
-        return loss, accuracy
+            # Mean per-block max matching prefix length (positions 1..block_size-1 vs anchor).
+            # Aligned with FlashMTP_exp/specforge/core/flashmtp.py (prefix_length there).
+            pred_ids_by_block = logits.argmax(dim=-1).view(
+                bsz, anchor_positions.size(1), self.block_size
+            )
+            correct_by_block = pred_ids_by_block == target_ids
+            valid_by_block = binary_eval_mask.view(
+                bsz, anchor_positions.size(1), self.block_size
+            ) > 0.5
+            prefix_correct = (
+                correct_by_block[:, :, 1:] & valid_by_block[:, :, 1:]
+            ).cumprod(dim=-1)
+            prefix_lengths = prefix_correct.sum(dim=-1).float() + 1.0
+            valid_blocks = block_keep_mask & valid_by_block[:, :, 1:].any(dim=-1)
+            prefix_count = valid_blocks.sum().float()
+            prefix_sum = (
+                prefix_lengths[valid_blocks].sum()
+                if valid_blocks.any()
+                else torch.zeros((), device=device, dtype=torch.float32)
+            )
+            prefix_acc = prefix_sum / prefix_count.clamp(min=1.0)
+
+        return loss, accuracy, prefix_acc
