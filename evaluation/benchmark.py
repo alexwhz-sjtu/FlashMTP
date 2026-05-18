@@ -384,6 +384,8 @@ def main() -> None:
     for idx in tqdm(indices, disable=not dist.is_main()):
         instance = dataset[idx]
         messages = []
+        if idx==29 and args.dataset=='aime25':
+                continue
         for turn_index, user_content in enumerate(instance["turns"]):
             messages.append({"role": "user", "content": user_content})
             input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
