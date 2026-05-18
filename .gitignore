@@ -193,6 +193,7 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 outputs/
+log/
 wandb/
 .idea
 .vscode/
