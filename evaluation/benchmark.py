@@ -376,6 +376,9 @@ def main() -> None:
     responses = []
     indices = range(dist.rank(), len(dataset), dist.size())
     for idx in tqdm(indices, disable=not dist.is_main()):
+        # for alpaca dataset, num 50 exclude sample 8 due to repetition
+        if args.dataset == "alpaca" and idx == 8:
+            continue
         instance = dataset[idx]
         messages = []
         for turn_index, user_content in enumerate(instance["turns"]):
