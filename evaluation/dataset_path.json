@@ -14,6 +14,6 @@
   "number_string": "/data/wanghanzhen/downloads/InfiniteBench/data/number_string.jsonl",
   "passkey": "/data/wanghanzhen/downloads/InfiniteBench/data/passkey.jsonl",
   "longbench_v2": "/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/datasets/longbench_v2/data_20k_40k.json",
-  "swe_bench_20k_50k": "/data/wanghanzhen/datasets/SWE-bench/swe_bench_20k_50k.json"
+  "swe_bench_20k_50k": "/data/wanghanzhen/datasets/SWE-bench_bm25_40K/swe_bench_64k_96k.jsonl"
 }
  

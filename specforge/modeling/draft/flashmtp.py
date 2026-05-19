@@ -372,38 +372,54 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         max_new_tokens: int,
         stop_token_ids: list[int],
         temperature: float,
+        target_block_size: Optional[int] = None,
     ):
         self.eval()
+        batch_size = int(input_ids.shape[0])
+        if batch_size > 1 and temperature >= 1e-5:
+            print_on_rank0(
+                "FlashMTP spec_generate: batch_size>1 with temperature>0 may desynchronize "
+                "rows; use temperature=0 for identical replicated throughput runs."
+            )
         self._last_decode_stats = {
             "accept_lengths": [],
             "target_prefill_time": 0.0,
             "target_decode_time": 0.0,
             "target_total_time": 0.0,
             "draft_total_time": 0.0,
+            "draft_model_time": 0.0,
+            "target_embed_lm_decode_time": 0.0,
+            "target_verify_decode_time": 0.0,
             "total_time": 0.0,
             "steps": 0,
             "chs_len": self.sink_num + 1,
             "sink_num": self.sink_num,
             "context_tokens": self.sink_num + 1,
+            "batch_size": batch_size,
+            "target_block_size": target_block_size,
         }
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
 
         block_size = self.block_size
+        if target_block_size is not None and target_block_size < 1:
+            raise ValueError("target_block_size must be >= 1 when set")
         self._last_decode_stats["accepted_tokens"] = 0
+        dev = input_ids.device
         output_ids = torch.full(
-            (1, max_length + block_size),
+            (batch_size, max_length + block_size),
             self.mask_token_id,
             dtype=torch.long,
             device=target.device,
         )
         position_ids = torch.arange(
-            output_ids.shape[1], device=target.device
-        ).unsqueeze(0)
+            output_ids.shape[1], device=target.device, dtype=torch.long
+        ).unsqueeze(0).expand(batch_size, -1)
 
         past_key_values_target = DynamicCache()
 
-        # Prefill stage
+        # Prefill stage (target only)
+        t_pf0 = cuda_time(target.device)
         output = target(
             input_ids,
             position_ids=position_ids[:, :num_input_tokens],
@@ -412,16 +428,16 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             logits_to_keep=1,
             output_hidden_states=True,
         )
+        self._last_decode_stats["target_prefill_time"] = cuda_time(target.device) - t_pf0
 
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
             output.logits, temperature
         )
-        dev = input_ids.device
         smax = max(num_input_tokens - 1, 0)
         sink_seq = torch.arange(self.sink_num, device=dev, dtype=torch.long).clamp(max=smax)
         pivot_seq = torch.tensor([smax], device=dev, dtype=torch.long)
-        chs_gather = torch.cat([sink_seq, pivot_seq]).unsqueeze(0)
+        chs_gather = torch.cat([sink_seq, pivot_seq]).unsqueeze(0).expand(batch_size, -1)
         target_hidden = extract_context_features_at_positions(
             output.hidden_states,
             self.target_layer_ids,
@@ -430,7 +446,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         sink_hidden = target_hidden[:, : self.sink_num, :]
         pivot_hidden = target_hidden[:, self.sink_num :, :]
         context_position_ids = build_chs_rope_position_ids(
-            1, 1, self.sink_num, dev, torch.long
+            batch_size, 1, self.sink_num, dev, torch.long
         )
 
         # Decode stage
@@ -438,17 +454,20 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         decode_start = cuda_time(target.device)
         while start < max_length:
             step_start = start
-            current_block_size = min(block_size, max_length - start)
-            block_output_ids = output_ids[
-                :, start : start + current_block_size
-            ].clone()
-            verify_size = current_block_size
-            if current_block_size > 1:
+            draft_len = min(block_size, max_length - start)
+            verify_size = draft_len
+            if target_block_size is not None:
+                verify_size = min(draft_len, int(target_block_size))
+            block_output_ids = output_ids[:, start : start + draft_len].clone()
+            if draft_len > 1:
+                t_emb0 = cuda_time(target.device)
                 noise_embedding = target.model.embed_tokens(block_output_ids)
+                t_emb1 = cuda_time(target.device)
                 draft_rope_pos = build_draft_rope_position_ids(
-                    1, 1, current_block_size, self.sink_num, dev, torch.long
+                    batch_size, 1, draft_len, self.sink_num, dev, torch.long
                 )
                 target_hidden = torch.cat([sink_hidden, pivot_hidden], dim=1)
+                t_df0 = cuda_time(target.device)
                 draft_hidden = self(
                     target_hidden=target_hidden,
                     context_position_ids=context_position_ids,
@@ -458,11 +477,18 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                     use_cache=False,
                     is_causal=False,
                 )
-                draft_logits = target.lm_head(draft_hidden[:, 1:verify_size, :])
-                block_output_ids[:, 1:verify_size] = sample(draft_logits)
+                t_df1 = cuda_time(target.device)
+                draft_logits = target.lm_head(draft_hidden[:, 1:draft_len, :])
+                block_output_ids[:, 1:draft_len] = sample(draft_logits)
+                t_lm1 = cuda_time(target.device)
+                self._last_decode_stats["target_embed_lm_decode_time"] += (
+                    (t_emb1 - t_emb0) + (t_lm1 - t_df1)
+                )
+                self._last_decode_stats["draft_model_time"] += t_df1 - t_df0
 
             verify_output_ids = block_output_ids[:, :verify_size]
             verify_position_ids = position_ids[:, start : start + verify_size]
+            t_v0 = cuda_time(target.device)
             output = target(
                 verify_output_ids,
                 position_ids=verify_position_ids,
@@ -470,15 +496,18 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 use_cache=True,
                 output_hidden_states=True,
             )
+            self._last_decode_stats["target_verify_decode_time"] += (
+                cuda_time(target.device) - t_v0
+            )
 
             posterior = sample(output.logits, temperature)
             if verify_size > 1:
-                acceptance_length = (
+                acceptance_lengths = (
                     (verify_output_ids[:, 1:] == posterior[:, :-1])
                     .cumprod(dim=1)
-                    .sum(dim=1)[0]
-                    .item()
+                    .sum(dim=1)
                 )
+                acceptance_length = int(acceptance_lengths[0].item())
             else:
                 acceptance_length = 0
             output_ids[:, start : start + acceptance_length + 1] = verify_output_ids[
@@ -488,10 +517,17 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 :, acceptance_length
             ]
             start += acceptance_length + 1
-            self._last_decode_stats["accepted_tokens"] += acceptance_length + 1
+            self._last_decode_stats["accepted_tokens"] += batch_size * (
+                acceptance_length + 1
+            )
             past_key_values_target.crop(start)
 
-            pivot_rel = torch.tensor([[acceptance_length]], device=dev, dtype=torch.long)
+            pivot_rel = torch.full(
+                (batch_size, 1),
+                acceptance_length,
+                device=dev,
+                dtype=torch.long,
+            )
             pivot_hidden = extract_context_features_at_positions(
                 output.hidden_states,
                 self.target_layer_ids,
@@ -500,23 +536,28 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
 
             self._last_decode_stats["accept_lengths"].append(acceptance_length + 1)
             self._last_decode_stats["steps"] += 1
-            if stop_token_ids is not None and any(
-                stop_token_id in output_ids[:, step_start:start]
-                for stop_token_id in stop_token_ids
-            ):
-                break
+            if stop_token_ids is not None:
+                st_t = torch.tensor(stop_token_ids, device=output_ids.device)
+                span = output_ids[:, step_start:start]
+                if torch.isin(span, st_t).any():
+                    break
 
         decode_time = cuda_time(target.device) - decode_start
         self._last_decode_stats["target_decode_time"] = decode_time
-        self._last_decode_stats["target_total_time"] = decode_time
+        draft_m = float(self._last_decode_stats.get("draft_model_time", 0.0))
+        self._last_decode_stats["draft_total_time"] = draft_m
+        t_pf = float(self._last_decode_stats.get("target_prefill_time", 0.0))
+        t_emb_lm = float(self._last_decode_stats.get("target_embed_lm_decode_time", 0.0))
+        t_ver = float(self._last_decode_stats.get("target_verify_decode_time", 0.0))
+        self._last_decode_stats["target_total_time"] = t_pf + t_emb_lm + t_ver
         self._last_decode_stats["total_time"] = decode_time
 
         output_ids = output_ids[:, :start]
         output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
         if stop_token_ids is not None:
-            stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
+            stop_t = torch.tensor(stop_token_ids, device=output_ids.device)
             stop_token_indices = torch.isin(
-                output_ids[0][num_input_tokens:], stop_token_ids
+                output_ids[0][num_input_tokens:], stop_t
             ).nonzero(as_tuple=True)[0]
             if stop_token_indices.numel() > 0:
                 output_ids = output_ids[

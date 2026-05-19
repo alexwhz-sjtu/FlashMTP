@@ -149,6 +149,21 @@ def load_benchmark_dataset(dataset_name: str):
         task_name = infer_infinitebench_task(original_dataset_name, dataset_path)
         instances = []
         with dataset_path.open("r", encoding="utf-8") as f:
+            # Some exports use a ``.jsonl`` name but store one pretty-printed JSON array.
+            head = f.read(8192)
+            f.seek(0)
+            if head.lstrip("\ufeff").lstrip().startswith("["):
+                data = json.load(f)
+                if not isinstance(data, list):
+                    raise ValueError(f"{dataset_path} must contain a JSON list")
+                if original_dataset_name.lower() == "longbench_v2" or dataset_path.parent.name.lower() == "longbench_v2":
+                    return [{"turns": [format_longbench_v2_prompt(item)]} for item in data]
+                if is_swe_bench_style_json(data, dataset_path, original_dataset_name):
+                    return load_swe_bench_json_instances(data, dataset_path)
+                raise ValueError(
+                    f"Unsupported JSON-array dataset with .jsonl extension: {dataset_path}"
+                )
+
             for line_number, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:
@@ -198,12 +213,17 @@ def target_generate(
     stop_token_ids: list[int],
     temperature: float = 0.0,
 ) -> SimpleNamespace:
+    """Autoregressive baseline. ``input_ids`` may be ``(1, L)`` or ``(B, L)`` (e.g. repeated for throughput)."""
+    batch_size = int(input_ids.shape[0])
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
-    output_ids = torch.empty((1, max_length), dtype=torch.long, device=input_ids.device)
+    output_ids = torch.empty((batch_size, max_length), dtype=torch.long, device=input_ids.device)
     output_ids[:, :num_input_tokens] = input_ids
-    position_ids = torch.arange(max_length, device=input_ids.device).unsqueeze(0)
+    position_ids = torch.arange(max_length, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(
+        batch_size, -1
+    )
     past_key_values_target = DynamicCache()
+    st = torch.tensor(stop_token_ids, device=input_ids.device) if stop_token_ids else None
 
     prefill_start = cuda_time()
     output = target(
@@ -218,12 +238,12 @@ def target_generate(
     time_to_first_token = cuda_time() - prefill_start
 
     decode_start = cuda_time()
-    start = input_ids.shape[1]
+    start = num_input_tokens
     while start < max_length:
         output_ids[:, start : start + 1] = next_token
         start += 1
 
-        if stop_token_ids is not None and next_token.item() in stop_token_ids:
+        if st is not None and torch.isin(next_token.squeeze(-1), st).any():
             break
         if start >= max_length:
             break
@@ -243,7 +263,8 @@ def target_generate(
 
     num_output_tokens = output_ids.shape[1] - num_input_tokens
     total_decode_time = cuda_time() - decode_start
-    time_per_output_token = total_decode_time / max(num_output_tokens, 1)
+    denom = max(batch_size * num_output_tokens, 1)
+    time_per_output_token = total_decode_time / denom
 
     return SimpleNamespace(
         output_ids=output_ids,
@@ -264,6 +285,7 @@ def flashmtp_generate(
     block_size: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
+    target_block_size: int | None = None,
 ) -> SimpleNamespace:
     original_block_size = model.block_size
     model.block_size = block_size
@@ -274,18 +296,20 @@ def flashmtp_generate(
             max_new_tokens=max_new_tokens,
             stop_token_ids=stop_token_ids,
             temperature=temperature,
+            target_block_size=target_block_size,
         )
     finally:
         model.block_size = original_block_size
 
     stats = model.get_last_decode_stats()
+    batch_size = int(input_ids.shape[0])
     num_input_tokens = input_ids.shape[1]
     num_output_tokens = output_ids.shape[1] - num_input_tokens
     measured_decode_time = stats.get(
         "total_time",
         stats.get("target_total_time", 0.0) + stats.get("draft_total_time", 0.0),
     )
-    time_per_output_token = measured_decode_time / max(num_output_tokens, 1)
+    time_per_output_token = measured_decode_time / max(batch_size * num_output_tokens, 1)
 
     return SimpleNamespace(
         output_ids=output_ids,
@@ -294,12 +318,17 @@ def flashmtp_generate(
         time_to_first_token=0.0,
         time_per_output_token=time_per_output_token,
         acceptance_lengths=stats.get("accept_lengths", []),
-        target_prefill_time=0.0,
+        target_prefill_time=stats.get("target_prefill_time", 0.0),
         target_decode_time=measured_decode_time,
         target_total_time=measured_decode_time,
         draft_total_time=stats.get("draft_total_time", 0.0),
         accepted_tokens=stats.get("accepted_tokens", 0),
         total_time=measured_decode_time,
+        mtp_prefill_sec=float(stats.get("target_prefill_time", 0.0)),
+        mtp_decode_wall_sec=float(stats.get("total_time", 0.0)),
+        mtp_draft_model_sec=float(stats.get("draft_model_time", 0.0)),
+        mtp_target_embed_lm_sec=float(stats.get("target_embed_lm_decode_time", 0.0)),
+        mtp_target_verify_sec=float(stats.get("target_verify_decode_time", 0.0)),
     )
 
 
@@ -308,10 +337,30 @@ def main() -> None:
     parser.add_argument("--model-name-or-path", type=str, default='/data/wanghanzhen/models/Qwen/Qwen3-8B')
     parser.add_argument("--draft-name-or-path", type=str, default='/data/wanghanzhen/Projects/MTP/NIPS26/FlashMTP_v5.1/cache/models/flashmtp_v5.1_fix_h100_sample_40000_think_off_nlayers5_block_16_maxlen4096_epochs6/epoch_6_step_29844')
     parser.add_argument("--block-size", type=int, default=None)
+    parser.add_argument(
+        "--target-block-size",
+        type=int,
+        default=None,
+        help="Max tokens the target verifies per speculative step (prefix of the draft block). "
+        "Default: same as draft block (full verify). Smaller values truncate target forward; "
+        "draft still proposes --block-size tokens.",
+    )
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--max-samples", type=int, default=10)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Repeat the same prompt on batch dim B for target + FlashMTP (throughput). "
+        "time/token = wall_time / (B * new_tokens_per_seq).",
+    )
+    parser.add_argument(
+        "--mtp-profile",
+        action="store_true",
+        help="After run, print FlashMTP time breakdown (target vs draft model, prefill vs decode).",
+    )
     parser.add_argument(
         "--sink-num",
         type=int,
@@ -374,35 +423,89 @@ def main() -> None:
         f"chs_len={draft_model.sink_num + 1}, block_size={draft_model.block_size}"
     )
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
+    target_block_size = args.target_block_size
+    if target_block_size is not None and target_block_size < 1:
+        raise ValueError("--target-block-size must be >= 1 when set")
+    if target_block_size is not None:
+        logger.info(
+            f"Spec decode: draft proposes block_size={block_size} tokens per step; "
+            f"target verifies at most target_block_size={target_block_size} (rest truncated)."
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     dataset = select_max_samples(dataset, args.max_samples)
 
+    batch_size = max(1, int(args.batch_size))
+    if batch_size > 1:
+        logger.info(
+            f"Throughput mode: each generation uses batch_size={batch_size} identical prompts; "
+            "reported sec/token divides wall time by (batch_size * new_tokens per sequence)."
+        )
+
     benchmark_start = cuda_time()
     responses = []
-    indices = range(dist.rank(), len(dataset), dist.size())
+
+    def _print_and_record_response(idx: int, turn_index: int, response: dict) -> str:
+        spec_response = response[block_size]
+        generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens :]
+        output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+        acceptance_lengths_text = ", ".join(
+            [f"{position}:{length}" for position, length in enumerate(spec_response.acceptance_lengths)]
+        )
+        avg_acceptance_length = np.mean(spec_response.acceptance_lengths)
+        print(f"\n[Sample {idx} | Turn {turn_index}] Response:\n{output_text}")
+        print(
+            f"[Sample {idx} | Turn {turn_index}] Decode timing: "
+            f"baseline={response[1].time_per_output_token:.6f}s/token, "
+            f"flashmtp_total={spec_response.time_per_output_token:.6f}s/token"
+        )
+        print(
+            f"[Sample {idx} | Turn {turn_index}] Token stats: "
+            f"accepted={spec_response.accepted_tokens}"
+        )
+        print(
+            f"[Sample {idx} | Turn {turn_index}] Acceptance lengths (position:length): "
+            f"{acceptance_lengths_text}"
+        )
+        print(f"[Sample {idx} | Turn {turn_index}] Average acceptance length: {avg_acceptance_length:.2f}")
+        responses.append(response)
+        return output_text
+
+    indices = [
+        idx
+        for idx in range(dist.rank(), len(dataset), dist.size())
+        if not (idx == 29 and args.dataset == "aime25")
+    ]
+
     for idx in tqdm(indices, disable=not dist.is_main()):
         instance = dataset[idx]
-        messages = []
-        if idx==29 and args.dataset=='aime25':
-                continue
+        messages: list[dict] = []
+        if idx==1 or idx==4:
+            continue
         for turn_index, user_content in enumerate(instance["turns"]):
             messages.append({"role": "user", "content": user_content})
-            input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+            input_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
             input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
+            if batch_size > 1:
+                input_ids = input_ids.repeat(batch_size, 1)
             print(
                 f"\n[Sample {idx} | Turn {turn_index}] Input length: "
                 f"{input_ids.shape[1]} tokens ({len(user_content)} chars)"
+                + (f" (batch_size={batch_size})" if batch_size > 1 else "")
             )
 
-            response = {}
-            response[1] = target_generate(
-                target=target,
-                input_ids=input_ids,
-                max_new_tokens=args.max_new_tokens,
-                stop_token_ids=[tokenizer.eos_token_id],
-                temperature=args.temperature,
-            )
+            response = {
+                1: target_generate(
+                    target=target,
+                    input_ids=input_ids,
+                    max_new_tokens=args.max_new_tokens,
+                    stop_token_ids=[tokenizer.eos_token_id],
+                    temperature=args.temperature,
+                ),
+            }
             response[block_size] = flashmtp_generate(
                 model=draft_model,
                 target=target,
@@ -411,34 +514,11 @@ def main() -> None:
                 block_size=block_size,
                 stop_token_ids=[tokenizer.eos_token_id],
                 temperature=args.temperature,
+                target_block_size=target_block_size,
             )
-            
-            spec_response = response[block_size]
-            generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens:]
-            output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
-            acceptance_lengths_text = ", ".join(
-                [f"{position}:{length}" for position, length in enumerate(spec_response.acceptance_lengths)]
-            )
-            avg_acceptance_length = np.mean(spec_response.acceptance_lengths)
-            print(f"\n[Sample {idx} | Turn {turn_index}] Response:\n{output_text}")
-            print(
-                f"[Sample {idx} | Turn {turn_index}] Decode timing: "
-                f"baseline={response[1].time_per_output_token:.6f}s/token, "
-                f"flashmtp_total={spec_response.time_per_output_token:.6f}s/token"
-            )
-            print(
-                f"[Sample {idx} | Turn {turn_index}] Token stats: "
-                f"accepted={spec_response.accepted_tokens}"
-            )
-            print(
-                f"[Sample {idx} | Turn {turn_index}] Acceptance lengths (position:length): "
-                f"{acceptance_lengths_text}"
-            )
-            print(f"[Sample {idx} | Turn {turn_index}] Average acceptance length: {avg_acceptance_length:.2f}")
-
+            output_text = _print_and_record_response(idx, turn_index, response)
             messages.append({"role": "assistant", "content": output_text})
-            responses.append(response)
 
     if dist.size() > 1:
         responses = dist.gather(responses, dst=0)
@@ -450,12 +530,44 @@ def main() -> None:
     tb = np.mean([r[block_size].time_per_output_token for r in responses])
     print(f"Decoding speedup: {t1 / tb:.2f}")
 
-    tau = np.mean([np.mean(r[block_size].acceptance_lengths) for r in responses])
-    print(f"Average Acceptance length: {tau:.2f}")
-
     acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
-    histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
+    n = len(acceptance_lengths)
+    if n == 0:
+        histogram = [0.0] * (block_size + 1)
+        tau = 0.0
+    else:
+        histogram = [acceptance_lengths.count(b) / n for b in range(block_size + 1)]
+        tau = float(sum(b * histogram[b] for b in range(block_size + 1)))
+
+    print(f"Average Acceptance length: {tau:.2f}")
     print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
+
+    if args.mtp_profile and dist.is_main():
+        pre = sum(getattr(r[block_size], "mtp_prefill_sec", 0.0) for r in responses)
+        dw = sum(getattr(r[block_size], "mtp_decode_wall_sec", 0.0) for r in responses)
+        dr = sum(getattr(r[block_size], "mtp_draft_model_sec", 0.0) for r in responses)
+        em = sum(getattr(r[block_size], "mtp_target_embed_lm_sec", 0.0) for r in responses)
+        ve = sum(getattr(r[block_size], "mtp_target_verify_sec", 0.0) for r in responses)
+        print("\n[MTP time profile] summed over all generations (CUDA-synced timers in spec_generate):")
+        print(f"  大模型 prefill（单独）: {pre:.4f}s  （不计入下方解码占比）")
+        if dw > 0:
+            tgt_decode = em + ve
+            misc = max(0.0, dw - dr - em - ve)
+            pct_dec = lambda x: 100.0 * x / dw
+            print(f"  解码阶段 wall（分母）: {dw:.4f}s")
+            print(
+                f"  大模型 decode（embed+lm_head + verify）: {tgt_decode:.4f}s "
+                f"({pct_dec(tgt_decode):.1f}%)  [embed+lm_head {em:.4f}s, verify {ve:.4f}s]"
+            )
+            print(
+                f"  小模型 draft（FlashMTP forward）: {dr:.4f}s ({pct_dec(dr):.1f}%)"
+            )
+            print(
+                f"  decode 内未分项（gather/crop/sample 等）: {misc:.4f}s ({pct_dec(misc):.1f}%)"
+            )
+            print(f"  端到端（prefill+解码 wall）: {pre + dw:.4f}s")
+        else:
+            print("  （无解码计时，可能未进入 spec_generate 解码循环）")
 
     total_elapsed_time = cuda_time() - benchmark_start
     print(f"Total elapsed time: {total_elapsed_time:.2f}s")
