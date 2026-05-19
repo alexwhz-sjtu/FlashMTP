@@ -40,7 +40,7 @@ MASTER_ADDR="${MASTER_ADDR:-${PET_MASTER_ADDR:-127.0.0.1}}"
 MASTER_PORT="${MASTER_PORT:-${PET_MASTER_PORT:-29502}}"
 
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
-MAX_LENGTH="${MAX_LENGTH:-4096}"
+MAX_LENGTH="${MAX_LENGTH:-12288}"
 CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
 if [ "${CHS_CONCAT_MODE}" != "feature" ]; then
     echo "错误: FlashMTP v5.1 仅支持 CHS_CONCAT_MODE=feature"
@@ -56,7 +56,7 @@ CKPT_DIR="${CKPT_DIR:-}"
 # 主要数据集参数
 # ========================================
 # 数据特征参数
-DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-70000}"
+DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-5000}"
 ENABLE_THINKING="${ENABLE_THINKING:-off}"
 
 # 草稿层数：默认目录名/ WandB id/ run name 中均带 nlayers${NUM_DRAFT_LAYERS}
@@ -80,9 +80,9 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
-# CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/think_${ENABLE_THINKING}}"
-CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/mix_${DATA_NUM_SAMPLES}/think_${ENABLE_THINKING}}"
-
+DATASET_NAME="${DATASET_NAME:-swe-bench}"        
+CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/${DATASET_NAME}_${DATA_NUM_SAMPLES}/think_${ENABLE_THINKING}}"
+# CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/mix_${DATA_NUM_SAMPLES}/think_${ENABLE_THINKING}}"
 
 # 模型参数
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
@@ -95,17 +95,17 @@ if [ "$DT" = "qz" ]; then
     # export NNODES=2
     # export NODE_RANK=${RANK:-0}
     export WANDB_MODE=offline
-    # TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/mix_codealpaca_20k_nemotron_40k_orcamath_10k/merged_70k.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v5.1.1_qz_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/${DATASET_NAME}_${DATA_NUM_SAMPLES}/${DATASET_NAME}_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+    # TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/mix_codealpaca_20k_nemotron_40k_orcamath_10k/merged_70k.jsonl}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v5.1.1_qz_${CHS_CONCAT_MODE}_${DATASET_NAME}_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 elif [ "$DT" = "h100" ]; then
-    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-../training_data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v5.1.1_fix_h100_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-../training_data/regen_data/${DATASET_NAME}_${DATA_NUM_SAMPLES}/${DATASET_NAME}_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v5.1.1_fix_h100_${CHS_CONCAT_MODE}_${DATASET_NAME}_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 else
-    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/${DATASET_NAME}_40000/${DATASET_NAME}_think_on_samples_40000_qwen3_8b_regen.jsonl"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_${CHS_CONCAT_MODE}_${DATASET_NAME}_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
@@ -119,7 +119,7 @@ REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-mix}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v5.1.1_mixed_${DT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v5.1.1_${DT}_${DATASET_NAME}_${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_epochs${NUM_EPOCHS}}"
 WANDB_RESUME="${WANDB_RESUME:-allow}"
 WANDB_NAME="${WANDB_RUN_NAME:-}"
 
