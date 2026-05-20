@@ -288,6 +288,14 @@ def main() -> None:
         default=None,
         help="Optional legacy override; ignored if checkpoint has no sink_num.",
     )
+    parser.add_argument(
+        "--local-position",
+        type=str,
+        default=None,
+        choices=("true", "false"),
+        help="Override draft local_position: true = CHS rope ids 0, draft block ids 1..block_size; "
+        "false = global positions. Default: use checkpoint flashmtp_config.",
+    )
     args = parser.parse_args()
 
     random.seed(0)
@@ -333,6 +341,13 @@ def main() -> None:
         if hasattr(draft_model, "sink_num"):
             draft_model.sink_num = int(eff_sink)
         logger.info(f"Overriding sink_num={eff_sink} (legacy)")
+    if args.local_position is not None:
+        lp = args.local_position == "true"
+        draft_model.local_position = lp
+        if draft_model.config.flashmtp_config is None:
+            draft_model.config.flashmtp_config = {}
+        draft_model.config.flashmtp_config["local_position"] = lp
+        logger.info(f"Overriding local_position={lp} (from --local-position {args.local_position})")
     if fcfg.get("sink_num") is not None and hasattr(draft_model, "sink_num"):
         logger.info(
             f"FlashMTP draft (legacy): sink_num={draft_model.sink_num}, "
@@ -343,6 +358,7 @@ def main() -> None:
         f"num_middle_layers_n={fcfg.get('num_middle_layers_n', 'n/a')}, "
         f"target_layer_ids={getattr(draft_model, 'target_layer_ids', None)}, "
         f"train_lm_head={fcfg.get('train_lm_head', getattr(draft_model, 'train_lm_head', False))}, "
+        f"local_position={getattr(draft_model, 'local_position', fcfg.get('local_position', False))}, "
         f"block_size={draft_model.block_size}"
     )
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
