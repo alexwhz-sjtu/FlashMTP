@@ -309,7 +309,10 @@ class OnlineFlashMTPModel(nn.Module):
             rotary_position_ids=full_rotary_position_ids,
         )
 
-        logits = self.lm_head(output_hidden)
+        if self.draft_model.draft_lm_head is not None:
+            logits = self.draft_model.draft_lm_head(output_hidden)
+        else:
+            logits = self.lm_head(output_hidden)
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
         label_offsets = torch.arange(0, self.block_size,

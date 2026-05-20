@@ -342,6 +342,7 @@ def main() -> None:
         f"FlashMTP draft: pivot_fuse_mode={getattr(draft_model, 'pivot_fuse_mode', fcfg.get('pivot_fuse_mode'))}, "
         f"num_middle_layers_n={fcfg.get('num_middle_layers_n', 'n/a')}, "
         f"target_layer_ids={getattr(draft_model, 'target_layer_ids', None)}, "
+        f"train_lm_head={fcfg.get('train_lm_head', getattr(draft_model, 'train_lm_head', False))}, "
         f"block_size={draft_model.block_size}"
     )
     block_size = args.block_size if args.block_size is not None else draft_model.block_size

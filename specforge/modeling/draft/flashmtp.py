@@ -348,6 +348,14 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         flashmtp_config.setdefault("pivot_fuse_mode", self.pivot_fuse_mode)
         flashmtp_config.setdefault("num_middle_layers_n", self.num_middle_layers_n)
         flashmtp_config["target_layer_ids"] = self.target_layer_ids
+        self.train_lm_head = bool(flashmtp_config.get("train_lm_head", False))
+        flashmtp_config["train_lm_head"] = self.train_lm_head
+        if self.train_lm_head:
+            self.draft_lm_head = nn.Linear(
+                config.hidden_size, config.vocab_size, bias=False
+            )
+        else:
+            self.draft_lm_head = None
         config.flashmtp_config = flashmtp_config
 
         self.layers = nn.ModuleList(
@@ -386,7 +394,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         print_on_rank0(
             f"FlashMTP: pivot_fuse_mode={self.pivot_fuse_mode}, "
             f"num_middle_layers_n={self.num_middle_layers_n}, "
-            f"target_layer_ids={self.target_layer_ids}"
+            f"target_layer_ids={self.target_layer_ids}, "
+            f"train_lm_head={self.train_lm_head}"
         )
 
         self.post_init()
@@ -531,17 +540,19 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 device=target.device,
             )
             full_rotary = torch.cat([ctx_pos_part, block_position_ids], dim=-1)
-            draft_logits = target.lm_head(
-                self(
-                    target_hidden=target_hidden,
-                    noise_embedding=noise_embedding,
-                    position_ids=block_position_ids,
-                    rotary_position_ids=full_rotary,
-                    past_key_values=None,
-                    use_cache=False,
-                    is_causal=False,
-                )[:, -block_size + 1 :, :]
-            )
+            draft_hidden = self(
+                target_hidden=target_hidden,
+                noise_embedding=noise_embedding,
+                position_ids=block_position_ids,
+                rotary_position_ids=full_rotary,
+                past_key_values=None,
+                use_cache=False,
+                is_causal=False,
+            )[:, -block_size + 1 :, :]
+            if self.draft_lm_head is not None:
+                draft_logits = self.draft_lm_head(draft_hidden)
+            else:
+                draft_logits = target.lm_head(draft_hidden)
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)
             self._last_decode_stats["draft_total_time"] += time.perf_counter() - draft_start

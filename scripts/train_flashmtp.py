@@ -93,6 +93,12 @@ def parse_args():
         help="Gamma for exponential loss decay weighting (paper Eq.4). "
         "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
     )
+    model_group.add_argument(
+        "--train-lm-head",
+        action="store_true",
+        help="Add a trainable draft lm_head (init from target head); share only frozen "
+        "embeddings with the target. Default: share frozen target lm_head as today.",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -203,10 +209,14 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
 
     if not hasattr(draft_config, "flashmtp_config") or draft_config.flashmtp_config is None:
         draft_config.flashmtp_config = {}
-        
+
     draft_config.flashmtp_config["chs_concat_mode"] = "feature"
     draft_config.flashmtp_config["pivot_fuse_mode"] = args.pivot_fuse_mode
     draft_config.flashmtp_config["num_middle_layers_n"] = args.num_middle_layers_n
+    if args.train_lm_head:
+        draft_config.flashmtp_config["train_lm_head"] = True
+    elif "train_lm_head" not in draft_config.flashmtp_config:
+        draft_config.flashmtp_config["train_lm_head"] = False
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
@@ -224,6 +234,10 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     )
     print_on_rank0(
         f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}"
+    )
+    print_on_rank0(
+        f"train_lm_head={getattr(draft_model, 'train_lm_head', False)} "
+        f"(draft_lm_head={'on' if draft_model.draft_lm_head is not None else 'off'})"
     )
 
     return target_model, draft_model
@@ -405,12 +419,14 @@ def main():
         print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
 
     resume_state = None
+    draft_weights_from_checkpoint = False
     if draft_model_last_checkpoint:
         loaded_model = FlashMTPDraftModel.from_pretrained(
             draft_model_last_checkpoint, torch_dtype=torch.bfloat16
         )
         draft_model.load_state_dict(loaded_model.state_dict())
         del loaded_model
+        draft_weights_from_checkpoint = True
         print_on_rank0("Loaded draft model weights from checkpoint")
 
         training_state_path = os.path.join(
@@ -445,6 +461,9 @@ def main():
     draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
     draft_model.config.flashmtp_config["pivot_fuse_mode"] = draft_model.pivot_fuse_mode
     draft_model.config.flashmtp_config["num_middle_layers_n"] = draft_model.num_middle_layers_n
+    draft_model.config.flashmtp_config["train_lm_head"] = bool(
+        getattr(draft_model, "train_lm_head", False)
+    )
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
@@ -461,6 +480,23 @@ def main():
         device="cuda",
         trust_remote_code=args.trust_remote_code,
     )
+
+    if draft_model.draft_lm_head is not None:
+        if not draft_weights_from_checkpoint:
+            with torch.no_grad():
+                draft_model.draft_lm_head.weight.copy_(
+                    target_components.lm_head.weight.to(
+                        device=draft_model.draft_lm_head.weight.device,
+                        dtype=draft_model.draft_lm_head.weight.dtype,
+                    )
+                )
+            print_on_rank0(
+                "Initialized draft_lm_head from target lm_head (trainable; embeddings stay shared/frozen)."
+            )
+        else:
+            print_on_rank0(
+                "draft_lm_head: using weights from checkpoint (skip copy from target)."
+            )
 
     flashmtp_model = OnlineFlashMTPModel(
         draft_model=draft_model,
