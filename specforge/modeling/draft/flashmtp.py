@@ -350,6 +350,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         flashmtp_config["target_layer_ids"] = self.target_layer_ids
         self.train_lm_head = bool(flashmtp_config.get("train_lm_head", False))
         flashmtp_config["train_lm_head"] = self.train_lm_head
+        self.local_position = bool(flashmtp_config.get("local_position", False))
+        flashmtp_config["local_position"] = self.local_position
         if self.train_lm_head:
             self.draft_lm_head = nn.Linear(
                 config.hidden_size, config.vocab_size, bias=False
@@ -395,7 +397,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             f"FlashMTP: pivot_fuse_mode={self.pivot_fuse_mode}, "
             f"num_middle_layers_n={self.num_middle_layers_n}, "
             f"target_layer_ids={self.target_layer_ids}, "
-            f"train_lm_head={self.train_lm_head}"
+            f"train_lm_head={self.train_lm_head}, "
+            f"local_position={self.local_position}"
         )
 
         self.post_init()
@@ -527,23 +530,34 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         start = input_ids.shape[1]
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
-            block_position_ids = position_ids[:, start : start + block_size]
+            target_block_pos = position_ids[:, start : start + block_size]
+            if self.local_position:
+                draft_block_pos = torch.arange(
+                    1, block_size + 1, device=target.device, dtype=torch.long
+                ).unsqueeze(0)
+            else:
+                draft_block_pos = target_block_pos
             noise_embedding = target.model.embed_tokens(block_output_ids)
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)
             draft_start = time.perf_counter()
             chs = self.chs_len_per_block
-            ctx_pos_part = torch.full(
-                (1, chs),
-                start - 1,
-                dtype=torch.long,
-                device=target.device,
-            )
-            full_rotary = torch.cat([ctx_pos_part, block_position_ids], dim=-1)
+            if self.local_position:
+                ctx_pos_part = torch.zeros(
+                    1, chs, dtype=torch.long, device=target.device
+                )
+            else:
+                ctx_pos_part = torch.full(
+                    (1, chs),
+                    start - 1,
+                    dtype=torch.long,
+                    device=target.device,
+                )
+            full_rotary = torch.cat([ctx_pos_part, draft_block_pos], dim=-1)
             draft_hidden = self(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
-                position_ids=block_position_ids,
+                position_ids=draft_block_pos,
                 rotary_position_ids=full_rotary,
                 past_key_values=None,
                 use_cache=False,
@@ -563,7 +577,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             target_start = time.perf_counter()
             output = target(
                 block_output_ids,
-                position_ids=block_position_ids,
+                position_ids=target_block_pos,
                 past_key_values=past_key_values_target,
                 use_cache=True,
                 output_hidden_states=True,

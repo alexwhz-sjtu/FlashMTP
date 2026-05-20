@@ -216,12 +216,18 @@ class OnlineFlashMTPModel(nn.Module):
         noise_input_ids[is_block_start] = input_ids[is_block_start]
         return noise_input_ids
 
-    def _create_position_ids(self,
-                             anchor_positions: torch.Tensor) -> torch.Tensor:
-        """Create absolute position IDs for parallel draft blocks."""
+    def _create_draft_position_ids(self,
+                                   anchor_positions: torch.Tensor) -> torch.Tensor:
+        """Draft token position ids: global (anchor + offset) or block-local 1..block_size."""
         bsz, n_blocks = anchor_positions.shape
         device = anchor_positions.device
-        offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        bs = self.block_size
+        if getattr(self.draft_model, "local_position", False):
+            local = torch.arange(1, bs + 1, device=device).view(1, 1, -1).expand(
+                bsz, n_blocks, -1
+            )
+            return local.reshape(bsz, -1)
+        offsets = torch.arange(bs, device=device).view(1, 1, -1)
         pos_ids = anchor_positions.unsqueeze(-1) + offsets
         return pos_ids.view(bsz, -1)
 
@@ -272,16 +278,21 @@ class OnlineFlashMTPModel(nn.Module):
         noise_embedding = self._create_noise_embed(input_ids, anchor_positions,
                                                    block_keep_mask)
 
-        # CHS uses the target hidden at anchor-1, so its RoPE position is anchor-1.
-        draft_position_ids = self._create_position_ids(
-            anchor_positions)  # (bsz, n_blocks * block_size)
+        # Non-local: CHS rotary ids follow anchor-1 (gather index for pivot hs).
+        # local_position: CHS rotary ids are 0; draft ids are block-local 1..block_size.
+        draft_position_ids = self._create_draft_position_ids(anchor_positions)
 
         chs = self.draft_model.chs_len_per_block
         bsz, n_blk = anchor_positions.shape
-        ctx_base = (anchor_positions - 1).clamp(min=0)
-        ctx_pos_flat = ctx_base.unsqueeze(-1).expand(bsz, n_blk, chs).reshape(
-            bsz, n_blk * chs
-        )
+        if getattr(self.draft_model, "local_position", False):
+            ctx_pos_flat = torch.zeros(
+                bsz, n_blk * chs, device=device, dtype=torch.long
+            )
+        else:
+            ctx_base = (anchor_positions - 1).clamp(min=0)
+            ctx_pos_flat = ctx_base.unsqueeze(-1).expand(bsz, n_blk, chs).reshape(
+                bsz, n_blk * chs
+            )
         full_rotary_position_ids = torch.cat(
             [ctx_pos_flat, draft_position_ids], dim=-1
         )

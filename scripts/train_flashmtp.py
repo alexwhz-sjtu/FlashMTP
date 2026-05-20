@@ -99,6 +99,12 @@ def parse_args():
         help="Add a trainable draft lm_head (init from target head); share only frozen "
         "embeddings with the target. Default: share frozen target lm_head as today.",
     )
+    model_group.add_argument(
+        "--local-position",
+        action="store_true",
+        help="Draft uses block-local position ids 1..block_size (repeated per parallel "
+        "block in training). CHS rotary prefix uses zeros. Target model still uses global ids.",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -213,6 +219,7 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     draft_config.flashmtp_config["chs_concat_mode"] = "feature"
     draft_config.flashmtp_config["pivot_fuse_mode"] = args.pivot_fuse_mode
     draft_config.flashmtp_config["num_middle_layers_n"] = args.num_middle_layers_n
+    draft_config.flashmtp_config["local_position"] = bool(args.local_position)
     if args.train_lm_head:
         draft_config.flashmtp_config["train_lm_head"] = True
     elif "train_lm_head" not in draft_config.flashmtp_config:
@@ -237,7 +244,8 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     )
     print_on_rank0(
         f"train_lm_head={getattr(draft_model, 'train_lm_head', False)} "
-        f"(draft_lm_head={'on' if draft_model.draft_lm_head is not None else 'off'})"
+        f"(draft_lm_head={'on' if draft_model.draft_lm_head is not None else 'off'}), "
+        f"local_position={getattr(draft_model, 'local_position', False)}"
     )
 
     return target_model, draft_model
@@ -463,6 +471,9 @@ def main():
     draft_model.config.flashmtp_config["num_middle_layers_n"] = draft_model.num_middle_layers_n
     draft_model.config.flashmtp_config["train_lm_head"] = bool(
         getattr(draft_model, "train_lm_head", False)
+    )
+    draft_model.config.flashmtp_config["local_position"] = bool(
+        getattr(draft_model, "local_position", False)
     )
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
