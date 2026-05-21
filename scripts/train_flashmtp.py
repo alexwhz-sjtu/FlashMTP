@@ -9,7 +9,7 @@ import os
 import shutil
 import time
 import warnings
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -102,7 +102,8 @@ def parse_args():
         default=None,
         help=(
             "Comma-separated chunk lengths summing to block_size, e.g. '4,4,4,4' for "
-            "block_size=16 (exp_version decode chunks). Omit to use default slot groups."
+            "block_size=16. If omitted, uses flashmtp_config from draft config when "
+            "present; otherwise defaults to a single chunk equal to block_size."
         ),
     )
     model_group.add_argument(
@@ -235,12 +236,19 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         
     draft_config.flashmtp_config["chs_concat_mode"] = "feature"
 
+    bs = int(draft_config.block_size)
     if args.decode_chunk_sizes is not None:
-        draft_config.flashmtp_config["decode_chunk_sizes"] = (
-            normalize_decode_chunk_sizes(
-                args.decode_chunk_sizes, int(draft_config.block_size)
-            )
+        raw_decode_chunks: Any = args.decode_chunk_sizes
+    elif draft_config.flashmtp_config.get("decode_chunk_sizes") is not None:
+        raw_decode_chunks = draft_config.flashmtp_config["decode_chunk_sizes"]
+    else:
+        raw_decode_chunks = str(bs)
+    sizes = normalize_decode_chunk_sizes(raw_decode_chunks, bs)
+    if sizes is None:
+        raise ValueError(
+            f"Could not resolve decode_chunk_sizes from {raw_decode_chunks!r} for block_size={bs}"
         )
+    draft_config.flashmtp_config["decode_chunk_sizes"] = sizes
 
     _sync_draft_layer_types_to_num_hidden_layers(draft_config)
 
@@ -492,13 +500,15 @@ def main():
         draft_model.decode_chunk_sizes = normalize_decode_chunk_sizes(
             draft_model.config.flashmtp_config.get("decode_chunk_sizes"),
             int(draft_model.block_size),
-        )
-        if draft_model.decode_chunk_sizes is not None:
-            draft_model.config.flashmtp_config["decode_chunk_sizes"] = list(
-                draft_model.decode_chunk_sizes
+        ) or draft_model.decode_chunk_sizes
+        if draft_model.decode_chunk_sizes is None:
+            raise ValueError(
+                "decode_chunk_sizes missing after loading checkpoint; "
+                "re-save checkpoints with flashmtp_config['decode_chunk_sizes']."
             )
-        else:
-            draft_model.config.flashmtp_config.pop("decode_chunk_sizes", None)
+        draft_model.config.flashmtp_config["decode_chunk_sizes"] = list(
+            draft_model.decode_chunk_sizes
+        )
 
         draft_model.load_state_dict(loaded_model.state_dict())
         del loaded_model
@@ -534,12 +544,9 @@ def main():
     draft_model.config.flashmtp_config["chs_concat_mode"] = "feature"
     draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
     draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
-    if draft_model.decode_chunk_sizes is not None:
-        draft_model.config.flashmtp_config["decode_chunk_sizes"] = list(
-            draft_model.decode_chunk_sizes
-        )
-    else:
-        draft_model.config.flashmtp_config.pop("decode_chunk_sizes", None)
+    draft_model.config.flashmtp_config["decode_chunk_sizes"] = list(
+        draft_model.decode_chunk_sizes
+    )
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)

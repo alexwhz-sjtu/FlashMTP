@@ -306,6 +306,97 @@ def create_flashmtp_full_chunk_symmetric_mask(
     return mask.masked_fill(~vis.view(1, 1, L, L), torch.finfo(dtype).min)
 
 
+def create_flashmtp_full_chunk_symmetric_mask_with_chs(
+    group_start: int,
+    group_end: int,
+    block_size: int,
+    decode_chunk_sizes: list[int],
+    batch_size: int,
+    device: torch.device,
+    attention_backend: str,
+    dtype: torch.dtype = torch.float32,
+) -> Optional[torch.Tensor]:
+    """Decode-chunk inference mask: **full block** draft Q, CHS-prefixed KV.
+
+    - **Q_LEN = block_size** (one query row per draft slot ``0 .. block_size-1``).
+      No extra prepended pivot token in the draft sequence (no ``P0`` slot in Q/KV).
+    - **KV_LEN = block_size + 1**: index ``0`` = CHS (target fused hidden at anchor−1),
+      indices ``1 .. block_size`` = draft slots ``0 .. block_size-1`` embeddings.
+
+    Within prefix slots ``< group_end``, draft–draft visibility matches the legacy
+    ``(1+group_end)×(1+group_end)`` pivot layout mapped by ``slot → old_index = slot+1``.
+    Slots ``>= group_end`` are future groups (still mask): queries ``q < group_end``
+    may not attend those KV positions; tail queries ``q >= group_end`` see CHS, the
+    whole prefix, and each other.
+    """
+    decode_chunk_sizes = normalize_decode_chunk_sizes(decode_chunk_sizes, block_size)
+    assert decode_chunk_sizes is not None
+    chunk_of = _chunk_index_table(decode_chunk_sizes, block_size)
+    gs, ge = int(group_start), int(group_end)
+    B = int(block_size)
+    if ge > B or gs < 0 or gs >= ge:
+        raise ValueError(
+            f"invalid group [{gs}, {ge}) or block_size={B} for block decode+CHS mask"
+        )
+
+    # Legacy pivot layout indices 0..ge (inclusive ge on old q/kv) for prefix slots.
+    def _legacy_visible_pair(q_old: int, kv_old: int) -> bool:
+        if q_old == 0:
+            return kv_old == 0
+        if kv_old == 0:
+            return q_old != 0
+        qs = q_old - 1
+        kvs = kv_old - 1
+        if 1 <= kv_old <= gs:
+            if 1 <= q_old <= gs:
+                return chunk_of[kvs] <= chunk_of[qs]
+            if q_old > gs:
+                return True
+            return False
+        if kv_old > gs:
+            if q_old == 0:
+                return False
+            if 1 <= q_old <= gs:
+                return False
+            return gs <= qs < ge and gs <= kvs < ge
+        return False
+
+    kv_len = B + 1
+
+    def visible(q: int, kv: int) -> bool:
+        if kv == 0:
+            return True
+        kvs = kv - 1
+        if q < ge and kvs >= ge:
+            return False
+        if q < ge and kvs < ge:
+            return _legacy_visible_pair(q + 1, kvs + 1)
+        return q >= ge
+
+    if attention_backend == "flex_attention":
+        if not FLEX_ATTENTION_AVAILABLE:
+            raise ImportError("flex_attention is required for FlashMTP BlockMask.")
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            return visible(int(q_idx), int(kv_idx))
+
+        return create_block_mask(
+            mask_mod,
+            B=batch_size,
+            H=None,
+            Q_LEN=B,
+            KV_LEN=kv_len,
+            device=device,
+        )
+
+    vis = torch.zeros((B, kv_len), dtype=torch.bool, device=device)
+    for qi in range(B):
+        for kvi in range(kv_len):
+            vis[qi, kvi] = visible(qi, kvi)
+    mask = torch.zeros((batch_size, 1, B, kv_len), device=device, dtype=dtype)
+    return mask.masked_fill(~vis.view(1, 1, B, kv_len), torch.finfo(dtype).min)
+
+
 class Qwen3FlashMTPAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -516,9 +607,13 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.decode_chunk_sizes = normalize_decode_chunk_sizes(
             flashmtp_config.get("decode_chunk_sizes"), int(config.block_size)
         )
-        if self.decode_chunk_sizes is not None:
-            flashmtp_config["decode_chunk_sizes"] = self.decode_chunk_sizes
-            config.flashmtp_config = flashmtp_config
+        if self.decode_chunk_sizes is None:
+            raise ValueError(
+                "flashmtp_config['decode_chunk_sizes'] is required for FlashMTPDraftModel "
+                "(must sum to config.block_size)."
+            )
+        flashmtp_config["decode_chunk_sizes"] = self.decode_chunk_sizes
+        config.flashmtp_config = flashmtp_config
 
         self.fc = nn.Linear(
             len(self.target_layer_ids) * config.hidden_size,
@@ -587,7 +682,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         target_hidden = self.fuse_target_hidden(target_hidden)
         # RoPE cos/sin length must match K sequence = ctx (CHS) + draft noise.
         # Training passes full_position_ids (context at anchor-1 per block + draft slots).
-        # Inference (spec_generate) passes draft absolute positions only; prepend pivot at anchor-1.
+        # Inference with ctx_len==1 passes draft block ``position_ids`` only; prepend
+        # anchor−1 global position for the CHS column in RoPE (matches training).
         ctx_len = target_hidden.shape[1]
         q_len = hidden_states.shape[1]
         kv_noise_len = (
@@ -709,20 +805,15 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         )
 
         start = input_ids.shape[1]
-        if self.decode_chunk_sizes is not None:
-            prediction_groups = build_decode_chunk_prediction_groups(
-                self.decode_chunk_sizes, block_size
-            )
-        else:
-            prediction_groups = build_flashmtp_prediction_groups(block_size)
+        prediction_groups = build_decode_chunk_prediction_groups(
+            self.decode_chunk_sizes, block_size
+        )
         draft_dtype = next(self.parameters()).dtype
-        in_feat = self.fc.in_features
         while start < max_length:
             print_fn(f"\n[Spec step {self._last_decode_stats['steps']}] start={start}")
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
             for group_start, group_end in prediction_groups:
-                chunk_len = group_end - group_start
                 if group_start == 0:
                     block_output_ids[:, group_start + 1 : group_end] = (
                         self.mask_token_id
@@ -730,133 +821,56 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 else:
                     block_output_ids[:, group_start:group_end] = self.mask_token_id
 
-                if self.decode_chunk_sizes is not None:
-                    decode_sizes = self.decode_chunk_sizes
-                    assert decode_sizes is not None
-                    draft_attention_mask = create_flashmtp_full_chunk_symmetric_mask(
-                        group_start=group_start,
-                        group_end=group_end,
-                        block_size=block_size,
-                        decode_chunk_sizes=decode_sizes,
-                        batch_size=input_ids.shape[0],
-                        device=target.device,
-                        attention_backend=self.config._attn_implementation,
-                        dtype=draft_dtype,
+                draft_attention_mask = create_flashmtp_full_chunk_symmetric_mask_with_chs(
+                    group_start=group_start,
+                    group_end=group_end,
+                    block_size=block_size,
+                    decode_chunk_sizes=self.decode_chunk_sizes,
+                    batch_size=input_ids.shape[0],
+                    device=target.device,
+                    attention_backend=self.config._attn_implementation,
+                    dtype=draft_dtype,
+                )
+                noise_embedding = target.model.embed_tokens(block_output_ids)
+                noise_kv_embedding = noise_embedding
+                if target.device.type == "cuda":
+                    torch.cuda.synchronize(target.device)
+                draft_start = time.perf_counter()
+                draft_hidden = self(
+                    target_hidden=target_hidden,
+                    noise_embedding=noise_embedding,
+                    noise_kv_embedding=noise_kv_embedding,
+                    position_ids=block_position_ids,
+                    attention_mask=draft_attention_mask,
+                    past_key_values=None,
+                    use_cache=False,
+                    is_causal=False,
+                )
+                hid_logits = draft_hidden[:, group_start : group_end, :]
+                draft_logits = target.lm_head(hid_logits)
+                if target.device.type == "cuda":
+                    torch.cuda.synchronize(target.device)
+                self._last_decode_stats["draft_total_time"] += (
+                    time.perf_counter() - draft_start
+                )
+
+                for offset, slot in enumerate(range(group_start, group_end)):
+                    topk_entries = self._format_token_topk(
+                        draft_logits[0, offset], tokenizer, top_k
                     )
-                    pivot_src = max(start - 1, 0)
-                    pivot_ids = output_ids[:, pivot_src : pivot_src + 1]
-                    clean_seg = block_output_ids[:, :group_start]
-                    mask_seg = block_output_ids[:, group_start:group_end]
-                    full_ids = torch.cat([pivot_ids, clean_seg, mask_seg], dim=1)
-                    p0 = position_ids[:, pivot_src : pivot_src + 1]
-                    p1 = position_ids[:, start : start + group_start]
-                    p2 = position_ids[
-                        :, start + group_start : start + group_end
-                    ]
-                    full_pos = torch.cat([p0, p1, p2], dim=1)
-                    noise_embedding = target.model.embed_tokens(full_ids)
-                    noise_kv_embedding = noise_embedding
-                    empty_ctx = torch.zeros(
-                        (input_ids.shape[0], 0, in_feat),
-                        device=target.device,
-                        dtype=target_hidden.dtype,
-                    )
-                    if target.device.type == "cuda":
-                        torch.cuda.synchronize(target.device)
-                    draft_start = time.perf_counter()
-                    draft_hidden = self(
-                        target_hidden=empty_ctx,
-                        noise_embedding=noise_embedding,
-                        noise_kv_embedding=noise_kv_embedding,
-                        position_ids=full_pos,
-                        attention_mask=draft_attention_mask,
-                        past_key_values=None,
-                        use_cache=False,
-                        is_causal=False,
-                    )
-                    hid_logits = draft_hidden[
-                        :, 1 + group_start : 1 + group_end, :
-                    ]
-                    draft_logits = target.lm_head(hid_logits)
-                    if target.device.type == "cuda":
-                        torch.cuda.synchronize(target.device)
-                    self._last_decode_stats["draft_total_time"] += (
-                        time.perf_counter() - draft_start
+                    print_fn(
+                        f"  [Draft slot {slot} | abs_pos={start + slot}] "
+                        f"top{top_k}={topk_entries}"
                     )
 
-                    for offset, slot in enumerate(range(group_start, group_end)):
-                        topk_entries = self._format_token_topk(
-                            draft_logits[0, offset], tokenizer, top_k
-                        )
-                        print_fn(
-                            f"  [Draft slot {slot} | abs_pos={start + slot}] "
-                            f"top{top_k}={topk_entries}"
-                        )
-
-                    if group_start == 0:
-                        block_output_ids[:, group_start + 1 : group_end] = sample(
-                            draft_logits[:, 1:], temperature
-                        )
-                    else:
-                        block_output_ids[:, group_start:group_end] = sample(
-                            draft_logits, temperature
-                        )
+                if group_start == 0:
+                    block_output_ids[:, group_start + 1 : group_end] = sample(
+                        draft_logits[:, 1:], temperature
+                    )
                 else:
-                    draft_attention_mask = create_flashmtp_single_block_mask(
-                        batch_size=input_ids.shape[0],
-                        block_size=block_size,
-                        device=target.device,
-                        attention_backend=self.config._attn_implementation,
-                        dtype=draft_dtype,
-                        decode_chunk_sizes=None,
-                        noise_seq_len=group_end,
-                        q_noise_seq_len=chunk_len,
-                        q_slot_offset=group_start,
+                    block_output_ids[:, group_start:group_end] = sample(
+                        draft_logits, temperature
                     )
-                    noise_embedding = target.model.embed_tokens(
-                        block_output_ids[:, group_start:group_end]
-                    )
-                    noise_kv_embedding = target.model.embed_tokens(
-                        block_output_ids[:, :group_end]
-                    )
-                    draft_position_ids = position_ids[:, start : start + group_end]
-                    if target.device.type == "cuda":
-                        torch.cuda.synchronize(target.device)
-                    draft_start = time.perf_counter()
-                    draft_hidden = self(
-                        target_hidden=target_hidden,
-                        noise_embedding=noise_embedding,
-                        noise_kv_embedding=noise_kv_embedding,
-                        position_ids=draft_position_ids,
-                        attention_mask=draft_attention_mask,
-                        past_key_values=None,
-                        use_cache=False,
-                        is_causal=False,
-                    )
-                    draft_logits = target.lm_head(draft_hidden)
-                    if target.device.type == "cuda":
-                        torch.cuda.synchronize(target.device)
-                    self._last_decode_stats["draft_total_time"] += (
-                        time.perf_counter() - draft_start
-                    )
-
-                    for offset, slot in enumerate(range(group_start, group_end)):
-                        topk_entries = self._format_token_topk(
-                            draft_logits[0, offset], tokenizer, top_k
-                        )
-                        print_fn(
-                            f"  [Draft slot {slot} | abs_pos={start + slot}] "
-                            f"top{top_k}={topk_entries}"
-                        )
-
-                    if group_start == 0:
-                        block_output_ids[:, group_start + 1 : group_end] = sample(
-                            draft_logits[:, 1:], temperature
-                        )
-                    else:
-                        block_output_ids[:, group_start:group_end] = sample(
-                            draft_logits, temperature
-                        )
 
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)
@@ -997,22 +1011,16 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         )
 
         # Decode stage
-        acceptance_lengths = []
         start = input_ids.shape[1]
-        if self.decode_chunk_sizes is not None:
-            prediction_groups = build_decode_chunk_prediction_groups(
-                self.decode_chunk_sizes, block_size
-            )
-        else:
-            prediction_groups = build_flashmtp_prediction_groups(block_size)
+        prediction_groups = build_decode_chunk_prediction_groups(
+            self.decode_chunk_sizes, block_size
+        )
 
         draft_dtype = next(self.parameters()).dtype
-        in_feat = self.fc.in_features
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
             for group_start, group_end in prediction_groups:
-                chunk_len = group_end - group_start
                 if group_start == 0:
                     block_output_ids[:, group_start + 1 : group_end] = (
                         self.mask_token_id
@@ -1020,113 +1028,46 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 else:
                     block_output_ids[:, group_start:group_end] = self.mask_token_id
 
-                if self.decode_chunk_sizes is not None:
-                    decode_sizes = self.decode_chunk_sizes
-                    assert decode_sizes is not None
-                    draft_attention_mask = create_flashmtp_full_chunk_symmetric_mask(
-                        group_start=group_start,
-                        group_end=group_end,
-                        block_size=block_size,
-                        decode_chunk_sizes=decode_sizes,
-                        batch_size=input_ids.shape[0],
-                        device=target.device,
-                        attention_backend=self.config._attn_implementation,
-                        dtype=draft_dtype,
+                draft_attention_mask = create_flashmtp_full_chunk_symmetric_mask_with_chs(
+                    group_start=group_start,
+                    group_end=group_end,
+                    block_size=block_size,
+                    decode_chunk_sizes=self.decode_chunk_sizes,
+                    batch_size=input_ids.shape[0],
+                    device=target.device,
+                    attention_backend=self.config._attn_implementation,
+                    dtype=draft_dtype,
+                )
+                noise_embedding = target.model.embed_tokens(block_output_ids)
+                noise_kv_embedding = noise_embedding
+                if target.device.type == "cuda":
+                    torch.cuda.synchronize(target.device)
+                draft_start = time.perf_counter()
+                draft_hidden = self(
+                    target_hidden=target_hidden,
+                    noise_embedding=noise_embedding,
+                    noise_kv_embedding=noise_kv_embedding,
+                    position_ids=block_position_ids,
+                    attention_mask=draft_attention_mask,
+                    past_key_values=None,
+                    use_cache=False,
+                    is_causal=False,
+                )
+                hid_logits = draft_hidden[:, group_start : group_end, :]
+                draft_logits = target.lm_head(hid_logits)
+                if target.device.type == "cuda":
+                    torch.cuda.synchronize(target.device)
+                self._last_decode_stats["draft_total_time"] += (
+                    time.perf_counter() - draft_start
+                )
+                if group_start == 0:
+                    block_output_ids[:, group_start + 1 : group_end] = sample(
+                        draft_logits[:, 1:], temperature
                     )
-                    pivot_src = max(start - 1, 0)
-                    pivot_ids = output_ids[:, pivot_src : pivot_src + 1]
-                    clean_seg = block_output_ids[:, :group_start]
-                    mask_seg = block_output_ids[:, group_start:group_end]
-                    full_ids = torch.cat([pivot_ids, clean_seg, mask_seg], dim=1)
-                    p0 = position_ids[:, pivot_src : pivot_src + 1]
-                    p1 = position_ids[:, start : start + group_start]
-                    p2 = position_ids[
-                        :, start + group_start : start + group_end
-                    ]
-                    full_pos = torch.cat([p0, p1, p2], dim=1)
-                    noise_embedding = target.model.embed_tokens(full_ids)
-                    noise_kv_embedding = noise_embedding
-                    empty_ctx = torch.zeros(
-                        (input_ids.shape[0], 0, in_feat),
-                        device=target.device,
-                        dtype=target_hidden.dtype,
-                    )
-                    if target.device.type == "cuda":
-                        torch.cuda.synchronize(target.device)
-                    draft_start = time.perf_counter()
-                    draft_hidden = self(
-                        target_hidden=empty_ctx,
-                        noise_embedding=noise_embedding,
-                        noise_kv_embedding=noise_kv_embedding,
-                        position_ids=full_pos,
-                        attention_mask=draft_attention_mask,
-                        past_key_values=None,
-                        use_cache=False,
-                        is_causal=False,
-                    )
-                    hid_logits = draft_hidden[
-                        :, 1 + group_start : 1 + group_end, :
-                    ]
-                    draft_logits = target.lm_head(hid_logits)
-                    if target.device.type == "cuda":
-                        torch.cuda.synchronize(target.device)
-                    self._last_decode_stats["draft_total_time"] += (
-                        time.perf_counter() - draft_start
-                    )
-                    if group_start == 0:
-                        block_output_ids[:, group_start + 1 : group_end] = sample(
-                            draft_logits[:, 1:], temperature
-                        )
-                    else:
-                        block_output_ids[:, group_start:group_end] = sample(
-                            draft_logits, temperature
-                        )
                 else:
-                    draft_attention_mask = create_flashmtp_single_block_mask(
-                        batch_size=input_ids.shape[0],
-                        block_size=block_size,
-                        device=target.device,
-                        attention_backend=self.config._attn_implementation,
-                        dtype=draft_dtype,
-                        decode_chunk_sizes=None,
-                        noise_seq_len=group_end,
-                        q_noise_seq_len=chunk_len,
-                        q_slot_offset=group_start,
+                    block_output_ids[:, group_start:group_end] = sample(
+                        draft_logits, temperature
                     )
-                    noise_embedding = target.model.embed_tokens(
-                        block_output_ids[:, group_start:group_end]
-                    )
-                    noise_kv_embedding = target.model.embed_tokens(
-                        block_output_ids[:, :group_end]
-                    )
-                    draft_position_ids = position_ids[:, start : start + group_end]
-                    if target.device.type == "cuda":
-                        torch.cuda.synchronize(target.device)
-                    draft_start = time.perf_counter()
-                    draft_hidden = self(
-                        target_hidden=target_hidden,
-                        noise_embedding=noise_embedding,
-                        noise_kv_embedding=noise_kv_embedding,
-                        position_ids=draft_position_ids,
-                        attention_mask=draft_attention_mask,
-                        past_key_values=None,
-                        use_cache=False,
-                        is_causal=False,
-                    )
-                    draft_logits = target.lm_head(draft_hidden)
-                    if target.device.type == "cuda":
-                        torch.cuda.synchronize(target.device)
-                    self._last_decode_stats["draft_total_time"] += (
-                        time.perf_counter() - draft_start
-                    )
-                    if group_start == 0:
-                        block_output_ids[:, group_start + 1 : group_end] = sample(
-                            draft_logits[:, 1:], temperature
-                        )
-                    else:
-                        block_output_ids[:, group_start:group_end] = sample(
-                            draft_logits, temperature
-                        )
 
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)
@@ -1165,7 +1106,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 self.target_layer_ids,
                 token_index=pivot_index,
             )
-            acceptance_lengths.append(acceptance_length + 1)
             self._last_decode_stats["accept_lengths"].append(acceptance_length + 1)
             self._last_decode_stats["steps"] += 1
             if stop_token_ids is not None and any(
