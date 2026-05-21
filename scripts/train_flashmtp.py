@@ -82,19 +82,15 @@ def parse_args():
         "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
     )
     model_group.add_argument(
-        "--chs-fusion-layer-idx",
+        "--num-middle-layers-n",
         type=int,
         default=0,
-        help="Which Qwen3 layer type index to use for CHS Qwen3Attention (sliding window / norm).",
+        help="Interior layers for build_ablation_target_layer_ids (v1.1 FlashMTP).",
     )
     model_group.add_argument(
-        "--chs-concat-mode",
-        type=str,
-        default="feature",
-        choices=["feature", "seq"],
-        help="CHS layout stored in flashmtp_config. 'feature': stacked target layers (embed+decoders) "
-        "at anchor-1 with depth self-attn fusion, one context token per block. "
-        "'seq': not implemented in this tree (multi-token CHS + mask changes required).",
+        "--use-legacy-layer-sampling",
+        action="store_true",
+        help="Use build_target_layer_ids instead of ablation sampling.",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -175,39 +171,32 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         **target_model_kwargs,
     )
 
+    target_cfg = AutoConfig.from_pretrained(args.target_model_path)
+
     if args.draft_config_path:
         draft_config = AutoConfig.from_pretrained(args.draft_config_path)
         _align_draft_config_layer_depth(draft_config, int(draft_config.num_hidden_layers))
         print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
+        if getattr(draft_config, "num_target_layers", None) in (None, 0):
+            draft_config.num_target_layers = target_cfg.num_hidden_layers
     else:
-        target_config = AutoConfig.from_pretrained(args.target_model_path)
         draft_config = AutoConfig.from_pretrained(args.target_model_path)
         draft_config.block_size = args.block_size
-        draft_config.num_target_layers = target_config.num_hidden_layers
+        draft_config.num_target_layers = target_cfg.num_hidden_layers
         _align_draft_config_layer_depth(draft_config, args.num_draft_layers)
         print_on_rank0("Auto-generated draft config from target model")
 
     if not hasattr(draft_config, "flashmtp_config") or draft_config.flashmtp_config is None:
         draft_config.flashmtp_config = {}
 
-    if args.chs_concat_mode == "seq":
-        raise NotImplementedError(
-            "--chs-concat-mode seq is not supported in this FlashMTP version "
-            "(requires multiple CHS keys per block and block-mask changes). Use --chs-concat-mode feature."
-        )
-
-    target_cfg = AutoConfig.from_pretrained(args.target_model_path)
-    n_chs_default = target_cfg.num_hidden_layers + 1
-    n_chs = int(
-        draft_config.flashmtp_config.get("num_chs_source_tokens", n_chs_default)
+    draft_config.flashmtp_config["chs_concat_mode"] = "feature"
+    draft_config.flashmtp_config["num_middle_layers_n"] = int(args.num_middle_layers_n)
+    draft_config.flashmtp_config["use_legacy_layer_sampling"] = bool(
+        args.use_legacy_layer_sampling
     )
-    draft_config.flashmtp_config["num_chs_source_tokens"] = n_chs
-    draft_config.flashmtp_config["chs_fusion_layer_idx"] = args.chs_fusion_layer_idx
-    draft_config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
-    print_on_rank0(f"CHS concat mode: {args.chs_concat_mode}")
 
     draft_model = FlashMTPDraftModel(draft_config).cuda().to(torch.bfloat16)
 
@@ -219,7 +208,7 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     print_on_rank0(
         f"Draft config: block_size={draft_config.block_size}, "
         f"num_hidden_layers={draft_config.num_hidden_layers}, "
-        f"num_chs_source_tokens={n_chs} (embed + {target_cfg.num_hidden_layers} layers)"
+        f"target_layer_ids={draft_model.target_layer_ids}"
     )
     print_on_rank0(
         f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}"

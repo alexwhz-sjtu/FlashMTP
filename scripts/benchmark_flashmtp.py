@@ -30,7 +30,7 @@ import distributed as dist  # noqa: E402
 
 from specforge.modeling.draft.flashmtp import (  # noqa: E402
     FlashMTPDraftModel,
-    extract_stacked_chs,
+    gather_pivot_multilayer_inference,
     sample,
 )
 
@@ -182,9 +182,13 @@ def flashmtp_spec_generate(
     output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
         output.logits, temperature
     )
-    pre_idx = (num_input_tokens - 1) * torch.ones(1, 1, device=dev, dtype=torch.long)
-    pre_idx = pre_idx.clamp(min=0)
-    target_hidden = extract_stacked_chs(output.hidden_states, pre_idx)
+    num_tl = int(draft.config.num_target_layers)
+    target_hidden = gather_pivot_multilayer_inference(
+        output.hidden_states,
+        draft.target_layer_ids,
+        -1,
+        num_tl,
+    )
     time_to_first_token = cuda_time() - prefill_start
 
     decode_start = cuda_time()
@@ -192,21 +196,37 @@ def flashmtp_spec_generate(
     start = input_ids.shape[1]
     draft_prefill = True
 
+    chs = draft.chs_len_per_block
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
         block_position_ids = position_ids[:, start : start + block_size]
+        if getattr(draft, "local_position", False):
+            draft_block_pos = torch.arange(
+                1, block_size + 1, device=dev, dtype=torch.long
+            ).unsqueeze(0)
+        else:
+            draft_block_pos = block_position_ids
+        if getattr(draft, "local_position", False):
+            ctx_pos_part = torch.zeros(1, chs, dtype=torch.long, device=dev)
+        else:
+            ctx_pos_part = torch.full(
+                (1, chs), start - 1, dtype=torch.long, device=dev
+            )
+        full_rotary = torch.cat([ctx_pos_part, draft_block_pos], dim=-1)
         noise_embedding = target.model.embed_tokens(block_output_ids)
-        block_position_ids_for_draft = position_ids[:, start : start + block_size]
-        draft_logits = target.lm_head(
-            draft(
-                target_hidden=target_hidden,
-                noise_embedding=noise_embedding,
-                position_ids=block_position_ids_for_draft,
-                past_key_values=None,
-                use_cache=False,
-                is_causal=False,
-            )[:, -block_size + 1 :, :]
-        )
+        draft_hidden = draft(
+            target_hidden=target_hidden,
+            noise_embedding=noise_embedding,
+            position_ids=draft_block_pos,
+            rotary_position_ids=full_rotary,
+            past_key_values=None,
+            use_cache=False,
+            is_causal=False,
+        )[:, -block_size + 1 :, :]
+        if draft.draft_lm_head is not None:
+            draft_logits = draft.draft_lm_head(draft_hidden)
+        else:
+            draft_logits = target.lm_head(draft_hidden)
         block_output_ids[:, 1:] = sample(draft_logits)
         if draft_prefill:
             draft_prefill = False
@@ -234,12 +254,15 @@ def flashmtp_spec_generate(
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
         start += acceptance_length + 1
         past_key_values_target.crop(start)
-        hs_len = output.hidden_states[0].shape[1]
-        last_chunk_idx = min(int(acceptance_length), hs_len - 1)
-        last_chunk_idx = max(last_chunk_idx, 0)
-        target_hidden = extract_stacked_chs(
+        pivot_index = min(
+            int(acceptance_length), output.hidden_states[0].shape[1] - 1
+        )
+        pivot_index = max(pivot_index, 0)
+        target_hidden = gather_pivot_multilayer_inference(
             output.hidden_states,
-            torch.tensor([[last_chunk_idx]], device=dev, dtype=torch.long),
+            draft.target_layer_ids,
+            pivot_index,
+            num_tl,
         )
         if stop_token_ids is not None and any(
             stop_token_id in output_ids[:, num_input_tokens:]

@@ -61,12 +61,16 @@ def add_flashmtp_common_args(parser: argparse.ArgumentParser) -> None:
     )
     model_group.add_argument("--trust-remote-code", action="store_true")
     model_group.add_argument("--num-anchors", type=int, default=512)
-    model_group.add_argument("--chs-fusion-layer-idx", type=int, default=0)
     model_group.add_argument(
-        "--chs-concat-mode",
-        type=str,
-        default="feature",
-        choices=["feature", "seq"],
+        "--num-middle-layers-n",
+        type=int,
+        default=0,
+        help="Interior layers for build_ablation_target_layer_ids (v1.1 FlashMTP).",
+    )
+    model_group.add_argument(
+        "--use-legacy-layer-sampling",
+        action="store_true",
+        help="Use build_target_layer_ids instead of ablation sampling.",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -130,35 +134,35 @@ def build_models(args: Any) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         **target_model_kwargs,
     )
 
+    target_cfg = AutoConfig.from_pretrained(args.target_model_path)
+
     if args.draft_config_path:
         draft_config = AutoConfig.from_pretrained(args.draft_config_path)
         _align_draft_config_layer_depth(draft_config, int(draft_config.num_hidden_layers))
+        if getattr(draft_config, "num_target_layers", None) in (None, 0):
+            draft_config.num_target_layers = target_cfg.num_hidden_layers
     else:
-        target_config = AutoConfig.from_pretrained(args.target_model_path)
         draft_config = AutoConfig.from_pretrained(args.target_model_path)
         draft_config.block_size = args.block_size
-        draft_config.num_target_layers = target_config.num_hidden_layers
+        draft_config.num_target_layers = target_cfg.num_hidden_layers
         _align_draft_config_layer_depth(draft_config, args.num_draft_layers)
 
     if not hasattr(draft_config, "flashmtp_config") or draft_config.flashmtp_config is None:
         draft_config.flashmtp_config = {}
 
-    if args.chs_concat_mode == "seq":
-        raise NotImplementedError("Use --chs-concat-mode feature for FlashMTP v3.3.")
+    draft_config.flashmtp_config["chs_concat_mode"] = "feature"
+    draft_config.flashmtp_config["num_middle_layers_n"] = int(args.num_middle_layers_n)
+    draft_config.flashmtp_config["use_legacy_layer_sampling"] = bool(
+        args.use_legacy_layer_sampling
+    )
 
-    target_cfg = AutoConfig.from_pretrained(args.target_model_path)
-    n_chs_default = target_cfg.num_hidden_layers + 1
-    n_chs = int(draft_config.flashmtp_config.get("num_chs_source_tokens", n_chs_default))
-    draft_config.flashmtp_config["num_chs_source_tokens"] = n_chs
-    draft_config.flashmtp_config["chs_fusion_layer_idx"] = args.chs_fusion_layer_idx
-    draft_config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
     draft_config._attn_implementation = args.attention_backend
 
     draft_model = FlashMTPDraftModel(draft_config).cuda().to(torch.bfloat16)
     target_model.set_capture_layers(list(range(target_cfg.num_hidden_layers + 1)))
     print_on_rank0(
         f"Draft: layers={draft_config.num_hidden_layers}, block={draft_config.block_size}, "
-        f"chs_tokens={n_chs}"
+        f"target_layer_ids={draft_model.target_layer_ids}"
     )
     return target_model, draft_model
 

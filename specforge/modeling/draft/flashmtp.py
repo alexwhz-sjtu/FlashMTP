@@ -1,5 +1,5 @@
 import time
-from typing import Callable, List, Optional, Sequence, Union
+from typing import Any, Callable, List, Optional
 
 import torch
 from torch import nn
@@ -11,7 +11,6 @@ from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
     FlashAttentionKwargs,
     GradientCheckpointingLayer,
-    Qwen3Attention,
     Qwen3Config,
     Qwen3MLP,
     Qwen3PreTrainedModel,
@@ -22,8 +21,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
-# MDLM-style block fill: unmask counts per draft round (covers block_size-1 when sum == 15).
-MDLM_CONFIDENCE_ROUND_COUNTS: Tuple[int, ...] = (1, 2, 2,2,2, 6)
+# MDLM-style block fill: unmask counts per draft round (1+2+4+8 == block_size-1 when bs=16).
+MDLM_CONFIDENCE_ROUND_COUNTS: Tuple[int, ...] = (1, 2, 4, 8)
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -40,94 +39,110 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_len = q.size(-2)
-    q_embed = (q * cos[..., -q_len:, :]) + (rotate_half(q) * sin[..., -q_len:, :])
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    k_len = k.size(-2)
+    q_cos = cos[..., -q_len:, :]
+    q_sin = sin[..., -q_len:, :]
+    k_cos = cos[..., -k_len:, :]
+    k_sin = sin[..., -k_len:, :]
+    q_embed = (q * q_cos) + (rotate_half(q) * q_sin)
+    k_embed = (k * k_cos) + (rotate_half(k) * k_sin)
     return q_embed, k_embed
 
 
-def stack_hidden_states_for_positions(
-    hidden_states: Union[Sequence[torch.Tensor], torch.Tensor],
-    context_positions: torch.Tensor,
-) -> torch.Tensor:
-    """Gather embed + every decoder layer at context_positions -> (B, N, S, H).
+def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> list[int]:
+    if num_draft_layers == 1:
+        return [num_target_layers // 2]
+    start = 1
+    end = num_target_layers - 3
+    span = end - start
+    return [
+        int(round(start + (i * span) / (num_draft_layers - 1)))
+        for i in range(num_draft_layers)
+    ]
 
-    hidden_states: tuple of (B, T, H) for each of S sources, or (B, T, S, H) stacked.
-    context_positions: (B, N) indices along T.
-    """
-    if isinstance(hidden_states, torch.Tensor) and hidden_states.dim() == 4:
-        b, t, s, d = hidden_states.shape
-        n = context_positions.size(1)
-        b_idx = (
-            torch.arange(b, device=hidden_states.device)[:, None].expand(b, n)
+
+def _infer_hs_embedding_offset(
+    hidden_states: tuple | list, num_transformer_layers: int
+) -> int:
+    lt = len(hidden_states)
+    if lt == num_transformer_layers:
+        return 0
+    if lt == num_transformer_layers + 1:
+        return 1
+    return 1 if lt > num_transformer_layers else 0
+
+
+def build_ablation_target_layer_ids(
+    num_transformer_layers: int, n_middle: int
+) -> list[int]:
+    """First + last transformer layer (0-based), plus ``n_middle`` evenly spaced interior layers."""
+    L = num_transformer_layers
+    if L <= 0:
+        return [0]
+    picked: set[int] = {0, L - 1}
+    n_middle = max(0, int(n_middle))
+    lo, hi = 1, L - 2
+    if n_middle > 0 and lo <= hi:
+        interior_span = hi - lo
+        cap = hi - lo + 1
+        n_take = min(n_middle, cap)
+        if n_take == 1:
+            picked.add((lo + hi) // 2)
+        else:
+            for i in range(n_take):
+                if interior_span == 0:
+                    idx = lo
+                else:
+                    idx = lo + int(round(i * interior_span / (n_take - 1)))
+                picked.add(int(max(lo, min(hi, idx))))
+    if n_middle > 0 and L > 2 and len(picked) - 2 < n_middle:
+        print_on_rank0(
+            f"[FlashMTP] num_middle_layers_n={n_middle} capped by depth; "
+            f"using {len(picked)} target layers on L={L}."
         )
-        return hidden_states[b_idx, context_positions, :, :]
-    if isinstance(hidden_states, torch.Tensor):
-        raise ValueError("Expected tuple of (B, T, H) or stacked (B, T, S, H).")
-    out = []
-    for h in hidden_states:
-        g = torch.gather(
-            h,
-            1,
-            context_positions.unsqueeze(-1).expand(
-                -1, -1, h.size(-1)
+    return sorted(picked)
+
+
+def gather_pivot_multilayer_inference(
+    hidden_states: tuple | list,
+    target_layer_ids: list[int],
+    token_index: int,
+    num_transformer_layers: int,
+) -> torch.Tensor:
+    """Return (B, 1, S, H) pivot features for inference (``token_index`` along seq dim)."""
+    off = _infer_hs_embedding_offset(hidden_states, num_transformer_layers)
+    pieces: list[torch.Tensor] = []
+    for layer_id in target_layer_ids:
+        layer_h = hidden_states[layer_id + off]
+        pieces.append(layer_h[:, token_index, :].unsqueeze(1))
+    return torch.stack(pieces, dim=2)
+
+
+def prepare_target_hidden(
+    hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor],
+    anchor_positions: torch.Tensor,
+    target_layer_ids: list[int],
+    num_transformer_layers: int,
+) -> torch.Tensor:
+    """Gather pivot hidden states for selected transformer layers at anchor-1 -> (B, N, S, H)."""
+    context_positions = (anchor_positions - 1).clamp(min=0)
+    off = _infer_hs_embedding_offset(hidden_states, num_transformer_layers)
+    pieces: list[torch.Tensor] = []
+    for layer_id in target_layer_ids:
+        layer_hidden = hidden_states[layer_id + off]
+        layer_selected = torch.gather(
+            layer_hidden,
+            dim=1,
+            index=context_positions.unsqueeze(-1).expand(
+                -1, -1, layer_hidden.size(-1)
             ),
         )
-        out.append(g)
-    return torch.stack(out, dim=2)
-
-
-class CHSQueryFusion(nn.Module):
-    """Depth-axis non-causal self-attn: last slot (top-layer HS) queries all S sources.
-
-    Sequence order is [embed, layer_0, …, layer_{L-1}] with S=L+1. RoPE uses positions
-    0..S-1. The output is the last position's representation (last layer's Q attends
-    to every K/V) and is fed as the single CHS condition token per block.
-    """
-
-    def __init__(
-        self,
-        config: Qwen3Config,
-        num_chs_source_tokens: int,
-        chs_fusion_layer_idx: int = 0,
-    ):
-        super().__init__()
-        d = config.hidden_size
-        self.S = num_chs_source_tokens
-        self.input_layernorm = Qwen3RMSNorm(d, eps=config.rms_norm_eps)
-        # Same Qwen3 self-attn as the draft stack; not causal (no attention mask)
-        self.attn = Qwen3Attention(config, layer_idx=chs_fusion_layer_idx)
-        self.attn.is_causal = False
-        self.rotary_emb = Qwen3RotaryEmbedding(config)
-        self.out_norm = Qwen3RMSNorm(d, eps=config.rms_norm_eps)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, N, S, d) — embed + each target layer at anchor-1
-        bsz, n, s, d = x.shape
-        if s != self.S:
-            raise ValueError(
-                f"CHSQueryFusion: expected S={self.S} stacked inputs, got {s}."
-            )
-        flat = x.view(bsz * n, s, d)
-        slen = s
-        position_ids = torch.arange(
-            0, slen, device=flat.device, dtype=torch.long
-        ).view(1, -1)
-        position_ids = position_ids.expand(flat.size(0), -1)
-        position_embeddings = self.rotary_emb(flat, position_ids)
-        h = self.input_layernorm(flat)
-        attn_out, _ = self.attn(
-            h,
-            position_embeddings,
-            attention_mask=None,
-            past_key_value=None,
-        )
-        # Last index = final decoder layer; its output is the fusion readout
-        out = attn_out[:, -1, :].view(bsz, n, d)
-        return self.out_norm(out)
+        pieces.append(layer_selected)
+    return torch.stack(pieces, dim=2)
 
 
 class Qwen3FlashMTPAttention(nn.Module):
-    """Non-causal self-attn: K/V = context + draft, full RoPE on k."""
+    """Non-causal self-attn: K/V = fused pivot ctx + draft; RoPE on full K (v1.1 linear_fuse path)."""
 
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
@@ -191,6 +206,8 @@ class Qwen3FlashMTPAttention(nn.Module):
         v_ctx = self.v_proj(target_hidden)
         v_noise = self.v_proj(hidden_states)
 
+        cos, sin = position_embeddings
+
         k = torch.cat([k_ctx, k_noise], dim=1).view(
             bsz, ctx_len + q_len, -1, self.head_dim
         )
@@ -200,8 +217,6 @@ class Qwen3FlashMTPAttention(nn.Module):
 
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
-
-        cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         if past_key_values is not None:
@@ -279,27 +294,6 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
-def extract_stacked_chs(
-    hidden_states: Union[Sequence[torch.Tensor], torch.Tensor],
-    time_indices: torch.Tensor,
-) -> torch.Tensor:
-    """Stacked CHS at per-token indices (B, T) from target forward, shape (B, T, S, H)."""
-    if isinstance(hidden_states, torch.Tensor) and hidden_states.dim() == 4:
-        b, t, s, d = hidden_states.shape
-        npos = time_indices.size(1)
-        b_idx = torch.arange(b, device=hidden_states.device)[:, None].expand(b, npos)
-        return hidden_states[b_idx, time_indices, :, :]
-    if isinstance(hidden_states, torch.Tensor):
-        raise ValueError("Expected tuple of (B, T, H) or stacked (B, T, S, H).")
-    out = []
-    for h in hidden_states:
-        g = torch.gather(
-            h, 1, time_indices.unsqueeze(-1).expand(-1, -1, h.size(-1))
-        )
-        out.append(g)
-    return torch.stack(out, dim=2)
-
-
 def _merged_flashmtp_config(config: Qwen3Config) -> dict:
     """Train 写入 flashmtp_config；部分 checkpoint 仅存 dflashconfig，需合并。"""
     fc = getattr(config, "flashmtp_config", None) or {}
@@ -320,39 +314,75 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         super().__init__(config)
         self.config = config
         flashmtp_config = _merged_flashmtp_config(config)
-        num_chs = int(
-            flashmtp_config.get(
-                "num_chs_source_tokens",
-                getattr(config, "num_target_layers", 0) + 1,
+        self.chs_concat_mode = "feature"
+        flashmtp_config["chs_concat_mode"] = "feature"
+        self.num_middle_layers_n = int(flashmtp_config.get("num_middle_layers_n", 0))
+
+        if flashmtp_config.get("target_layer_ids") is not None:
+            self.target_layer_ids = list(flashmtp_config["target_layer_ids"])
+        elif flashmtp_config.get("use_legacy_layer_sampling", False):
+            self.target_layer_ids = build_target_layer_ids(
+                config.num_target_layers, config.num_hidden_layers
             )
-        )
-        self.num_chs_source_tokens = num_chs
-        chs_fusion_layer_idx = int(
-            flashmtp_config.get("chs_fusion_layer_idx", 0)
-        )
+        else:
+            self.target_layer_ids = build_ablation_target_layer_ids(
+                config.num_target_layers, self.num_middle_layers_n
+            )
+
+        flashmtp_config.setdefault("num_middle_layers_n", self.num_middle_layers_n)
+        flashmtp_config["target_layer_ids"] = self.target_layer_ids
+        self.train_lm_head = bool(flashmtp_config.get("train_lm_head", False))
+        flashmtp_config["train_lm_head"] = self.train_lm_head
+        self.local_position = bool(flashmtp_config.get("local_position", False))
+        flashmtp_config["local_position"] = self.local_position
+        if self.train_lm_head:
+            self.draft_lm_head = nn.Linear(
+                config.hidden_size, config.vocab_size, bias=False
+            )
+        else:
+            self.draft_lm_head = None
+        config.flashmtp_config = flashmtp_config
+
         self.layers = nn.ModuleList(
             [
                 Qwen3FlashMTPDecoderLayer(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.chs_fusion = CHSQueryFusion(
-            config,
-            num_chs,
-            chs_fusion_layer_idx=chs_fusion_layer_idx,
-        )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
         self.sink_num = flashmtp_config.get("sink_num", None)
-        print_on_rank0(
-            "FlashMTP: num_chs_source_tokens="
-            f"{self.num_chs_source_tokens} (embed+layers), "
-            "CHS fusion=depth self-attn, readout=last layer slot"
-        )
-        self.post_init()
         self._last_decode_stats: dict = {}
+
+        s_layers = len(self.target_layer_ids)
+        h = config.hidden_size
+        self.fc = nn.Linear(s_layers * h, h, bias=False)
+        self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        print_on_rank0(
+            "FlashMTP: linear_fuse (v1.1), "
+            f"num_middle_layers_n={self.num_middle_layers_n}, "
+            f"target_layer_ids={self.target_layer_ids}, "
+            f"train_lm_head={self.train_lm_head}, local_position={self.local_position}"
+        )
+
+        self.post_init()
+
+    @property
+    def chs_len_per_block(self) -> int:
+        return 1
+
+    def _fuse_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
+        """(B, N, S, H) -> (B, N, H) linear fuse + norm (v1.1)."""
+        bsz, n_blk, s_len, h = target_hidden.shape
+        if s_len != len(self.target_layer_ids):
+            raise ValueError(
+                f"target_hidden S={s_len} != len(target_layer_ids)={len(self.target_layer_ids)}"
+            )
+        flat = target_hidden.reshape(bsz, n_blk, s_len * h)
+        return self.hidden_norm(self.fc(flat))
 
     def forward(
         self,
@@ -362,38 +392,32 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         target_hidden: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
+        rotary_position_ids: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
-        if target_hidden is None:
-            raise ValueError("target_hidden is required.")
-        # (B, N, S, H) before fusion
-        target_hidden = self.chs_fusion(target_hidden)
-        # RoPE must cover K/V = [context | draft]. Previously only `hidden_states` (draft)
-        # was used, so cos/sin length did not match concat(k_ctx, k_noise) in attention.
-        bs = self.block_size
-        dlen = hidden_states.size(1)
-        if dlen % bs != 0:
-            raise ValueError(
-                f"Draft sequence length {dlen} must be divisible by block_size {bs}."
-            )
-        n_blocks = dlen // bs
-        if target_hidden.size(1) != n_blocks:
-            raise ValueError(
-                f"Fused target_hidden len {target_hidden.size(1)} != num_blocks {n_blocks}."
-            )
-        # Block i draft starts at position_ids[:, i * bs] (= anchor i); CHS uses anchor-1.
-        first_of_block = position_ids[:, ::bs]
-        ctx_position_ids = (first_of_block - 1).clamp(min=0)
-        pos_full = torch.cat([ctx_position_ids, position_ids], dim=1)
-        h_full = torch.cat([target_hidden, hidden_states], dim=1)
-        position_embeddings = self.rotary_emb(h_full, pos_full)
+        assert target_hidden is not None and target_hidden.ndim == 4
+        noise_len = hidden_states.shape[1]
+        if position_ids.shape[1] != noise_len:
+            draft_pos = position_ids[:, -noise_len:]
+        else:
+            draft_pos = position_ids
+
+        target_hidden = self._fuse_target_hidden(target_hidden)
+        rotary_pos = (
+            rotary_position_ids if rotary_position_ids is not None else draft_pos
+        )
+        total_len = rotary_pos.shape[1]
+        dummy = hidden_states.new_zeros(
+            hidden_states.shape[0], total_len, hidden_states.shape[-1]
+        )
+        position_embeddings = self.rotary_emb(dummy, rotary_pos)
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
                 target_hidden=target_hidden,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
+                position_ids=draft_pos,
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
@@ -417,17 +441,22 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         target_hidden: torch.Tensor,
         block_output_ids: torch.LongTensor,
         block_position_ids_for_draft: torch.LongTensor,
+        rotary_position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         noise_embedding = target.model.embed_tokens(block_output_ids)
         hidden = self(
             target_hidden=target_hidden,
             noise_embedding=noise_embedding,
             position_ids=block_position_ids_for_draft,
+            rotary_position_ids=rotary_position_ids,
             past_key_values=None,
             use_cache=False,
             is_causal=False,
         )
-        return target.lm_head(hidden[:, -self.block_size + 1 :, :])
+        tail = hidden[:, -self.block_size + 1 :, :]
+        if self.draft_lm_head is not None:
+            return self.draft_lm_head(tail)
+        return target.lm_head(tail)
 
     def _confidence_and_token_for_row(
         self, row: torch.Tensor, temperature: float
@@ -447,6 +476,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         target_hidden: torch.Tensor,
         block_output_ids: torch.LongTensor,
         block_position_ids_for_draft: torch.LongTensor,
+        rotary_position_ids: Optional[torch.LongTensor],
         temperature: float,
         draft_forwards: list,
         draft_time: list,
@@ -466,6 +496,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 target_hidden,
                 block_output_ids,
                 block_position_ids_for_draft,
+                rotary_position_ids,
             )
             draft_time[0] += time.perf_counter() - t0
             draft_forwards[0] += 1
@@ -489,6 +520,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 target_hidden,
                 block_output_ids,
                 block_position_ids_for_draft,
+                rotary_position_ids,
             )
             draft_time[0] += time.perf_counter() - t0
             draft_forwards[0] += 1
@@ -509,6 +541,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         temperature: float,
         accept_lengths_out: Optional[List[int]],
         draft_decode: str,
+        spec_trace_fn: Optional[Callable[..., None]] = None,
     ) -> torch.Tensor:
         self.eval()
         if self.mask_token_id is None:
@@ -554,32 +587,64 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
             output.logits, temperature
         )
-        pre_idx = (num_input_tokens - 1) * torch.ones(1, 1, device=dev, dtype=torch.long)
-        pre_idx = pre_idx.clamp(min=0)
-        target_hidden = extract_stacked_chs(output.hidden_states, pre_idx)
+        target_hidden = gather_pivot_multilayer_inference(
+            output.hidden_states,
+            self.target_layer_ids,
+            -1,
+            self.config.num_target_layers,
+        )
 
         start = input_ids.shape[1]
+        spec_step = 0
+        chs = self.chs_len_per_block
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
-            block_position_ids_for_draft = position_ids[
-                :, start : start + block_size
-            ]
+            if self.local_position:
+                draft_block_pos = torch.arange(
+                    1, block_size + 1, device=dev, dtype=torch.long
+                ).unsqueeze(0)
+            else:
+                draft_block_pos = block_position_ids
+            if self.local_position:
+                ctx_pos_part = torch.zeros(1, chs, dtype=torch.long, device=dev)
+            else:
+                ctx_pos_part = torch.full(
+                    (1, chs),
+                    start - 1,
+                    dtype=torch.long,
+                    device=dev,
+                )
+            full_rotary = torch.cat([ctx_pos_part, draft_block_pos], dim=-1)
+            block_position_ids_for_draft = draft_block_pos
 
             dfw = [0]
             dtw = [0.0]
+            draft_logits: Optional[torch.Tensor] = None
             if draft_decode == "mdlm":
                 self._fill_block_draft_mdlm_confidence(
                     target,
                     target_hidden,
                     block_output_ids,
                     block_position_ids_for_draft,
+                    full_rotary,
                     temperature,
                     dfw,
                     dtw,
                 )
                 draft_forwards += dfw[0]
                 draft_time += dtw[0]
+                if spec_trace_fn is not None:
+                    t0 = time.perf_counter()
+                    draft_logits = self._forward_block_draft_logits(
+                        target,
+                        target_hidden,
+                        block_output_ids,
+                        block_position_ids_for_draft,
+                        full_rotary,
+                    )
+                    draft_time += time.perf_counter() - t0
+                    draft_forwards += 1
             else:
                 t0 = time.perf_counter()
                 draft_logits = self._forward_block_draft_logits(
@@ -587,6 +652,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                     target_hidden,
                     block_output_ids,
                     block_position_ids_for_draft,
+                    full_rotary,
                 )
                 draft_time += time.perf_counter() - t0
                 draft_forwards += 1
@@ -611,6 +677,18 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             )
             accept_len_report = int(acceptance_length) + 1
             accept_buf.append(accept_len_report)
+            if spec_trace_fn is not None and draft_logits is not None:
+                spec_trace_fn(
+                    spec_step,
+                    int(start),
+                    block_output_ids,
+                    draft_logits,
+                    output.logits,
+                    posterior,
+                    int(acceptance_length),
+                    int(accept_len_report),
+                )
+            spec_step += 1
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
                 :, : acceptance_length + 1
             ]
@@ -619,12 +697,15 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             ]
             start += acceptance_length + 1
             past_key_values_target.crop(start)
-            hs_len = output.hidden_states[0].shape[1]
-            last_chunk_idx = min(int(acceptance_length), hs_len - 1)
-            last_chunk_idx = max(last_chunk_idx, 0)
-            target_hidden = extract_stacked_chs(
+            pivot_index = min(
+                int(acceptance_length), output.hidden_states[0].shape[1] - 1
+            )
+            pivot_index = max(pivot_index, 0)
+            target_hidden = gather_pivot_multilayer_inference(
                 output.hidden_states,
-                torch.tensor([[last_chunk_idx]], device=dev, dtype=torch.long),
+                self.target_layer_ids,
+                pivot_index,
+                self.config.num_target_layers,
             )
             if stop_token_ids is not None and any(
                 stop_token_id in output_ids[:, num_input_tokens:]
@@ -665,6 +746,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         stop_token_ids: list[int],
         temperature: float,
         accept_lengths_out: Optional[List[int]] = None,
+        spec_trace_fn: Optional[Callable[..., None]] = None,
     ):
         """Spec decode with MDLM-style draft: 4 confidence rounds (1,2,4,8) + tail fill, then target verify."""
         return self._speculative_generate_impl(
@@ -675,6 +757,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             temperature=temperature,
             accept_lengths_out=accept_lengths_out,
             draft_decode="mdlm",
+            spec_trace_fn=spec_trace_fn,
         )
 
     @torch.inference_mode()
@@ -686,6 +769,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         stop_token_ids: list[int],
         temperature: float,
         accept_lengths_out: Optional[List[int]] = None,
+        spec_trace_fn: Optional[Callable[..., None]] = None,
     ):
         """Spec decode: single draft forward fills the whole draft tail, then target verify."""
         return self._speculative_generate_impl(
@@ -696,4 +780,5 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             temperature=temperature,
             accept_lengths_out=accept_lengths_out,
             draft_decode="oneshot",
+            spec_trace_fn=spec_trace_fn,
         )

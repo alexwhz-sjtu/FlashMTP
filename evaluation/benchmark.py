@@ -4,15 +4,18 @@ import random
 import re
 import sys
 import time
+from datetime import datetime
 from itertools import chain
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Callable, Optional
+
 from loguru import logger
 import numpy as np
 import torch
 from rich import print
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -25,6 +28,96 @@ from evaluation import distributed as dist
 from evaluation.utils import load_and_process_dataset
 
 DATASET_PATH_FILE = Path(__file__).resolve().with_name("dataset_path.json")
+
+
+def _draft_topk_list(
+    row: torch.Tensor, tokenizer, k: int, temperature: float
+) -> list:
+    row = row.float()
+    if temperature < 1e-5:
+        probs = torch.softmax(row, dim=-1)
+    else:
+        probs = torch.softmax(row / temperature, dim=-1)
+    vals, idx = probs.topk(k)
+    out = []
+    for j in range(min(k, vals.shape[-1])):
+        tid = int(idx[j].item())
+        p = float(vals[j].item())
+        text = tokenizer.decode([tid], skip_special_tokens=False)
+        out.append({"token_id": tid, "prob": p, "text": text})
+    return out
+
+
+def _make_flashmtp_spec_trace_fn(
+    tokenizer: AutoTokenizer,
+    temperature: float,
+    jsonl_path: Path,
+    sample_idx: int,
+    turn_index: int,
+    flashmtp_decode: str,
+    target_layer_ids: list[int],
+) -> Callable[..., None]:
+    """每步追加一行 JSONL：接收长度、块首 anchor token、各 draft 位 top3、最后接受位标记。"""
+
+    def _fn(
+        step_idx: int,
+        start: int,
+        block_output_ids: torch.Tensor,
+        draft_logits: torch.Tensor,
+        target_logits: torch.Tensor,
+        posterior: torch.Tensor,
+        acceptance_length: int,
+        accept_len_report: int,
+    ) -> None:
+        block_size = int(block_output_ids.shape[1])
+        last_acc = int(acceptance_length)
+        anchor_id = int(block_output_ids[0, 0].item())
+        anchor_text = tokenizer.decode([anchor_id], skip_special_tokens=False)
+        # 与 draft[1] 核对用的目标采样位（posterior[:,0]），非 anchor 本身
+        t_pos1 = int(posterior[0, 0].item())
+        text_pos1 = tokenizer.decode([t_pos1], skip_special_tokens=False)
+        draft_positions = []
+        for pos in range(1, block_size):
+            li = pos - 1
+            row = draft_logits[0, li]
+            did = int(block_output_ids[0, pos].item())
+            draft_positions.append(
+                {
+                    "pos": pos,
+                    "last_accepted": pos == last_acc,
+                    "draft_token_id": did,
+                    "draft_text": tokenizer.decode([did], skip_special_tokens=False),
+                    "top3": _draft_topk_list(row, tokenizer, 3, temperature),
+                }
+            )
+        rec = {
+            "sample_idx": sample_idx,
+            "turn_index": turn_index,
+            "spec_step": step_idx,
+            "global_block_start": start,
+            "accept_length": accept_len_report,
+            "consecutive_draft_matches": acceptance_length,
+            "flashmtp_decode": flashmtp_decode,
+            "target_layer_ids": list(target_layer_ids),
+            "anchor": {
+                "last_accepted": last_acc == 0,
+                "token_id": anchor_id,
+                "text": anchor_text,
+            },
+            "target_reference_for_draft_pos1": {
+                "token_id": t_pos1,
+                "text": text_pos1,
+            },
+            "draft_positions": draft_positions,
+            "block_token_ids": block_output_ids[0].tolist(),
+            "posterior_token_ids": posterior[0].tolist(),
+        }
+        jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    return _fn
+
 
 INFINITEBENCH_PROMPTS = {
     "passkey": "There is an important info hidden inside a lot of irrelevant text. Find it and memorize it. I will quiz you about the important information.\n\n{context}\n\n{input}\n\nThe pass key is",
@@ -235,6 +328,7 @@ def flashmtp_generate(
     stop_token_ids: list[int],
     temperature: float = 0.0,
     decode: str = "oneshot",
+    spec_trace_fn: Optional[Callable[..., None]] = None,
 ) -> SimpleNamespace:
     original_block_size = model.block_size
     model.block_size = block_size
@@ -246,6 +340,7 @@ def flashmtp_generate(
                 max_new_tokens=max_new_tokens,
                 stop_token_ids=stop_token_ids,
                 temperature=temperature,
+                spec_trace_fn=spec_trace_fn,
             )
         elif decode == "oneshot":
             output_ids = model.spec_generate(
@@ -254,6 +349,7 @@ def flashmtp_generate(
                 max_new_tokens=max_new_tokens,
                 stop_token_ids=stop_token_ids,
                 temperature=temperature,
+                spec_trace_fn=spec_trace_fn,
             )
         else:
             raise ValueError("decode must be 'oneshot' or 'mdlm'")
@@ -308,6 +404,17 @@ def main() -> None:
         help="Draft fill strategy: oneshot = one draft forward per block; "
         "mdlm = confidence rounds 1+2+4+8 then tail fill (more draft forwards).",
     )
+    parser.add_argument(
+        "--flashmtp-spec-trace",
+        action="store_true",
+        help="Record per speculative step to JSONL (see --flashmtp-spec-trace-jsonl); rank0 only.",
+    )
+    parser.add_argument(
+        "--flashmtp-spec-trace-jsonl",
+        type=str,
+        default=None,
+        help="JSONL path for spec-trace (default under repo log/: flashmtp_spec_trace_<timestamp>.jsonl).",
+    )
     args = parser.parse_args()
 
     random.seed(0)
@@ -340,8 +447,14 @@ def main() -> None:
         dtype=torch.bfloat16,
     ).to(device).eval()
 
+    draft_cfg = AutoConfig.from_pretrained(
+        args.draft_name_or_path,
+        trust_remote_code=True,
+    )
+
     draft_model = FlashMTPDraftModel.from_pretrained(
         args.draft_name_or_path,
+        config=draft_cfg,
         attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
         dtype=torch.bfloat16,
     ).to(device).eval()
@@ -356,19 +469,36 @@ def main() -> None:
         draft_model.sink_num = int(eff_sink)
     elif getattr(draft_model, "sink_num", None) is None:
         draft_model.sink_num = eff_sink
+    eff_tl = list(getattr(draft_model, "target_layer_ids", []) or [])
     if eff_sink is not None:
         logger.info(
             f"FlashMTP draft: sink_num={draft_model.sink_num}, "
+            f"target_layer_ids={eff_tl}, "
             f"block_size={draft_model.block_size}, decode={args.flashmtp_decode}"
         )
     else:
         logger.info(
             f"FlashMTP draft: no sink_num in config, "
+            f"target_layer_ids={eff_tl}, "
             f"block_size={draft_model.block_size}, decode={args.flashmtp_decode}"
         )
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+
+    spec_trace_jsonl_path: Optional[Path] = None
+    if args.flashmtp_spec_trace and dist.is_main():
+        if args.flashmtp_spec_trace_jsonl:
+            spec_trace_jsonl_path = Path(args.flashmtp_spec_trace_jsonl)
+        else:
+            spec_trace_jsonl_path = (
+                PROJECT_ROOT
+                / "log"
+                / f"flashmtp_spec_trace_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
+            )
+        spec_trace_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.info(f"spec-trace JSONL (rank0): {spec_trace_jsonl_path.resolve()}")
+
     dataset = load_benchmark_dataset(args.dataset)
     dataset = select_max_samples(dataset, args.max_samples)
 
@@ -398,6 +528,17 @@ def main() -> None:
                 stop_token_ids=[tokenizer.eos_token_id],
                 temperature=args.temperature,
             )
+            trace_fn = None
+            if args.flashmtp_spec_trace and dist.is_main() and spec_trace_jsonl_path is not None:
+                trace_fn = _make_flashmtp_spec_trace_fn(
+                    tokenizer,
+                    args.temperature,
+                    spec_trace_jsonl_path,
+                    idx,
+                    turn_index,
+                    args.flashmtp_decode,
+                    eff_tl,
+                )
             response[block_size] = flashmtp_generate(
                 model=draft_model,
                 target=target,
@@ -407,6 +548,7 @@ def main() -> None:
                 stop_token_ids=[tokenizer.eos_token_id],
                 temperature=args.temperature,
                 decode=args.flashmtp_decode,
+                spec_trace_fn=trace_fn,
             )
             
             spec_response = response[block_size]

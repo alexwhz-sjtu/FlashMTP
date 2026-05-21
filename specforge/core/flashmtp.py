@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from specforge.modeling.draft.flashmtp import (
     FlashMTPDraftModel,
-    stack_hidden_states_for_positions,
+    prepare_target_hidden,
 )
 
 try:
@@ -20,9 +20,6 @@ except ImportError:
     FLEX_ATTENTION_AVAILABLE = False
     BlockMask = None
     create_block_mask = None
-
-CHS_LEN_PER_BLOCK = 1  # Fused to one condition token per block
-
 
 def create_flashmtp_block_mask(
     anchor_positions: torch.Tensor,
@@ -36,7 +33,7 @@ def create_flashmtp_block_mask(
     Args:
         anchor_positions: (B, N) tensor of anchor positions for each block
         block_keep_mask: (B, N) boolean mask indicating valid blocks
-        chs_len_per_block: Number of context tokens per block (1 after query fusion)
+        chs_len_per_block: Context tokens per block (1 for depth/linear fuse; S for prefix_condition)
         block_size: Number of tokens per draft block
         device: torch device
 
@@ -63,6 +60,43 @@ def create_flashmtp_block_mask(
     return create_block_mask(
         flashmtp_mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device
     )
+
+
+def _draft_position_ids_for_flashmtp_training(
+    anchor_positions: torch.Tensor,
+    block_size: int,
+    local_position: bool,
+) -> torch.Tensor:
+    """Draft token position ids: global (anchor + offset) or block-local 1..block_size (v1.1)."""
+    bsz, n_blocks = anchor_positions.shape
+    device = anchor_positions.device
+    if local_position:
+        local = torch.arange(1, block_size + 1, device=device).view(1, 1, -1).expand(
+            bsz, n_blocks, -1
+        )
+        return local.reshape(bsz, -1)
+    offsets = torch.arange(block_size, device=device).view(1, 1, -1)
+    return (anchor_positions.unsqueeze(-1) + offsets).view(bsz, -1)
+
+
+def _full_rotary_position_ids_for_flashmtp(
+    anchor_positions: torch.Tensor,
+    draft_position_ids: torch.Tensor,
+    chs_len_per_block: int,
+    local_position: bool,
+) -> torch.Tensor:
+    """Concatenate CHS rotary ids (per-block anchor-1) with draft ids (v1.1)."""
+    bsz, n_blk = anchor_positions.shape
+    device = anchor_positions.device
+    chs = chs_len_per_block
+    if local_position:
+        ctx_pos_flat = torch.zeros(bsz, n_blk * chs, device=device, dtype=torch.long)
+    else:
+        ctx_base = (anchor_positions - 1).clamp(min=0)
+        ctx_pos_flat = ctx_base.unsqueeze(-1).expand(bsz, n_blk, chs).reshape(
+            bsz, n_blk * chs
+        )
+    return torch.cat([ctx_pos_flat, draft_position_ids], dim=-1)
 
 
 class OnlineFlashMTPModel(nn.Module):
@@ -136,15 +170,6 @@ class OnlineFlashMTPModel(nn.Module):
 
         return anchors, keep_mask
 
-    def _create_position_ids(
-        self, anchor_positions: torch.Tensor
-    ) -> torch.Tensor:
-        bsz, n_blocks = anchor_positions.shape
-        device = anchor_positions.device
-        offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
-        pos_ids = anchor_positions.unsqueeze(-1) + offsets
-        return pos_ids.view(bsz, -1)
-
     def _create_noise_embed(
         self, input_ids, anchor_positions, block_keep_mask
     ):
@@ -192,29 +217,40 @@ class OnlineFlashMTPModel(nn.Module):
             input_ids, anchor_positions, block_keep_mask
         )
 
-        draft_position_ids = self._create_position_ids(anchor_positions)
-        full_position_ids = draft_position_ids
+        draft_position_ids = _draft_position_ids_for_flashmtp_training(
+            anchor_positions,
+            self.block_size,
+            self.draft_model.local_position,
+        )
+        full_rotary_position_ids = _full_rotary_position_ids_for_flashmtp(
+            anchor_positions,
+            draft_position_ids,
+            self.draft_model.chs_len_per_block,
+            self.draft_model.local_position,
+        )
 
-        chs_len_per_block = CHS_LEN_PER_BLOCK
+        chs_len = self.draft_model.chs_len_per_block
         flashmtp_attn_mask = create_flashmtp_block_mask(
             anchor_positions=anchor_positions,
             block_keep_mask=block_keep_mask,
-            chs_len_per_block=chs_len_per_block,
+            chs_len_per_block=chs_len,
             block_size=self.block_size,
             device=device,
         )
 
-        # Anchor at p: use target states at p-1 (context for position p)
-        context_positions = (anchor_positions - 1).clamp(min=0)
-        target_hidden = stack_hidden_states_for_positions(
-            hidden_states, context_positions
+        target_hidden = prepare_target_hidden(
+            hidden_states,
+            anchor_positions,
+            self.draft_model.target_layer_ids,
+            self.draft_model.config.num_target_layers,
         )
 
         output_hidden = self.draft_model(
-            position_ids=full_position_ids,
+            position_ids=draft_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=target_hidden,
             attention_mask=flashmtp_attn_mask,
+            rotary_position_ids=full_rotary_position_ids,
         )
 
         logits = self.lm_head(output_hidden)

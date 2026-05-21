@@ -7,12 +7,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from specforge.modeling.draft.flashmtp import (
-    FlashMTPDraftModel,
-    stack_hidden_states_for_positions,
+from specforge.core.flashmtp import (
+    _draft_position_ids_for_flashmtp_training,
+    _full_rotary_position_ids_for_flashmtp,
+    create_flashmtp_block_mask,
 )
-
-from specforge.core.flashmtp import CHS_LEN_PER_BLOCK, create_flashmtp_block_mask
+from specforge.modeling.draft.flashmtp import FlashMTPDraftModel, prepare_target_hidden
 
 def kl_to_teacher(
     student_logits: torch.Tensor,
@@ -106,12 +106,6 @@ class FlashMTPMDLMModel(nn.Module):
         )
         return anchors, keep_mask
 
-    def _create_position_ids(self, anchor_positions: torch.Tensor) -> torch.Tensor:
-        bsz, n_blocks = anchor_positions.shape
-        device = anchor_positions.device
-        offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
-        return (anchor_positions.unsqueeze(-1) + offsets).view(bsz, -1)
-
     def _mdlm_noise_and_mask(
         self,
         input_ids: torch.Tensor,
@@ -179,23 +173,37 @@ class FlashMTPMDLMModel(nn.Module):
         noise_embedding, ce_mask = self._mdlm_noise_and_mask(
             input_ids, anchor_positions, block_keep_mask, loss_mask
         )
-        draft_position_ids = self._create_position_ids(anchor_positions)
+        draft_position_ids = _draft_position_ids_for_flashmtp_training(
+            anchor_positions,
+            self.block_size,
+            self.draft_model.local_position,
+        )
+        full_rotary_position_ids = _full_rotary_position_ids_for_flashmtp(
+            anchor_positions,
+            draft_position_ids,
+            self.draft_model.chs_len_per_block,
+            self.draft_model.local_position,
+        )
+        chs_len = self.draft_model.chs_len_per_block
         flashmtp_attn_mask = create_flashmtp_block_mask(
             anchor_positions=anchor_positions,
             block_keep_mask=block_keep_mask,
-            chs_len_per_block=CHS_LEN_PER_BLOCK,
+            chs_len_per_block=chs_len,
             block_size=self.block_size,
             device=device,
         )
-        context_positions = (anchor_positions - 1).clamp(min=0)
-        target_hidden = stack_hidden_states_for_positions(
-            hidden_states, context_positions
+        target_hidden = prepare_target_hidden(
+            hidden_states,
+            anchor_positions,
+            self.draft_model.target_layer_ids,
+            self.draft_model.config.num_target_layers,
         )
         output_hidden = self.draft_model(
             position_ids=draft_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=target_hidden,
             attention_mask=flashmtp_attn_mask,
+            rotary_position_ids=full_rotary_position_ids,
         )
         logits = self.lm_head(output_hidden)
         # CE：仅 ce_mask ∧ 序列边界 ∧ loss_mask 处，对真 token_id 做交叉熵；可选在相同位置上对 teacher_logits 加 KL。

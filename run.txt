@@ -121,5 +121,5 @@ python scripts/regenerate_train_data.py \
 cd /inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP_v3.3 && \
 mkdir -p whz_mtp_logs && \
 export NUM_DRAFT_LAYERS=5 && \
-bash scripts/run_v3_3_mdlm.sh --dt qz \
+bash scripts/train_mdlm_v33.sh --dt qz \
   > "whz_mtp_logs/train_flashmtp_v3.3_qz_dist_$(date +%Y%m%d_%H%M%S).log" 2>&1
