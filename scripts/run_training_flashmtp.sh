@@ -34,9 +34,13 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
-NUM_ANCHORS="${NUM_ANCHORS:-2048}"
+NUM_ANCHORS="${NUM_ANCHORS:-512}"
 ANCHOR_CHUNK_SIZE="${ANCHOR_CHUNK_SIZE:-512}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
+
+# decode chunk（与 BLOCK_SIZE 配套）：逗号分隔正整数，须满足 sum == BLOCK_SIZE。
+# 例：BLOCK_SIZE=16 时可设 4,4,4,4；留空则不传参，训练使用默认 flashmtp_slot_group 语义组 mask。
+DECODE_CHUNK_SIZES="${DECODE_CHUNK_SIZES:-4,4,4,4}"
 
 # 恢复训练
 RESUME="${RESUME:-}"
@@ -67,11 +71,11 @@ if [ "$DT" = "qz" ]; then
     # export NODE_RANK=${RANK:-0}
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_exp2_qz_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 elif [ "$DT" = "h100" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-../training_data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_exp_h100_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_exp2_h100_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
@@ -108,8 +112,8 @@ REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-exp}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_exp_${DT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_exp_${DT}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_exp2_${DT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_exp2_${DT}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}}"
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen}"
@@ -140,6 +144,11 @@ echo "------------------------------------------"
 echo "模型配置:"
 echo "  草稿模型层数: ${NUM_DRAFT_LAYERS}"
 echo "  块大小: ${BLOCK_SIZE}"
+if [ -n "${DECODE_CHUNK_SIZES}" ]; then
+    echo "  decode_chunk_sizes: ${DECODE_CHUNK_SIZES}"
+else
+    echo "  decode_chunk_sizes: (未设置，使用默认 slot_group)"
+fi
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Anchor chunk大小: ${ANCHOR_CHUNK_SIZE:-0} (0表示关闭)"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
@@ -218,6 +227,10 @@ fi
 
 if [ -n "${KL_TOP_K}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --kl-top-k ${KL_TOP_K}"
+fi
+
+if [ -n "${DECODE_CHUNK_SIZES}" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --decode-chunk-sizes ${DECODE_CHUNK_SIZES}"
 fi
 
 if [ -n "${IS_PREFORMATTED}" ]; then

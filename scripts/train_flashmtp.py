@@ -26,6 +26,7 @@ from specforge.core.flashmtp import OnlineFlashMTPModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
+from specforge.modeling.draft.flashmtp_chunk_utils import normalize_decode_chunk_sizes
 from specforge.modeling.target.flashmtp_target_model import (
     FlashMTPTargetModel,
     get_flashmtp_target_model,
@@ -96,6 +97,15 @@ def parse_args():
         help="Weight for target-distribution KL loss. 0 disables KL.",
     )
     model_group.add_argument(
+        "--decode-chunk-sizes",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated chunk lengths summing to block_size, e.g. '4,4,4,4' for "
+            "block_size=16 (exp_version decode chunks). Omit to use default slot groups."
+        ),
+    )
+    model_group.add_argument(
         "--kl-top-k",
         type=int,
         default=0,
@@ -159,6 +169,37 @@ def parse_args():
     return parser.parse_args()
 
 
+def _sync_draft_layer_types_to_num_hidden_layers(draft_config) -> None:
+    """Ensure ``layer_types`` has one entry per draft layer (matches ``num_hidden_layers``).
+
+    When the draft config is cloned from the target model, ``num_hidden_layers`` is set to
+    the draft depth but ``layer_types`` often still lists every target layer; fix before
+    constructing ``FlashMTPDraftModel`` so checkpoints serialize a consistent config.
+    """
+    n = getattr(draft_config, "num_hidden_layers", None)
+    if n is None:
+        return
+    n = int(n)
+    if n <= 0:
+        return
+    lt = getattr(draft_config, "layer_types", None)
+    if not lt:
+        draft_config.layer_types = ["full_attention"] * n
+        return
+    lt = list(lt)
+    if len(lt) == n:
+        return
+    old_len = len(lt)
+    if len(lt) > n:
+        draft_config.layer_types = lt[:n]
+    else:
+        pad = lt[-1] if lt else "full_attention"
+        draft_config.layer_types = lt + [pad] * (n - len(lt))
+    print_on_rank0(
+        f"Adjusted layer_types length {old_len} -> {n} to match draft num_hidden_layers"
+    )
+
+
 def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     """Build target model (backend wrapper) and draft model."""
     print_on_rank0(
@@ -193,6 +234,15 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         draft_config.flashmtp_config = {}
         
     draft_config.flashmtp_config["chs_concat_mode"] = "feature"
+
+    if args.decode_chunk_sizes is not None:
+        draft_config.flashmtp_config["decode_chunk_sizes"] = (
+            normalize_decode_chunk_sizes(
+                args.decode_chunk_sizes, int(draft_config.block_size)
+            )
+        )
+
+    _sync_draft_layer_types_to_num_hidden_layers(draft_config)
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
@@ -429,6 +479,27 @@ def main():
         loaded_model = FlashMTPDraftModel.from_pretrained(
             draft_model_last_checkpoint, torch_dtype=torch.bfloat16
         )
+        # Weights-only load leaves `draft_model.config` from build_models; merge
+        # flashmtp_config from disk so decode_chunk_sizes / target_layer_ids match
+        # the checkpoint and are written back on save_pretrained.
+        src_fc = getattr(loaded_model.config, "flashmtp_config", None)
+        if src_fc is not None:
+            dst_fc = getattr(draft_model.config, "flashmtp_config", None) or {}
+            draft_model.config.flashmtp_config = {**dst_fc, **dict(src_fc)}
+            tids = draft_model.config.flashmtp_config.get("target_layer_ids")
+            if tids is not None:
+                draft_model.target_layer_ids = list(tids)
+        draft_model.decode_chunk_sizes = normalize_decode_chunk_sizes(
+            draft_model.config.flashmtp_config.get("decode_chunk_sizes"),
+            int(draft_model.block_size),
+        )
+        if draft_model.decode_chunk_sizes is not None:
+            draft_model.config.flashmtp_config["decode_chunk_sizes"] = list(
+                draft_model.decode_chunk_sizes
+            )
+        else:
+            draft_model.config.flashmtp_config.pop("decode_chunk_sizes", None)
+
         draft_model.load_state_dict(loaded_model.state_dict())
         del loaded_model
         print_on_rank0("Loaded draft model weights from checkpoint")
@@ -463,6 +534,12 @@ def main():
     draft_model.config.flashmtp_config["chs_concat_mode"] = "feature"
     draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
     draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
+    if draft_model.decode_chunk_sizes is not None:
+        draft_model.config.flashmtp_config["decode_chunk_sizes"] = list(
+            draft_model.decode_chunk_sizes
+        )
+    else:
+        draft_model.config.flashmtp_config.pop("decode_chunk_sizes", None)
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
@@ -629,7 +706,7 @@ def main():
                     total_correct_count / total_actual_token_count.clamp(min=1.0)
                 )
                 metrics = {
-                    "prefix_length": total_prefix_sum
+                    "prefix_acc": total_prefix_sum
                     / total_prefix_count.clamp(min=1.0),
                     "ce_loss": total_ce_loss_numerator
                     / total_valid_token_count.clamp(min=1e-6),

@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from specforge.modeling.draft.flashmtp import FlashMTPDraftModel, flashmtp_slot_group
+from specforge.modeling.draft.flashmtp_chunk_utils import normalize_decode_chunk_sizes
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -57,6 +58,7 @@ def create_flashmtp_block_mask(
     chs_len_per_block: int,
     block_size: int,
     device: torch.device,
+    decode_chunk_sizes: Optional[list[int]] = None,
 ):
     """Construct Flex Attention BlockMask for FlashMTP training with per-block CHS.
 
@@ -67,6 +69,10 @@ def create_flashmtp_block_mask(
             feature-concat CHS, so this is 1.
         block_size: Number of tokens per draft block
         device: torch device
+        decode_chunk_sizes: Optional list of positive ints summing to ``block_size``
+            (e.g. ``[4,4,4,4]`` for ``block_size=16``). When set, draft visibility
+            follows decode-chunk rules (see below). When ``None``, use
+            ``flashmtp_slot_group`` semantics.
 
     Layout:
         KV: [CHS_0 | ... | CHS_{N-1} | Clean_0, Mask_0 | Clean_1, Mask_1 | ...]
@@ -74,14 +80,59 @@ def create_flashmtp_block_mask(
             - Each Clean_i and Mask_i has length block_size
         Q:  [Clean_0, Mask_0 | Clean_1, Mask_1 | ...]
 
-    Rules:
+    Rules (shared):
       1. Block_i only sees CHS_i (its own feature-concat context token).
-      2. Clean queries only see previous/current clean semantic groups.
-      3. Mask queries see previous clean groups and the current mask group.
-      4. Tokens inside the same predicted mask group are bidirectional.
-      5. Different sampled training blocks are invisible to each other.
-      6. Invalid blocks (block_keep_mask=False) see nothing.
+      2. Different sampled training blocks are invisible to each other.
+      3. Invalid blocks (block_keep_mask=False) see nothing.
+
+    When ``decode_chunk_sizes`` is ``None`` (default slot groups):
+      4. Clean queries only see previous/current clean semantic groups.
+      5. Mask queries see previous clean groups and the current mask group.
+      6. Tokens inside the same predicted mask group are bidirectional.
+
+    When ``decode_chunk_sizes`` is set (exp chunk layout, sum = block_size):
+      - Slots are partitioned into consecutive chunks on ``0 .. block_size-1``.
+      - Each position only attends to CHS and, in **strictly earlier** decode
+        chunks, **clean-stream KV only** (GT); mask KV in earlier chunks is hidden.
+      - **Mask stream slot 0** (``M0:0`` KV): **not attended** (redundant with clean
+        anchor); input uses the **same token embedding as** ``C0:0`` (see
+        ``OnlineFlashMTPModel._create_noise_embed``).
+      - **Mask queries**: CHS; in **earlier** chunks **clean only** (all GT slots in
+        those chunks); in **chunk 0** also **clean at slot 0** (anchor) and **mask
+        KV in chunk 0 for slots ``kvs>=1``** (exclude redundant mask-stream slot 0);
+        in **chunk ≥ 1** only **mask KV in the same chunk** (slots in that chunk are
+        all ``>=1`` when chunk 0 has size ≥1). Never later chunks; never earlier-chunk
+        mask KV.
+      - **Clean queries**: draft KV is **clean only**: in **earlier** chunks, all clean
+        slots; in the **same** chunk, **clean→clean** is **fully bidirectional**. Clean
+        queries **do not** attend to mask-stream KV (only mask queries use the mask
+        band).
     """
+
+    decode_chunk_sizes = normalize_decode_chunk_sizes(
+        decode_chunk_sizes, block_size
+    )
+
+    # Tensor maps so mask_mod never indexes Python lists with vmap'd indices (no .item()).
+    chunk_of_slot_t: Optional[torch.Tensor] = None
+    chunk_lo_t: Optional[torch.Tensor] = None
+    chunk_hi_t: Optional[torch.Tensor] = None
+    if decode_chunk_sizes is not None:
+        acc = 0
+        _chunk_lo: list[int] = []
+        _chunk_hi: list[int] = []
+        _chunk_of_slot: list[int] = [0] * block_size
+        for k, sz in enumerate(decode_chunk_sizes):
+            lo, hi = acc, acc + int(sz)
+            _chunk_lo.append(lo)
+            _chunk_hi.append(hi)
+            for s in range(lo, hi):
+                _chunk_of_slot[s] = k
+            acc = hi
+        assert acc == block_size
+        chunk_of_slot_t = torch.tensor(_chunk_of_slot, dtype=torch.long, device=device)
+        chunk_lo_t = torch.tensor(_chunk_lo, dtype=torch.long, device=device)
+        chunk_hi_t = torch.tensor(_chunk_hi, dtype=torch.long, device=device)
 
     def flashmtp_mask_mod(b, h, q_idx, kv_idx):
         stream_block_size = 2 * block_size
@@ -89,7 +140,6 @@ def create_flashmtp_block_mask(
         q_stream_offset = q_idx % stream_block_size
         q_is_mask = q_stream_offset >= block_size
         q_slot = q_stream_offset % block_size
-        q_group = flashmtp_slot_group(q_slot)
 
         # Total length of all CHS segments
         total_chs_len = N * chs_len_per_block
@@ -109,15 +159,56 @@ def create_flashmtp_block_mask(
         kv_stream_offset = draft_kv_idx % stream_block_size
         kv_is_mask = kv_stream_offset >= block_size
         kv_slot = kv_stream_offset % block_size
-        kv_group = flashmtp_slot_group(kv_slot)
 
         same_block = kv_block_id == q_block_id
-        clean_query_visible = (~q_is_mask) & (~kv_is_mask) & (kv_group <= q_group)
-        mask_query_visible = q_is_mask & (
-            ((~kv_is_mask) & (kv_group < q_group))
-            | (kv_is_mask & (kv_group == q_group))
-        )
-        mask_draft = is_draft & same_block & (clean_query_visible | mask_query_visible)
+
+        if decode_chunk_sizes is not None and chunk_of_slot_t is not None:
+            cq = chunk_of_slot_t[q_slot]
+            ckv = chunk_of_slot_t[kv_slot]
+            lo_q = chunk_lo_t[cq]
+            hi_q = chunk_hi_t[cq]
+            kvs_in_chunk = (kv_slot >= lo_q) & (kv_slot < hi_q)
+
+            in_block = is_draft & same_block
+            # Same logic as previous int branch, expressed with torch.where (vmap-safe).
+            draft_visible = torch.where(
+                ~in_block,
+                torch.zeros((), dtype=torch.bool, device=q_idx.device),
+                torch.where(
+                    ckv > cq,
+                    torch.zeros((), dtype=torch.bool, device=q_idx.device),
+                    torch.where(
+                        ckv < cq,
+                        ~kv_is_mask,
+                        torch.where(
+                            cq == 0,
+                            torch.where(
+                                q_is_mask,
+                                (kv_is_mask & kvs_in_chunk & (kv_slot > 0))
+                                | ((~kv_is_mask) & (kv_slot == 0)),
+                                (~kv_is_mask) & kvs_in_chunk,
+                            ),
+                            torch.where(
+                                q_is_mask,
+                                kv_is_mask & kvs_in_chunk & (kv_slot > 0),
+                                (~kv_is_mask) & kvs_in_chunk,
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            mask_draft = is_draft & same_block & draft_visible
+        else:
+            q_group = flashmtp_slot_group(q_slot)
+            kv_group = flashmtp_slot_group(kv_slot)
+            clean_query_visible = (~q_is_mask) & (~kv_is_mask) & (kv_group <= q_group)
+            mask_query_visible = q_is_mask & (
+                ((~kv_is_mask) & (kv_group < q_group))
+                | (kv_is_mask & (kv_group == q_group))
+            )
+            mask_draft = is_draft & same_block & (
+                clean_query_visible | mask_query_visible
+            )
 
         is_valid_block = block_keep_mask[b, q_block_id]
         return (mask_context | mask_draft) & is_valid_block
@@ -302,6 +393,8 @@ class OnlineFlashMTPModel(nn.Module):
         )
 
         mask_ids = torch.full_like(clean_ids, self.mask_token_id)
+        # Mask stream slot 0: use anchor token (same as clean slot 0), not mask_id.
+        mask_ids[:, :, 0] = clean_ids[:, :, 0]
         draft_ids = torch.cat([clean_ids, mask_ids], dim=-1).reshape(
             bsz, n * 2 * bs
         )
@@ -320,6 +413,7 @@ class OnlineFlashMTPModel(nn.Module):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
+        # some blocks are padding blocks, block_keep_mask means we don't keep them
         if anchor_positions is None or block_keep_mask is None:
             anchor_positions, block_keep_mask = self._sample_anchor_positions(
                 seq_len, loss_mask, device)
@@ -346,6 +440,9 @@ class OnlineFlashMTPModel(nn.Module):
             chs_len_per_block=1,
             block_size=self.block_size,
             device=device,
+            decode_chunk_sizes=getattr(
+                self.draft_model, "decode_chunk_sizes", None
+            ),
         )
 
         # only use the hidden states from the target model at anchor positions (CHS) as input to the draft model
@@ -502,17 +599,11 @@ class OnlineFlashMTPModel(nn.Module):
             prefix_length = prefix_sum / prefix_count.clamp(min=1.0)
 
         metrics = {
-            "prefix_length": prefix_length.detach(),
+            "prefix_acc": prefix_length.detach(),
             "loss_numerator": loss_numerator.detach(),
             "ce_loss": ce_loss.detach(),
             "kl_loss": kl_loss.detach(),
-            "ce_loss_numerator": ce_loss_numerator.detach(),
-            "kl_loss_numerator": kl_loss_numerator.detach(),
-            "valid_token_count": valid_token_count.detach(),
-            "correct_count": correct_count.detach(),
-            "actual_token_count": actual_token_count.detach(),
-            "prefix_sum": prefix_sum.detach(),
-            "prefix_count": prefix_count.detach(),
+           
         }
 
         return loss, accuracy, metrics

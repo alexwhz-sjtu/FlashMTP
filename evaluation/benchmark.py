@@ -151,6 +151,7 @@ def main() -> None:
     dist.init()
     torch.cuda.set_device(dist.local_rank())
     device = torch.device(f"cuda:{dist.local_rank()}")
+    print(f"Using draft model: {args.draft_name_or_path}")
 
     def has_flash_attn():
         try:

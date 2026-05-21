@@ -2,6 +2,11 @@ import time
 from typing import Callable, Optional
 
 import torch
+
+from specforge.modeling.draft.flashmtp_chunk_utils import (
+    build_decode_chunk_prediction_groups,
+    normalize_decode_chunk_sizes,
+)
 from torch import nn
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
@@ -96,29 +101,82 @@ def create_flashmtp_single_block_mask(
     device: torch.device,
     attention_backend: str,
     dtype: torch.dtype = torch.float32,
+    num_context_tokens: int = 1,
+    decode_chunk_sizes: Optional[list[int]] = None,
+    noise_seq_len: Optional[int] = None,
+    q_noise_seq_len: Optional[int] = None,
+    q_slot_offset: int = 0,
 ) -> Optional[torch.Tensor]:
-    """Build inference mask for one pivot plus one FlashMTP draft block.
+    """Build inference mask for CHS prefix plus a **prefix** of one FlashMTP draft block.
 
-    KV layout: [Pivot | anchor, draft slots...]
-    Q layout:  [anchor, draft slots...]
+    KV layout: [Pivot_0..Pivot_{S-1} | anchor, draft slots 0..kv_noise_len-1]
+    (``S = num_context_tokens``).
 
-    Pivot is visible to all draft slots. Draft slots follow block-causal
-    semantic groups: anchor, [1], [2,3], [4..7], ...
+    **Default (training / full-prefix inference):** queries attend with the same noise
+    length as KV: set ``noise_seq_len`` to the prefix length and leave ``q_noise_seq_len``
+    as ``None`` so ``Q_LEN == kv_noise_len``.
+
+    **Spec decode (chunk queries):** pass ``noise_seq_len=group_end`` (KV noise length),
+    ``q_noise_seq_len=group_end - group_start``, and ``q_slot_offset=group_start`` so
+    queries are only the new masked chunk while keys/values still cover the full prefix
+    up to ``group_end``.
+
+    When ``noise_seq_len`` is ``None``, uses the full block (``kv_noise_len == block_size``).
+
+    Pivot / CHS tokens are visible to every query position. Draft slots use either
+    ``flashmtp_slot_group`` or **decode_chunk_sizes** chunk causality (``chunk(kv) <= chunk(q)``).
     """
-    q_len = block_size
-    kv_len = block_size + 1
+    S = int(num_context_tokens)
+    if S < 1:
+        raise ValueError("num_context_tokens must be >= 1")
+    kv_noise_len = int(noise_seq_len) if noise_seq_len is not None else int(block_size)
+    if kv_noise_len < 1 or kv_noise_len > block_size:
+        raise ValueError(
+            f"noise_seq_len must be in [1, block_size={block_size}], got {kv_noise_len!r}"
+        )
+    q_len = int(q_noise_seq_len) if q_noise_seq_len is not None else kv_noise_len
+    if q_len < 1 or q_len > block_size:
+        raise ValueError(
+            f"q_noise_seq_len must be in [1, block_size={block_size}], got {q_len!r}"
+        )
+    q_off = int(q_slot_offset)
+    if q_noise_seq_len is not None and q_off + q_len > kv_noise_len:
+        raise ValueError(
+            "q_slot_offset + q_noise_seq_len must be <= noise_seq_len (KV noise length); "
+            f"got q_slot_offset={q_off}, q_noise_seq_len={q_len}, noise_seq_len={kv_noise_len}"
+        )
+    if q_noise_seq_len is None and q_off != 0:
+        raise ValueError("q_slot_offset must be 0 when q_noise_seq_len is None (full-prefix Q)")
+    kv_len = kv_noise_len + S
+    decode_chunk_sizes = normalize_decode_chunk_sizes(decode_chunk_sizes, block_size)
+
+    chunk_of: Optional[list[int]] = None
+    if decode_chunk_sizes is not None:
+        chunk_of = [0] * block_size
+        acc = 0
+        for k, sz in enumerate(decode_chunk_sizes):
+            for s in range(acc, acc + int(sz)):
+                chunk_of[s] = k
+            acc += int(sz)
 
     if attention_backend == "flex_attention":
         if not FLEX_ATTENTION_AVAILABLE:
             raise ImportError("flex_attention is required for FlashMTP BlockMask.")
 
         def mask_mod(b, h, q_idx, kv_idx):
-            is_context = kv_idx == 0
-            kv_slot = kv_idx - 1
-            q_group = flashmtp_slot_group(q_idx)
+            if kv_idx < S:
+                return True
+            kv_slot = kv_idx - S
+            if kv_slot < 0 or kv_slot >= kv_noise_len:
+                return False
+            q_global = q_off + int(q_idx)
+            if chunk_of is not None:
+                q_ch = chunk_of[q_global]
+                kv_ch = chunk_of[kv_slot]
+                return kv_ch <= q_ch
+            q_group = flashmtp_slot_group(q_global)
             kv_group = flashmtp_slot_group(kv_slot)
-            same_or_previous_group = kv_group <= q_group
-            return is_context | ((kv_idx > 0) & same_or_previous_group)
+            return kv_group <= q_group
 
         return create_block_mask(
             mask_mod,
@@ -129,11 +187,24 @@ def create_flashmtp_single_block_mask(
             device=device,
         )
 
-    q_slots = torch.arange(q_len, device=device).view(q_len, 1)
-    kv_slots = torch.arange(kv_len, device=device).view(1, kv_len) - 1
-    q_groups = flashmtp_slot_group(q_slots)
-    kv_groups = flashmtp_slot_group(kv_slots.clamp(min=0))
-    visible = (kv_slots < 0) | (kv_groups <= q_groups)
+    q_slots = (q_off + torch.arange(q_len, device=device)).view(q_len, 1)
+    kv_indices = torch.arange(kv_len, device=device).view(1, kv_len)
+    kv_slots = kv_indices - S
+    if chunk_of is not None:
+        q_ch = torch.tensor([chunk_of[int(i)] for i in q_slots.view(-1)], device=device)
+        kv_ch = torch.tensor(
+            [
+                chunk_of[int(x.clamp(0, block_size - 1).item())]
+                for x in kv_slots.view(-1)
+            ],
+            device=device,
+        ).view(1, kv_len)
+        q_ch = q_ch.view(q_len, 1)
+        visible = (kv_slots < 0) | (kv_ch <= q_ch)
+    else:
+        q_groups = flashmtp_slot_group(q_slots)
+        kv_groups = flashmtp_slot_group(kv_slots.clamp(min=0))
+        visible = (kv_slots < 0) | (kv_groups <= q_groups)
     mask = torch.zeros(
         (batch_size, 1, q_len, kv_len),
         device=device,
@@ -196,22 +267,29 @@ class Qwen3FlashMTPAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        noise_states_for_kv: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden.shape[1]
+        noise_kv = hidden_states if noise_states_for_kv is None else noise_states_for_kv
+        kv_noise_len = noise_kv.shape[1]
 
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
         k_ctx = self.k_proj(target_hidden) # (B, N*L, H)  
 
-        k_noise = self.k_proj(hidden_states)  # (B, N*S, H) 
+        k_noise = self.k_proj(noise_kv)  # (B, kv_noise_len, H)
         v_ctx = self.v_proj(target_hidden)
-        v_noise = self.v_proj(hidden_states)
+        v_noise = self.v_proj(noise_kv)
 
-        k = torch.cat([k_ctx, k_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
-        v = torch.cat([v_ctx, v_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
+        k = torch.cat([k_ctx, k_noise], dim=1).view(
+            bsz, ctx_len + kv_noise_len, -1, self.head_dim
+        )
+        v = torch.cat([v_ctx, v_noise], dim=1).view(
+            bsz, ctx_len + kv_noise_len, -1, self.head_dim
+        )
 
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
@@ -268,12 +346,18 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
+        noise_states_for_kv: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        noise_kv_for_attn = (
+            self.input_layernorm(noise_states_for_kv)
+            if noise_states_for_kv is not None
+            else None
+        )
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             target_hidden=target_hidden,
@@ -284,6 +368,7 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            noise_states_for_kv=noise_kv_for_attn,
             **kwargs,
         )[0]
         hidden_states = residual + hidden_states
@@ -335,6 +420,12 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
         self._last_decode_stats = {}
+        self.decode_chunk_sizes = normalize_decode_chunk_sizes(
+            flashmtp_config.get("decode_chunk_sizes"), int(config.block_size)
+        )
+        if self.decode_chunk_sizes is not None:
+            flashmtp_config["decode_chunk_sizes"] = self.decode_chunk_sizes
+            config.flashmtp_config = flashmtp_config
 
         self.fc = nn.Linear(
             len(self.target_layer_ids) * config.hidden_size,
@@ -343,6 +434,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         )
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         print_on_rank0(f"self.chs_concat_mode: {self.chs_concat_mode}")
+        print_on_rank0(f"FlashMTP decode_chunk_sizes: {self.decode_chunk_sizes}")
 
         self.post_init()
 
@@ -384,6 +476,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         position_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor] = None,
         noise_embedding: Optional[torch.Tensor] = None,
+        noise_kv_embedding: Optional[torch.Tensor] = None,
         target_hidden: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
@@ -391,8 +484,33 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
         target_hidden = self.fuse_target_hidden(target_hidden)
-        # position_embeddings = self.rotary_emb(torch.cat([target_hidden, hidden_states], dim=1), position_ids)
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # RoPE cos/sin length must match K sequence = ctx (CHS) + draft noise.
+        # Training passes full_position_ids (context at anchor-1 per block + draft slots).
+        # Inference (spec_generate) passes draft absolute positions only; prepend pivot at anchor-1.
+        ctx_len = target_hidden.shape[1]
+        q_len = hidden_states.shape[1]
+        kv_noise_len = (
+            noise_kv_embedding.shape[1]
+            if noise_kv_embedding is not None
+            else q_len
+        )
+        if position_ids.shape[1] == ctx_len + kv_noise_len:
+            rotary_position_ids = position_ids
+        elif position_ids.shape[1] == kv_noise_len and ctx_len == 1:
+            pivot = (position_ids[:, 0:1] - 1).clamp(min=0)
+            rotary_position_ids = torch.cat([pivot, position_ids], dim=1)
+        else:
+            raise ValueError(
+                "position_ids must have shape (batch, ctx_len + kv_noise_len) matching "
+                "target_hidden and noise KV length, or (batch, kv_noise_len) with "
+                f"ctx_len==1 for single-CHS inference; got position_ids.shape[1]="
+                f"{position_ids.shape[1]}, ctx_len={ctx_len}, kv_noise_len={kv_noise_len}, "
+                f"q_len={q_len}."
+            )
+        rope_hidden = (
+            noise_kv_embedding if noise_kv_embedding is not None else hidden_states
+        )
+        position_embeddings = self.rotary_emb(rope_hidden, rotary_position_ids)
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
@@ -402,6 +520,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
+                noise_states_for_kv=noise_kv_embedding,
                 **kwargs,
             )
         return self.norm(hidden_states)
@@ -480,35 +599,52 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         )
 
         start = input_ids.shape[1]
-        prediction_groups = build_flashmtp_prediction_groups(block_size)
-        draft_attention_mask = create_flashmtp_single_block_mask(
-            batch_size=input_ids.shape[0],
-            block_size=block_size,
-            device=target.device,
-            attention_backend=self.config._attn_implementation,
-            dtype=next(self.parameters()).dtype,
-        )
+        if self.decode_chunk_sizes is not None:
+            prediction_groups = build_decode_chunk_prediction_groups(
+                self.decode_chunk_sizes, block_size
+            )
+        else:
+            prediction_groups = build_flashmtp_prediction_groups(block_size)
+        draft_dtype = next(self.parameters()).dtype
         while start < max_length:
             print_fn(f"\n[Spec step {self._last_decode_stats['steps']}] start={start}")
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
             for group_start, group_end in prediction_groups:
-                noise_embedding = target.model.embed_tokens(block_output_ids)
+                chunk_len = group_end - group_start
+                block_output_ids[:, group_start:group_end] = self.mask_token_id
+                draft_attention_mask = create_flashmtp_single_block_mask(
+                    batch_size=input_ids.shape[0],
+                    block_size=block_size,
+                    device=target.device,
+                    attention_backend=self.config._attn_implementation,
+                    dtype=draft_dtype,
+                    decode_chunk_sizes=self.decode_chunk_sizes,
+                    noise_seq_len=group_end,
+                    q_noise_seq_len=chunk_len,
+                    q_slot_offset=group_start,
+                )
+                noise_embedding = target.model.embed_tokens(
+                    block_output_ids[:, group_start:group_end]
+                )
+                noise_kv_embedding = target.model.embed_tokens(
+                    block_output_ids[:, :group_end]
+                )
+                draft_position_ids = position_ids[:, start : start + group_end]
                 if target.device.type == "cuda":
                     torch.cuda.synchronize(target.device)
                 draft_start = time.perf_counter()
                 draft_hidden = self(
                     target_hidden=target_hidden,
                     noise_embedding=noise_embedding,
-                    position_ids=position_ids[:, start - 1 : start + block_size],
+                    noise_kv_embedding=noise_kv_embedding,
+                    position_ids=draft_position_ids,
                     attention_mask=draft_attention_mask,
                     past_key_values=None,
                     use_cache=False,
                     is_causal=False,
                 )
-                draft_logits = target.lm_head(
-                    draft_hidden[:, group_start:group_end, :]
-                )
+                draft_logits = target.lm_head(draft_hidden)
                 if target.device.type == "cuda":
                     torch.cuda.synchronize(target.device)
                 self._last_decode_stats["draft_total_time"] += (
@@ -669,42 +805,71 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         # Decode stage
         acceptance_lengths = []
         start = input_ids.shape[1]
-        prediction_groups = build_flashmtp_prediction_groups(block_size)
-        draft_attention_mask = create_flashmtp_single_block_mask(
-            batch_size=input_ids.shape[0],
-            block_size=block_size,
-            device=target.device,
-            attention_backend=self.config._attn_implementation,
-            dtype=next(self.parameters()).dtype,
-        )
+        if self.decode_chunk_sizes is not None:
+            print(f"Using decode chunk sizes: {self.decode_chunk_sizes}")
+            prediction_groups = build_decode_chunk_prediction_groups(
+                self.decode_chunk_sizes, block_size
+            )
+        else:
+            prediction_groups = build_flashmtp_prediction_groups(block_size)
+
+        print(f"Using prediction groups: {prediction_groups}")
+        draft_dtype = next(self.parameters()).dtype
         while start < max_length:
+            # block: the output of draft forward (complete)
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
             for group_start, group_end in prediction_groups:
-                noise_embedding = target.model.embed_tokens(block_output_ids)
+                # group_start: starting from 0 (anchor)
+                chunk_len = group_end - group_start
+                block_output_ids[:, group_start:group_end] = self.mask_token_id
+                draft_attention_mask = create_flashmtp_single_block_mask(
+                    batch_size=input_ids.shape[0],
+                    block_size=block_size,
+                    device=target.device,
+                    attention_backend=self.config._attn_implementation,
+                    dtype=draft_dtype,
+                    decode_chunk_sizes=self.decode_chunk_sizes,
+                    noise_seq_len=group_end,
+                    q_noise_seq_len=chunk_len,
+                    q_slot_offset=group_start,
+                )
+                noise_embedding = target.model.embed_tokens(
+                    block_output_ids[:, group_start:group_end]
+                )
+                noise_kv_embedding = target.model.embed_tokens(
+                    block_output_ids[:, :group_end]
+                )
+                draft_position_ids = position_ids[:, start : start + group_end]
                 if target.device.type == "cuda":
                     torch.cuda.synchronize(target.device)
                 draft_start = time.perf_counter()
                 draft_hidden = self(
                     target_hidden=target_hidden,
                     noise_embedding=noise_embedding,
-                    position_ids=position_ids[:, start - 1 : start + block_size],
+                    noise_kv_embedding=noise_kv_embedding,
+                    position_ids=draft_position_ids,
                     attention_mask=draft_attention_mask,
                     past_key_values=None,
                     use_cache=False,
                     is_causal=False,
                 )
-                draft_logits = target.lm_head(
-                    draft_hidden[:, group_start:group_end, :]
-                )
+                draft_logits = target.lm_head(draft_hidden)
                 if target.device.type == "cuda":
                     torch.cuda.synchronize(target.device)
                 self._last_decode_stats["draft_total_time"] += (
                     time.perf_counter() - draft_start
                 )
-                block_output_ids[:, group_start:group_end] = sample(
-                    draft_logits, temperature
-                )
+
+                if group_start == 0:
+                    # we don't sample the anchor token
+                    block_output_ids[:, group_start+1:group_end] = sample(
+                        draft_logits[:, 1:], temperature
+                    )
+                else:
+                    block_output_ids[:, group_start:group_end] = sample(
+                        draft_logits, temperature
+                    )
 
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)

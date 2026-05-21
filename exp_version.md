@@ -33,14 +33,19 @@ Eagle这类方法，token遵循严格因果关系，后面的token可以注意�
 
 FlashMTP exp 的思路是把未来 token 按语义块组织起来，让同一块内的 token 可以双向交互，同时让不同语义块之间保持从左到右的因果顺序。这样，在块内，由于token之间语义关联强，一次预测难度较低。而且后面的块可以看到前面确定下来的token，形成清晰语义关联。
 
-因此，exp version 不是简单地一次预测 `B-1` 个互相独立的 mask，而是把一个长度为 `B` 的 draft block 拆成多个语义组，按组逐步补全：
+因此，exp version 不是简单地一次预测 `B-1` 个互相独立的 mask，而是把一个长度为 `B` 的 draft block 拆成多个语义组chunk，按组逐步补全：
 
-- slot 0：anchor token，已知。
-- slot 1：第一预测组，单 token。
-- slot 2-3：第二预测组，两个 token。
-- slot 4-7、8-11、...：后续预测组，每组四个 token。
+chunk大小可选择，总和要等于block_size
 
-组内 token 可以互相可见；组间只允许看见更早的组。
+比如，block_size=16, chunk：[4,4,4,4]
+
+- chunk 1: anchor+mask0~2
+- chunk 2: mask3~6
+- chunk 3: mask7~10
+- chunk 4: mask11~14
+
+chunk（组）内 token 可以互相可见；组间只允许看见更早的组（clean的内容）。当配置了 `decode_chunk_sizes` 时，**clean query 对 draft 只 attend clean KV**：更早 chunk 的全部 clean、同 chunk 内 clean 全双向；**不看** mask 流 KV。**mask 流在 slot0（`M0:0`）的 KV 不参与 attention**（anchor 仅由 clean 列 `C0:0` 表示）；mask query 仍按 `create_flashmtp_block_mask` 使用本 chunk 内 `M0:1` 起的 mask 列等。
+
 
 ### 2. 上下文表示：Contextual Pivot
 
@@ -68,7 +73,7 @@ Q layout:
 
 - `CHS_i` 是 anchor `i` 对应的 contextual pivot。
 - `Clean_i[k]` 是真实 token `input_ids[anchor+k]` 的 embedding；越界或无效 block 会替换为 mask token。
-- `Mask_i[k]` 全部是 mask token embedding，是真正用于预测的位置。
+- `Mask_i[k]`：在 **slot 0** 处嵌入与 **`Clean_i[0]`（anchor）相同的 token**，其余槽位为 mask token embedding；与推理单流「首位为 anchor」对齐。仍只取 **mask 流** 送入 `lm_head` 算 logits（slot 0 若被 loss 权重关掉则与此前一致）。
 - 输出 hidden 会 reshape 成 `(batch, anchors, 2, block_size, hidden)`，只取 mask stream 送入 target `lm_head` 计算 logits。
 
 因此，训练不是只输入 `anchor token + B-1 masks`。当前实现输入的是完整 clean stream 加完整 mask stream。clean stream 提供块内可见的真实条件，mask stream 负责学习对应位置的并行预测。
