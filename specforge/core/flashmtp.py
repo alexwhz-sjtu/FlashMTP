@@ -521,17 +521,9 @@ class OnlineFlashMTPModel(nn.Module):
             prefix_length = prefix_sum / prefix_count.clamp(min=1.0)
 
         metrics = {
-            "prefix_length": prefix_length.detach(),
-            "loss_numerator": loss_numerator.detach(),
+            "prefix_acc": prefix_length.detach(),
             "ce_loss": ce_loss.detach(),
             "kl_loss": kl_loss.detach(),
-            "ce_loss_numerator": ce_loss_numerator.detach(),
-            "kl_loss_numerator": kl_loss_numerator.detach(),
-            "valid_token_count": valid_token_count.detach(),
-            "correct_count": correct_count.detach(),
-            "actual_token_count": actual_token_count.detach(),
-            "prefix_sum": prefix_sum.detach(),
-            "prefix_count": prefix_count.detach(),
         }
 
         return loss, accuracy, metrics

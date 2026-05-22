@@ -16,6 +16,10 @@ cd "${PROJECT_DIR}"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --dt) DT="$2"; shift 2 ;;
+        --chunksize|--flashmtp-chunk-sizes)
+            FLASHMTP_CHUNK_SIZES="$2"
+            shift 2
+            ;;
         *) shift ;;
     esac
 done
@@ -37,6 +41,8 @@ CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
 NUM_ANCHORS="${NUM_ANCHORS:-2048}"
 ANCHOR_CHUNK_SIZE="${ANCHOR_CHUNK_SIZE:-512}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
+# 逗号分隔，各段之和须等于 BLOCK_SIZE；为空则沿用训练脚本默认 legacy 1,1,2,4,...
+FLASHMTP_CHUNK_SIZES="${FLASHMTP_CHUNK_SIZES:-4,4,4,4}"
 
 # 恢复训练
 RESUME="${RESUME:-}"
@@ -124,7 +130,7 @@ BUILD_DATASET_NUM_PROC="${BUILD_DATASET_NUM_PROC:-8}"
 echo "=========================================="
 echo "FlashMTP 训练启动脚本"
 echo "=========================================="
-echo "运行环境: --dt ${DT} (qz | a800 | h100)"
+echo "运行环境: --dt ${DT} (qz | a800 | h100)，可选 --chunksize CSV（同 --flashmtp-chunk-sizes）"
 echo "数据特征:"
 echo "  样本数量: ${DATA_NUM_SAMPLES}"
 echo "  思考模式: ${ENABLE_THINKING}"
@@ -140,6 +146,7 @@ echo "------------------------------------------"
 echo "模型配置:"
 echo "  草稿模型层数: ${NUM_DRAFT_LAYERS}"
 echo "  块大小: ${BLOCK_SIZE}"
+echo "  FlashMTP chunk_sizes: ${FLASHMTP_CHUNK_SIZES:-默认 legacy（与 Python 默认一致）}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Anchor chunk大小: ${ANCHOR_CHUNK_SIZE:-0} (0表示关闭)"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
@@ -230,6 +237,10 @@ fi
 
 if [ -n "${CKPT_DIR}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --ckpt-dir ${CKPT_DIR}"
+fi
+
+if [ -n "${FLASHMTP_CHUNK_SIZES}" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --flashmtp-chunk-sizes ${FLASHMTP_CHUNK_SIZES}"
 fi
 
 if [ "${REPORT_TO}" != "none" ]; then
