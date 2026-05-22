@@ -210,7 +210,6 @@ def main() -> None:
                 group_end=group_end,
                 block_size=block_size,
                 decode_chunk_sizes=decode_chunks,
-                batch_size=1,
                 device=device,
                 attention_backend=attn_backend,
                 dtype=dtype,
