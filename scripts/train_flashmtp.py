@@ -50,6 +50,15 @@ def parse_args():
     )
     model_group.add_argument("--draft-config-path", type=str, default=None)
     model_group.add_argument("--block-size", type=int, default=16)
+    model_group.add_argument(
+        "--flashmtp-chunk-sizes",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated chunk sizes that sum to --block-size, e.g. 4,4,4,4. "
+            "Each chunk is one parallel prediction group. Default: legacy 1,1,2,4,..."
+        ),
+    )
     model_group.add_argument("--num-draft-layers", type=int, default=1)
     model_group.add_argument(
         "--mask-token-id",
@@ -193,6 +202,14 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         draft_config.flashmtp_config = {}
         
     draft_config.flashmtp_config["chs_concat_mode"] = "feature"
+    if args.flashmtp_chunk_sizes:
+        chunk_sizes = [
+            int(x.strip())
+            for x in args.flashmtp_chunk_sizes.split(",")
+            if x.strip()
+        ]
+        draft_config.flashmtp_config["chunk_sizes"] = chunk_sizes
+        print_on_rank0(f"FlashMTP chunk_sizes from CLI: {chunk_sizes}")
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")

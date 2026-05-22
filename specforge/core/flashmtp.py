@@ -1,13 +1,17 @@
 # coding=utf-8
 """FlashMTP Training Wrapper."""
 
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from specforge.modeling.draft.flashmtp import FlashMTPDraftModel, flashmtp_slot_group
+from specforge.modeling.draft.flashmtp import (
+    FlashMTPDraftModel,
+    build_flashmtp_slot_to_chunk,
+    resolve_flashmtp_chunk_sizes,
+)
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -57,6 +61,7 @@ def create_flashmtp_block_mask(
     chs_len_per_block: int,
     block_size: int,
     device: torch.device,
+    chunk_sizes: Optional[Sequence[int]] = None,
 ):
     """Construct Flex Attention BlockMask for FlashMTP training with per-block CHS.
 
@@ -82,6 +87,8 @@ def create_flashmtp_block_mask(
       5. Different sampled training blocks are invisible to each other.
       6. Invalid blocks (block_keep_mask=False) see nothing.
     """
+    resolved = resolve_flashmtp_chunk_sizes(block_size, chunk_sizes)
+    slot_to_chunk = build_flashmtp_slot_to_chunk(resolved, device=device)
 
     def flashmtp_mask_mod(b, h, q_idx, kv_idx):
         stream_block_size = 2 * block_size
@@ -89,7 +96,7 @@ def create_flashmtp_block_mask(
         q_stream_offset = q_idx % stream_block_size
         q_is_mask = q_stream_offset >= block_size
         q_slot = q_stream_offset % block_size
-        q_group = flashmtp_slot_group(q_slot)
+        q_group = slot_to_chunk[q_slot]
 
         # Total length of all CHS segments
         total_chs_len = N * chs_len_per_block
@@ -109,7 +116,7 @@ def create_flashmtp_block_mask(
         kv_stream_offset = draft_kv_idx % stream_block_size
         kv_is_mask = kv_stream_offset >= block_size
         kv_slot = kv_stream_offset % block_size
-        kv_group = flashmtp_slot_group(kv_slot)
+        kv_group = slot_to_chunk[kv_slot]
 
         same_block = kv_block_id == q_block_id
         clean_query_visible = (~q_is_mask) & (~kv_is_mask) & (kv_group <= q_group)
@@ -161,6 +168,11 @@ class OnlineFlashMTPModel(nn.Module):
         self.kl_top_k = kl_top_k
         self.chs_concat_mode = "feature"
         self.draft_model.chs_concat_mode = "feature"
+        self.chunk_sizes = getattr(
+            draft_model,
+            "chunk_sizes",
+            resolve_flashmtp_chunk_sizes(block_size, None),
+        )
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -302,6 +314,12 @@ class OnlineFlashMTPModel(nn.Module):
         )
 
         mask_ids = torch.full_like(clean_ids, self.mask_token_id)
+        slot0 = torch.arange(bs, device=device).view(1, 1, -1) == 0
+        mask_ids = torch.where(
+            block_keep_mask.unsqueeze(-1) & slot0,
+            clean_ids,
+            mask_ids,
+        )
         draft_ids = torch.cat([clean_ids, mask_ids], dim=-1).reshape(
             bsz, n * 2 * bs
         )
@@ -346,6 +364,7 @@ class OnlineFlashMTPModel(nn.Module):
             chs_len_per_block=1,
             block_size=self.block_size,
             device=device,
+            chunk_sizes=self.chunk_sizes,
         )
 
         # only use the hidden states from the target model at anchor positions (CHS) as input to the draft model

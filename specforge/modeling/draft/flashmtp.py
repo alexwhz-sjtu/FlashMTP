@@ -1,5 +1,5 @@
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import torch
 from torch import nn
@@ -67,7 +67,7 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> lis
 
 
 def flashmtp_slot_group(slot):
-    """Map slots to FlashMTP semantic groups: anchor, 1, 2, then chunks of 4."""
+    """Map slots to legacy FlashMTP semantic groups (anchor, 1, 2, then chunks of 4)."""
     if not torch.is_tensor(slot):
         slot = torch.as_tensor(slot)
     return torch.where(
@@ -77,16 +77,75 @@ def flashmtp_slot_group(slot):
     )
 
 
-def build_flashmtp_prediction_groups(block_size: int) -> list[tuple[int, int]]:
-    """Return prediction groups over draft slots: [1], [2,3], [4..7], ..."""
-    groups = []
-    start = 1
+def build_default_flashmtp_chunk_sizes(block_size: int) -> tuple[int, ...]:
+    """Implicit chunk schedule matching legacy flashmtp_slot_group boundaries."""
+    if block_size < 1:
+        raise ValueError(f"block_size must be >= 1, got {block_size}")
+    sizes: list[int] = []
+    remaining = block_size
+    sizes.append(1)
+    remaining -= 1
     group_size = 1
-    while start < block_size:
-        end = min(block_size, start + group_size)
-        groups.append((start, end))
-        start = end
+    while remaining > 0:
+        take = min(group_size, remaining)
+        sizes.append(take)
+        remaining -= take
         group_size = 2 if group_size == 1 else 4
+    return tuple(sizes)
+
+
+def resolve_flashmtp_chunk_sizes(
+    block_size: int,
+    chunk_sizes: Optional[Sequence[int]] = None,
+) -> tuple[int, ...]:
+    """Resolve chunk_sizes; default matches legacy 1+1+2+4+... schedule."""
+    if chunk_sizes is None:
+        return build_default_flashmtp_chunk_sizes(block_size)
+    sizes = tuple(int(x) for x in chunk_sizes)
+    if not sizes or any(s <= 0 for s in sizes):
+        raise ValueError("chunk_sizes must be a non-empty list of positive integers")
+    if sum(sizes) != block_size:
+        raise ValueError(
+            f"sum(chunk_sizes)={sum(sizes)} must equal block_size={block_size}"
+        )
+    return sizes
+
+
+def build_flashmtp_slot_to_chunk(
+    chunk_sizes: Sequence[int],
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """Map each slot index to its chunk id (length sum(chunk_sizes))."""
+    slot_to_chunk: list[int] = []
+    for chunk_id, size in enumerate(chunk_sizes):
+        slot_to_chunk.extend([chunk_id] * size)
+    return torch.tensor(slot_to_chunk, device=device, dtype=torch.long)
+
+
+def flashmtp_slot_chunk_id(
+    slot: torch.Tensor | int,
+    slot_to_chunk: torch.Tensor,
+) -> torch.Tensor | int:
+    """Look up chunk id for slot(s) using a precomputed slot_to_chunk vector."""
+    if isinstance(slot, int):
+        return int(slot_to_chunk[slot].item())
+    return slot_to_chunk[slot]
+
+
+def build_flashmtp_prediction_groups(
+    block_size: int,
+    chunk_sizes: Optional[Sequence[int]] = None,
+) -> list[tuple[int, int]]:
+    """Return inference prediction intervals per chunk (slot 0 anchor skipped)."""
+    sizes = resolve_flashmtp_chunk_sizes(block_size, chunk_sizes)
+    groups: list[tuple[int, int]] = []
+    cum = 0
+    for size in sizes:
+        end = cum + size
+        pred_start = 1 if cum == 0 else cum
+        if pred_start < end:
+            groups.append((pred_start, end))
+        cum = end
     return groups
 
 
@@ -95,6 +154,7 @@ def create_flashmtp_single_block_mask(
     block_size: int,
     device: torch.device,
     attention_backend: str,
+    chunk_sizes: Optional[Sequence[int]] = None,
     dtype: torch.dtype = torch.float32,
 ) -> Optional[torch.Tensor]:
     """Build inference mask for one pivot plus one FlashMTP draft block.
@@ -103,8 +163,10 @@ def create_flashmtp_single_block_mask(
     Q layout:  [anchor, draft slots...]
 
     Pivot is visible to all draft slots. Draft slots follow block-causal
-    semantic groups: anchor, [1], [2,3], [4..7], ...
+    chunk groups defined by chunk_sizes (default: legacy 1,1,2,4,...).
     """
+    resolved = resolve_flashmtp_chunk_sizes(block_size, chunk_sizes)
+    slot_to_chunk = build_flashmtp_slot_to_chunk(resolved, device=device)
     q_len = block_size
     kv_len = block_size + 1
 
@@ -115,10 +177,10 @@ def create_flashmtp_single_block_mask(
         def mask_mod(b, h, q_idx, kv_idx):
             is_context = kv_idx == 0
             kv_slot = kv_idx - 1
-            q_group = flashmtp_slot_group(q_idx)
-            kv_group = flashmtp_slot_group(kv_slot)
-            same_or_previous_group = kv_group <= q_group
-            return is_context | ((kv_idx > 0) & same_or_previous_group)
+            q_chunk = slot_to_chunk[q_idx]
+            kv_chunk = slot_to_chunk[kv_slot]
+            same_or_previous_chunk = kv_chunk <= q_chunk
+            return is_context | ((kv_idx > 0) & same_or_previous_chunk)
 
         return create_block_mask(
             mask_mod,
@@ -131,9 +193,9 @@ def create_flashmtp_single_block_mask(
 
     q_slots = torch.arange(q_len, device=device).view(q_len, 1)
     kv_slots = torch.arange(kv_len, device=device).view(1, kv_len) - 1
-    q_groups = flashmtp_slot_group(q_slots)
-    kv_groups = flashmtp_slot_group(kv_slots.clamp(min=0))
-    visible = (kv_slots < 0) | (kv_groups <= q_groups)
+    q_chunks = slot_to_chunk[q_slots]
+    kv_chunks = slot_to_chunk[kv_slots.clamp(min=0)]
+    visible = (kv_slots < 0) | (kv_chunks <= q_chunks)
     mask = torch.zeros(
         (batch_size, 1, q_len, kv_len),
         device=device,
@@ -333,6 +395,11 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.block_size = config.block_size
+        self.chunk_sizes = resolve_flashmtp_chunk_sizes(
+            config.block_size,
+            flashmtp_config.get("chunk_sizes"),
+        )
+        flashmtp_config["chunk_sizes"] = list(self.chunk_sizes)
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
         self._last_decode_stats = {}
 
@@ -343,6 +410,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         )
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         print_on_rank0(f"self.chs_concat_mode: {self.chs_concat_mode}")
+        print_on_rank0(f"FlashMTP chunk_sizes: {self.chunk_sizes}")
 
         self.post_init()
 
@@ -480,12 +548,15 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         )
 
         start = input_ids.shape[1]
-        prediction_groups = build_flashmtp_prediction_groups(block_size)
+        prediction_groups = build_flashmtp_prediction_groups(
+            block_size, self.chunk_sizes
+        )
         draft_attention_mask = create_flashmtp_single_block_mask(
             batch_size=input_ids.shape[0],
             block_size=block_size,
             device=target.device,
             attention_backend=self.config._attn_implementation,
+            chunk_sizes=self.chunk_sizes,
             dtype=next(self.parameters()).dtype,
         )
         while start < max_length:
@@ -669,12 +740,15 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         # Decode stage
         acceptance_lengths = []
         start = input_ids.shape[1]
-        prediction_groups = build_flashmtp_prediction_groups(block_size)
+        prediction_groups = build_flashmtp_prediction_groups(
+            block_size, self.chunk_sizes
+        )
         draft_attention_mask = create_flashmtp_single_block_mask(
             batch_size=input_ids.shape[0],
             block_size=block_size,
             device=target.device,
             attention_backend=self.config._attn_implementation,
+            chunk_sizes=self.chunk_sizes,
             dtype=next(self.parameters()).dtype,
         )
         while start < max_length:

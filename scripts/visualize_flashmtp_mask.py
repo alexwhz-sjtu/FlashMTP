@@ -3,15 +3,12 @@
 
 import argparse
 from pathlib import Path
+from typing import Optional, Sequence
 
-
-def slot_group(slot: int) -> int:
-    """Mirror FlashMTP groups: anchor, [1], [2,3], then chunks of 4."""
-    if slot <= 1:
-        return slot
-    if slot < 4:
-        return 2
-    return 3 + (slot - 4) // 4
+from specforge.modeling.draft.flashmtp import (
+    build_flashmtp_slot_to_chunk,
+    resolve_flashmtp_chunk_sizes,
+)
 
 
 def build_labels(block_size: int, num_blocks: int):
@@ -25,7 +22,13 @@ def build_labels(block_size: int, num_blocks: int):
     return q_labels, kv_labels
 
 
-def is_visible(q_idx: int, kv_idx: int, block_size: int, num_blocks: int) -> bool:
+def is_visible(
+    q_idx: int,
+    kv_idx: int,
+    block_size: int,
+    num_blocks: int,
+    slot_to_chunk: list[int],
+) -> bool:
     stream_block_size = 2 * block_size
     total_chs_len = num_blocks
 
@@ -33,7 +36,7 @@ def is_visible(q_idx: int, kv_idx: int, block_size: int, num_blocks: int) -> boo
     q_stream_offset = q_idx % stream_block_size
     q_is_mask = q_stream_offset >= block_size
     q_slot = q_stream_offset % block_size
-    q_group = slot_group(q_slot)
+    q_group = slot_to_chunk[q_slot]
 
     if kv_idx < total_chs_len:
         return kv_idx == q_block
@@ -43,7 +46,7 @@ def is_visible(q_idx: int, kv_idx: int, block_size: int, num_blocks: int) -> boo
     kv_stream_offset = draft_kv_idx % stream_block_size
     kv_is_mask = kv_stream_offset >= block_size
     kv_slot = kv_stream_offset % block_size
-    kv_group = slot_group(kv_slot)
+    kv_group = slot_to_chunk[kv_slot]
 
     if kv_block != q_block:
         return False
@@ -56,11 +59,17 @@ def is_visible(q_idx: int, kv_idx: int, block_size: int, num_blocks: int) -> boo
     return (not kv_is_mask) and kv_group <= q_group
 
 
-def build_mask(block_size: int, num_blocks: int):
+def build_mask(
+    block_size: int,
+    num_blocks: int,
+    chunk_sizes: Optional[Sequence[int]] = None,
+):
+    resolved = resolve_flashmtp_chunk_sizes(block_size, chunk_sizes)
+    slot_to_chunk = build_flashmtp_slot_to_chunk(resolved).tolist()
     q_len = num_blocks * 2 * block_size
     kv_len = num_blocks + num_blocks * 2 * block_size
     return [
-        [is_visible(q, kv, block_size, num_blocks) for kv in range(kv_len)]
+        [is_visible(q, kv, block_size, num_blocks, slot_to_chunk) for kv in range(kv_len)]
         for q in range(q_len)
     ]
 
@@ -127,12 +136,24 @@ def save_png(mask, q_labels, kv_labels, output_path: Path):
     plt.close(fig)
 
 
+def parse_chunk_sizes(value: Optional[str], block_size: int) -> Optional[list[int]]:
+    if value is None:
+        return None
+    return [int(x.strip()) for x in value.split(",") if x.strip()]
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Visualize FlashMTP clean/mask stream training attention mask."
     )
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--num-blocks", type=int, default=1)
+    parser.add_argument(
+        "--chunk-sizes",
+        type=str,
+        default=None,
+        help="Comma-separated chunk sizes summing to block-size, e.g. 4,4,4,4",
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -146,8 +167,12 @@ def main():
     if args.num_blocks < 1:
         raise SystemExit("--num-blocks must be >= 1")
 
+    chunk_sizes = parse_chunk_sizes(args.chunk_sizes, args.block_size)
+    resolved = resolve_flashmtp_chunk_sizes(args.block_size, chunk_sizes)
+    print(f"chunk_sizes: {list(resolved)}")
+
     q_labels, kv_labels = build_labels(args.block_size, args.num_blocks)
-    mask = build_mask(args.block_size, args.num_blocks)
+    mask = build_mask(args.block_size, args.num_blocks, chunk_sizes)
     print_ascii(mask, q_labels, kv_labels)
 
     if args.output is not None:

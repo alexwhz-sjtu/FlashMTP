@@ -68,7 +68,8 @@ Q layout:
 
 - `CHS_i` 是 anchor `i` 对应的 contextual pivot。
 - `Clean_i[k]` 是真实 token `input_ids[anchor+k]` 的 embedding；越界或无效 block 会替换为 mask token。
-- `Mask_i[k]` 全部是 mask token embedding，是真正用于预测的位置。
+- `Mask_i[0]` 使用与 clean 流相同的 anchor token embedding（slot 0 为干净 anchor）。
+- `Mask_i[k]`（`k>0`）为 mask token embedding，是真正用于预测的位置。
 - 输出 hidden 会 reshape 成 `(batch, anchors, 2, block_size, hidden)`，只取 mask stream 送入 target `lm_head` 计算 logits。
 
 因此，训练不是只输入 `anchor token + B-1 masks`。当前实现输入的是完整 clean stream 加完整 mask stream。clean stream 提供块内可见的真实条件，mask stream 负责学习对应位置的并行预测。
@@ -80,17 +81,17 @@ KV layout: [Pivot | anchor, draft slots...]
 Q layout:  [anchor, draft slots...]
 ```
 
-推理按预测组迭代：每次用当前已经填好的 `block_output_ids` 重新 embedding，预测当前组的 token，并把预测结果写回 block，再进入下一组。
+推理按 chunk 预测组迭代：每次用当前已经填好的 `block_output_ids` 重新 embedding，预测当前 chunk 内 token，并把预测结果写回 block，再进入下一 chunk。chunk 边界由 `flashmtp_config["chunk_sizes"]` 定义（元素和等于 `block_size`）。
 
 ### 4. 块因果注意力
 
-核心 mask 由 `flashmtp_slot_group()` 定义语义组：
+核心 mask 由可配置 `chunk_sizes` 定义语义组（chunk 下标 = 原 group id）：
+
+- 默认（未配置时）与旧版 `flashmtp_slot_group` 等价：`[1, 1, 2, 4, 4, ...]` 截断至 `block_size`。
+- 自定义示例：`chunk_sizes=[4,4,4,4]`、`block_size=16` 表示四个等长 chunk；slot 0 属于第一个 chunk（含 anchor）。
 
 ```text
-slot 0 -> group 0      anchor
-slot 1 -> group 1      first token
-slot 2-3 -> group 2    two-token group
-slot >=4 -> group 3 + floor((slot-4)/4)
+chunk_id = slot 所在 chunk 的下标（由 chunk_sizes 前缀和划分）
 ```
 
 训练时的 visibility 规则：
@@ -109,7 +110,7 @@ slot >=4 -> group 3 + floor((slot-4)/4)
 - 当前语义组内 token 双向可见。
 - 后续语义组不可见。
 
-这保证了训练和推理都遵循同一组语义块顺序：`anchor -> 1 -> 2 -> 4 -> 4 -> ...`。
+这保证了训练和推理都遵循同一套 chunk 顺序（默认等价于 `anchor -> 1 -> 2 -> 4 -> 4 -> ...`）。
 
 ### 5. 训练目标与 anchor 采样
 
