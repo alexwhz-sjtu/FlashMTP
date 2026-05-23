@@ -466,6 +466,306 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             )
         return self.norm(hidden_states)
 
+    @staticmethod
+    def _format_token_topk(
+        logits: torch.Tensor,
+        tokenizer,
+        top_k: int,
+    ) -> list[dict]:
+        probs = torch.softmax(logits.float(), dim=-1)
+        top_k = max(int(top_k), 1)
+        top_probs, top_ids = torch.topk(
+            probs, k=min(top_k, probs.shape[-1]), dim=-1
+        )
+        entries = []
+        for token_id, prob in zip(top_ids.tolist(), top_probs.tolist()):
+            entries.append(
+                {
+                    "id": int(token_id),
+                    "token": tokenizer.decode([int(token_id)]),
+                    "confidence": float(prob),
+                }
+            )
+        return entries
+
+    @staticmethod
+    def _format_token_list(token_ids: torch.Tensor, tokenizer) -> list[dict]:
+        return [
+            {"id": int(tid), "token": tokenizer.decode([int(tid)])}
+            for tid in token_ids.view(-1).tolist()
+        ]
+
+    @staticmethod
+    def _serialize_topk_entries(entries: list[dict]) -> list[dict]:
+        return [
+            {
+                "token_id": int(e["id"]),
+                "token": e["token"],
+                "confidence": float(e["confidence"]),
+            }
+            for e in entries
+        ]
+
+    @torch.inference_mode()
+    def spec_generate_with_profile(
+        self,
+        target: nn.Module,
+        tokenizer,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int,
+        stop_token_ids: list[int],
+        temperature: float,
+        top_k: int = 4,
+        print_fn: Callable[..., None] = print,
+        profile_records: Optional[list] = None,
+    ) -> torch.LongTensor:
+        """Same decode path as ``spec_generate``, plus optional JSONL-friendly profiling.
+
+        Draft logits are taken from the same slice ``[:, -block_size + 1:, :]`` as
+        ``spec_generate`` (slots ``1 .. block_size-1``). Slot 0 is the per-step anchor.
+        """
+        self.eval()
+        self._last_decode_stats = {
+            "accept_lengths": [],
+            "target_total_time": 0.0,
+            "draft_total_time": 0.0,
+            "steps": 0,
+        }
+        if self.mask_token_id is None:
+            raise ValueError(
+                "FlashMTPDraftModel.mask_token_id is None. Set flashmtp_config['mask_token_id'] "
+                "or draft_model.mask_token_id before spec_generate_with_profile()."
+            )
+        num_input_tokens = input_ids.shape[1]
+        max_length = num_input_tokens + max_new_tokens
+        block_size = self.block_size
+
+        output_ids = torch.full(
+            (1, max_length + block_size),
+            self.mask_token_id,
+            dtype=torch.long,
+            device=target.device,
+        )
+        position_ids = torch.arange(
+            output_ids.shape[1], device=target.device
+        ).unsqueeze(0)
+        past_key_values_target = DynamicCache()
+
+        if target.device.type == "cuda":
+            torch.cuda.synchronize(target.device)
+        target_start = time.perf_counter()
+        output = target(
+            input_ids,
+            position_ids=position_ids[:, :num_input_tokens],
+            past_key_values=past_key_values_target,
+            use_cache=True,
+            logits_to_keep=1,
+            output_hidden_states=True,
+        )
+        if target.device.type == "cuda":
+            torch.cuda.synchronize(target.device)
+        self._last_decode_stats["target_total_time"] += time.perf_counter() - target_start
+
+        output_ids[:, :num_input_tokens] = input_ids
+        output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
+            output.logits, temperature
+        )
+        anchor_token = output_ids[:, num_input_tokens : num_input_tokens + 1]
+        print_fn(
+            f"\n[Prefill anchor] pos={num_input_tokens} "
+            f"token={self._format_token_list(anchor_token[0], tokenizer)}"
+        )
+
+        prefill_slot0_confidence: Optional[float] = None
+        if profile_records is not None:
+            logits_prefill = output.logits[0, -1].float()
+            probs_prefill = torch.softmax(logits_prefill, dim=-1)
+            aid = int(output_ids[0, num_input_tokens].item())
+            prefill_slot0_confidence = float(probs_prefill[aid])
+
+        target_hidden = gather_pivot_multilayer_inference(
+            output.hidden_states,
+            self.target_layer_ids,
+            -1,
+            self.config.num_target_layers,
+        )
+
+        start = input_ids.shape[1]
+        while start < max_length:
+            spec_step_idx = int(self._last_decode_stats["steps"])
+            print_fn(f"\n[Spec step {spec_step_idx}] start={start}")
+            block_output_ids = output_ids[:, start : start + block_size].clone()
+            target_block_pos = position_ids[:, start : start + block_size]
+            if self.local_position:
+                draft_block_pos = torch.arange(
+                    1, block_size + 1, device=target.device, dtype=torch.long
+                ).unsqueeze(0)
+            else:
+                draft_block_pos = target_block_pos
+            block_start_abs = int(start)
+            slot0_tid = int(output_ids[0, start].item())
+
+            noise_embedding = target.model.embed_tokens(block_output_ids)
+            if target.device.type == "cuda":
+                torch.cuda.synchronize(target.device)
+            draft_start = time.perf_counter()
+            chs = self.chs_len_per_block
+            if self.local_position:
+                ctx_pos_part = torch.zeros(
+                    1, chs, dtype=torch.long, device=target.device
+                )
+            else:
+                ctx_pos_part = torch.full(
+                    (1, chs),
+                    start - 1,
+                    dtype=torch.long,
+                    device=target.device,
+                )
+            full_rotary = torch.cat([ctx_pos_part, draft_block_pos], dim=-1)
+            draft_hidden = self(
+                target_hidden=target_hidden,
+                noise_embedding=noise_embedding,
+                position_ids=draft_block_pos,
+                rotary_position_ids=full_rotary,
+                past_key_values=None,
+                use_cache=False,
+                is_causal=False,
+            )[:, -block_size + 1 :, :]
+            if self.draft_lm_head is not None:
+                draft_logits = self.draft_lm_head(draft_hidden)
+            else:
+                draft_logits = target.lm_head(draft_hidden)
+            if target.device.type == "cuda":
+                torch.cuda.synchronize(target.device)
+            self._last_decode_stats["draft_total_time"] += time.perf_counter() - draft_start
+
+            draft_topk_by_slot: dict[int, list[dict]] = {}
+            for slot in range(1, block_size):
+                topk_entries = self._format_token_topk(
+                    draft_logits[0, slot - 1], tokenizer, top_k
+                )
+                if profile_records is not None:
+                    draft_topk_by_slot[slot] = self._serialize_topk_entries(topk_entries)
+                print_fn(
+                    f"  [Draft slot {slot} | abs_pos={start + slot}] "
+                    f"top{top_k}={topk_entries}"
+                )
+
+            block_output_ids[:, 1:] = sample(draft_logits, temperature)
+
+            pending_profile_chunk: list[dict] = []
+            if profile_records is not None:
+                slot0_row = {
+                    "abs_pos": block_start_abs,
+                    "slot": 0,
+                    "token_id": slot0_tid,
+                    "token": tokenizer.decode([slot0_tid]),
+                }
+                if (
+                    prefill_slot0_confidence is not None
+                    and block_start_abs == num_input_tokens
+                ):
+                    slot0_row["confidence"] = round(prefill_slot0_confidence, 4)
+                pending_profile_chunk.append(slot0_row)
+                for s in sorted(draft_topk_by_slot):
+                    cand_list = [
+                        {
+                            "id": int(c["token_id"]),
+                            "t": c["token"],
+                            "p": round(float(c["confidence"]), 3),
+                        }
+                        for c in draft_topk_by_slot[s]
+                    ]
+                    row = {
+                        "abs_pos": block_start_abs + int(s),
+                        "slot": int(s),
+                        "top_k": int(top_k),
+                        "candidates": cand_list,
+                    }
+                    pending_profile_chunk.append(row)
+
+            if target.device.type == "cuda":
+                torch.cuda.synchronize(target.device)
+            target_start = time.perf_counter()
+            output = target(
+                block_output_ids,
+                position_ids=target_block_pos,
+                past_key_values=past_key_values_target,
+                use_cache=True,
+                output_hidden_states=True,
+            )
+            if target.device.type == "cuda":
+                torch.cuda.synchronize(target.device)
+            self._last_decode_stats["target_total_time"] += time.perf_counter() - target_start
+
+            posterior = sample(output.logits, temperature)
+            acceptance_length = (
+                (block_output_ids[:, 1:] == posterior[:, :-1])
+                .cumprod(dim=1)
+                .sum(dim=1)[0]
+                .item()
+            )
+            accepted_tokens = block_output_ids[:, : acceptance_length + 1]
+            print_fn(
+                f"  [Accept] length={acceptance_length + 1} "
+                f"tokens={self._format_token_list(accepted_tokens[0], tokenizer)}"
+            )
+
+            for target_pos in range(min(acceptance_length + 1, output.logits.shape[1])):
+                role = "accepted" if target_pos < acceptance_length else "correction"
+                target_token = posterior[:, target_pos : target_pos + 1]
+                target_top3 = self._format_token_topk(
+                    output.logits[0, target_pos], tokenizer, 3
+                )
+                print_fn(
+                    f"  [Target {role} pos={start + target_pos + 1}] "
+                    f"token={self._format_token_list(target_token[0], tokenizer)} "
+                    f"top3={target_top3}"
+                )
+
+            output_ids[:, start : start + acceptance_length + 1] = accepted_tokens
+            output_ids[:, start + acceptance_length + 1] = posterior[
+                :, acceptance_length
+            ]
+            start += acceptance_length + 1
+            past_key_values_target.crop(start)
+            pivot_index = min(
+                acceptance_length, output.hidden_states[0].shape[1] - 1
+            )
+            target_hidden = gather_pivot_multilayer_inference(
+                output.hidden_states,
+                self.target_layer_ids,
+                pivot_index,
+                self.config.num_target_layers,
+            )
+            accept_len_out = int(acceptance_length + 1)
+            self._last_decode_stats["accept_lengths"].append(accept_len_out)
+            if profile_records is not None:
+                profile_records.append(
+                    {"block_start": block_start_abs, "accept_length": accept_len_out}
+                )
+                profile_records.extend(pending_profile_chunk)
+            self._last_decode_stats["steps"] += 1
+            if stop_token_ids is not None and any(
+                stop_token_id in output_ids[:, num_input_tokens:]
+                for stop_token_id in stop_token_ids
+            ):
+                break
+
+        output_ids = output_ids[:, :max_length]
+        output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
+        if stop_token_ids is not None:
+            stop_tensor = torch.tensor(stop_token_ids, device=output_ids.device)
+            stop_token_indices = torch.isin(
+                output_ids[0][num_input_tokens:], stop_tensor
+            ).nonzero(as_tuple=True)[0]
+            if stop_token_indices.numel() > 0:
+                output_ids = output_ids[
+                    :, : num_input_tokens + stop_token_indices[0] + 1
+                ]
+
+        return output_ids
+
     @torch.inference_mode()
     def spec_generate(
         self,
