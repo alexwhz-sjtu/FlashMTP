@@ -19,9 +19,11 @@ from specforge.modeling.draft.flashmtp import FlashMTPDraftModel, prepare_target
 class FlashMTPStreakModel(nn.Module):
     """块首为真实 token 嵌入、块内其余为 [MASK]。
 
-    Streak 项使用 Log-Smoothed Relative Streak Loss：用教师 target 概率给每个位置设锚点，
-    再在相对概率上做 streak 累乘。当学生对真标签的概率已超过锚点 T=max(0.5,p_teacher) 时，
-    对 streak 项 ∂loss/∂lp 为 0（不再通过 log_phi 回传）。CE_aux 若开启仍可对该位置施梯度。
+    默认 streak 使用 Log-Smoothed Relative Streak Loss（LS-RSL）：教师 target 概率作锚点
+    ``T=max(0.5,p_teacher)``，相对 log 上做分段映射 ``log_phi``；高置信时对 streak 不回传梯度。
+
+    ``streak_raw_probs=True`` 时简化为直接使用草案在真标签上的 log 概率 ``log q``（经
+    ``log_prob_min`` 截断），不做教师锚点与 ``log_phi`` 映射。
     """
 
     def __init__(
@@ -36,6 +38,7 @@ class FlashMTPStreakModel(nn.Module):
         log_prob_min: float = -40.0,
         streak_weight: float = 1.0,
         ce_aux_weight: float = 0.0,
+        streak_raw_probs: bool = False,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -48,6 +51,7 @@ class FlashMTPStreakModel(nn.Module):
         self.log_prob_min = log_prob_min
         self.streak_weight = streak_weight
         self.ce_aux_weight = ce_aux_weight
+        self.streak_raw_probs = streak_raw_probs
 
     def _sample_anchor_positions(
         self,
@@ -225,25 +229,26 @@ class FlashMTPStreakModel(nn.Module):
             * pos_in_block_ok
         )
 
-        teacher_p = self._teacher_target_probs(
-            hidden_states=hidden_states,
-            teacher_logits=teacher_logits,
-            teacher_context_indices=(safe_label_indices - 1).clamp(min=0),
-            target_ids=target_ids,
-        )
-        target_anchor = torch.maximum(
-            torch.full_like(teacher_p, 0.5), teacher_p
-        ).clamp_min(1e-12)
+        if self.streak_raw_probs:
+            # 简化 streak：前缀积用草案对真标签的 log 概率之和（等价于 Σ log q），无教师锚点、无 log_phi。
+            lp_tail = lp[..., 1:]
+        else:
+            teacher_p = self._teacher_target_probs(
+                hidden_states=hidden_states,
+                teacher_logits=teacher_logits,
+                teacher_context_indices=(safe_label_indices - 1).clamp(min=0),
+                target_ids=target_ids,
+            )
+            target_anchor = torch.maximum(
+                torch.full_like(teacher_p, 0.5), teacher_p
+            ).clamp_min(1e-12)
 
-        # LS-RSL: log_rho = log(q/T), T = max(0.5, p_teacher(y*)).
-        # log_rho <= 0: log_phi = log_rho（对 lp 梯度为 1）。
-        # log_rho > 0: 前向仍用 log1p 平滑值，但 detach，使 streak 对 lp 梯度为 0（更激进）。
-        log_rho = lp - target_anchor.log()
-        high_conf_alpha = 0.5
-        pos_value = torch.log1p(high_conf_alpha * log_rho.clamp_min(0.0))
-        log_phi = torch.where(log_rho <= 0, log_rho, pos_value.detach())
-
-        lp_tail = log_phi[..., 1:]
+            # LS-RSL: log_rho = log(q/T), T = max(0.5, p_teacher(y*)).
+            log_rho = lp - target_anchor.log()
+            high_conf_alpha = 0.5
+            pos_value = torch.log1p(high_conf_alpha * log_rho.clamp_min(0.0))
+            log_phi = torch.where(log_rho <= 0, log_rho, pos_value.detach())
+            lp_tail = log_phi[..., 1:]
         valid_tail = valid_pos[..., 1:]
         prefix_valid = valid_tail.cumprod(dim=-1)
         prefix_log = (lp_tail * valid_tail).cumsum(dim=-1)

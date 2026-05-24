@@ -48,13 +48,18 @@ def parse_args():
         "--streak-weight",
         type=float,
         default=1.0,
-        help="LS-RSL streak loss 系数；通常作为主 loss。",
+        help="Streak 主 loss 系数（默认 LS-RSL；与 --streak-raw-probs 联用时为草案 log-q streak）。",
     )
     g.add_argument(
         "--streak-ce-weight",
         type=float,
         default=0.0,
         help="块内除 anchor 外的逐位置平均 CE 系数；0 关闭。",
+    )
+    g.add_argument(
+        "--streak-raw-probs",
+        action="store_true",
+        help="简化 streak：主项直接用草案对真标签的 log 概率做前缀 streak，不使用教师锚点与 log_phi。",
     )
     return p.parse_args()
 
@@ -94,7 +99,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
     )
 
-    # 前向核心：块首 clean，其余 [MASK]；LS-RSL streak 是主项，CE_aux 是不调权逐位置辅助项。
+    # 前向核心：块首 clean，其余 [MASK]；默认 LS-RSL；--streak-raw-probs 时用草案 log q 直接 streak。
     wrapper = FlashMTPStreakModel(
         draft_model=draft_model,
         target_lm_head=target_components.lm_head,
@@ -106,6 +111,7 @@ def main():
         log_prob_min=args.log_prob_min,
         streak_weight=args.streak_weight,
         ce_aux_weight=args.streak_ce_weight,
+        streak_raw_probs=args.streak_raw_probs,
     )
     wrapper = FSDP(
         wrapper,
@@ -156,7 +162,7 @@ def main():
             hidden_states = tuple(h.cuda() for h in to.hidden_states)
             tlog = to.teacher_logits.cuda() if to.teacher_logits is not None else None
 
-            # 总损失 = streak_weight * LS-RSL + streak_ce_weight * CE_aux。
+            # 总损失 = streak_weight * streak_main + streak_ce_weight * CE_aux。
             loss, acc, loss_streak, loss_ce = wrapper(
                 input_ids=input_ids,
                 hidden_states=hidden_states,

@@ -5,6 +5,7 @@
 # 用法:
 #   ./scripts/train_streak_v33.sh
 #   STREAK_FROM_SCRATCH=0 MDLM_INIT_CKPT=/path/to/epoch_1_step_1000 ./scripts/train_streak_v33.sh --dt qz
+#   STREAK_RAW_PROBS=1 ./scripts/train_streak_v33.sh   # streak 主项仅用草案 log q，无教师锚点 / log_phi
 #   [额外参数透传给 train_flashmtp_streak.py]
 set -euo pipefail
 
@@ -63,6 +64,8 @@ MAX_GRAD_NORM="1.0"
 STREAK_WEIGHT="1.0"
 STREAK_CE_WEIGHT="0.1"
 LOG_PROB_MIN="-40.0"
+# 1= streak 主项直接用草案 log q（无教师锚点 / 无 log_phi）；0= 默认 LS-RSL
+STREAK_RAW_PROBS="${STREAK_RAW_PROBS:-0}"
 
 SAVE_INTERVAL="10000"
 LOG_INTERVAL="50"
@@ -151,6 +154,9 @@ fi
 
 STAMP_BASE="v33_${DT}_nlayers${NUM_DRAFT_LAYERS}_nmiddle${NUM_MIDDLE_LAYERS_N}_bs${BLOCK_SIZE}_samples${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_maxlen${MAX_LENGTH}_kl_na_eps${NUM_EPOCHS}"
 STREAK_STAMP="${STAMP_BASE}_wst${STREAK_WEIGHT}_wce${STREAK_CE_WEIGHT}"
+if [[ "${STREAK_RAW_PROBS}" == "1" ]]; then
+  STREAK_STAMP="${STREAK_STAMP}_rawstreak"
+fi
 if [[ -z "${STREAK_OUTPUT_DIR}" ]]; then
   STREAK_OUTPUT_DIR="./cache/models/flashmtp_streak_${STREAK_STAMP}"
 fi
@@ -194,6 +200,7 @@ echo "  目标模型: ${TARGET_MODEL}"
 echo "  训练数据: ${TRAIN_DATA_PATH}"
 echo "  输出: ${STREAK_OUTPUT_DIR}"
 echo "  STREAK_FROM_SCRATCH=${STREAK_FROM_SCRATCH}"
+echo "  STREAK_RAW_PROBS=${STREAK_RAW_PROBS} (1=草案 log-q streak，无教师锚点)"
 echo "  NUM_EPOCHS=${NUM_EPOCHS}  LR=${LEARNING_RATE}"
 echo "=========================================="
 
@@ -245,6 +252,11 @@ if [[ "${REPORT_TO}" == "wandb" ]]; then
 fi
 [[ -n "${IS_PREFORMATTED}" ]] && COMMON+=(--is-preformatted)
 
+STREAK_PY_EXTRA=()
+if [[ "${STREAK_RAW_PROBS}" == "1" ]]; then
+  STREAK_PY_EXTRA+=(--streak-raw-probs)
+fi
+
 exec "${TORCH_CMD[@]}" "${ROOT}/scripts/train_flashmtp_streak.py" \
   "${COMMON[@]}" \
   --output-dir "${STREAK_OUTPUT_DIR}" \
@@ -253,5 +265,6 @@ exec "${TORCH_CMD[@]}" "${ROOT}/scripts/train_flashmtp_streak.py" \
   --streak-weight "${STREAK_WEIGHT}" \
   --streak-ce-weight "${STREAK_CE_WEIGHT}" \
   --log-prob-min "${LOG_PROB_MIN}" \
+  "${STREAK_PY_EXTRA[@]}" \
   "${INIT_ARGS[@]}" \
   "${PY_EXTRA[@]}"
