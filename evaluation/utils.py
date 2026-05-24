@@ -22,7 +22,7 @@ LONGBENCH_V2_FILE = Path(
 )
 
 DATASET_CACHE_ROOT = Path(
-    "/share/wanghanzhen/SpeculativeDecoding/NIPS26/dflash/train_exp/processed_dataset_cache"
+    "../../processed_dataset_cache"
 )
 DATASET_CACHE_VERSION = "v1"
 

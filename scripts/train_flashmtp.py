@@ -94,6 +94,12 @@ def parse_args():
         "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
     )
     model_group.add_argument(
+        "--loss-teacher-match-cap",
+        action="store_true",
+        help="When p_draft(y*)/max(p_teacher(y*),0.5) > 1, set that slot's CE weight to the "
+        "last speculative slot's weight within the same parallel block (after decay).",
+    )
+    model_group.add_argument(
         "--train-lm-head",
         action="store_true",
         help="Add a trainable draft lm_head (init from target head); share only frozen "
@@ -475,6 +481,9 @@ def main():
     draft_model.config.flashmtp_config["local_position"] = bool(
         getattr(draft_model, "local_position", False)
     )
+    draft_model.config.flashmtp_config["loss_teacher_match_cap"] = bool(
+        args.loss_teacher_match_cap
+    )
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
@@ -519,6 +528,7 @@ def main():
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
         chs_concat_mode="feature",
+        loss_teacher_match_cap=args.loss_teacher_match_cap,
     )
 
     flashmtp_model = FSDP(
