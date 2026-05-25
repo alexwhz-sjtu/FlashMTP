@@ -653,6 +653,10 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
 
             block_output_ids[:, 1:] = sample(draft_logits, temperature)
 
+            draft_probs_on_logits: Optional[torch.Tensor] = None
+            if profile_records is not None:
+                draft_probs_on_logits = torch.softmax(draft_logits.float(), dim=-1)
+
             pending_profile_chunk: list[dict] = []
             if profile_records is not None:
                 slot0_row = {
@@ -676,11 +680,20 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                         }
                         for c in draft_topk_by_slot[s]
                     ]
+                    sampled_tid = int(block_output_ids[0, s].item())
                     row = {
                         "abs_pos": block_start_abs + int(s),
                         "slot": int(s),
                         "top_k": int(top_k),
                         "candidates": cand_list,
+                        "sampled_token_id": sampled_tid,
+                        "sampled_token": tokenizer.decode([sampled_tid]),
+                        "draft_p_sampled": round(
+                            float(
+                                draft_probs_on_logits[0, s - 1, sampled_tid].item()
+                            ),
+                            4,
+                        ),
                     }
                     pending_profile_chunk.append(row)
 
@@ -711,12 +724,28 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 f"tokens={self._format_token_list(accepted_tokens[0], tokenizer)}"
             )
 
+            target_verify: list[dict] = []
             for target_pos in range(min(acceptance_length + 1, output.logits.shape[1])):
                 role = "accepted" if target_pos < acceptance_length else "correction"
                 target_token = posterior[:, target_pos : target_pos + 1]
                 target_top3 = self._format_token_topk(
                     output.logits[0, target_pos], tokenizer, 3
                 )
+                if profile_records is not None:
+                    tid = int(posterior[0, target_pos].item())
+                    probs_tp = torch.softmax(
+                        output.logits[0, target_pos].float(), dim=-1
+                    )
+                    target_verify.append(
+                        {
+                            "verify_step": int(target_pos),
+                            "role": role,
+                            "abs_pos": int(block_start_abs + target_pos + 1),
+                            "chosen_token_id": tid,
+                            "chosen_token": tokenizer.decode([tid]),
+                            "target_p_chosen": round(float(probs_tp[tid].item()), 4),
+                        }
+                    )
                 print_fn(
                     f"  [Target {role} pos={start + target_pos + 1}] "
                     f"token={self._format_token_list(target_token[0], tokenizer)} "
@@ -742,7 +771,12 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             self._last_decode_stats["accept_lengths"].append(accept_len_out)
             if profile_records is not None:
                 profile_records.append(
-                    {"block_start": block_start_abs, "accept_length": accept_len_out}
+                    {
+                        "block_start": block_start_abs,
+                        "accept_length": accept_len_out,
+                        "speculative_match_count": int(acceptance_length),
+                        "target_verify": target_verify,
+                    }
                 )
                 profile_records.extend(pending_profile_chunk)
             self._last_decode_stats["steps"] += 1

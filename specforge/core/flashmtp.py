@@ -382,7 +382,7 @@ class OnlineFlashMTPModel(nn.Module):
                 target_ids.reshape(bsz, nk, 1),
             ).squeeze(-1)
             p_teacher = p_teacher.view(bsz, n_blk, self.block_size)
-            p_den = torch.clamp(p_teacher, min=0.5)
+            p_den = torch.clamp(p_teacher, min=0.6)
 
             p_draft = torch.gather(
                 F.softmax(logits.reshape(bsz, nk, -1).float(), dim=-1),
