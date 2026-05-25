@@ -163,7 +163,7 @@ def main():
             tlog = to.teacher_logits.cuda() if to.teacher_logits is not None else None
 
             # 总损失 = streak_weight * streak_main + streak_ce_weight * CE_aux。
-            loss, acc, loss_streak, loss_ce = wrapper(
+            loss, acc, prefix_acc, loss_streak, loss_ce = wrapper(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
@@ -176,33 +176,41 @@ def main():
             if global_step % args.log_interval == 0:
                 lf = loss.detach().clone()
                 af = acc.detach().clone()
+                pf = prefix_acc.detach().clone()
                 sf = loss_streak.detach().clone()
                 cf = loss_ce.detach().clone()
                 dist.all_reduce(lf)
                 dist.all_reduce(af)
+                dist.all_reduce(pf)
                 dist.all_reduce(sf)
                 dist.all_reduce(cf)
                 ws = float(dist.get_world_size())
-                lf, af, sf, cf = lf / ws, af / ws, sf / ws, cf / ws
+                lf, af, pf, sf, cf = lf / ws, af / ws, pf / ws, sf / ws, cf / ws
                 tracker.log(
                     {
                         "train/loss": lf.item(),
                         "train/streak_loss": sf.item(),
                         "train/ce_loss": cf.item(),
                         "train/acc": af.item(),
+                        "train/prefix_acc": pf.item(),
                         "train/lr": optimizer.get_learning_rate(),
                     },
                     step=global_step,
                 )
                 print_on_rank0(
                     f"step {global_step} loss={lf.item():.4f} streak={sf.item():.4f} "
-                    f"ce={cf.item():.4f} acc={af.item():.4f}"
+                    f"ce={cf.item():.4f} acc={af.item():.4f} prefix_acc={pf.item():.4f}"
                 )
 
             if dist.get_rank() == 0:
                 dt = time.time() - last_t
                 last_t = time.time()
-                bar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc.item():.4f}", t=f"{dt:.2f}s")
+                bar.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    acc=f"{acc.item():.4f}",
+                    pfx=f"{prefix_acc.item():.4f}",
+                    t=f"{dt:.2f}s",
+                )
 
             if global_step % args.save_interval == 0:
                 save_checkpoint(args, epoch, global_step, wrapper, draft_model, optimizer)

@@ -151,7 +151,7 @@ class FlashMTPStreakModel(nn.Module):
         hidden_states,
         loss_mask: torch.Tensor,
         teacher_logits: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
@@ -290,9 +290,23 @@ class FlashMTPStreakModel(nn.Module):
             correct = (pred == target_ids) & (valid_pos > 0.5)
             acc = correct.sum().float() / (valid_pos > 0.5).sum().float().clamp(min=1.0)
 
+            # 块内最大连续匹配前缀长度（含块首 anchor，计为 1）；与 specforge/core/flashmtp.py 一致。
+            correct_tail = (pred[..., 1:] == target_ids[..., 1:]) & (valid_tail > 0.5)
+            prefix_correct = correct_tail.cumprod(dim=-1)
+            prefix_lengths = prefix_correct.sum(dim=-1).float() + 1.0
+            valid_blocks = block_keep_mask & (valid_tail > 0.5).any(dim=-1)
+            prefix_count = valid_blocks.sum().float()
+            prefix_sum = (
+                prefix_lengths[valid_blocks].sum()
+                if valid_blocks.any()
+                else torch.zeros((), device=device, dtype=torch.float32)
+            )
+            prefix_acc = prefix_sum / prefix_count.clamp(min=1.0)
+
         return (
             loss_total,
             acc,
+            prefix_acc,
             loss_streak.detach(),
             loss_ce.detach(),
         )

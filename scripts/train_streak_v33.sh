@@ -75,7 +75,7 @@ DATALOADER_NUM_WORKERS="8"
 BUILD_DATASET_NUM_PROC="8"
 
 REPORT_TO="wandb"
-WANDB_PROJECT="flashmtp_training_exp"
+WANDB_PROJECT="flashmtp-training-exp"
 WANDB_DIR="./wandb"
 WANDB_RUN_NAME=""
 WANDB_RUN_ID=""
