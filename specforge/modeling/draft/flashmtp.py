@@ -24,6 +24,12 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from typing_extensions import Tuple, Unpack
 
 
+def _cuda_sync_time(device: torch.device) -> float:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return time.perf_counter()
+
+
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     if temperature < 1e-5:
         return torch.argmax(logits, dim=-1)
@@ -32,6 +38,14 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     logits = logits / temperature
     probs = torch.softmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
+
+
+from .flashmtp_draft_tree import (
+    DraftTreeSpec,
+    build_draft_tree_from_logits,
+    greedy_accept_tree_causal,
+    target_forward_tree_verify,
+)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -801,41 +815,57 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         return output_ids
 
     @torch.inference_mode()
-    def spec_generate(
+    def spec_generate_with_draft_tree(
         self,
         target: nn.Module,
         input_ids: torch.LongTensor,
         max_new_tokens: int,
         stop_token_ids: list[int],
-        temperature: float,
-    ):
+        temperature: float = 0.0,
+        *,
+        trunc_thres: float = 0.2,
+        expand_thres: float = 0.5,
+        tree_width: int = 4,
+        entropy_ratio: float = 0.4,
+        decode_timing_after_first_token: bool = False,
+    ) -> torch.LongTensor:
+        """Speculative decode with dynamic draft tree (``block_size`` from model config).
+
+        Draft tree with truncation/expansion; one target forward over all nodes using
+        ancestor attention mask and shared ``position_ids`` per depth. Acceptance walks
+        the path: ``logits[accepted_{d-1}]`` vs candidates at depth ``d``.
+        """
         self.eval()
+        block_size = int(self.block_size)
         self._last_decode_stats = {
             "accept_lengths": [],
+            "decode_wall_time": 0.0,
             "target_total_time": 0.0,
             "draft_total_time": 0.0,
             "steps": 0,
+            "tree_chain_steps": 0,
+            "tree_branch_steps": 0,
+            "tree_trunc_steps": 0,
+            "tree_expand_steps": 0,
+            "tree_avg_nodes": 0.0,
         }
+        bsz = input_ids.shape[0]
+        if bsz != 1:
+            raise ValueError("spec_generate_with_draft_tree currently supports batch_size=1")
+
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
-
-        block_size = self.block_size
         output_ids = torch.full(
-            (1, max_length + block_size),
+            (bsz, max_length + block_size),
             self.mask_token_id,
             dtype=torch.long,
             device=target.device,
         )
         position_ids = torch.arange(
             output_ids.shape[1], device=target.device
-        ).unsqueeze(0)
+        ).unsqueeze(0).expand(bsz, -1)
 
         past_key_values_target = DynamicCache()
-
-        # Prefill stage
-        if target.device.type == "cuda":
-            torch.cuda.synchronize(target.device)
-        target_start = time.perf_counter()
         output = target(
             input_ids,
             position_ids=position_ids[:, :num_input_tokens],
@@ -844,10 +874,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             logits_to_keep=1,
             output_hidden_states=True,
         )
-        if target.device.type == "cuda":
-            torch.cuda.synchronize(target.device)
-        self._last_decode_stats["target_total_time"] += time.perf_counter() - target_start
-
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
             output.logits, temperature
@@ -859,30 +885,31 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             self.config.num_target_layers,
         )
 
-        # Decode stage
-        acceptance_lengths = []
+        decode_start: float | None = (
+            None if decode_timing_after_first_token else _cuda_sync_time(target.device)
+        )
+        acceptance_lengths: list[int] = []
+        tree_node_total = 0
         start = input_ids.shape[1]
+
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             target_block_pos = position_ids[:, start : start + block_size]
             if self.local_position:
                 draft_block_pos = torch.arange(
                     1, block_size + 1, device=target.device, dtype=torch.long
-                ).unsqueeze(0)
+                ).unsqueeze(0).expand(bsz, -1)
             else:
                 draft_block_pos = target_block_pos
             noise_embedding = target.model.embed_tokens(block_output_ids)
-            if target.device.type == "cuda":
-                torch.cuda.synchronize(target.device)
-            draft_start = time.perf_counter()
             chs = self.chs_len_per_block
             if self.local_position:
                 ctx_pos_part = torch.zeros(
-                    1, chs, dtype=torch.long, device=target.device
+                    bsz, chs, dtype=torch.long, device=target.device
                 )
             else:
                 ctx_pos_part = torch.full(
-                    (1, chs),
+                    (bsz, chs),
                     start - 1,
                     dtype=torch.long,
                     device=target.device,
@@ -901,14 +928,201 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 draft_logits = self.draft_lm_head(draft_hidden)
             else:
                 draft_logits = target.lm_head(draft_hidden)
-            if target.device.type == "cuda":
-                torch.cuda.synchronize(target.device)
-            self._last_decode_stats["draft_total_time"] += time.perf_counter() - draft_start
+
+            anchor_id = int(block_output_ids[0, 0].item())
+            tree_spec = build_draft_tree_from_logits(
+                draft_logits[0],
+                anchor_id,
+                block_size,
+                tree_width,
+                trunc_thres,
+                expand_thres,
+                entropy_ratio,
+            )
+            tree_node_total += len(tree_spec.token_ids)
+            if tree_spec.trunc_depth is not None:
+                self._last_decode_stats["tree_trunc_steps"] += 1
+            if tree_spec.expand_start_depth is not None:
+                self._last_decode_stats["tree_expand_steps"] += 1
+
+            if tree_spec.is_chain:
+                self._last_decode_stats["tree_chain_steps"] += 1
+            else:
+                self._last_decode_stats["tree_branch_steps"] += 1
+
+            output = target_forward_tree_verify(
+                target,
+                tree_spec,
+                start,
+                past_key_values_target,
+                target.device,
+                noise_embedding.dtype,
+            )
+            accepted_prefix, correction, acceptance_length, accepted_node = (
+                greedy_accept_tree_causal(
+                    tree_spec, output.logits[0], temperature
+                )
+            )
+            n_prefix = len(accepted_prefix)
+            output_ids[:, start : start + n_prefix] = torch.tensor(
+                accepted_prefix, device=target.device, dtype=torch.long
+            ).unsqueeze(0)
+            if correction is not None:
+                output_ids[:, start + n_prefix] = correction
+                pivot_index = min(
+                    accepted_node, output.hidden_states[0].shape[1] - 1
+                )
+            else:
+                output_ids[:, start + n_prefix] = sample(
+                    output.logits[:, accepted_node : accepted_node + 1],
+                    temperature,
+                ).squeeze(-1)
+                pivot_index = min(
+                    accepted_node, output.hidden_states[0].shape[1] - 1
+                )
+
+            start += acceptance_length + 1
+            past_key_values_target.crop(start)
+            target_hidden = gather_pivot_multilayer_inference(
+                output.hidden_states,
+                self.target_layer_ids,
+                pivot_index,
+                self.config.num_target_layers,
+            )
+            acceptance_lengths.append(acceptance_length + 1)
+            self._last_decode_stats["accept_lengths"].append(acceptance_length + 1)
+            self._last_decode_stats["steps"] += 1
+
+            if decode_timing_after_first_token and decode_start is None:
+                decode_start = _cuda_sync_time(target.device)
+            if stop_token_ids is not None and any(
+                stop_token_id in output_ids[:, num_input_tokens:]
+                for stop_token_id in stop_token_ids
+            ):
+                break
+
+        steps = max(self._last_decode_stats["steps"], 1)
+        self._last_decode_stats["tree_avg_nodes"] = tree_node_total / steps
+        if decode_start is None:
+            decode_start = _cuda_sync_time(target.device)
+        decode_wall_time = _cuda_sync_time(target.device) - decode_start
+        self._last_decode_stats["decode_wall_time"] = decode_wall_time
+        self._last_decode_stats["target_total_time"] = decode_wall_time
+        self._last_decode_stats["draft_total_time"] = 0.0
+
+        output_ids = output_ids[:, :max_length]
+        output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
+        if stop_token_ids is not None:
+            stop_token_ids_t = torch.tensor(stop_token_ids, device=output_ids.device)
+            stop_token_indices = torch.isin(
+                output_ids[0][num_input_tokens:], stop_token_ids_t
+            ).nonzero(as_tuple=True)[0]
+            if stop_token_indices.numel() > 0:
+                output_ids = output_ids[
+                    :, : num_input_tokens + stop_token_indices[0] + 1
+                ]
+        return output_ids
+
+    @torch.inference_mode()
+    def spec_generate(
+        self,
+        target: nn.Module,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int,
+        stop_token_ids: list[int],
+        temperature: float,
+        decode_timing_after_first_token: bool = False,
+    ):
+        self.eval()
+        self._last_decode_stats = {
+            "accept_lengths": [],
+            "decode_wall_time": 0.0,
+            "target_total_time": 0.0,
+            "draft_total_time": 0.0,
+            "steps": 0,
+        }
+        bsz = input_ids.shape[0]
+        num_input_tokens = input_ids.shape[1]
+        max_length = num_input_tokens + max_new_tokens
+
+        block_size = self.block_size
+        output_ids = torch.full(
+            (bsz, max_length + block_size),
+            self.mask_token_id,
+            dtype=torch.long,
+            device=target.device,
+        )
+        position_ids = torch.arange(
+            output_ids.shape[1], device=target.device
+        ).unsqueeze(0).expand(bsz, -1)
+
+        past_key_values_target = DynamicCache()
+
+        # Prefill stage (not included in decode wall time)
+        output = target(
+            input_ids,
+            position_ids=position_ids[:, :num_input_tokens],
+            past_key_values=past_key_values_target,
+            use_cache=True,
+            logits_to_keep=1,
+            output_hidden_states=True,
+        )
+
+        output_ids[:, :num_input_tokens] = input_ids
+        output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
+            output.logits, temperature
+        )
+        target_hidden = gather_pivot_multilayer_inference(
+            output.hidden_states,
+            self.target_layer_ids,
+            -1,
+            self.config.num_target_layers,
+        )
+
+        # Decode stage: single cuda-synced wall clock (draft + target + bookkeeping)
+        decode_start: float | None = (
+            None if decode_timing_after_first_token else _cuda_sync_time(target.device)
+        )
+        acceptance_lengths = []
+        start = input_ids.shape[1]
+        while start < max_length:
+            block_output_ids = output_ids[:, start : start + block_size].clone()
+            target_block_pos = position_ids[:, start : start + block_size]
+            if self.local_position:
+                draft_block_pos = torch.arange(
+                    1, block_size + 1, device=target.device, dtype=torch.long
+                ).unsqueeze(0).expand(bsz, -1)
+            else:
+                draft_block_pos = target_block_pos
+            noise_embedding = target.model.embed_tokens(block_output_ids)
+            chs = self.chs_len_per_block
+            if self.local_position:
+                ctx_pos_part = torch.zeros(
+                    bsz, chs, dtype=torch.long, device=target.device
+                )
+            else:
+                ctx_pos_part = torch.full(
+                    (bsz, chs),
+                    start - 1,
+                    dtype=torch.long,
+                    device=target.device,
+                )
+            full_rotary = torch.cat([ctx_pos_part, draft_block_pos], dim=-1)
+            draft_hidden = self(
+                target_hidden=target_hidden,
+                noise_embedding=noise_embedding,
+                position_ids=draft_block_pos,
+                rotary_position_ids=full_rotary,
+                past_key_values=None,
+                use_cache=False,
+                is_causal=False,
+            )[:, -block_size + 1 :, :]
+            if self.draft_lm_head is not None:
+                draft_logits = self.draft_lm_head(draft_hidden)
+            else:
+                draft_logits = target.lm_head(draft_hidden)
             block_output_ids[:, 1:] = sample(draft_logits)
 
-            if target.device.type == "cuda":
-                torch.cuda.synchronize(target.device)
-            target_start = time.perf_counter()
             output = target(
                 block_output_ids,
                 position_ids=target_block_pos,
@@ -916,17 +1130,12 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 use_cache=True,
                 output_hidden_states=True,
             )
-            if target.device.type == "cuda":
-                torch.cuda.synchronize(target.device)
-            self._last_decode_stats["target_total_time"] += time.perf_counter() - target_start
 
             posterior = sample(output.logits, temperature)
-            acceptance_length = (
-                (block_output_ids[:, 1:] == posterior[:, :-1])
-                .cumprod(dim=1)
-                .sum(dim=1)[0]
-                .item()
+            acceptance_lengths_per_row = (
+                (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)
             )
+            acceptance_length = int(acceptance_lengths_per_row.min().item())
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
                 :, : acceptance_length + 1
             ]
@@ -947,11 +1156,23 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             acceptance_lengths.append(acceptance_length + 1)
             self._last_decode_stats["accept_lengths"].append(acceptance_length + 1)
             self._last_decode_stats["steps"] += 1
+
+            if decode_timing_after_first_token and decode_start is None:
+                decode_start = _cuda_sync_time(target.device)
+
             if stop_token_ids is not None and any(
                 stop_token_id in output_ids[:, num_input_tokens:]
                 for stop_token_id in stop_token_ids
             ):
                 break
+        if decode_start is None:
+            decode_start = _cuda_sync_time(target.device)
+        decode_wall_time = _cuda_sync_time(target.device) - decode_start
+        self._last_decode_stats["decode_wall_time"] = decode_wall_time
+        # Legacy fields: whole decode wall (no draft/target split)
+        self._last_decode_stats["target_total_time"] = decode_wall_time
+        self._last_decode_stats["draft_total_time"] = 0.0
+
         output_ids = output_ids[:, :max_length]
         output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
         if stop_token_ids is not None:

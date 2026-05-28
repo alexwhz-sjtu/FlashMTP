@@ -111,6 +111,25 @@ def parse_args():
         help="Draft uses block-local position ids 1..block_size (repeated per parallel "
         "block in training). CHS rotary prefix uses zeros. Target model still uses global ids.",
     )
+    model_group.add_argument(
+        "--add-noise",
+        action="store_true",
+        help="Add uniform noise U(-r, r) to each selected-layer target hidden before draft "
+        "forward (default r=0.1 from --target-hidden-noise-ratio).",
+    )
+    model_group.add_argument(
+        "--target-hidden-noise-ratio",
+        type=float,
+        default=0.1,
+        help="Half-width r for uniform noise U(-r, r) when --add-noise is set.",
+    )
+    model_group.add_argument(
+        "--w1-mse",
+        type=float,
+        default=0.0,
+        help="Weight for MSE between draft last-layer hidden and target last-layer "
+        "hidden at the first predicted token (block position 1). 0 disables.",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -374,6 +393,7 @@ def record_metrics(
     train_dataloader=None,
     mode: str = "train",
     prefix_acc: float | None = None,
+    mse_loss: float | None = None,
 ) -> None:
     logdict = {}
 
@@ -384,10 +404,14 @@ def record_metrics(
     logdict[f"{mode}/accuracy"] = accuracy
     if prefix_acc is not None:
         logdict[f"{mode}/prefix_acc"] = prefix_acc
+    if mse_loss is not None:
+        logdict[f"{mode}/w1_mse_loss"] = mse_loss
 
     extra = ""
     if prefix_acc is not None:
         extra = f", PrefixAcc: {prefix_acc:.4f}"
+    if mse_loss is not None:
+        extra += f", W1MSE: {mse_loss:.4f}"
     print_on_rank0(
         f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}{extra}"
     )
@@ -484,6 +508,11 @@ def main():
     draft_model.config.flashmtp_config["loss_teacher_match_cap"] = bool(
         args.loss_teacher_match_cap
     )
+    draft_model.config.flashmtp_config["add_noise"] = bool(args.add_noise)
+    draft_model.config.flashmtp_config["target_hidden_noise_ratio"] = float(
+        args.target_hidden_noise_ratio
+    )
+    draft_model.config.flashmtp_config["w1_mse"] = float(args.w1_mse)
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
@@ -529,6 +558,13 @@ def main():
         loss_decay_gamma=args.loss_decay_gamma,
         chs_concat_mode="feature",
         loss_teacher_match_cap=args.loss_teacher_match_cap,
+        add_noise=args.add_noise,
+        target_hidden_noise_ratio=args.target_hidden_noise_ratio,
+        w1_mse=args.w1_mse,
+    )
+    print_on_rank0(
+        f"target hidden noise: add_noise={args.add_noise}, "
+        f"ratio={args.target_hidden_noise_ratio}, w1_mse={args.w1_mse}"
     )
 
     flashmtp_model = FSDP(
@@ -596,7 +632,7 @@ def main():
             hidden_states = tuple(h.cuda() for h in target_output.hidden_states)
             # hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 
-            loss, accuracy, prefix_acc = flashmtp_model(
+            loss, accuracy, prefix_acc, mse_loss = flashmtp_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
@@ -611,12 +647,15 @@ def main():
                 loss_log = loss.clone()
                 acc_log = accuracy.clone()
                 pfx_log = prefix_acc.clone()
+                mse_log = mse_loss.clone()
                 dist.all_reduce(loss_log)
                 dist.all_reduce(acc_log)
                 dist.all_reduce(pfx_log)
+                dist.all_reduce(mse_log)
                 loss_log = loss_log / dist.get_world_size()
                 acc_log = acc_log / dist.get_world_size()
                 pfx_log = pfx_log / dist.get_world_size()
+                mse_log = mse_log / dist.get_world_size()
 
                 record_metrics(
                     args,
@@ -628,6 +667,7 @@ def main():
                     train_dataloader,
                     mode="train",
                     prefix_acc=pfx_log.item(),
+                    mse_loss=mse_log.item() if args.w1_mse > 0 else None,
                 )
 
             if dist.get_rank() == 0:
