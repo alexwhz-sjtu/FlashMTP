@@ -37,7 +37,7 @@ for p in (PROJECT_ROOT, _PROFILE_UTILS):
 from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
 
 from evaluation import distributed as dist
-from evaluation.benchmark import load_benchmark_dataset, select_max_samples
+from evaluation.datasets import load_benchmark_dataset, select_max_samples
 
 from flashmtp_cuda_profile import profile_flashmtp_generate, stats_to_jsonable
 from flashmtp_profile_format import compact_profile_token_lines

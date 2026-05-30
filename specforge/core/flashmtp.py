@@ -64,22 +64,6 @@ def prepare_target_hidden(
     return torch.stack(pieces, dim=2)  # (B, N, S, H)
 
 
-def add_noise_to_target_hidden(
-    target_hidden: torch.Tensor,
-    noise_ratio: float = 0.1,
-) -> torch.Tensor:
-    """Add uniform noise to each selected-layer pivot hidden (training augmentation).
-
-    Samples i.i.d. from U(-noise_ratio, noise_ratio) per element (default U(-0.1, 0.1)).
-    """
-    if noise_ratio <= 0:
-        return target_hidden
-    noise = torch.empty_like(target_hidden).uniform_(
-        -noise_ratio, noise_ratio
-    )
-    return target_hidden + noise
-
-
 def create_flashmtp_block_mask(
     anchor_positions: torch.Tensor,
     block_keep_mask: torch.Tensor,
@@ -156,10 +140,6 @@ class OnlineFlashMTPModel(nn.Module):
             num_anchors: int = 512,
             loss_decay_gamma: Optional[float] = None,
             chs_concat_mode: str = "feature",
-            loss_teacher_match_cap: bool = False,
-            add_noise: bool = False,
-            target_hidden_noise_ratio: float = 0.1,
-            w1_mse: float = 0.0,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -170,10 +150,6 @@ class OnlineFlashMTPModel(nn.Module):
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
-        self.loss_teacher_match_cap = loss_teacher_match_cap
-        self.add_noise = add_noise
-        self.target_hidden_noise_ratio = target_hidden_noise_ratio
-        self.w1_mse = w1_mse
         self.chs_concat_mode = "feature"
         self.draft_model.chs_concat_mode = "feature"
 
@@ -336,10 +312,6 @@ class OnlineFlashMTPModel(nn.Module):
             self.draft_model.target_layer_ids,
             self.draft_model.config.num_target_layers,
         )
-        if self.add_noise:
-            target_hidden = add_noise_to_target_hidden(
-                target_hidden, noise_ratio=self.target_hidden_noise_ratio
-            )
 
         output_hidden = self.draft_model(
             position_ids=draft_position_ids,
@@ -349,10 +321,7 @@ class OnlineFlashMTPModel(nn.Module):
             rotary_position_ids=full_rotary_position_ids,
         )
 
-        if self.draft_model.draft_lm_head is not None:
-            logits = self.draft_model.draft_lm_head(output_hidden)
-        else:
-            logits = self.lm_head(output_hidden)
+        logits = self.lm_head(output_hidden)
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
         label_offsets = torch.arange(0, self.block_size,
@@ -392,38 +361,6 @@ class OnlineFlashMTPModel(nn.Module):
                                       self.loss_decay_gamma)
             weight_mask = weight_mask * decay_weights
 
-        # --- Optional: down-weight slots where draft already exceeds teacher on y* ---
-        if self.loss_teacher_match_cap:
-            n_blk = anchor_positions.size(1)
-            nk = n_blk * self.block_size
-            h_dim = hidden_states[-1].size(-1)
-            seq_h = hidden_states[-1].size(1)
-            pred_idx = (safe_label_indices - 1).clamp(min=0).clamp(max=seq_h - 1)
-            flat_pred = pred_idx.reshape(bsz, nk)
-            idx_h = flat_pred.unsqueeze(-1).expand(bsz, nk, h_dim)
-            teacher_h = torch.gather(hidden_states[-1], 1, idx_h)
-            teacher_logits = self.lm_head(teacher_h)
-            p_teacher = torch.gather(
-                F.softmax(teacher_logits.float(), dim=-1),
-                2,
-                target_ids.reshape(bsz, nk, 1),
-            ).squeeze(-1)
-            p_teacher = p_teacher.view(bsz, n_blk, self.block_size)
-            p_den = torch.clamp(p_teacher, min=0.6)
-
-            p_draft = torch.gather(
-                F.softmax(logits.reshape(bsz, nk, -1).float(), dim=-1),
-                2,
-                target_ids.reshape(bsz, nk, 1),
-            ).squeeze(-1)
-            p_draft = p_draft.view(bsz, n_blk, self.block_size)
-
-            with torch.no_grad():
-                ratio = (p_draft / p_den).detach()
-            over = (ratio > 1.0) & (weight_mask > 0)
-            w_tail = weight_mask[:, :, -1:].expand_as(weight_mask)
-            weight_mask = torch.where(over, w_tail, weight_mask)
-
         # --- Cross entropy ---
         flat_logits = logits.view(-1, logits.size(-1))
         flat_targets = target_ids.view(-1)
@@ -434,36 +371,6 @@ class OnlineFlashMTPModel(nn.Module):
                                          reduction="none")
         valid_token_count = flat_weights.sum() + 1e-6
         loss = (loss_per_token * flat_weights).sum() / valid_token_count
-
-        # --- First predicted token hidden MSE (block pos 1 -> teacher last layer at anchor) ---
-        mse_loss = torch.zeros((), device=device, dtype=loss.dtype)
-        if self.w1_mse > 0:
-            n_blk = anchor_positions.size(1)
-            h_dim = output_hidden.size(-1)
-            draft_first_h = output_hidden.view(
-                bsz, n_blk, self.block_size, h_dim
-            )[:, :, 1, :]
-            first_label_indices = (anchor_positions + 1).clamp(max=seq_len - 1)
-            teacher_pos = (first_label_indices - 1).clamp(min=0)
-            teacher_first_h = torch.gather(
-                hidden_states[-1],
-                1,
-                teacher_pos.unsqueeze(-1).expand(-1, -1, h_dim),
-            )
-            mse_mask = block_keep_mask.float()
-            mse_mask = mse_mask * (first_label_indices < seq_len).float()
-            mse_mask = mse_mask * torch.gather(
-                loss_mask,
-                1,
-                first_label_indices,
-            )
-            mse_per_block = F.mse_loss(
-                draft_first_h.float(),
-                teacher_first_h.float(),
-                reduction="none",
-            ).mean(dim=-1)
-            mse_loss = (mse_per_block * mse_mask).sum() / (mse_mask.sum() + 1e-6)
-            loss = loss + self.w1_mse * mse_loss
 
         # --- Accuracy ---
         with torch.no_grad():
@@ -495,4 +402,4 @@ class OnlineFlashMTPModel(nn.Module):
             )
             prefix_acc = prefix_sum / prefix_count.clamp(min=1.0)
 
-        return loss, accuracy, prefix_acc, mse_loss
+        return loss, accuracy, prefix_acc

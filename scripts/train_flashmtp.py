@@ -74,13 +74,6 @@ def parse_args():
         help="Number of anchor positions per sequence",
     )
     model_group.add_argument(
-        "--pivot-fuse-mode",
-        type=str,
-        default="linear_fuse",
-        choices=["linear_fuse", "attention_fuse", "prefix_condition"],
-        help="How to fuse multi-layer teacher pivots (v1.1 ablation).",
-    )
-    model_group.add_argument(
         "--num-middle-layers-n",
         type=int,
         default=0,
@@ -94,41 +87,10 @@ def parse_args():
         "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
     )
     model_group.add_argument(
-        "--loss-teacher-match-cap",
-        action="store_true",
-        help="When p_draft(y*)/max(p_teacher(y*),0.5) > 1, set that slot's CE weight to the "
-        "last speculative slot's weight within the same parallel block (after decay).",
-    )
-    model_group.add_argument(
-        "--train-lm-head",
-        action="store_true",
-        help="Add a trainable draft lm_head (init from target head); share only frozen "
-        "embeddings with the target. Default: share frozen target lm_head as today.",
-    )
-    model_group.add_argument(
         "--local-position",
         action="store_true",
         help="Draft uses block-local position ids 1..block_size (repeated per parallel "
         "block in training). CHS rotary prefix uses zeros. Target model still uses global ids.",
-    )
-    model_group.add_argument(
-        "--add-noise",
-        action="store_true",
-        help="Add uniform noise U(-r, r) to each selected-layer target hidden before draft "
-        "forward (default r=0.1 from --target-hidden-noise-ratio).",
-    )
-    model_group.add_argument(
-        "--target-hidden-noise-ratio",
-        type=float,
-        default=0.1,
-        help="Half-width r for uniform noise U(-r, r) when --add-noise is set.",
-    )
-    model_group.add_argument(
-        "--w1-mse",
-        type=float,
-        default=0.0,
-        help="Weight for MSE between draft last-layer hidden and target last-layer "
-        "hidden at the first predicted token (block position 1). 0 disables.",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -242,13 +204,8 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         draft_config.flashmtp_config = {}
 
     draft_config.flashmtp_config["chs_concat_mode"] = "feature"
-    draft_config.flashmtp_config["pivot_fuse_mode"] = args.pivot_fuse_mode
     draft_config.flashmtp_config["num_middle_layers_n"] = args.num_middle_layers_n
     draft_config.flashmtp_config["local_position"] = bool(args.local_position)
-    if args.train_lm_head:
-        draft_config.flashmtp_config["train_lm_head"] = True
-    elif "train_lm_head" not in draft_config.flashmtp_config:
-        draft_config.flashmtp_config["train_lm_head"] = False
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
@@ -268,8 +225,6 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}"
     )
     print_on_rank0(
-        f"train_lm_head={getattr(draft_model, 'train_lm_head', False)} "
-        f"(draft_lm_head={'on' if draft_model.draft_lm_head is not None else 'off'}), "
         f"local_position={getattr(draft_model, 'local_position', False)}"
     )
 
@@ -393,7 +348,6 @@ def record_metrics(
     train_dataloader=None,
     mode: str = "train",
     prefix_acc: float | None = None,
-    mse_loss: float | None = None,
 ) -> None:
     logdict = {}
 
@@ -404,14 +358,10 @@ def record_metrics(
     logdict[f"{mode}/accuracy"] = accuracy
     if prefix_acc is not None:
         logdict[f"{mode}/prefix_acc"] = prefix_acc
-    if mse_loss is not None:
-        logdict[f"{mode}/w1_mse_loss"] = mse_loss
 
     extra = ""
     if prefix_acc is not None:
         extra = f", PrefixAcc: {prefix_acc:.4f}"
-    if mse_loss is not None:
-        extra += f", W1MSE: {mse_loss:.4f}"
     print_on_rank0(
         f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}{extra}"
     )
@@ -497,22 +447,10 @@ def main():
     draft_model.config.flashmtp_config["chs_concat_mode"] = "feature"
     draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
     draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
-    draft_model.config.flashmtp_config["pivot_fuse_mode"] = draft_model.pivot_fuse_mode
     draft_model.config.flashmtp_config["num_middle_layers_n"] = draft_model.num_middle_layers_n
-    draft_model.config.flashmtp_config["train_lm_head"] = bool(
-        getattr(draft_model, "train_lm_head", False)
-    )
     draft_model.config.flashmtp_config["local_position"] = bool(
         getattr(draft_model, "local_position", False)
     )
-    draft_model.config.flashmtp_config["loss_teacher_match_cap"] = bool(
-        args.loss_teacher_match_cap
-    )
-    draft_model.config.flashmtp_config["add_noise"] = bool(args.add_noise)
-    draft_model.config.flashmtp_config["target_hidden_noise_ratio"] = float(
-        args.target_hidden_noise_ratio
-    )
-    draft_model.config.flashmtp_config["w1_mse"] = float(args.w1_mse)
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
@@ -530,23 +468,6 @@ def main():
         trust_remote_code=args.trust_remote_code,
     )
 
-    if draft_model.draft_lm_head is not None:
-        if not draft_weights_from_checkpoint:
-            with torch.no_grad():
-                draft_model.draft_lm_head.weight.copy_(
-                    target_components.lm_head.weight.to(
-                        device=draft_model.draft_lm_head.weight.device,
-                        dtype=draft_model.draft_lm_head.weight.dtype,
-                    )
-                )
-            print_on_rank0(
-                "Initialized draft_lm_head from target lm_head (trainable; embeddings stay shared/frozen)."
-            )
-        else:
-            print_on_rank0(
-                "draft_lm_head: using weights from checkpoint (skip copy from target)."
-            )
-
     flashmtp_model = OnlineFlashMTPModel(
         draft_model=draft_model,
         target_lm_head=target_components.lm_head,
@@ -557,14 +478,6 @@ def main():
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
         chs_concat_mode="feature",
-        loss_teacher_match_cap=args.loss_teacher_match_cap,
-        add_noise=args.add_noise,
-        target_hidden_noise_ratio=args.target_hidden_noise_ratio,
-        w1_mse=args.w1_mse,
-    )
-    print_on_rank0(
-        f"target hidden noise: add_noise={args.add_noise}, "
-        f"ratio={args.target_hidden_noise_ratio}, w1_mse={args.w1_mse}"
     )
 
     flashmtp_model = FSDP(
@@ -632,7 +545,7 @@ def main():
             hidden_states = tuple(h.cuda() for h in target_output.hidden_states)
             # hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 
-            loss, accuracy, prefix_acc, mse_loss = flashmtp_model(
+            loss, accuracy, prefix_acc = flashmtp_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
@@ -647,15 +560,12 @@ def main():
                 loss_log = loss.clone()
                 acc_log = accuracy.clone()
                 pfx_log = prefix_acc.clone()
-                mse_log = mse_loss.clone()
                 dist.all_reduce(loss_log)
                 dist.all_reduce(acc_log)
                 dist.all_reduce(pfx_log)
-                dist.all_reduce(mse_log)
                 loss_log = loss_log / dist.get_world_size()
                 acc_log = acc_log / dist.get_world_size()
                 pfx_log = pfx_log / dist.get_world_size()
-                mse_log = mse_log / dist.get_world_size()
 
                 record_metrics(
                     args,
@@ -667,7 +577,6 @@ def main():
                     train_dataloader,
                     mode="train",
                     prefix_acc=pfx_log.item(),
-                    mse_loss=mse_log.item() if args.w1_mse > 0 else None,
                 )
 
             if dist.get_rank() == 0:

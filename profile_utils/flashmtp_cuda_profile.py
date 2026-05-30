@@ -155,10 +155,7 @@ def profile_flashmtp_generate(
             use_cache=False,
             is_causal=False,
         )[:, -block_size + 1 :, :]
-        if model.draft_lm_head is not None:
-            draft_logits = model.draft_lm_head(draft_hidden)
-        else:
-            draft_logits = target.lm_head(draft_hidden)
+        draft_logits = target.lm_head(draft_hidden)
         ev_df1.record()
         ev_df1.synchronize()
         draft_forward_times_ms.append(_elapsed_ms(ev_df0, ev_df1))

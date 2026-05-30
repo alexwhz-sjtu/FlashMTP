@@ -1,5 +1,4 @@
 import time
-from copy import deepcopy
 from typing import Callable, Optional
 
 import torch
@@ -12,7 +11,6 @@ from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
     FlashAttentionKwargs,
     GradientCheckpointingLayer,
-    Qwen3Attention,
     Qwen3Config,
     Qwen3MLP,
     Qwen3PreTrainedModel,
@@ -38,14 +36,6 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     logits = logits / temperature
     probs = torch.softmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
-
-
-from .flashmtp_draft_tree import (
-    DraftTreeSpec,
-    build_draft_tree_from_logits,
-    greedy_accept_tree_causal,
-    target_forward_tree_verify,
-)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -131,44 +121,15 @@ def gather_pivot_multilayer_inference(
     return torch.stack(pieces, dim=2)
 
 
-class PivotAttentionFuse(nn.Module):
-    """Last layer attends previous layers via Qwen3Attention + RoPE positions 0..S-1; residual on last hs."""
-
-    def __init__(self, config: Qwen3Config) -> None:
-        super().__init__()
-        attn_cfg = deepcopy(config)
-        attn_cfg._attn_implementation = "eager"
-        self.attention = Qwen3Attention(attn_cfg, layer_idx=0)
-        self.rotary = Qwen3RotaryEmbedding(attn_cfg)
-        self.out_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, N, S, H)
-        bsz, n_blk, s_len, h = x.shape
-        flat = x.view(bsz * n_blk, s_len, h)
-        pos = torch.arange(s_len, device=x.device, dtype=torch.long).unsqueeze(0).expand(
-            bsz * n_blk, -1
-        )
-        pos_emb = self.rotary(flat, pos)
-        attn_out, _ = self.attention(
-            flat, position_embeddings=pos_emb, attention_mask=None, past_key_values=None
-        )
-        last_out = attn_out[:, -1, :]
-        last_h = x[:, :, -1, :].reshape(bsz * n_blk, h)
-        fused = self.out_norm(last_out + last_h).view(bsz, n_blk, h)
-        return fused
-
-
 class Qwen3FlashMTPAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(
-        self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str, pivot_fuse_mode: str
+        self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str
     ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.pivot_fuse_mode = pivot_fuse_mode
         self.head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
@@ -231,7 +192,7 @@ class Qwen3FlashMTPAttention(nn.Module):
 
         cos, sin = position_embeddings
 
-        if self.pivot_fuse_mode == "prefix_condition" and ctx_len > 0:
+        if ctx_len > 0:
             k_ctx = k_ctx.view(bsz, ctx_len, -1, self.head_dim).transpose(1, 2)
             k_noise = k_noise.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
             q, k_noise = apply_rotary_pos_emb(q, k_noise, cos, sin)
@@ -241,14 +202,9 @@ class Qwen3FlashMTPAttention(nn.Module):
             v_noise = v_noise.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
             v = torch.cat([v_ctx, v_noise], dim=2)
         else:
-            k = torch.cat([k_ctx, k_noise], dim=1).view(
-                bsz, ctx_len + q_len, -1, self.head_dim
-            )
-            v = torch.cat([v_ctx, v_noise], dim=1).view(
-                bsz, ctx_len + q_len, -1, self.head_dim
-            )
-            k = self.k_norm(k).transpose(1, 2)
-            v = v.transpose(1, 2)
+            k = k_noise.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+            v = v_noise.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+            k = self.k_norm(k)
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         if past_key_values is not None:
@@ -275,11 +231,11 @@ class Qwen3FlashMTPAttention(nn.Module):
 
 
 class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str, pivot_fuse_mode: str):
+    def __init__(self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = Qwen3FlashMTPAttention(
-            config=config, layer_idx=layer_idx, chs_concat_mode=chs_concat_mode, pivot_fuse_mode=pivot_fuse_mode
+            config=config, layer_idx=layer_idx, chs_concat_mode=chs_concat_mode
         )
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -336,16 +292,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         flashmtp_config = getattr(config, "flashmtp_config", {}) or {}
         self.chs_concat_mode = "feature"
         flashmtp_config["chs_concat_mode"] = "feature"
-        self.pivot_fuse_mode = flashmtp_config.get("pivot_fuse_mode", "linear_fuse")
-        if self.pivot_fuse_mode not in (
-            "linear_fuse",
-            "attention_fuse",
-            "prefix_condition",
-        ):
-            raise ValueError(
-                f"Unknown pivot_fuse_mode={self.pivot_fuse_mode!r}; "
-                "expected linear_fuse | attention_fuse | prefix_condition"
-            )
         self.num_middle_layers_n = int(flashmtp_config.get("num_middle_layers_n", 0))
 
         if flashmtp_config.get("target_layer_ids") is not None:
@@ -359,19 +305,10 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 config.num_target_layers, self.num_middle_layers_n
             )
 
-        flashmtp_config.setdefault("pivot_fuse_mode", self.pivot_fuse_mode)
         flashmtp_config.setdefault("num_middle_layers_n", self.num_middle_layers_n)
         flashmtp_config["target_layer_ids"] = self.target_layer_ids
-        self.train_lm_head = bool(flashmtp_config.get("train_lm_head", False))
-        flashmtp_config["train_lm_head"] = self.train_lm_head
         self.local_position = bool(flashmtp_config.get("local_position", False))
         flashmtp_config["local_position"] = self.local_position
-        if self.train_lm_head:
-            self.draft_lm_head = nn.Linear(
-                config.hidden_size, config.vocab_size, bias=False
-            )
-        else:
-            self.draft_lm_head = None
         config.flashmtp_config = flashmtp_config
 
         self.layers = nn.ModuleList(
@@ -380,7 +317,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                     config,
                     layer_idx,
                     self.chs_concat_mode,
-                    self.pivot_fuse_mode,
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
@@ -391,27 +327,12 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
         self._last_decode_stats = {}
 
-        s_layers = len(self.target_layer_ids)
         h = config.hidden_size
-        if self.pivot_fuse_mode == "linear_fuse":
-            self.fc = nn.Linear(s_layers * h, h, bias=False)
-            self.pivot_attn_fuse = None
-            self.layer_depth_embedding = None
-        elif self.pivot_fuse_mode == "attention_fuse":
-            self.fc = None
-            self.pivot_attn_fuse = PivotAttentionFuse(config)
-            self.layer_depth_embedding = None
-        else:
-            self.fc = None
-            self.pivot_attn_fuse = None
-            self.layer_depth_embedding = nn.Embedding(config.num_target_layers, h)
-
+        self.layer_depth_embedding = nn.Embedding(config.num_target_layers, h)
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         print_on_rank0(
-            f"FlashMTP: pivot_fuse_mode={self.pivot_fuse_mode}, "
-            f"num_middle_layers_n={self.num_middle_layers_n}, "
+            f"FlashMTP: num_middle_layers_n={self.num_middle_layers_n}, "
             f"target_layer_ids={self.target_layer_ids}, "
-            f"train_lm_head={self.train_lm_head}, "
             f"local_position={self.local_position}"
         )
 
@@ -419,21 +340,14 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
 
     @property
     def chs_len_per_block(self) -> int:
-        return len(self.target_layer_ids) if self.pivot_fuse_mode == "prefix_condition" else 1
+        return len(self.target_layer_ids)
 
     def get_last_decode_stats(self) -> dict:
         return dict(self._last_decode_stats)
 
     def _fuse_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        """(B, N, S, H) -> (B, N, H) for linear/attention, or (B, N*S, H) for prefix."""
+        """(B, N, S, H) -> (B, N*S, H) with per-layer depth embedding (prefix condition)."""
         bsz, n_blk, s_len, h = target_hidden.shape
-        if self.pivot_fuse_mode == "linear_fuse":
-            flat = target_hidden.reshape(bsz, n_blk, s_len * h)
-            return self.hidden_norm(self.fc(flat))
-        if self.pivot_fuse_mode == "attention_fuse":
-            assert self.pivot_attn_fuse is not None
-            return self.pivot_attn_fuse(target_hidden)
-        assert self.layer_depth_embedding is not None
         depth_ids = torch.tensor(
             self.target_layer_ids, device=target_hidden.device, dtype=torch.long
         )
@@ -645,10 +559,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 use_cache=False,
                 is_causal=False,
             )[:, -block_size + 1 :, :]
-            if self.draft_lm_head is not None:
-                draft_logits = self.draft_lm_head(draft_hidden)
-            else:
-                draft_logits = target.lm_head(draft_hidden)
+            draft_logits = target.lm_head(draft_hidden)
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)
             self._last_decode_stats["draft_total_time"] += time.perf_counter() - draft_start
@@ -815,215 +726,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         return output_ids
 
     @torch.inference_mode()
-    def spec_generate_with_draft_tree(
-        self,
-        target: nn.Module,
-        input_ids: torch.LongTensor,
-        max_new_tokens: int,
-        stop_token_ids: list[int],
-        temperature: float = 0.0,
-        *,
-        trunc_thres: float = 0.2,
-        expand_thres: float = 0.5,
-        tree_width: int = 4,
-        entropy_ratio: float = 0.4,
-        decode_timing_after_first_token: bool = False,
-    ) -> torch.LongTensor:
-        """Speculative decode with dynamic draft tree (``block_size`` from model config).
-
-        Draft tree with truncation/expansion; one target forward over all nodes using
-        ancestor attention mask and shared ``position_ids`` per depth. Acceptance walks
-        the path: ``logits[accepted_{d-1}]`` vs candidates at depth ``d``.
-        """
-        self.eval()
-        block_size = int(self.block_size)
-        self._last_decode_stats = {
-            "accept_lengths": [],
-            "decode_wall_time": 0.0,
-            "target_total_time": 0.0,
-            "draft_total_time": 0.0,
-            "steps": 0,
-            "tree_chain_steps": 0,
-            "tree_branch_steps": 0,
-            "tree_trunc_steps": 0,
-            "tree_expand_steps": 0,
-            "tree_avg_nodes": 0.0,
-        }
-        bsz = input_ids.shape[0]
-        if bsz != 1:
-            raise ValueError("spec_generate_with_draft_tree currently supports batch_size=1")
-
-        num_input_tokens = input_ids.shape[1]
-        max_length = num_input_tokens + max_new_tokens
-        output_ids = torch.full(
-            (bsz, max_length + block_size),
-            self.mask_token_id,
-            dtype=torch.long,
-            device=target.device,
-        )
-        position_ids = torch.arange(
-            output_ids.shape[1], device=target.device
-        ).unsqueeze(0).expand(bsz, -1)
-
-        past_key_values_target = DynamicCache()
-        output = target(
-            input_ids,
-            position_ids=position_ids[:, :num_input_tokens],
-            past_key_values=past_key_values_target,
-            use_cache=True,
-            logits_to_keep=1,
-            output_hidden_states=True,
-        )
-        output_ids[:, :num_input_tokens] = input_ids
-        output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
-            output.logits, temperature
-        )
-        target_hidden = gather_pivot_multilayer_inference(
-            output.hidden_states,
-            self.target_layer_ids,
-            -1,
-            self.config.num_target_layers,
-        )
-
-        decode_start: float | None = (
-            None if decode_timing_after_first_token else _cuda_sync_time(target.device)
-        )
-        acceptance_lengths: list[int] = []
-        tree_node_total = 0
-        start = input_ids.shape[1]
-
-        while start < max_length:
-            block_output_ids = output_ids[:, start : start + block_size].clone()
-            target_block_pos = position_ids[:, start : start + block_size]
-            if self.local_position:
-                draft_block_pos = torch.arange(
-                    1, block_size + 1, device=target.device, dtype=torch.long
-                ).unsqueeze(0).expand(bsz, -1)
-            else:
-                draft_block_pos = target_block_pos
-            noise_embedding = target.model.embed_tokens(block_output_ids)
-            chs = self.chs_len_per_block
-            if self.local_position:
-                ctx_pos_part = torch.zeros(
-                    bsz, chs, dtype=torch.long, device=target.device
-                )
-            else:
-                ctx_pos_part = torch.full(
-                    (bsz, chs),
-                    start - 1,
-                    dtype=torch.long,
-                    device=target.device,
-                )
-            full_rotary = torch.cat([ctx_pos_part, draft_block_pos], dim=-1)
-            draft_hidden = self(
-                target_hidden=target_hidden,
-                noise_embedding=noise_embedding,
-                position_ids=draft_block_pos,
-                rotary_position_ids=full_rotary,
-                past_key_values=None,
-                use_cache=False,
-                is_causal=False,
-            )[:, -block_size + 1 :, :]
-            if self.draft_lm_head is not None:
-                draft_logits = self.draft_lm_head(draft_hidden)
-            else:
-                draft_logits = target.lm_head(draft_hidden)
-
-            anchor_id = int(block_output_ids[0, 0].item())
-            tree_spec = build_draft_tree_from_logits(
-                draft_logits[0],
-                anchor_id,
-                block_size,
-                tree_width,
-                trunc_thres,
-                expand_thres,
-                entropy_ratio,
-            )
-            tree_node_total += len(tree_spec.token_ids)
-            if tree_spec.trunc_depth is not None:
-                self._last_decode_stats["tree_trunc_steps"] += 1
-            if tree_spec.expand_start_depth is not None:
-                self._last_decode_stats["tree_expand_steps"] += 1
-
-            if tree_spec.is_chain:
-                self._last_decode_stats["tree_chain_steps"] += 1
-            else:
-                self._last_decode_stats["tree_branch_steps"] += 1
-
-            output = target_forward_tree_verify(
-                target,
-                tree_spec,
-                start,
-                past_key_values_target,
-                target.device,
-                noise_embedding.dtype,
-            )
-            accepted_prefix, correction, acceptance_length, accepted_node = (
-                greedy_accept_tree_causal(
-                    tree_spec, output.logits[0], temperature
-                )
-            )
-            n_prefix = len(accepted_prefix)
-            output_ids[:, start : start + n_prefix] = torch.tensor(
-                accepted_prefix, device=target.device, dtype=torch.long
-            ).unsqueeze(0)
-            if correction is not None:
-                output_ids[:, start + n_prefix] = correction
-                pivot_index = min(
-                    accepted_node, output.hidden_states[0].shape[1] - 1
-                )
-            else:
-                output_ids[:, start + n_prefix] = sample(
-                    output.logits[:, accepted_node : accepted_node + 1],
-                    temperature,
-                ).squeeze(-1)
-                pivot_index = min(
-                    accepted_node, output.hidden_states[0].shape[1] - 1
-                )
-
-            start += acceptance_length + 1
-            past_key_values_target.crop(start)
-            target_hidden = gather_pivot_multilayer_inference(
-                output.hidden_states,
-                self.target_layer_ids,
-                pivot_index,
-                self.config.num_target_layers,
-            )
-            acceptance_lengths.append(acceptance_length + 1)
-            self._last_decode_stats["accept_lengths"].append(acceptance_length + 1)
-            self._last_decode_stats["steps"] += 1
-
-            if decode_timing_after_first_token and decode_start is None:
-                decode_start = _cuda_sync_time(target.device)
-            if stop_token_ids is not None and any(
-                stop_token_id in output_ids[:, num_input_tokens:]
-                for stop_token_id in stop_token_ids
-            ):
-                break
-
-        steps = max(self._last_decode_stats["steps"], 1)
-        self._last_decode_stats["tree_avg_nodes"] = tree_node_total / steps
-        if decode_start is None:
-            decode_start = _cuda_sync_time(target.device)
-        decode_wall_time = _cuda_sync_time(target.device) - decode_start
-        self._last_decode_stats["decode_wall_time"] = decode_wall_time
-        self._last_decode_stats["target_total_time"] = decode_wall_time
-        self._last_decode_stats["draft_total_time"] = 0.0
-
-        output_ids = output_ids[:, :max_length]
-        output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
-        if stop_token_ids is not None:
-            stop_token_ids_t = torch.tensor(stop_token_ids, device=output_ids.device)
-            stop_token_indices = torch.isin(
-                output_ids[0][num_input_tokens:], stop_token_ids_t
-            ).nonzero(as_tuple=True)[0]
-            if stop_token_indices.numel() > 0:
-                output_ids = output_ids[
-                    :, : num_input_tokens + stop_token_indices[0] + 1
-                ]
-        return output_ids
-
-    @torch.inference_mode()
     def spec_generate(
         self,
         target: nn.Module,
@@ -1117,10 +819,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 use_cache=False,
                 is_causal=False,
             )[:, -block_size + 1 :, :]
-            if self.draft_lm_head is not None:
-                draft_logits = self.draft_lm_head(draft_hidden)
-            else:
-                draft_logits = target.lm_head(draft_hidden)
+            draft_logits = target.lm_head(draft_hidden)
             block_output_ids[:, 1:] = sample(draft_logits)
 
             output = target(
