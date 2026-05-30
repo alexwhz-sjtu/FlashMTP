@@ -362,16 +362,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         flashmtp_config.setdefault("pivot_fuse_mode", self.pivot_fuse_mode)
         flashmtp_config.setdefault("num_middle_layers_n", self.num_middle_layers_n)
         flashmtp_config["target_layer_ids"] = self.target_layer_ids
-        self.train_lm_head = bool(flashmtp_config.get("train_lm_head", False))
-        flashmtp_config["train_lm_head"] = self.train_lm_head
         self.local_position = bool(flashmtp_config.get("local_position", False))
         flashmtp_config["local_position"] = self.local_position
-        if self.train_lm_head:
-            self.draft_lm_head = nn.Linear(
-                config.hidden_size, config.vocab_size, bias=False
-            )
-        else:
-            self.draft_lm_head = None
         config.flashmtp_config = flashmtp_config
 
         self.layers = nn.ModuleList(
@@ -411,7 +403,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             f"FlashMTP: pivot_fuse_mode={self.pivot_fuse_mode}, "
             f"num_middle_layers_n={self.num_middle_layers_n}, "
             f"target_layer_ids={self.target_layer_ids}, "
-            f"train_lm_head={self.train_lm_head}, "
             f"local_position={self.local_position}"
         )
 
@@ -645,10 +636,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 use_cache=False,
                 is_causal=False,
             )[:, -block_size + 1 :, :]
-            if self.draft_lm_head is not None:
-                draft_logits = self.draft_lm_head(draft_hidden)
-            else:
-                draft_logits = target.lm_head(draft_hidden)
+            draft_logits = target.lm_head(draft_hidden)
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)
             self._last_decode_stats["draft_total_time"] += time.perf_counter() - draft_start
@@ -924,10 +912,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 use_cache=False,
                 is_causal=False,
             )[:, -block_size + 1 :, :]
-            if self.draft_lm_head is not None:
-                draft_logits = self.draft_lm_head(draft_hidden)
-            else:
-                draft_logits = target.lm_head(draft_hidden)
+            draft_logits = target.lm_head(draft_hidden)
 
             anchor_id = int(block_output_ids[0, 0].item())
             tree_spec = build_draft_tree_from_logits(
@@ -1117,10 +1102,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 use_cache=False,
                 is_causal=False,
             )[:, -block_size + 1 :, :]
-            if self.draft_lm_head is not None:
-                draft_logits = self.draft_lm_head(draft_hidden)
-            else:
-                draft_logits = target.lm_head(draft_hidden)
+            draft_logits = target.lm_head(draft_hidden)
             block_output_ids[:, 1:] = sample(draft_logits)
 
             output = target(

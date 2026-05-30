@@ -25,6 +25,7 @@ from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.flashmtp import OnlineFlashMTPModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
+from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
 from specforge.modeling.target.flashmtp_target_model import (
     FlashMTPTargetModel,
@@ -100,28 +101,10 @@ def parse_args():
         "last speculative slot's weight within the same parallel block (after decay).",
     )
     model_group.add_argument(
-        "--train-lm-head",
-        action="store_true",
-        help="Add a trainable draft lm_head (init from target head); share only frozen "
-        "embeddings with the target. Default: share frozen target lm_head as today.",
-    )
-    model_group.add_argument(
         "--local-position",
         action="store_true",
         help="Draft uses block-local position ids 1..block_size (repeated per parallel "
         "block in training). CHS rotary prefix uses zeros. Target model still uses global ids.",
-    )
-    model_group.add_argument(
-        "--add-noise",
-        action="store_true",
-        help="Add uniform noise U(-r, r) to each selected-layer target hidden before draft "
-        "forward (default r=0.1 from --target-hidden-noise-ratio).",
-    )
-    model_group.add_argument(
-        "--target-hidden-noise-ratio",
-        type=float,
-        default=0.1,
-        help="Half-width r for uniform noise U(-r, r) when --add-noise is set.",
     )
     model_group.add_argument(
         "--w1-mse",
@@ -129,6 +112,45 @@ def parse_args():
         default=0.0,
         help="Weight for MSE between draft last-layer hidden and target last-layer "
         "hidden at the first predicted token (block position 1). 0 disables.",
+    )
+    model_group.add_argument(
+        "--dflash-teacher-path",
+        type=str,
+        default=None,
+        help="Optional pretrained DFlash checkpoint for two-stage distillation.",
+    )
+    model_group.add_argument(
+        "--dflash-distill-stage",
+        type=str,
+        default="none",
+        choices=["none", "stage1", "stage2"],
+        help="DFlash distillation mode: none, stage1 (KL only), or stage2 (CE + gated KL).",
+    )
+    model_group.add_argument(
+        "--dflash-distill-weight",
+        type=float,
+        default=1.0,
+        help="Weight for DFlash KL loss. Stage1 total loss is weight * KL.",
+    )
+    model_group.add_argument(
+        "--dflash-distill-temperature",
+        type=float,
+        default=2.0,
+        help="Temperature for DFlash KL distillation.",
+    )
+    model_group.add_argument(
+        "--dflash-distill-top-k",
+        type=int,
+        default=128,
+        help="Teacher top-k candidates for KL; true label is forced into the set.",
+    )
+    model_group.add_argument(
+        "--dflash-stage2-ce-gate",
+        type=str,
+        default="all",
+        choices=["all", "correct_only"],
+        help="Stage2 CE mask policy. all keeps CE on every valid slot; "
+        "correct_only applies CE only where DFlash top1 equals the true label.",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -159,6 +181,13 @@ def parse_args():
         type=str,
         default=None,
         help="Directory of the checkpoint to resume training from",
+    )
+    training_group.add_argument(
+        "--init-ckpt-dir",
+        type=str,
+        default=None,
+        help="Directory of a draft checkpoint to initialize weights from without "
+        "restoring optimizer, scheduler, epoch, or global step.",
     )
 
     output_group = parser.add_argument_group("output")
@@ -245,10 +274,6 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     draft_config.flashmtp_config["pivot_fuse_mode"] = args.pivot_fuse_mode
     draft_config.flashmtp_config["num_middle_layers_n"] = args.num_middle_layers_n
     draft_config.flashmtp_config["local_position"] = bool(args.local_position)
-    if args.train_lm_head:
-        draft_config.flashmtp_config["train_lm_head"] = True
-    elif "train_lm_head" not in draft_config.flashmtp_config:
-        draft_config.flashmtp_config["train_lm_head"] = False
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
@@ -268,8 +293,6 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}"
     )
     print_on_rank0(
-        f"train_lm_head={getattr(draft_model, 'train_lm_head', False)} "
-        f"(draft_lm_head={'on' if draft_model.draft_lm_head is not None else 'off'}), "
         f"local_position={getattr(draft_model, 'local_position', False)}"
     )
 
@@ -394,6 +417,9 @@ def record_metrics(
     mode: str = "train",
     prefix_acc: float | None = None,
     mse_loss: float | None = None,
+    ce_loss: float | None = None,
+    dflash_kl_loss: float | None = None,
+    dflash_kl_active_ratio: float | None = None,
 ) -> None:
     logdict = {}
 
@@ -406,12 +432,24 @@ def record_metrics(
         logdict[f"{mode}/prefix_acc"] = prefix_acc
     if mse_loss is not None:
         logdict[f"{mode}/w1_mse_loss"] = mse_loss
+    if ce_loss is not None:
+        logdict[f"{mode}/ce_loss"] = ce_loss
+    if dflash_kl_loss is not None:
+        logdict[f"{mode}/dflash_kl_loss"] = dflash_kl_loss
+    if dflash_kl_active_ratio is not None:
+        logdict[f"{mode}/dflash_kl_active_ratio"] = dflash_kl_active_ratio
 
     extra = ""
     if prefix_acc is not None:
         extra = f", PrefixAcc: {prefix_acc:.4f}"
     if mse_loss is not None:
         extra += f", W1MSE: {mse_loss:.4f}"
+    if ce_loss is not None:
+        extra += f", CE: {ce_loss:.4f}"
+    if dflash_kl_loss is not None:
+        extra += f", DFlashKL: {dflash_kl_loss:.4f}"
+    if dflash_kl_active_ratio is not None:
+        extra += f", DFlashActive: {dflash_kl_active_ratio:.4f}"
     print_on_rank0(
         f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}{extra}"
     )
@@ -433,7 +471,14 @@ def main():
     )
 
     args = parse_args()
+    if args.dflash_distill_stage != "none" and not args.dflash_teacher_path:
+        raise ValueError(
+            "--dflash-teacher-path is required when --dflash-distill-stage is not none"
+        )
     set_seed(args.seed)
+
+    if args.ckpt_dir is not None and args.init_ckpt_dir is not None:
+        raise ValueError("--ckpt-dir and --init-ckpt-dir cannot be used together")
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
@@ -441,6 +486,18 @@ def main():
     target_model, draft_model = build_models(args)
 
     draft_model_last_checkpoint = None
+    init_model_checkpoint = None
+    if args.init_ckpt_dir is not None:
+        if os.path.isdir(args.init_ckpt_dir):
+            init_model_checkpoint = args.init_ckpt_dir
+            print_on_rank0(
+                f"Initializing draft model weights from: {init_model_checkpoint}"
+            )
+        else:
+            raise ValueError(
+                f"Provided init ckpt dir {args.init_ckpt_dir} is not a valid directory."
+            )
+
     if args.ckpt_dir is not None:
         if os.path.isdir(args.ckpt_dir):
             draft_model_last_checkpoint = args.ckpt_dir
@@ -457,14 +514,22 @@ def main():
         print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
 
     resume_state = None
-    draft_weights_from_checkpoint = False
-    if draft_model_last_checkpoint:
+    if init_model_checkpoint:
+        loaded_model = FlashMTPDraftModel.from_pretrained(
+            init_model_checkpoint, torch_dtype=torch.bfloat16
+        )
+        draft_model.load_state_dict(loaded_model.state_dict())
+        del loaded_model
+        print_on_rank0(
+            "Loaded draft model weights from init checkpoint; "
+            "optimizer/scheduler/global_step will start fresh"
+        )
+    elif draft_model_last_checkpoint:
         loaded_model = FlashMTPDraftModel.from_pretrained(
             draft_model_last_checkpoint, torch_dtype=torch.bfloat16
         )
         draft_model.load_state_dict(loaded_model.state_dict())
         del loaded_model
-        draft_weights_from_checkpoint = True
         print_on_rank0("Loaded draft model weights from checkpoint")
 
         training_state_path = os.path.join(
@@ -499,20 +564,26 @@ def main():
     draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
     draft_model.config.flashmtp_config["pivot_fuse_mode"] = draft_model.pivot_fuse_mode
     draft_model.config.flashmtp_config["num_middle_layers_n"] = draft_model.num_middle_layers_n
-    draft_model.config.flashmtp_config["train_lm_head"] = bool(
-        getattr(draft_model, "train_lm_head", False)
-    )
     draft_model.config.flashmtp_config["local_position"] = bool(
         getattr(draft_model, "local_position", False)
     )
     draft_model.config.flashmtp_config["loss_teacher_match_cap"] = bool(
         args.loss_teacher_match_cap
     )
-    draft_model.config.flashmtp_config["add_noise"] = bool(args.add_noise)
-    draft_model.config.flashmtp_config["target_hidden_noise_ratio"] = float(
-        args.target_hidden_noise_ratio
-    )
     draft_model.config.flashmtp_config["w1_mse"] = float(args.w1_mse)
+    draft_model.config.flashmtp_config["dflash_distill_stage"] = args.dflash_distill_stage
+    draft_model.config.flashmtp_config["dflash_distill_weight"] = float(
+        args.dflash_distill_weight
+    )
+    draft_model.config.flashmtp_config["dflash_distill_temperature"] = float(
+        args.dflash_distill_temperature
+    )
+    draft_model.config.flashmtp_config["dflash_distill_top_k"] = int(
+        args.dflash_distill_top_k
+    )
+    draft_model.config.flashmtp_config["dflash_stage2_ce_gate"] = (
+        args.dflash_stage2_ce_gate
+    )
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
@@ -530,22 +601,27 @@ def main():
         trust_remote_code=args.trust_remote_code,
     )
 
-    if draft_model.draft_lm_head is not None:
-        if not draft_weights_from_checkpoint:
-            with torch.no_grad():
-                draft_model.draft_lm_head.weight.copy_(
-                    target_components.lm_head.weight.to(
-                        device=draft_model.draft_lm_head.weight.device,
-                        dtype=draft_model.draft_lm_head.weight.dtype,
-                    )
-                )
-            print_on_rank0(
-                "Initialized draft_lm_head from target lm_head (trainable; embeddings stay shared/frozen)."
-            )
-        else:
-            print_on_rank0(
-                "draft_lm_head: using weights from checkpoint (skip copy from target)."
-            )
+    dflash_teacher_model = None
+    if args.dflash_distill_stage != "none":
+        print_on_rank0(f"Loading DFlash teacher from {args.dflash_teacher_path}")
+        dflash_teacher_model = DFlashDraftModel.from_pretrained(
+            args.dflash_teacher_path,
+            torch_dtype=torch.bfloat16,
+        ).cuda().to(torch.bfloat16)
+        dflash_teacher_model.config._attn_implementation = args.attention_backend
+        dflash_teacher_model.eval()
+        for param in dflash_teacher_model.parameters():
+            param.requires_grad_(False)
+        print_on_rank0(
+            "DFlash distillation: "
+            f"stage={args.dflash_distill_stage}, "
+            f"weight={args.dflash_distill_weight}, "
+            f"temperature={args.dflash_distill_temperature}, "
+            f"top_k={args.dflash_distill_top_k}, "
+            f"stage2_ce_gate={args.dflash_stage2_ce_gate}, "
+            f"attention_backend={dflash_teacher_model.config._attn_implementation}, "
+            f"teacher_layers={dflash_teacher_model.target_layer_ids}"
+        )
 
     flashmtp_model = OnlineFlashMTPModel(
         draft_model=draft_model,
@@ -558,13 +634,16 @@ def main():
         loss_decay_gamma=args.loss_decay_gamma,
         chs_concat_mode="feature",
         loss_teacher_match_cap=args.loss_teacher_match_cap,
-        add_noise=args.add_noise,
-        target_hidden_noise_ratio=args.target_hidden_noise_ratio,
         w1_mse=args.w1_mse,
+        dflash_teacher_model=dflash_teacher_model,
+        dflash_distill_stage=args.dflash_distill_stage,
+        dflash_distill_weight=args.dflash_distill_weight,
+        dflash_distill_temperature=args.dflash_distill_temperature,
+        dflash_distill_top_k=args.dflash_distill_top_k,
+        dflash_stage2_ce_gate=args.dflash_stage2_ce_gate,
     )
     print_on_rank0(
-        f"target hidden noise: add_noise={args.add_noise}, "
-        f"ratio={args.target_hidden_noise_ratio}, w1_mse={args.w1_mse}"
+        f"w1_mse={args.w1_mse}"
     )
 
     flashmtp_model = FSDP(
@@ -632,7 +711,15 @@ def main():
             hidden_states = tuple(h.cuda() for h in target_output.hidden_states)
             # hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 
-            loss, accuracy, prefix_acc, mse_loss = flashmtp_model(
+            (
+                loss,
+                accuracy,
+                prefix_acc,
+                mse_loss,
+                ce_loss,
+                dflash_kl_loss,
+                dflash_kl_active_ratio,
+            ) = flashmtp_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
@@ -648,14 +735,23 @@ def main():
                 acc_log = accuracy.clone()
                 pfx_log = prefix_acc.clone()
                 mse_log = mse_loss.clone()
+                ce_log = ce_loss.clone()
+                dflash_kl_log = dflash_kl_loss.clone()
+                dflash_active_log = dflash_kl_active_ratio.clone()
                 dist.all_reduce(loss_log)
                 dist.all_reduce(acc_log)
                 dist.all_reduce(pfx_log)
                 dist.all_reduce(mse_log)
+                dist.all_reduce(ce_log)
+                dist.all_reduce(dflash_kl_log)
+                dist.all_reduce(dflash_active_log)
                 loss_log = loss_log / dist.get_world_size()
                 acc_log = acc_log / dist.get_world_size()
                 pfx_log = pfx_log / dist.get_world_size()
                 mse_log = mse_log / dist.get_world_size()
+                ce_log = ce_log / dist.get_world_size()
+                dflash_kl_log = dflash_kl_log / dist.get_world_size()
+                dflash_active_log = dflash_active_log / dist.get_world_size()
 
                 record_metrics(
                     args,
@@ -668,6 +764,17 @@ def main():
                     mode="train",
                     prefix_acc=pfx_log.item(),
                     mse_loss=mse_log.item() if args.w1_mse > 0 else None,
+                    ce_loss=ce_log.item(),
+                    dflash_kl_loss=(
+                        dflash_kl_log.item()
+                        if args.dflash_distill_stage != "none"
+                        else None
+                    ),
+                    dflash_kl_active_ratio=(
+                        dflash_active_log.item()
+                        if args.dflash_distill_stage != "none"
+                        else None
+                    ),
                 )
 
             if dist.get_rank() == 0:
@@ -676,6 +783,8 @@ def main():
                 progress_bar.set_postfix(
                     {
                         "loss": f"{loss.item():.4f}",
+                        "ce": f"{ce_loss.item():.4f}",
+                        "dkl": f"{dflash_kl_loss.item():.4f}",
                         "acc": f"{accuracy.item():.4f}",
                         "pfx": f"{prefix_acc.item():.4f}",
                         "iter_time": f"{elapsed:.2f}s",

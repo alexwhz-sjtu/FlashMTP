@@ -34,13 +34,18 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
-PIVOT_FUSE_MODE="${PIVOT_FUSE_MODE:-linear_fuse}"
+PIVOT_FUSE_MODE="${PIVOT_FUSE_MODE:-prefix_condition}"
 NUM_MIDDLE_LAYERS_N="${NUM_MIDDLE_LAYERS_N:-5}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
 
 # 恢复训练
 RESUME="${RESUME:-}"
 CKPT_DIR="${CKPT_DIR:-}"
+INIT_CKPT_DIR="${INIT_CKPT_DIR:-}"
+if [ -n "${INIT_CKPT_DIR}" ] && { [ -n "${CKPT_DIR}" ] || [ -n "${RESUME}" ]; }; then
+    echo "错误: INIT_CKPT_DIR 是只加载权重的新训练入口，不能和 CKPT_DIR/RESUME 同时使用"
+    exit 1
+fi
 
 # ========================================
 # 主要数据集参数
@@ -52,15 +57,8 @@ ENABLE_THINKING="${ENABLE_THINKING:-off}"
 # 草稿层数：默认目录名/ WandB id/ run name 中均带 nlayers${NUM_DRAFT_LAYERS}
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 
-# 是否单独训练草稿 lm_head（仅共享冻结的 target embedding；默认 false 与旧行为一致）
-TRAIN_LM_HEAD="${TRAIN_LM_HEAD:-false}"
-TRAIN_LM_HEAD_TAG="tlmh0"
-case "$(echo "${TRAIN_LM_HEAD}" | tr '[:upper:]' '[:lower:]')" in
-    true|1|yes) TRAIN_LM_HEAD_TAG="tlmh1" ;;
-esac
-
 # 草稿块内 position_ids：CHS RoPE 前缀全 0，draft 为 1..block_size（默认 false 为全局 anchor 位置）
-LOCAL_POSITION="${LOCAL_POSITION:-false}"
+LOCAL_POSITION="${LOCAL_POSITION:-true}"
 LOCAL_POSITION_TAG="lp0"
 case "$(echo "${LOCAL_POSITION}" | tr '[:upper:]' '[:lower:]')" in
     true|1|yes) LOCAL_POSITION_TAG="lp1" ;;
@@ -73,19 +71,41 @@ case "$(echo "${LOSS_TEACHER_MATCH_CAP}" | tr '[:upper:]' '[:lower:]')" in
     true|1|yes) TEACHER_MATCH_CAP_TAG="tmc1" ;;
 esac
 
-# 对各层 target hidden 加均匀噪声 U(-ratio, ratio)（默认关闭，默认 ratio=0.1）
-ADD_NOISE="${ADD_NOISE:-false}"
-TARGET_HIDDEN_NOISE_RATIO="${TARGET_HIDDEN_NOISE_RATIO:-0.1}"
-ADD_NOISE_TAG="an0"
-case "$(echo "${ADD_NOISE}" | tr '[:upper:]' '[:lower:]')" in
-    true|1|yes) ADD_NOISE_TAG="an1" ;;
-esac
-
 # 首个预测 token：draft 末层 hidden 与 target 末层 hidden 的 MSE，权重 w1_mse（0 关闭）
 W1_MSE="${W1_MSE:-0}"
 W1_MSE_TAG="w1mse0"
 if awk "BEGIN {exit !(${W1_MSE} > 0)}"; then
     W1_MSE_TAG="w1mse${W1_MSE}"
+fi
+
+# DFlash 两阶段蒸馏：none | stage1 | stage2（默认关闭）
+DFLASH_TEACHER_PATH="${DFLASH_TEACHER_PATH:-}"
+DFLASH_DISTILL_STAGE="${DFLASH_DISTILL_STAGE:-none}"
+DFLASH_DISTILL_WEIGHT="${DFLASH_DISTILL_WEIGHT:-1.0}"
+DFLASH_DISTILL_TEMPERATURE="${DFLASH_DISTILL_TEMPERATURE:-2.0}"
+DFLASH_DISTILL_TOP_K="${DFLASH_DISTILL_TOP_K:-128}"
+DFLASH_STAGE2_CE_GATE="${DFLASH_STAGE2_CE_GATE:-all}"
+BASE_LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
+DFLASH_STAGE1_LOSS_DECAY_GAMMA="${DFLASH_STAGE1_LOSS_DECAY_GAMMA:-${LOSS_DECAY_GAMMA:-14}}"
+DFLASH_STAGE2_LOSS_DECAY_GAMMA="${DFLASH_STAGE2_LOSS_DECAY_GAMMA:-${LOSS_DECAY_GAMMA:-7}}"
+case "${DFLASH_DISTILL_STAGE}" in
+    stage1)
+        EFFECTIVE_LOSS_DECAY_GAMMA="${DFLASH_STAGE1_LOSS_DECAY_GAMMA}"
+        ;;
+    stage2)
+        EFFECTIVE_LOSS_DECAY_GAMMA="${DFLASH_STAGE2_LOSS_DECAY_GAMMA}"
+        ;;
+    *)
+        EFFECTIVE_LOSS_DECAY_GAMMA="${BASE_LOSS_DECAY_GAMMA}"
+        ;;
+esac
+
+DFLASH_DISTILL_TAG="dnone"
+if [ "${DFLASH_DISTILL_STAGE}" != "none" ]; then
+    DFLASH_DISTILL_TAG="d${DFLASH_DISTILL_STAGE}_dklw${DFLASH_DISTILL_WEIGHT}_top${DFLASH_DISTILL_TOP_K}_g${EFFECTIVE_LOSS_DECAY_GAMMA}"
+    if [ "${DFLASH_DISTILL_STAGE}" = "stage2" ]; then
+        DFLASH_DISTILL_TAG="${DFLASH_DISTILL_TAG}_ce${DFLASH_STAGE2_CE_GATE}"
+    fi
 fi
 
 # ========================================
@@ -105,15 +125,15 @@ if [ "$DT" = "qz" ]; then
     # export NODE_RANK=${RANK:-0}
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${TRAIN_LM_HEAD_TAG}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${ADD_NOISE_TAG}_${W1_MSE_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${W1_MSE_TAG}_${DFLASH_DISTILL_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 elif [ "$DT" = "h100" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-../training_data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_${PIVOT_FUSE_MODE}_fuse$((NUM_MIDDLE_LAYERS_N + 2))_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${TRAIN_LM_HEAD_TAG}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${ADD_NOISE_TAG}_${W1_MSE_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_${PIVOT_FUSE_MODE}_fuse$((NUM_MIDDLE_LAYERS_N + 2))_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${W1_MSE_TAG}_${DFLASH_DISTILL_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${TRAIN_LM_HEAD_TAG}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${ADD_NOISE_TAG}_${W1_MSE_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${W1_MSE_TAG}_${DFLASH_DISTILL_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
@@ -131,7 +151,6 @@ EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
 CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
-LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
 # teacher-match cap 开关见上方 LOSS_TEACHER_MATCH_CAP（默认 false）
 
 # 日志和保存间隔
@@ -144,8 +163,8 @@ REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-exp}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}_${TRAIN_LM_HEAD_TAG}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${ADD_NOISE_TAG}_${W1_MSE_TAG}}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}_${TRAIN_LM_HEAD_TAG}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${ADD_NOISE_TAG}_${W1_MSE_TAG}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${W1_MSE_TAG}_${DFLASH_DISTILL_TAG}}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${W1_MSE_TAG}_${DFLASH_DISTILL_TAG}}"
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen}"
@@ -166,11 +185,17 @@ echo "  样本数量: ${DATA_NUM_SAMPLES}"
 echo "  思考模式: ${ENABLE_THINKING}"
 echo "  数据子目录: ${CHS_CONCAT_MODE}"
 echo "  Pivot 融合: ${PIVOT_FUSE_MODE} (中间层数 N=${NUM_MIDDLE_LAYERS_N})"
-echo "  train_lm_head: ${TRAIN_LM_HEAD} (tag ${TRAIN_LM_HEAD_TAG})"
 echo "  local_position: ${LOCAL_POSITION} (tag ${LOCAL_POSITION_TAG}; draft 1..block, CHS rope 0)"
 echo "  loss_teacher_match_cap: ${LOSS_TEACHER_MATCH_CAP} (tag ${TEACHER_MATCH_CAP_TAG})"
-echo "  add_noise: ${ADD_NOISE} (tag ${ADD_NOISE_TAG}; U(-${TARGET_HIDDEN_NOISE_RATIO},${TARGET_HIDDEN_NOISE_RATIO}))"
 echo "  w1_mse: ${W1_MSE} (tag ${W1_MSE_TAG}; first-pred hidden MSE weight)"
+echo "  dflash_distill_stage: ${DFLASH_DISTILL_STAGE} (tag ${DFLASH_DISTILL_TAG})"
+if [ "${DFLASH_DISTILL_STAGE}" != "none" ]; then
+    echo "  dflash_teacher_path: ${DFLASH_TEACHER_PATH}"
+    echo "  dflash_distill: weight=${DFLASH_DISTILL_WEIGHT}, temperature=${DFLASH_DISTILL_TEMPERATURE}, top_k=${DFLASH_DISTILL_TOP_K}"
+    echo "  dflash_stage2_ce_gate: ${DFLASH_STAGE2_CE_GATE}"
+    echo "  dflash_stage1_loss_decay_gamma: ${DFLASH_STAGE1_LOSS_DECAY_GAMMA}"
+    echo "  dflash_stage2_loss_decay_gamma: ${DFLASH_STAGE2_LOSS_DECAY_GAMMA}"
+fi
 echo "------------------------------------------"
 echo "目标模型: ${TARGET_MODEL}"
 echo "目标模型后端: ${TARGET_MODEL_BACKEND}"
@@ -184,7 +209,7 @@ echo "  草稿模型层数: ${NUM_DRAFT_LAYERS}"
 echo "  块大小: ${BLOCK_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
-echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
+echo "  Loss衰减Gamma: ${EFFECTIVE_LOSS_DECAY_GAMMA:-未设置(不启用)}"
 echo "------------------------------------------"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
@@ -193,6 +218,12 @@ echo "  学习率: ${LEARNING_RATE}"
 echo "  最大长度: ${MAX_LENGTH}"
 echo "  预热比例: ${WARMUP_RATIO}"
 echo "  梯度裁剪: ${MAX_GRAD_NORM}"
+if [ -n "${INIT_CKPT_DIR}" ]; then
+    echo "  初始化权重: ${INIT_CKPT_DIR} (不恢复 optimizer/scheduler/step)"
+fi
+if [ -n "${CKPT_DIR}" ]; then
+    echo "  恢复 checkpoint: ${CKPT_DIR} (恢复 scheduler/step)"
+fi
 echo "------------------------------------------"
 echo "分布式配置:"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
@@ -245,8 +276,8 @@ if [ -n "${EVAL_DATA_PATH}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --eval-data-path ${EVAL_DATA_PATH}"
 fi
 
-if [ -n "${LOSS_DECAY_GAMMA}" ]; then
-    OPTIONAL_ARGS="${OPTIONAL_ARGS} --loss-decay-gamma ${LOSS_DECAY_GAMMA}"
+if [ -n "${EFFECTIVE_LOSS_DECAY_GAMMA}" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --loss-decay-gamma ${EFFECTIVE_LOSS_DECAY_GAMMA}"
 fi
 
 if [ -n "${IS_PREFORMATTED}" ]; then
@@ -259,6 +290,10 @@ fi
 
 if [ -n "${CKPT_DIR}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --ckpt-dir ${CKPT_DIR}"
+fi
+
+if [ -n "${INIT_CKPT_DIR}" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --init-ckpt-dir ${INIT_CKPT_DIR}"
 fi
 
 if [ "${REPORT_TO}" != "none" ]; then
@@ -274,10 +309,6 @@ if [ "${REPORT_TO}" != "none" ]; then
     fi
 fi
 
-if [ "${TRAIN_LM_HEAD_TAG}" = "tlmh1" ]; then
-    OPTIONAL_ARGS="${OPTIONAL_ARGS} --train-lm-head"
-fi
-
 if [ "${LOCAL_POSITION_TAG}" = "lp1" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --local-position"
 fi
@@ -286,12 +317,21 @@ if [ "${TEACHER_MATCH_CAP_TAG}" = "tmc1" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --loss-teacher-match-cap"
 fi
 
-if [ "${ADD_NOISE_TAG}" = "an1" ]; then
-    OPTIONAL_ARGS="${OPTIONAL_ARGS} --add-noise --target-hidden-noise-ratio ${TARGET_HIDDEN_NOISE_RATIO}"
-fi
-
 if awk "BEGIN {exit !(${W1_MSE} > 0)}"; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --w1-mse ${W1_MSE}"
+fi
+
+if [ "${DFLASH_DISTILL_STAGE}" != "none" ]; then
+    if [ -z "${DFLASH_TEACHER_PATH}" ]; then
+        echo "错误: DFLASH_DISTILL_STAGE=${DFLASH_DISTILL_STAGE} 时必须设置 DFLASH_TEACHER_PATH"
+        exit 1
+    fi
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-teacher-path ${DFLASH_TEACHER_PATH}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-stage ${DFLASH_DISTILL_STAGE}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-weight ${DFLASH_DISTILL_WEIGHT}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-temperature ${DFLASH_DISTILL_TEMPERATURE}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-top-k ${DFLASH_DISTILL_TOP_K}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-stage2-ce-gate ${DFLASH_STAGE2_CE_GATE}"
 fi
 
 # 运行训练
