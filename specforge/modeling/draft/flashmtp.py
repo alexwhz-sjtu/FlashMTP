@@ -172,7 +172,8 @@ class Qwen3FlashMTPAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        target_hidden: torch.Tensor,
+        ctx_hidden: torch.Tensor,
+        ctx_len: int,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
@@ -180,32 +181,20 @@ class Qwen3FlashMTPAttention(nn.Module):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
-        ctx_len = target_hidden.shape[1]
+        kv_len = ctx_len + q_len
 
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
-        k_ctx = self.k_proj(target_hidden)
-        k_noise = self.k_proj(hidden_states)
-        v_ctx = self.v_proj(target_hidden)
-        v_noise = self.v_proj(hidden_states)
 
         cos, sin = position_embeddings
-
-        if ctx_len > 0:
-            k_ctx = k_ctx.view(bsz, ctx_len, -1, self.head_dim).transpose(1, 2)
-            k_noise = k_noise.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-            q, k_noise = apply_rotary_pos_emb(q, k_noise, cos, sin)
-            k = torch.cat([k_ctx, k_noise], dim=2)
-            k = self.k_norm(k)
-            v_ctx = v_ctx.view(bsz, ctx_len, -1, self.head_dim).transpose(1, 2)
-            v_noise = v_noise.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-            v = torch.cat([v_ctx, v_noise], dim=2)
-        else:
-            k = k_noise.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-            v = v_noise.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-            k = self.k_norm(k)
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        kv_hidden = torch.cat([ctx_hidden, hidden_states], dim=1)
+        k = self.k_proj(kv_hidden).view(bsz, kv_len, -1, self.head_dim).transpose(1, 2)
+        v = self.v_proj(kv_hidden).view(bsz, kv_len, -1, self.head_dim).transpose(1, 2)
+        k = self.k_norm(k)
+        k_ctx, k_noise = k.split([ctx_len, q_len], dim=2)
+        q, k_noise = apply_rotary_pos_emb(q, k_noise, cos, sin)
+        k = torch.cat([k_ctx, k_noise], dim=2)
 
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -245,7 +234,8 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
 
     def forward(
         self,
-        target_hidden: Optional[torch.Tensor] = None,
+        ctx_hidden: torch.Tensor,
+        ctx_len: int,
         hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -255,7 +245,7 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
-        ] = None,  # necessary, but kept here for BC
+        ] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -264,7 +254,8 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
-            target_hidden=target_hidden,
+            ctx_hidden=ctx_hidden,
+            ctx_len=ctx_len,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_value,
@@ -368,23 +359,27 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
         assert target_hidden is not None and target_hidden.ndim == 4
-        noise_len = hidden_states.shape[1]
-        if position_ids.shape[1] != noise_len:
-            draft_pos = position_ids[:, -noise_len:]
-        else:
-            draft_pos = position_ids
 
-        target_hidden = self._fuse_target_hidden(target_hidden)
-        rotary_pos = rotary_position_ids if rotary_position_ids is not None else draft_pos
-        total_len = rotary_pos.shape[1]
-        dummy = hidden_states.new_zeros(
-            hidden_states.shape[0], total_len, hidden_states.shape[-1]
+        ctx_hidden = self._fuse_target_hidden(target_hidden)
+        ctx_len = ctx_hidden.shape[1]
+        noise_len = hidden_states.shape[1]
+        draft_pos = (
+            position_ids[:, -noise_len:]
+            if position_ids.shape[1] != noise_len
+            else position_ids
         )
-        position_embeddings = self.rotary_emb(dummy, rotary_pos)
+        draft_rotary_pos = (
+            rotary_position_ids[:, -noise_len:]
+            if rotary_position_ids is not None
+            else draft_pos
+        )
+        position_embeddings = self.rotary_emb(hidden_states, draft_rotary_pos)
+
         for layer in self.layers:
             hidden_states = layer(
+                ctx_hidden=ctx_hidden,
+                ctx_len=ctx_len,
                 hidden_states=hidden_states,
-                target_hidden=target_hidden,
                 attention_mask=attention_mask,
                 position_ids=draft_pos,
                 past_key_value=past_key_values,
