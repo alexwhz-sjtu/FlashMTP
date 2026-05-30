@@ -130,6 +130,55 @@ def parse_args():
         help="Weight for MSE between draft last-layer hidden and target last-layer "
         "hidden at the first predicted token (block position 1). 0 disables.",
     )
+    model_group.add_argument(
+        "--hard-anchor-mining",
+        action="store_true",
+        help="Track per-sample anchor prefix acceptance and oversample positions "
+        "with consistently short acceptance.",
+    )
+    model_group.add_argument(
+        "--hard-anchor-ema-alpha",
+        type=float,
+        default=0.2,
+        help="EMA alpha when updating per-anchor prefix acceptance history.",
+    )
+    model_group.add_argument(
+        "--hard-anchor-threshold",
+        type=float,
+        default=2.5,
+        help="Mark anchor as hard when EMA prefix length (incl. anchor) <= threshold.",
+    )
+    model_group.add_argument(
+        "--hard-anchor-min-visits",
+        type=int,
+        default=2,
+        help="Minimum visits before an anchor can be treated as hard.",
+    )
+    model_group.add_argument(
+        "--hard-anchor-boost",
+        type=float,
+        default=8.0,
+        help="Sampling weight multiplier for hard anchors (weighted mode).",
+    )
+    model_group.add_argument(
+        "--hard-anchor-max-samples",
+        type=int,
+        default=10000,
+        help="LRU cap on number of training samples tracked for hard anchors.",
+    )
+    model_group.add_argument(
+        "--hard-anchor-mode",
+        type=str,
+        default="weighted",
+        choices=["weighted", "mixture"],
+        help="weighted: boost probability; mixture: reserve hard_anchor_ratio slots.",
+    )
+    model_group.add_argument(
+        "--hard-anchor-ratio",
+        type=float,
+        default=0.3,
+        help="Fraction of anchor slots reserved for hard positions (mixture mode).",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -561,11 +610,25 @@ def main():
         add_noise=args.add_noise,
         target_hidden_noise_ratio=args.target_hidden_noise_ratio,
         w1_mse=args.w1_mse,
+        hard_anchor_mining=args.hard_anchor_mining,
+        hard_anchor_ema_alpha=args.hard_anchor_ema_alpha,
+        hard_anchor_threshold=args.hard_anchor_threshold,
+        hard_anchor_min_visits=args.hard_anchor_min_visits,
+        hard_anchor_boost=args.hard_anchor_boost,
+        hard_anchor_max_samples=args.hard_anchor_max_samples,
+        hard_anchor_mode=args.hard_anchor_mode,
+        hard_anchor_ratio=args.hard_anchor_ratio,
     )
     print_on_rank0(
         f"target hidden noise: add_noise={args.add_noise}, "
         f"ratio={args.target_hidden_noise_ratio}, w1_mse={args.w1_mse}"
     )
+    if args.hard_anchor_mining:
+        print_on_rank0(
+            f"hard anchor mining: mode={args.hard_anchor_mode}, "
+            f"threshold={args.hard_anchor_threshold}, boost={args.hard_anchor_boost}, "
+            f"ratio={args.hard_anchor_ratio}, min_visits={args.hard_anchor_min_visits}"
+        )
 
     flashmtp_model = FSDP(
         flashmtp_model,

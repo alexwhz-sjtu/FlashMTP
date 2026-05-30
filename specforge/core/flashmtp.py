@@ -1,12 +1,13 @@
 # coding=utf-8
 """FlashMTP Training Wrapper."""
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from specforge.core.hard_anchor_tracker import HardAnchorTracker
 from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
 
 try:
@@ -160,6 +161,14 @@ class OnlineFlashMTPModel(nn.Module):
             add_noise: bool = False,
             target_hidden_noise_ratio: float = 0.1,
             w1_mse: float = 0.0,
+            hard_anchor_mining: bool = False,
+            hard_anchor_ema_alpha: float = 0.2,
+            hard_anchor_threshold: float = 2.5,
+            hard_anchor_min_visits: int = 2,
+            hard_anchor_boost: float = 8.0,
+            hard_anchor_max_samples: int = 10000,
+            hard_anchor_mode: str = "weighted",
+            hard_anchor_ratio: float = 0.3,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -176,15 +185,65 @@ class OnlineFlashMTPModel(nn.Module):
         self.w1_mse = w1_mse
         self.chs_concat_mode = "feature"
         self.draft_model.chs_concat_mode = "feature"
+        self.hard_anchor_tracker: Optional[HardAnchorTracker] = None
+        if hard_anchor_mining:
+            self.hard_anchor_tracker = HardAnchorTracker(
+                ema_alpha=hard_anchor_ema_alpha,
+                threshold=hard_anchor_threshold,
+                min_visits=hard_anchor_min_visits,
+                boost=hard_anchor_boost,
+                max_samples=hard_anchor_max_samples,
+                mode=hard_anchor_mode,
+                hard_ratio=hard_anchor_ratio,
+            )
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
 
+    def _sample_random_anchors(
+        self,
+        valid: torch.Tensor,
+        max_n: int,
+        max_anchor: int,
+        seq_len: int,
+        device: torch.device,
+        sampling_weights: Optional[torch.Tensor] = None,
+        exclude: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Sample up to ``max_n`` anchor indices without replacement."""
+        bsz = valid.shape[0]
+        indices = torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(
+            bsz, -1
+        )
+        masked_indices = torch.where(
+            valid, indices, torch.tensor(seq_len + 1, device=device)
+        )
+
+        random_vals = torch.rand(bsz, max_anchor + 1, device=device)
+        if sampling_weights is not None:
+            w = sampling_weights.clamp(min=1e-6)
+            random_vals = torch.where(
+                valid,
+                random_vals.pow(1.0 / w),
+                random_vals,
+            )
+        if exclude is not None:
+            random_vals = torch.where(exclude, torch.tensor(2.0, device=device), random_vals)
+        random_vals = torch.where(valid, random_vals, torch.tensor(2.0, device=device))
+
+        _, sorted_idx = random_vals.sort(dim=1, descending=True)
+        gathered = torch.gather(masked_indices, 1, sorted_idx)
+        return gathered[:, :max_n]
+
     def _sample_anchor_positions(
-            self, seq_len: int, loss_mask: torch.Tensor,
-            device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Randomly sample anchor positions per sample; returns (anchors, keep_mask)."""
+            self,
+            seq_len: int,
+            loss_mask: torch.Tensor,
+            device: torch.device,
+            input_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample anchor positions; optionally bias toward low-acceptance history."""
         bs = self.block_size
         bsz = loss_mask.shape[0]
         max_anchor = max(seq_len - bs, 0)
@@ -196,26 +255,76 @@ class OnlineFlashMTPModel(nn.Module):
         if max_n <= 0:
             raise ValueError("should preprocess the data.")
 
-        indices = (torch.arange(max_anchor + 1,
-                                device=device).unsqueeze(0).expand(bsz, -1))
-        masked_indices = torch.where(valid, indices,
-                                     torch.tensor(seq_len + 1, device=device))
-
-        random_vals = torch.rand(bsz, max_anchor + 1, device=device)
-        random_vals = torch.where(valid, random_vals,
-                                  torch.tensor(2.0, device=device))
-
-        _, sorted_idx = random_vals.sort(dim=1)
-        gathered = torch.gather(masked_indices, 1, sorted_idx)
-        anchors = gathered[:, :max_n].sort(dim=1).values
-
+        anchors = torch.zeros(bsz, max_n, dtype=torch.long, device=device)
         keep_mask = torch.arange(
             max_n,
-            device=device).unsqueeze(0) < valid_counts.unsqueeze(1).clamp(
-                max=max_n)
-        anchors = torch.where(keep_mask, anchors,
-                              torch.tensor(0, dtype=torch.long, device=device))
+            device=device,
+        ).unsqueeze(0) < valid_counts.unsqueeze(1).clamp(max=max_n)
 
+        tracker = self.hard_anchor_tracker
+        use_tracker = tracker is not None and input_ids is not None
+        mixture_mode = use_tracker and tracker.mode == "mixture"
+
+        for b in range(bsz):
+            n_b = int(valid_counts[b].item().clamp(max=max_n).item())
+            if n_b <= 0:
+                continue
+
+            sample_key = None
+            if use_tracker:
+                sample_key = tracker.sample_key(input_ids[b : b + 1])
+
+            hard_selected: List[int] = []
+            if mixture_mode and sample_key is not None:
+                hard_selected = tracker.select_hard_anchors(
+                    sample_key, valid[b], n_b
+                )
+
+            n_hard = len(hard_selected)
+            n_rand = n_b - n_hard
+            picked: List[int] = list(hard_selected)
+
+            if n_rand > 0:
+                exclude = torch.zeros(max_anchor + 1, dtype=torch.bool, device=device)
+                if hard_selected:
+                    exclude[hard_selected] = True
+                weights = None
+                if use_tracker and sample_key is not None and not mixture_mode:
+                    weights = tracker.get_sampling_weights(
+                        sample_key, max_anchor + 1, valid[b], device
+                    )
+                rand_anchors = self._sample_random_anchors(
+                    valid[b : b + 1],
+                    n_rand,
+                    max_anchor,
+                    seq_len,
+                    device,
+                    sampling_weights=weights.unsqueeze(0) if weights is not None else None,
+                    exclude=exclude.unsqueeze(0),
+                )[0]
+                picked.extend(rand_anchors.tolist())
+
+            picked = sorted(set(picked))[:n_b]
+            if len(picked) < n_b:
+                exclude = torch.zeros(max_anchor + 1, dtype=torch.bool, device=device)
+                exclude[picked] = True
+                extra = self._sample_random_anchors(
+                    valid[b : b + 1],
+                    n_b - len(picked),
+                    max_anchor,
+                    seq_len,
+                    device,
+                    exclude=exclude.unsqueeze(0),
+                )[0]
+                picked = sorted(set(picked + extra.tolist()))[:n_b]
+
+            anchors[b, : len(picked)] = torch.tensor(
+                picked, dtype=torch.long, device=device
+            )
+
+        anchors = torch.where(
+            keep_mask, anchors, torch.tensor(0, dtype=torch.long, device=device)
+        )
         return anchors, keep_mask
 
     def prepare_noise_input(
@@ -298,7 +407,7 @@ class OnlineFlashMTPModel(nn.Module):
 
         # TODO: keep_mask meaning: Valid anchor position
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device)
+            seq_len, loss_mask, device, input_ids=input_ids)
 
         noise_embedding = self._create_noise_embed(input_ids, anchor_positions,
                                                    block_keep_mask)
@@ -494,5 +603,17 @@ class OnlineFlashMTPModel(nn.Module):
                 else torch.zeros((), device=device, dtype=torch.float32)
             )
             prefix_acc = prefix_sum / prefix_count.clamp(min=1.0)
+
+            if self.hard_anchor_tracker is not None:
+                for b in range(bsz):
+                    sample_key = self.hard_anchor_tracker.sample_key(
+                        input_ids[b : b + 1]
+                    )
+                    self.hard_anchor_tracker.update(
+                        sample_key,
+                        anchor_positions[b],
+                        prefix_lengths[b],
+                        block_keep_mask[b],
+                    )
 
         return loss, accuracy, prefix_acc, mse_loss

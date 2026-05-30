@@ -88,6 +88,18 @@ if awk "BEGIN {exit !(${W1_MSE} > 0)}"; then
     W1_MSE_TAG="w1mse${W1_MSE}"
 fi
 
+# Hard anchor mining：记录低 prefix 接受长度 anchor，后续 oversample（默认关闭）
+HARD_ANCHOR_MINING="${HARD_ANCHOR_MINING:-false}"
+HARD_ANCHOR_MODE="${HARD_ANCHOR_MODE:-weighted}"
+HARD_ANCHOR_THRESHOLD="${HARD_ANCHOR_THRESHOLD:-2.5}"
+HARD_ANCHOR_BOOST="${HARD_ANCHOR_BOOST:-8.0}"
+HARD_ANCHOR_RATIO="${HARD_ANCHOR_RATIO:-0.3}"
+HARD_ANCHOR_MIN_VISITS="${HARD_ANCHOR_MIN_VISITS:-2}"
+HARD_ANCHOR_TAG="ham0"
+case "$(echo "${HARD_ANCHOR_MINING}" | tr '[:upper:]' '[:lower:]')" in
+    true|1|yes) HARD_ANCHOR_TAG="ham1" ;;
+esac
+
 # ========================================
 # 默认参数（通常不需要修改）
 # ========================================
@@ -105,15 +117,15 @@ if [ "$DT" = "qz" ]; then
     # export NODE_RANK=${RANK:-0}
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${TRAIN_LM_HEAD_TAG}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${ADD_NOISE_TAG}_${W1_MSE_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${TRAIN_LM_HEAD_TAG}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${ADD_NOISE_TAG}_${W1_MSE_TAG}_${HARD_ANCHOR_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 elif [ "$DT" = "h100" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-../training_data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_${PIVOT_FUSE_MODE}_fuse$((NUM_MIDDLE_LAYERS_N + 2))_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${TRAIN_LM_HEAD_TAG}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${ADD_NOISE_TAG}_${W1_MSE_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_${PIVOT_FUSE_MODE}_fuse$((NUM_MIDDLE_LAYERS_N + 2))_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${TRAIN_LM_HEAD_TAG}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${ADD_NOISE_TAG}_${W1_MSE_TAG}_${HARD_ANCHOR_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${TRAIN_LM_HEAD_TAG}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${ADD_NOISE_TAG}_${W1_MSE_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${TRAIN_LM_HEAD_TAG}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${ADD_NOISE_TAG}_${W1_MSE_TAG}_${HARD_ANCHOR_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
@@ -144,8 +156,8 @@ REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-exp}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}_${TRAIN_LM_HEAD_TAG}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${ADD_NOISE_TAG}_${W1_MSE_TAG}}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}_${TRAIN_LM_HEAD_TAG}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${ADD_NOISE_TAG}_${W1_MSE_TAG}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}_${TRAIN_LM_HEAD_TAG}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${ADD_NOISE_TAG}_${W1_MSE_TAG}_${HARD_ANCHOR_TAG}}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}_${TRAIN_LM_HEAD_TAG}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${ADD_NOISE_TAG}_${W1_MSE_TAG}_${HARD_ANCHOR_TAG}}"
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen}"
@@ -171,6 +183,7 @@ echo "  local_position: ${LOCAL_POSITION} (tag ${LOCAL_POSITION_TAG}; draft 1..b
 echo "  loss_teacher_match_cap: ${LOSS_TEACHER_MATCH_CAP} (tag ${TEACHER_MATCH_CAP_TAG})"
 echo "  add_noise: ${ADD_NOISE} (tag ${ADD_NOISE_TAG}; U(-${TARGET_HIDDEN_NOISE_RATIO},${TARGET_HIDDEN_NOISE_RATIO}))"
 echo "  w1_mse: ${W1_MSE} (tag ${W1_MSE_TAG}; first-pred hidden MSE weight)"
+echo "  hard_anchor_mining: ${HARD_ANCHOR_MINING} (tag ${HARD_ANCHOR_TAG}; mode=${HARD_ANCHOR_MODE}, threshold=${HARD_ANCHOR_THRESHOLD})"
 echo "------------------------------------------"
 echo "目标模型: ${TARGET_MODEL}"
 echo "目标模型后端: ${TARGET_MODEL_BACKEND}"
@@ -292,6 +305,15 @@ fi
 
 if awk "BEGIN {exit !(${W1_MSE} > 0)}"; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --w1-mse ${W1_MSE}"
+fi
+
+if [ "${HARD_ANCHOR_TAG}" = "ham1" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --hard-anchor-mining"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --hard-anchor-mode ${HARD_ANCHOR_MODE}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --hard-anchor-threshold ${HARD_ANCHOR_THRESHOLD}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --hard-anchor-boost ${HARD_ANCHOR_BOOST}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --hard-anchor-ratio ${HARD_ANCHOR_RATIO}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --hard-anchor-min-visits ${HARD_ANCHOR_MIN_VISITS}"
 fi
 
 # 运行训练
