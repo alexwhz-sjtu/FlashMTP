@@ -253,7 +253,7 @@ class CosineAnnealingWarmupLR(WarmupScheduler):
     ):
         base_scheduler = _CosineAnnealingLR(
             optimizer,
-            total_steps - warmup_steps,
+            max(total_steps - warmup_steps, 1),
             eta_min=eta_min,
             last_epoch=last_epoch,
         )

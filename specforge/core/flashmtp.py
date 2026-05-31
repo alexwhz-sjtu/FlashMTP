@@ -12,11 +12,16 @@ from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
+    from specforge.modeling.draft.flex_attention import (
+        compile_friendly_create_block_mask,
+    )
+
     FLEX_ATTENTION_AVAILABLE = True
 except ImportError:
     FLEX_ATTENTION_AVAILABLE = False
     BlockMask = None
     create_block_mask = None
+    compile_friendly_create_block_mask = None
 
 def infer_hidden_states_embedding_offset(
     hidden_states: tuple | list, num_transformer_layers: int
@@ -109,35 +114,48 @@ def create_flashmtp_block_mask(
       3. Different blocks are invisible to each other.
       4. Invalid blocks (block_keep_mask=False) see nothing.
     """
-
-    def flashmtp_mask_mod(b, h, q_idx, kv_idx):
-        q_block_id = q_idx // block_size
-
-        # Total length of all CHS segments
-        total_chs_len = N * chs_len_per_block
-
-        # Check if kv_idx falls within the CHS region
-        is_context = kv_idx < total_chs_len
-        # Which CHS segment this kv belongs to
-        chs_block_id = kv_idx // chs_len_per_block
-        # Block i only attends to CHS i (all CHS tokens are needed)
-        mask_context = is_context & (chs_block_id == q_block_id)
-
-        # Check if kv_idx falls within the draft block region
-        is_draft = kv_idx >= total_chs_len
-        # Which block this draft kv belongs to
-        kv_block_id = (kv_idx - total_chs_len) // block_size
-        # Block i only attends to Block i (bidirectional)
-        mask_draft = is_draft & (kv_block_id == q_block_id)
-
-        is_valid_block = block_keep_mask[b, q_block_id]
-        return (mask_context | mask_draft) & is_valid_block
+    block_size = int(block_size)
+    chs_len_per_block = int(chs_len_per_block)
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    if chs_len_per_block <= 0:
+        raise ValueError(
+            f"chs_len_per_block must be positive, got {chs_len_per_block}"
+        )
 
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
     KV_LEN = N * chs_len_per_block + N * block_size
+    total_chs_len = N * chs_len_per_block
+    max_block_id = max(N - 1, 0)
 
-    return create_block_mask(
+    def flashmtp_mask_mod(b, h, q_idx, kv_idx):
+        q_block_id = q_idx // block_size
+        q_block_ok = q_block_id <= max_block_id
+
+        is_context = kv_idx < total_chs_len
+        chs_block_id = kv_idx // chs_len_per_block
+        mask_context = is_context & (chs_block_id == q_block_id)
+
+        is_draft = kv_idx >= total_chs_len
+        kv_block_id = (kv_idx - total_chs_len) // block_size
+        mask_draft = is_draft & (kv_block_id == q_block_id)
+
+        # flex_attention vmap may probe out-of-range q_idx; clamp before indexing.
+        safe_q_block_id = q_block_id.clamp(min=0, max=max_block_id)
+        is_valid_block = block_keep_mask[b, safe_q_block_id] & q_block_ok
+        return (mask_context | mask_draft) & is_valid_block
+
+    flashmtp_mask_mod.__name__ = (
+        f"flashmtp_mask_N{N}_bs{block_size}_chs{chs_len_per_block}"
+    )
+
+    create_fn = (
+        compile_friendly_create_block_mask
+        if compile_friendly_create_block_mask is not None
+        else create_block_mask
+    )
+    return create_fn(
         flashmtp_mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device
     )
 

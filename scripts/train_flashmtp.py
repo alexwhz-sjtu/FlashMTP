@@ -276,6 +276,58 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     return target_model, draft_model
 
 
+def _ensure_embed_vocab_for_mask(
+    target_components: TargetEmbeddingsAndHead, mask_token_id: int
+) -> None:
+    """Expand frozen target embed/lm_head when mask_token_id exceeds loaded vocab."""
+    needed = int(mask_token_id) + 1
+    cur = target_components.embed_tokens.num_embeddings
+    if needed <= cur:
+        return
+
+    print_on_rank0(
+        f"Expanding target embed/lm_head for mask_token_id={mask_token_id}: "
+        f"vocab {cur} -> {needed}"
+    )
+    old_emb = target_components.embed_tokens
+    new_emb = torch.nn.Embedding(
+        needed,
+        old_emb.embedding_dim,
+        padding_idx=old_emb.padding_idx,
+        device=old_emb.weight.device,
+        dtype=old_emb.weight.dtype,
+    )
+    with torch.no_grad():
+        new_emb.weight[:cur].copy_(old_emb.weight)
+        init_row = old_emb.weight.mean(dim=0)
+        new_emb.weight[cur:].copy_(
+            init_row.unsqueeze(0).expand(needed - cur, -1)
+        )
+    target_components.embed_tokens = new_emb
+
+    lm = target_components.lm_head
+    if lm.weight.data_ptr() != old_emb.weight.data_ptr():
+        new_lm = torch.nn.Linear(
+            lm.in_features,
+            needed,
+            bias=lm.bias is not None,
+            device=lm.weight.device,
+            dtype=lm.weight.dtype,
+        )
+        with torch.no_grad():
+            new_lm.weight[:cur].copy_(lm.weight)
+            init_row = lm.weight.mean(dim=0)
+            new_lm.weight[cur:].copy_(
+                init_row.unsqueeze(0).expand(needed - cur, -1)
+            )
+            if lm.bias is not None:
+                new_lm.bias[:cur].copy_(lm.bias)
+                new_lm.bias[cur:].zero_()
+        target_components.lm_head = new_lm
+    else:
+        target_components.lm_head.weight = target_components.embed_tokens.weight
+
+
 def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
     """Build train and eval dataloaders."""
     import hashlib
@@ -520,6 +572,13 @@ def main():
     steps_per_epoch = math.ceil(len(train_dataloader) / args.accumulation_steps)
     total_steps = args.num_epochs * steps_per_epoch
     print_on_rank0(f"Total training steps: {total_steps}")
+    if total_steps <= 0:
+        raise ValueError(
+            f"total_steps must be positive, got {total_steps}. "
+            f"train_dataloader len={len(train_dataloader)}, "
+            f"accumulation_steps={args.accumulation_steps}, num_epochs={args.num_epochs}. "
+            "Check TRAIN_DATA_PATH / CHAT_TEMPLATE / loss_mask filter."
+        )
 
     print_on_rank0("Loading target embeddings and head...")
     target_components = TargetEmbeddingsAndHead.from_pretrained(
@@ -529,6 +588,7 @@ def main():
         device="cuda",
         trust_remote_code=args.trust_remote_code,
     )
+    _ensure_embed_vocab_for_mask(target_components, mask_token_id)
 
     if draft_model.draft_lm_head is not None:
         if not draft_weights_from_checkpoint:
