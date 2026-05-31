@@ -34,7 +34,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
-PIVOT_FUSE_MODE="${PIVOT_FUSE_MODE:-linear_fuse}"
+PIVOT_FUSE_MODE="${PIVOT_FUSE_MODE:-prefix_condition}"
 NUM_MIDDLE_LAYERS_N="${NUM_MIDDLE_LAYERS_N:-5}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
 
@@ -60,7 +60,7 @@ case "$(echo "${TRAIN_LM_HEAD}" | tr '[:upper:]' '[:lower:]')" in
 esac
 
 # 草稿块内 position_ids：CHS RoPE 前缀全 0，draft 为 1..block_size（默认 false 为全局 anchor 位置）
-LOCAL_POSITION="${LOCAL_POSITION:-false}"
+LOCAL_POSITION="${LOCAL_POSITION:-true}"
 LOCAL_POSITION_TAG="lp0"
 case "$(echo "${LOCAL_POSITION}" | tr '[:upper:]' '[:lower:]')" in
     true|1|yes) LOCAL_POSITION_TAG="lp1" ;;

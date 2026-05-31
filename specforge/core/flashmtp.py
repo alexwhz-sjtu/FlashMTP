@@ -211,8 +211,12 @@ class OnlineFlashMTPModel(nn.Module):
         sampling_weights: Optional[torch.Tensor] = None,
         exclude: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Sample up to ``max_n`` anchor indices without replacement."""
+        """Sample up to ``max_n`` valid anchor indices without replacement."""
+        if max_n <= 0:
+            return torch.empty(valid.shape[0], 0, dtype=torch.long, device=device)
+
         bsz = valid.shape[0]
+        invalid_score = torch.tensor(-1.0, device=device, dtype=torch.float32)
         indices = torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(
             bsz, -1
         )
@@ -220,21 +224,28 @@ class OnlineFlashMTPModel(nn.Module):
             valid, indices, torch.tensor(seq_len + 1, device=device)
         )
 
-        random_vals = torch.rand(bsz, max_anchor + 1, device=device)
+        scores = torch.rand(bsz, max_anchor + 1, device=device)
         if sampling_weights is not None:
-            w = sampling_weights.clamp(min=1e-6)
-            random_vals = torch.where(
+            w = sampling_weights
+            if w.dim() == 1:
+                w = w.unsqueeze(0).expand(bsz, -1)
+            scores = torch.where(
                 valid,
-                random_vals.pow(1.0 / w),
-                random_vals,
+                scores.pow(1.0 / w.clamp(min=1e-6)),
+                scores,
             )
         if exclude is not None:
-            random_vals = torch.where(exclude, torch.tensor(2.0, device=device), random_vals)
-        random_vals = torch.where(valid, random_vals, torch.tensor(2.0, device=device))
+            scores = torch.where(exclude, invalid_score, scores)
+        scores = torch.where(valid, scores, invalid_score)
 
-        _, sorted_idx = random_vals.sort(dim=1, descending=True)
+        _, sorted_idx = scores.sort(dim=1, descending=True)
         gathered = torch.gather(masked_indices, 1, sorted_idx)
-        return gathered[:, :max_n]
+        picked = gathered[:, :max_n]
+        return torch.where(
+            picked <= max_anchor,
+            picked,
+            torch.tensor(0, dtype=torch.long, device=device),
+        )
 
     def _sample_anchor_positions(
             self,
@@ -255,7 +266,6 @@ class OnlineFlashMTPModel(nn.Module):
         if max_n <= 0:
             raise ValueError("should preprocess the data.")
 
-        anchors = torch.zeros(bsz, max_n, dtype=torch.long, device=device)
         keep_mask = torch.arange(
             max_n,
             device=device,
@@ -263,38 +273,51 @@ class OnlineFlashMTPModel(nn.Module):
 
         tracker = self.hard_anchor_tracker
         use_tracker = tracker is not None and input_ids is not None
-        mixture_mode = use_tracker and tracker.mode == "mixture"
+
+        if not use_tracker:
+            anchors = self._sample_random_anchors(
+                valid, max_n, max_anchor, seq_len, device
+            ).sort(dim=1).values
+            anchors = torch.where(
+                keep_mask,
+                anchors,
+                torch.tensor(0, dtype=torch.long, device=device),
+            )
+            return anchors, keep_mask
+
+        mixture_mode = tracker.mode == "mixture"
+        anchors = torch.zeros(bsz, max_n, dtype=torch.long, device=device)
 
         for b in range(bsz):
-            n_b = int(valid_counts[b].item().clamp(max=max_n).item())
+            n_b = min(int(valid_counts[b].item()), max_n)
             if n_b <= 0:
                 continue
 
-            sample_key = None
-            if use_tracker:
-                sample_key = tracker.sample_key(input_ids[b : b + 1])
+            sample_key = tracker.sample_key(input_ids[b : b + 1])
+            valid_b = valid[b]
 
-            hard_selected: List[int] = []
-            if mixture_mode and sample_key is not None:
-                hard_selected = tracker.select_hard_anchors(
-                    sample_key, valid[b], n_b
+            picked: List[int] = []
+            if mixture_mode:
+                picked = tracker.select_hard_anchors(sample_key, valid_b, n_b)
+                picked = [
+                    pos for pos in picked
+                    if 0 <= pos <= max_anchor and bool(valid_b[pos].item())
+                ]
+
+            exclude = torch.zeros(max_anchor + 1, dtype=torch.bool, device=device)
+            if picked:
+                exclude[picked] = True
+
+            n_rand = n_b - len(picked)
+            weights = None
+            if not mixture_mode:
+                weights = tracker.get_sampling_weights(
+                    sample_key, max_anchor + 1, valid_b, device
                 )
 
-            n_hard = len(hard_selected)
-            n_rand = n_b - n_hard
-            picked: List[int] = list(hard_selected)
-
             if n_rand > 0:
-                exclude = torch.zeros(max_anchor + 1, dtype=torch.bool, device=device)
-                if hard_selected:
-                    exclude[hard_selected] = True
-                weights = None
-                if use_tracker and sample_key is not None and not mixture_mode:
-                    weights = tracker.get_sampling_weights(
-                        sample_key, max_anchor + 1, valid[b], device
-                    )
                 rand_anchors = self._sample_random_anchors(
-                    valid[b : b + 1],
+                    valid_b.unsqueeze(0),
                     n_rand,
                     max_anchor,
                     seq_len,
@@ -302,22 +325,41 @@ class OnlineFlashMTPModel(nn.Module):
                     sampling_weights=weights.unsqueeze(0) if weights is not None else None,
                     exclude=exclude.unsqueeze(0),
                 )[0]
-                picked.extend(rand_anchors.tolist())
+                for pos in rand_anchors.tolist():
+                    if (
+                        0 <= pos <= max_anchor
+                        and bool(valid_b[pos].item())
+                        and pos not in picked
+                    ):
+                        picked.append(pos)
 
-            picked = sorted(set(picked))[:n_b]
-            if len(picked) < n_b:
+            while len(picked) < n_b:
                 exclude = torch.zeros(max_anchor + 1, dtype=torch.bool, device=device)
-                exclude[picked] = True
+                if picked:
+                    exclude[picked] = True
                 extra = self._sample_random_anchors(
-                    valid[b : b + 1],
+                    valid_b.unsqueeze(0),
                     n_b - len(picked),
                     max_anchor,
                     seq_len,
                     device,
                     exclude=exclude.unsqueeze(0),
                 )[0]
-                picked = sorted(set(picked + extra.tolist()))[:n_b]
+                added = False
+                for pos in extra.tolist():
+                    if (
+                        0 <= pos <= max_anchor
+                        and bool(valid_b[pos].item())
+                        and pos not in picked
+                    ):
+                        picked.append(pos)
+                        added = True
+                        if len(picked) >= n_b:
+                            break
+                if not added:
+                    break
 
+            picked = sorted(picked)[:n_b]
             anchors[b, : len(picked)] = torch.tensor(
                 picked, dtype=torch.long, device=device
             )
