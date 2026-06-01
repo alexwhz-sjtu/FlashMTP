@@ -91,8 +91,8 @@ def parse_args():
         "--loss-decay-gamma",
         type=float,
         default=None,
-        help="Gamma for exponential loss decay weighting (paper Eq.4). "
-        "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
+        help="Gamma for CE-only exponential position decay weighting (paper Eq.4). "
+        "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None or <=0 disables.",
     )
     model_group.add_argument(
         "--local-position",
@@ -104,20 +104,13 @@ def parse_args():
         "--dflash-teacher-path",
         type=str,
         default=None,
-        help="Optional pretrained DFlash checkpoint for two-stage distillation.",
-    )
-    model_group.add_argument(
-        "--dflash-distill-stage",
-        type=str,
-        default="none",
-        choices=["none", "stage1", "stage2"],
-        help="DFlash distillation mode: none, stage1 (KL only), or stage2 (CE + gated KL).",
+        help="Optional pretrained DFlash checkpoint. Providing it enables DFlash distillation.",
     )
     model_group.add_argument(
         "--dflash-distill-weight",
         type=float,
         default=1.0,
-        help="Weight for DFlash KL loss. Stage1 total loss is weight * KL.",
+        help="Weight for DFlash KL loss.",
     )
     model_group.add_argument(
         "--dflash-distill-temperature",
@@ -132,12 +125,18 @@ def parse_args():
         help="Teacher top-k candidates for KL; true label is forced into the set.",
     )
     model_group.add_argument(
-        "--dflash-stage2-ce-gate",
+        "--dflash-ce-gate",
         type=str,
         default="all",
         choices=["all", "correct_only"],
-        help="Stage2 CE mask policy. all keeps CE on every valid slot; "
+        help="CE mask policy during DFlash distillation. all keeps CE on every valid slot; "
         "correct_only applies CE only where DFlash top1 equals the true label.",
+    )
+    model_group.add_argument(
+        "--dflash-distill-decay-gamma",
+        type=float,
+        default=None,
+        help="Gamma for KL/mid hidden-loss position decay. None or <=0 disables.",
     )
     model_group.add_argument(
         "--dflash-align-mode",
@@ -513,10 +512,7 @@ def main():
     )
 
     args = parse_args()
-    if args.dflash_distill_stage != "none" and not args.dflash_teacher_path:
-        raise ValueError(
-            "--dflash-teacher-path is required when --dflash-distill-stage is not none"
-        )
+    dflash_enabled = bool(args.dflash_teacher_path)
     set_seed(args.seed)
 
     if args.ckpt_dir is not None and args.init_ckpt_dir is not None:
@@ -609,7 +605,7 @@ def main():
     draft_model.config.flashmtp_config["local_position"] = bool(
         getattr(draft_model, "local_position", False)
     )
-    draft_model.config.flashmtp_config["dflash_distill_stage"] = args.dflash_distill_stage
+    draft_model.config.flashmtp_config["dflash_distill_enabled"] = dflash_enabled
     draft_model.config.flashmtp_config["dflash_distill_weight"] = float(
         args.dflash_distill_weight
     )
@@ -619,8 +615,11 @@ def main():
     draft_model.config.flashmtp_config["dflash_distill_top_k"] = int(
         args.dflash_distill_top_k
     )
-    draft_model.config.flashmtp_config["dflash_stage2_ce_gate"] = (
-        args.dflash_stage2_ce_gate
+    draft_model.config.flashmtp_config["dflash_ce_gate"] = args.dflash_ce_gate
+    draft_model.config.flashmtp_config["dflash_distill_decay_gamma"] = (
+        None
+        if args.dflash_distill_decay_gamma is None
+        else float(args.dflash_distill_decay_gamma)
     )
     draft_model.config.flashmtp_config["dflash_align_mode"] = args.dflash_align_mode
     draft_model.config.flashmtp_config["dflash_mid_align"] = args.dflash_mid_align
@@ -654,7 +653,7 @@ def main():
     )
 
     dflash_teacher_model = None
-    if args.dflash_distill_stage != "none":
+    if dflash_enabled:
         print_on_rank0(f"Loading DFlash teacher from {args.dflash_teacher_path}")
         dflash_teacher_model = DFlashDraftModel.from_pretrained(
             args.dflash_teacher_path,
@@ -666,11 +665,11 @@ def main():
             param.requires_grad_(False)
         print_on_rank0(
             "DFlash distillation: "
-            f"stage={args.dflash_distill_stage}, "
             f"weight={args.dflash_distill_weight}, "
             f"temperature={args.dflash_distill_temperature}, "
             f"top_k={args.dflash_distill_top_k}, "
-            f"stage2_ce_gate={args.dflash_stage2_ce_gate}, "
+            f"ce_gate={args.dflash_ce_gate}, "
+            f"distill_decay_gamma={args.dflash_distill_decay_gamma}, "
             f"align_mode={args.dflash_align_mode}, "
             f"mid_align={args.dflash_mid_align}, "
             f"mid_weight={args.dflash_mid_weight}, "
@@ -692,11 +691,11 @@ def main():
         loss_decay_gamma=args.loss_decay_gamma,
         chs_concat_mode="feature",
         dflash_teacher_model=dflash_teacher_model,
-        dflash_distill_stage=args.dflash_distill_stage,
         dflash_distill_weight=args.dflash_distill_weight,
         dflash_distill_temperature=args.dflash_distill_temperature,
         dflash_distill_top_k=args.dflash_distill_top_k,
-        dflash_stage2_ce_gate=args.dflash_stage2_ce_gate,
+        dflash_ce_gate=args.dflash_ce_gate,
+        dflash_distill_decay_gamma=args.dflash_distill_decay_gamma,
         dflash_align_mode=args.dflash_align_mode,
         dflash_mid_align=args.dflash_mid_align,
         dflash_mid_weight=args.dflash_mid_weight,
@@ -838,32 +837,32 @@ def main():
                     ce_loss=ce_log.item(),
                     dflash_kl_loss=(
                         dflash_kl_log.item()
-                        if args.dflash_distill_stage != "none"
+                        if dflash_enabled
                         else None
                     ),
                     dflash_kl_active_ratio=(
                         dflash_active_log.item()
-                        if args.dflash_distill_stage != "none"
+                        if dflash_enabled
                         else None
                     ),
                     dflash_mid_loss=(
                         dflash_mid_log.item()
-                        if args.dflash_align_mode == "final+mid"
+                        if dflash_enabled and args.dflash_align_mode == "final+mid"
                         else None
                     ),
                     dflash_kl_weight=(
                         dflash_kl_weight_log.item()
-                        if args.dflash_distill_stage != "none"
+                        if dflash_enabled
                         else None
                     ),
                     dflash_mid_weight=(
                         dflash_mid_weight_log.item()
-                        if args.dflash_align_mode == "final+mid"
+                        if dflash_enabled and args.dflash_align_mode == "final+mid"
                         else None
                     ),
                     dflash_ce_weight=(
                         dflash_ce_weight_log.item()
-                        if args.dflash_distill_stage != "none"
+                        if dflash_enabled
                         else None
                     ),
                 )

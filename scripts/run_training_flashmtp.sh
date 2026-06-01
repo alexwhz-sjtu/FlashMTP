@@ -80,8 +80,6 @@ LEARNING_RATE="${LEARNING_RATE:-6e-4}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
-# CE 位置衰减权重（paper Eq.4）；None 表示不启用
-BASE_LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
 
 # ========================================
 # Checkpoint / 恢复
@@ -95,11 +93,10 @@ if [ -n "${INIT_CKPT_DIR}" ] && { [ -n "${CKPT_DIR}" ] || [ -n "${RESUME}" ]; };
 fi
 
 # ========================================
-# DFlash 两阶段蒸馏 (none | stage1 | stage2)
+# DFlash 蒸馏（设置 DFLASH_TEACHER_PATH 即启用）
 # ========================================
 DFLASH_TEACHER_PATH="${DFLASH_TEACHER_PATH:-}"                         # DFlash teacher checkpoint 路径
 
-DFLASH_DISTILL_STAGE="${DFLASH_DISTILL_STAGE:-stage2}"                 # none: 关闭; stage1: 纯 KL; stage2: CE + gated KL
 DFLASH_ALIGN_MODE="${DFLASH_ALIGN_MODE:-final}"                        # final: 只蒸馏 logits; final+mid: 额外蒸馏中间层 hidden
 DFLASH_MID_ALIGN="${DFLASH_MID_ALIGN:-half}"                           # half: 中间一层; full: 除末层外所有层
 
@@ -108,9 +105,11 @@ DFLASH_DISTILL_WEIGHT="${DFLASH_DISTILL_WEIGHT:-1.0}"                  # KL 蒸�
 DFLASH_DISTILL_TEMPERATURE="${DFLASH_DISTILL_TEMPERATURE:-2.0}"        # KL 温度，越大 teacher 分布越平滑
 DFLASH_DISTILL_TOP_K="${DFLASH_DISTILL_TOP_K:-128}"                    # KL 候选 token 数：teacher top-k + true label
 
-DFLASH_STAGE2_CE_GATE="${DFLASH_STAGE2_CE_GATE:-all}"                  # stage2 CE 位置：all / correct_only
-DFLASH_STAGE1_LOSS_DECAY_GAMMA="${DFLASH_STAGE1_LOSS_DECAY_GAMMA:-${LOSS_DECAY_GAMMA:-14}}" # stage1 位置衰减 gamma
-DFLASH_STAGE2_LOSS_DECAY_GAMMA="${DFLASH_STAGE2_LOSS_DECAY_GAMMA:-${LOSS_DECAY_GAMMA:-7}}"  # stage2 位置衰减 gamma
+# CE 位置衰减权重（paper Eq.4）；0/空表示不启用
+LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA-7}"
+DFLASH_DISTILL_DECAY_GAMMA="${DFLASH_DISTILL_DECAY_GAMMA:-0}"          # KL/mid 位置衰减 gamma，0/空表示不开
+
+DFLASH_CE_GATE="${DFLASH_CE_GATE:-all}"                                # CE 位置：all / correct_only
 
 
 # 中间衰减
@@ -119,20 +118,10 @@ DFLASH_CE_WEIGHT="${DFLASH_CE_WEIGHT:-0.8}"                            # milesto
 DFLASH_DISTILL_MIN_SCALE="${DFLASH_DISTILL_MIN_SCALE:-0.2}"            # KL/mid 余弦衰减的最小保留比例，0 表示降到 0
 DFLASH_MID_WEIGHT="${DFLASH_MID_WEIGHT:-0.0}"                          # norm-hidden mid loss 权重，0 表示关闭
 
-
-case "${DFLASH_DISTILL_STAGE}" in
-    stage1) EFFECTIVE_LOSS_DECAY_GAMMA="${DFLASH_STAGE1_LOSS_DECAY_GAMMA}" ;;
-    stage2) EFFECTIVE_LOSS_DECAY_GAMMA="${DFLASH_STAGE2_LOSS_DECAY_GAMMA}" ;;
-    *)      EFFECTIVE_LOSS_DECAY_GAMMA="${BASE_LOSS_DECAY_GAMMA}" ;;
-esac
-
 # 用于 OUTPUT_DIR / WandB run id 的蒸馏配置摘要
 DFLASH_DISTILL_TAG="dnone"
-if [ "${DFLASH_DISTILL_STAGE}" != "none" ]; then
-    DFLASH_DISTILL_TAG="d${DFLASH_DISTILL_STAGE}_dklw${DFLASH_DISTILL_WEIGHT}_top${DFLASH_DISTILL_TOP_K}_g${EFFECTIVE_LOSS_DECAY_GAMMA}"
-    if [ "${DFLASH_DISTILL_STAGE}" = "stage2" ]; then
-        DFLASH_DISTILL_TAG="${DFLASH_DISTILL_TAG}_ce${DFLASH_STAGE2_CE_GATE}"
-    fi
+if [ -n "${DFLASH_TEACHER_PATH}" ]; then
+    DFLASH_DISTILL_TAG="dflash_dklw${DFLASH_DISTILL_WEIGHT}_top${DFLASH_DISTILL_TOP_K}_ceg${LOSS_DECAY_GAMMA:-none}_dkg${DFLASH_DISTILL_DECAY_GAMMA:-none}_ce${DFLASH_CE_GATE}"
     if [ "${DFLASH_ALIGN_MODE}" = "final+mid" ]; then
         DFLASH_DISTILL_TAG="${DFLASH_DISTILL_TAG}_mid${DFLASH_MID_ALIGN}_mw${DFLASH_MID_WEIGHT}_m${DFLASH_MILESTONE_EPOCH}_floor${DFLASH_DISTILL_MIN_SCALE}"
     fi
@@ -184,19 +173,18 @@ echo "  思考模式: ${ENABLE_THINKING}"
 echo "  数据子目录: ${CHS_CONCAT_MODE}"
 echo "  Pivot 融合: ${PIVOT_FUSE_MODE} (中间层数 N=${NUM_MIDDLE_LAYERS_N})"
 echo "  local_position: ${LOCAL_POSITION} (tag ${LOCAL_POSITION_TAG})"
-echo "  dflash_distill_stage: ${DFLASH_DISTILL_STAGE} (tag ${DFLASH_DISTILL_TAG})"
-if [ "${DFLASH_DISTILL_STAGE}" != "none" ]; then
+echo "  dflash_distill: $([ -n "${DFLASH_TEACHER_PATH}" ] && echo enabled || echo disabled) (tag ${DFLASH_DISTILL_TAG})"
+if [ -n "${DFLASH_TEACHER_PATH}" ]; then
     echo "  dflash_teacher_path: ${DFLASH_TEACHER_PATH}"
     echo "  dflash_distill: weight=${DFLASH_DISTILL_WEIGHT}, temperature=${DFLASH_DISTILL_TEMPERATURE}, top_k=${DFLASH_DISTILL_TOP_K}"
-    echo "  dflash_stage2_ce_gate: ${DFLASH_STAGE2_CE_GATE}"
+    echo "  dflash_distill_decay_gamma: ${DFLASH_DISTILL_DECAY_GAMMA:-未设置(不启用)}"
+    echo "  dflash_ce_gate: ${DFLASH_CE_GATE}"
     echo "  dflash_align_mode: ${DFLASH_ALIGN_MODE}"
     echo "  dflash_mid_align: ${DFLASH_MID_ALIGN}"
     echo "  dflash_mid_weight: ${DFLASH_MID_WEIGHT}"
     echo "  dflash_ce_weight: ${DFLASH_CE_WEIGHT}"
     echo "  dflash_milestone_epoch: ${DFLASH_MILESTONE_EPOCH}"
     echo "  dflash_distill_min_scale: ${DFLASH_DISTILL_MIN_SCALE}"
-    echo "  dflash_stage1_loss_decay_gamma: ${DFLASH_STAGE1_LOSS_DECAY_GAMMA}"
-    echo "  dflash_stage2_loss_decay_gamma: ${DFLASH_STAGE2_LOSS_DECAY_GAMMA}"
 fi
 echo "------------------------------------------"
 echo "目标模型: ${TARGET_MODEL}"
@@ -211,7 +199,7 @@ echo "  草稿模型层数: ${NUM_DRAFT_LAYERS}"
 echo "  块大小: ${BLOCK_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
-echo "  Loss衰减Gamma: ${EFFECTIVE_LOSS_DECAY_GAMMA:-未设置(不启用)}"
+echo "  CE Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
 echo "------------------------------------------"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
@@ -267,8 +255,8 @@ if [ -n "${EVAL_DATA_PATH}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --eval-data-path ${EVAL_DATA_PATH}"
 fi
 
-if [ -n "${EFFECTIVE_LOSS_DECAY_GAMMA}" ]; then
-    OPTIONAL_ARGS="${OPTIONAL_ARGS} --loss-decay-gamma ${EFFECTIVE_LOSS_DECAY_GAMMA}"
+if [ -n "${LOSS_DECAY_GAMMA}" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --loss-decay-gamma ${LOSS_DECAY_GAMMA}"
 fi
 
 if [ -n "${IS_PREFORMATTED}" ]; then
@@ -304,17 +292,15 @@ if [ "${LOCAL_POSITION_TAG}" = "lp1" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --local-position"
 fi
 
-if [ "${DFLASH_DISTILL_STAGE}" != "none" ]; then
-    if [ -z "${DFLASH_TEACHER_PATH}" ]; then
-        echo "错误: DFLASH_DISTILL_STAGE=${DFLASH_DISTILL_STAGE} 时必须设置 DFLASH_TEACHER_PATH"
-        exit 1
-    fi
+if [ -n "${DFLASH_TEACHER_PATH}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-teacher-path ${DFLASH_TEACHER_PATH}"
-    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-stage ${DFLASH_DISTILL_STAGE}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-weight ${DFLASH_DISTILL_WEIGHT}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-temperature ${DFLASH_DISTILL_TEMPERATURE}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-top-k ${DFLASH_DISTILL_TOP_K}"
-    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-stage2-ce-gate ${DFLASH_STAGE2_CE_GATE}"
+    if [ -n "${DFLASH_DISTILL_DECAY_GAMMA}" ]; then
+        OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-decay-gamma ${DFLASH_DISTILL_DECAY_GAMMA}"
+    fi
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-ce-gate ${DFLASH_CE_GATE}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-align-mode ${DFLASH_ALIGN_MODE}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-mid-align ${DFLASH_MID_ALIGN}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-mid-weight ${DFLASH_MID_WEIGHT}"

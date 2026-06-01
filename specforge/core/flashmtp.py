@@ -174,7 +174,7 @@ def create_flashmtp_block_mask(
 
 
 class OnlineFlashMTPModel(nn.Module):
-    """FlashMTP online training wrapper with block-wise CE loss."""
+    """FlashMTP online training wrapper with optional DFlash distillation."""
 
     def __init__(
             self,
@@ -188,11 +188,11 @@ class OnlineFlashMTPModel(nn.Module):
             loss_decay_gamma: Optional[float] = None,
             chs_concat_mode: str = "feature",
             dflash_teacher_model: Optional[nn.Module] = None,
-            dflash_distill_stage: str = "none",
             dflash_distill_weight: float = 1.0,
             dflash_distill_temperature: float = 2.0,
             dflash_distill_top_k: int = 128,
-            dflash_stage2_ce_gate: str = "all",
+            dflash_ce_gate: str = "all",
+            dflash_distill_decay_gamma: Optional[float] = None,
             dflash_align_mode: str = "final",
             dflash_mid_align: str = "half",
             dflash_mid_weight: float = 0.0,
@@ -211,11 +211,16 @@ class OnlineFlashMTPModel(nn.Module):
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
         self.dflash_teacher_model = dflash_teacher_model
-        self.dflash_distill_stage = dflash_distill_stage
+        self.use_dflash_distill = self.dflash_teacher_model is not None
         self.dflash_distill_weight = float(dflash_distill_weight)
         self.dflash_distill_temperature = float(dflash_distill_temperature)
         self.dflash_distill_top_k = int(dflash_distill_top_k)
-        self.dflash_stage2_ce_gate = dflash_stage2_ce_gate
+        self.dflash_ce_gate = dflash_ce_gate
+        self.dflash_distill_decay_gamma = (
+            None
+            if dflash_distill_decay_gamma is None
+            else float(dflash_distill_decay_gamma)
+        )
         self.dflash_align_mode = dflash_align_mode
         self.dflash_mid_align = dflash_mid_align
         self.dflash_mid_weight = float(dflash_mid_weight)
@@ -226,18 +231,12 @@ class OnlineFlashMTPModel(nn.Module):
         self.chs_concat_mode = "feature"
         self.draft_model.chs_concat_mode = "feature"
 
-        if self.dflash_distill_stage not in ("none", "stage1", "stage2"):
-            raise ValueError(
-                "dflash_distill_stage must be one of none, stage1, stage2"
-            )
-        if self.dflash_stage2_ce_gate not in ("all", "correct_only"):
-            raise ValueError("dflash_stage2_ce_gate must be one of all, correct_only")
+        if self.dflash_ce_gate not in ("all", "correct_only"):
+            raise ValueError("dflash_ce_gate must be one of all, correct_only")
         if self.dflash_align_mode not in ("final", "final+mid"):
             raise ValueError("dflash_align_mode must be one of final, final+mid")
         if self.dflash_mid_align not in ("full", "half"):
             raise ValueError("dflash_mid_align must be one of full, half")
-        if self.dflash_distill_stage != "none" and self.dflash_teacher_model is None:
-            raise ValueError("DFlash distillation requires dflash_teacher_model")
         if self.dflash_teacher_model is not None:
             self.dflash_teacher_model.eval()
             for param in self.dflash_teacher_model.parameters():
@@ -432,7 +431,7 @@ class OnlineFlashMTPModel(nn.Module):
         target_ids: torch.Tensor,
         distill_weight_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Top-k KL from DFlash to FlashMTP with stage-specific slot gating."""
+        """Top-k KL from DFlash to FlashMTP on teacher-correct slots."""
         device = student_logits.device
         zero = torch.zeros((), device=device, dtype=student_logits.dtype)
         valid = distill_weight_mask > 0
@@ -447,15 +446,14 @@ class OnlineFlashMTPModel(nn.Module):
         flat_student = student_logits.reshape(-1, vocab_size)
         flat_targets = target_ids.reshape(-1)
         flat_weights = distill_weight_mask.reshape(-1).float()
-        flat_valid = valid.reshape(-1)
-        valid_indices = flat_valid.nonzero(as_tuple=False).squeeze(-1)
-
-        teacher_top1 = flat_teacher.argmax(dim=-1)
-        if self.dflash_distill_stage == "stage2":
-            keep_valid = teacher_top1[valid_indices] == flat_targets[valid_indices]
-            active_indices = valid_indices[keep_valid]
-        else:
-            active_indices = valid_indices
+        prefix_correct_mask = self._compute_dflash_prefix_correct_mask(
+            teacher_logits=teacher_logits,
+            target_ids=target_ids,
+            valid_mask=distill_weight_mask,
+        )
+        active_indices = prefix_correct_mask.reshape(-1).nonzero(
+            as_tuple=False
+        ).squeeze(-1)
 
         if active_indices.numel() == 0:
             return zero, zero
@@ -498,16 +496,35 @@ class OnlineFlashMTPModel(nn.Module):
         teacher_top1 = teacher_logits.argmax(dim=-1)
         return (teacher_top1 == target_ids) & (valid_mask > 0)
 
+    def _compute_dflash_prefix_correct_mask(
+        self,
+        teacher_logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Continuous teacher-correct prefix inside each block, excluding anchor."""
+        correct = self._compute_dflash_correct_mask(
+            teacher_logits=teacher_logits,
+            target_ids=target_ids,
+            valid_mask=valid_mask,
+        )
+        prefix_correct = torch.zeros_like(correct, dtype=torch.bool)
+        if correct.size(-1) > 1:
+            prefix_correct[..., 1:] = correct[..., 1:].float().cumprod(
+                dim=-1
+            ).bool()
+        return prefix_correct
+
     def _compute_dflash_mid_loss(
         self,
         student_layer_hidden: tuple[torch.Tensor, ...],
         teacher_layer_hidden: tuple[torch.Tensor, ...],
-        correct_mask: torch.Tensor,
+        weight_mask: torch.Tensor,
         bsz: int,
         n_blk: int,
     ) -> torch.Tensor:
-        """Norm-hidden MSE on teacher-correct slots only."""
-        device = correct_mask.device
+        """Norm-hidden MSE on continuous teacher-correct prefix slots only."""
+        device = weight_mask.device
         zero = torch.zeros((), device=device, dtype=student_layer_hidden[-1].dtype)
         n_layers = min(len(student_layer_hidden), len(teacher_layer_hidden))
         if n_layers <= 1:
@@ -518,9 +535,9 @@ class OnlineFlashMTPModel(nn.Module):
         else:
             layer_ids = [min(n_layers // 2, n_layers - 2)]
 
-        active = correct_mask.reshape(-1).float()
-        active_count = active.sum()
-        if active_count <= 0:
+        flat_weights = weight_mask.reshape(-1).float()
+        weight_sum = flat_weights.sum()
+        if weight_sum <= 0:
             return zero
 
         losses = []
@@ -534,7 +551,10 @@ class OnlineFlashMTPModel(nn.Module):
             student_norm = F.normalize(student_h.float(), p=2, dim=-1, eps=1e-6)
             teacher_norm = F.normalize(teacher_h.float(), p=2, dim=-1, eps=1e-6)
             mse_per_slot = (student_norm - teacher_norm).pow(2).mean(dim=-1)
-            losses.append((mse_per_slot.reshape(-1) * active).sum() / (active_count + 1e-6))
+            losses.append(
+                (mse_per_slot.reshape(-1) * flat_weights).sum()
+                / (weight_sum + 1e-6)
+            )
 
         return torch.stack(losses).mean().to(student_layer_hidden[-1].dtype)
 
@@ -542,8 +562,8 @@ class OnlineFlashMTPModel(nn.Module):
         self,
         current_epoch: Optional[float],
     ) -> tuple[float, float, float]:
-        if self.dflash_distill_stage == "none":
-            return self.dflash_distill_weight, 0.0, 1.0
+        if not self.use_dflash_distill:
+            return 0.0, 0.0, 1.0
 
         epoch_value = 0.0 if current_epoch is None else float(current_epoch)
         if epoch_value < self.dflash_milestone_epoch:
@@ -631,7 +651,7 @@ class OnlineFlashMTPModel(nn.Module):
         need_mid_hidden = (
             self.dflash_align_mode == "final+mid"
             and self.dflash_mid_weight > 0
-            and self.dflash_distill_stage != "none"
+            and self.use_dflash_distill
         )
         draft_output = self.draft_model(
             position_ids=draft_position_ids,
@@ -680,25 +700,35 @@ class OnlineFlashMTPModel(nn.Module):
 
         binary_eval_mask = weight_mask.view(-1)
 
-        # --- Loss decay: exp(-(k-1)/γ) so k=1 (1st prediction) gets weight 1.0 ---
+        distill_weight_mask = weight_mask.clone()
+
+        # --- CE loss decay: exp(-(k-1)/γ) so k=1 (1st prediction) gets weight 1.0 ---
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
             k = torch.arange(self.block_size, device=device).view(1, 1, -1)
             decay_weights = torch.exp(-(k - 1).clamp(min=0).float() /
                                       self.loss_decay_gamma)
             weight_mask = weight_mask * decay_weights
 
-        distill_weight_mask = weight_mask.clone()
+        # --- KL/mid loss decay: disabled by default; independent from CE decay ---
+        if (
+            self.dflash_distill_decay_gamma is not None
+            and self.dflash_distill_decay_gamma > 0
+        ):
+            k = torch.arange(self.block_size, device=device).view(1, 1, -1)
+            decay_weights = torch.exp(
+                -(k - 1).clamp(min=0).float()
+                / self.dflash_distill_decay_gamma
+            )
+            distill_weight_mask = distill_weight_mask * decay_weights
+
         teacher_logits = None
         teacher_layer_hidden = None
         needs_dflash_teacher = (
-            self.dflash_distill_stage != "none"
+            self.use_dflash_distill
             and (
                 self.dflash_distill_weight > 0
                 or need_mid_hidden
-                or (
-                    self.dflash_distill_stage == "stage2"
-                    and self.dflash_stage2_ce_gate == "correct_only"
-                )
+                or self.dflash_ce_gate == "correct_only"
             )
         )
         if needs_dflash_teacher:
@@ -711,10 +741,7 @@ class OnlineFlashMTPModel(nn.Module):
                 output_hidden_states=need_mid_hidden,
             )
 
-        if (
-            self.dflash_distill_stage == "stage2"
-            and self.dflash_stage2_ce_gate == "correct_only"
-        ):
+        if self.use_dflash_distill and self.dflash_ce_gate == "correct_only":
             dflash_correct_mask = self._compute_dflash_correct_mask(
                 teacher_logits=teacher_logits,
                 target_ids=target_ids,
@@ -735,7 +762,7 @@ class OnlineFlashMTPModel(nn.Module):
         kl_weight, mid_weight, ce_weight = self._dflash_cosine_coefficients(
             current_epoch
         )
-        if self.dflash_distill_stage != "none":
+        if self.use_dflash_distill:
             loss = ce_loss * ce_weight
         else:
             loss = ce_loss
@@ -743,7 +770,7 @@ class OnlineFlashMTPModel(nn.Module):
         dflash_kl_loss = torch.zeros((), device=device, dtype=loss.dtype)
         dflash_kl_active_ratio = torch.zeros((), device=device, dtype=loss.dtype)
         dflash_mid_loss = torch.zeros((), device=device, dtype=loss.dtype)
-        if self.dflash_distill_stage != "none" and self.dflash_distill_weight > 0:
+        if self.use_dflash_distill and self.dflash_distill_weight > 0:
             if teacher_logits is None:
                 teacher_logits = self._compute_dflash_teacher_logits(
                     hidden_states=hidden_states,
@@ -760,10 +787,7 @@ class OnlineFlashMTPModel(nn.Module):
                 target_ids=target_ids,
                 distill_weight_mask=distill_weight_mask,
             )
-            if self.dflash_distill_stage == "stage1" and self.dflash_align_mode != "final+mid":
-                loss = kl_weight * dflash_kl_loss
-            else:
-                loss = loss + kl_weight * dflash_kl_loss
+            loss = loss + kl_weight * dflash_kl_loss
 
         if need_mid_hidden and mid_weight > 0:
             if teacher_logits is None or teacher_layer_hidden is None:
@@ -775,15 +799,18 @@ class OnlineFlashMTPModel(nn.Module):
                     seq_len=seq_len,
                     output_hidden_states=True,
                 )
-            dflash_correct_mask = self._compute_dflash_correct_mask(
+            dflash_prefix_correct_mask = self._compute_dflash_prefix_correct_mask(
                 teacher_logits=teacher_logits,
                 target_ids=target_ids,
                 valid_mask=distill_weight_mask,
             )
+            dflash_mid_weight_mask = (
+                distill_weight_mask * dflash_prefix_correct_mask.float()
+            )
             dflash_mid_loss = self._compute_dflash_mid_loss(
                 student_layer_hidden=student_layer_hidden,
                 teacher_layer_hidden=teacher_layer_hidden,
-                correct_mask=dflash_correct_mask,
+                weight_mask=dflash_mid_weight_mask,
                 bsz=bsz,
                 n_blk=anchor_positions.size(1),
             )
