@@ -1,18 +1,22 @@
 #!/bin/bash
-# FlashMTP 训练启动脚本（单目标 CE，无 DFlash++ 的 L_dflash/L_con 等多损失）
+# FlashMTP 训练启动脚本（单目标 CE + 可选 DFlash 蒸馏）
 
 set -e
 
-# 自动激活虚拟环境
+# ========================================
+# 环境初始化
+# ========================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
 if [ -f "${PROJECT_DIR}/.venv/bin/activate" ]; then
     source "${PROJECT_DIR}/.venv/bin/activate"
 fi
-
 cd "${PROJECT_DIR}"
 
-
+# ========================================
+# 命令行参数
+# ========================================
+# --dt: 运行环境 (qz | a800 | h100)，决定默认数据/模型路径
 while [[ $# -gt 0 ]]; do
     case $1 in
         --dt) DT="$2"; shift 2 ;;
@@ -26,19 +30,62 @@ if [[ "$DT" != "qz" && "$DT" != "a800" && "$DT" != "h100" ]]; then
 fi
 
 # ========================================
-# 主要训练参数
+# 分布式 / GPU
 # ========================================
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+MASTER_PORT="${MASTER_PORT:-29501}"
+TP_SIZE="${TP_SIZE:-1}"
+DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
 
+# ========================================
+# 模型结构
+# ========================================
+BLOCK_SIZE="${BLOCK_SIZE:-16}"
+NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
+NUM_ANCHORS="${NUM_ANCHORS:-512}"
+NUM_MIDDLE_LAYERS_N="${NUM_MIDDLE_LAYERS_N:-5}"
+PIVOT_FUSE_MODE="${PIVOT_FUSE_MODE:-prefix_condition}"
+CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
+TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
+
+# draft 块内 position_ids：CHS RoPE 前缀全 0，draft 为 1..block_size
+LOCAL_POSITION="${LOCAL_POSITION:-true}"
+LOCAL_POSITION_TAG="lp0"
+case "$(echo "${LOCAL_POSITION}" | tr '[:upper:]' '[:lower:]')" in
+    true|1|yes) LOCAL_POSITION_TAG="lp1" ;;
+esac
+
+# ========================================
+# 数据集
+# ========================================
+DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}"
+ENABLE_THINKING="${ENABLE_THINKING:-off}"
+CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen}"
+IS_PREFORMATTED="${IS_PREFORMATTED:-}"
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
+BUILD_DATASET_NUM_PROC="${BUILD_DATASET_NUM_PROC:-8}"
+CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
+EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
+
+# ========================================
+# 训练超参
+# ========================================
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
-CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
-PIVOT_FUSE_MODE="${PIVOT_FUSE_MODE:-prefix_condition}"
-NUM_MIDDLE_LAYERS_N="${NUM_MIDDLE_LAYERS_N:-5}"
-NUM_ANCHORS="${NUM_ANCHORS:-512}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
+LEARNING_RATE="${LEARNING_RATE:-6e-4}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
+MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
-# 恢复训练
+# CE 位置衰减权重（paper Eq.4）；None 表示不启用
+BASE_LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
+
+# ========================================
+# Checkpoint / 恢复
+# ========================================
 RESUME="${RESUME:-}"
 CKPT_DIR="${CKPT_DIR:-}"
 INIT_CKPT_DIR="${INIT_CKPT_DIR:-}"
@@ -48,130 +95,81 @@ if [ -n "${INIT_CKPT_DIR}" ] && { [ -n "${CKPT_DIR}" ] || [ -n "${RESUME}" ]; };
 fi
 
 # ========================================
-# 主要数据集参数
+# DFlash 两阶段蒸馏 (none | stage1 | stage2)
 # ========================================
-# 数据特征参数
-DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}"
-ENABLE_THINKING="${ENABLE_THINKING:-off}"
+DFLASH_TEACHER_PATH="${DFLASH_TEACHER_PATH:-}"                         # DFlash teacher checkpoint 路径
 
-# 草稿层数：默认目录名/ WandB id/ run name 中均带 nlayers${NUM_DRAFT_LAYERS}
-NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
+DFLASH_DISTILL_STAGE="${DFLASH_DISTILL_STAGE:-stage2}"                 # none: 关闭; stage1: 纯 KL; stage2: CE + gated KL
+DFLASH_ALIGN_MODE="${DFLASH_ALIGN_MODE:-final}"                        # final: 只蒸馏 logits; final+mid: 额外蒸馏中间层 hidden
+DFLASH_MID_ALIGN="${DFLASH_MID_ALIGN:-half}"                           # half: 中间一层; full: 除末层外所有层
 
-# 草稿块内 position_ids：CHS RoPE 前缀全 0，draft 为 1..block_size（默认 false 为全局 anchor 位置）
-LOCAL_POSITION="${LOCAL_POSITION:-true}"
-LOCAL_POSITION_TAG="lp0"
-case "$(echo "${LOCAL_POSITION}" | tr '[:upper:]' '[:lower:]')" in
-    true|1|yes) LOCAL_POSITION_TAG="lp1" ;;
-esac
+# 初始权重
+DFLASH_DISTILL_WEIGHT="${DFLASH_DISTILL_WEIGHT:-1.0}"                  # KL 蒸馏损失权重
+DFLASH_DISTILL_TEMPERATURE="${DFLASH_DISTILL_TEMPERATURE:-2.0}"        # KL 温度，越大 teacher 分布越平滑
+DFLASH_DISTILL_TOP_K="${DFLASH_DISTILL_TOP_K:-128}"                    # KL 候选 token 数：teacher top-k + true label
 
-# Teacher-match loss cap：p_draft/max(p_teacher,0.5)>1 时将该位置 CE 权重压到块尾槽（默认关闭）
-LOSS_TEACHER_MATCH_CAP="${LOSS_TEACHER_MATCH_CAP:-false}"
-TEACHER_MATCH_CAP_TAG="tmc0"
-case "$(echo "${LOSS_TEACHER_MATCH_CAP}" | tr '[:upper:]' '[:lower:]')" in
-    true|1|yes) TEACHER_MATCH_CAP_TAG="tmc1" ;;
-esac
+DFLASH_STAGE2_CE_GATE="${DFLASH_STAGE2_CE_GATE:-all}"                  # stage2 CE 位置：all / correct_only
+DFLASH_STAGE1_LOSS_DECAY_GAMMA="${DFLASH_STAGE1_LOSS_DECAY_GAMMA:-${LOSS_DECAY_GAMMA:-14}}" # stage1 位置衰减 gamma
+DFLASH_STAGE2_LOSS_DECAY_GAMMA="${DFLASH_STAGE2_LOSS_DECAY_GAMMA:-${LOSS_DECAY_GAMMA:-7}}"  # stage2 位置衰减 gamma
 
-# 首个预测 token：draft 末层 hidden 与 target 末层 hidden 的 MSE，权重 w1_mse（0 关闭）
-W1_MSE="${W1_MSE:-0}"
-W1_MSE_TAG="w1mse0"
-if awk "BEGIN {exit !(${W1_MSE} > 0)}"; then
-    W1_MSE_TAG="w1mse${W1_MSE}"
-fi
 
-# DFlash 两阶段蒸馏：none | stage1 | stage2（默认关闭）
-DFLASH_TEACHER_PATH="${DFLASH_TEACHER_PATH:-}"
-DFLASH_DISTILL_STAGE="${DFLASH_DISTILL_STAGE:-none}"
-DFLASH_DISTILL_WEIGHT="${DFLASH_DISTILL_WEIGHT:-1.0}"
-DFLASH_DISTILL_TEMPERATURE="${DFLASH_DISTILL_TEMPERATURE:-2.0}"
-DFLASH_DISTILL_TOP_K="${DFLASH_DISTILL_TOP_K:-128}"
-DFLASH_STAGE2_CE_GATE="${DFLASH_STAGE2_CE_GATE:-all}"
-BASE_LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
-DFLASH_STAGE1_LOSS_DECAY_GAMMA="${DFLASH_STAGE1_LOSS_DECAY_GAMMA:-${LOSS_DECAY_GAMMA:-14}}"
-DFLASH_STAGE2_LOSS_DECAY_GAMMA="${DFLASH_STAGE2_LOSS_DECAY_GAMMA:-${LOSS_DECAY_GAMMA:-7}}"
+# 中间衰减
+DFLASH_MILESTONE_EPOCH="${DFLASH_MILESTONE_EPOCH:-0.0}"                # DFlash 蒸馏中余弦切换开始的 epoch
+DFLASH_CE_WEIGHT="${DFLASH_CE_WEIGHT:-0.8}"                            # milestone 后 CE 最终目标权重
+DFLASH_DISTILL_MIN_SCALE="${DFLASH_DISTILL_MIN_SCALE:-0.2}"            # KL/mid 余弦衰减的最小保留比例，0 表示降到 0
+DFLASH_MID_WEIGHT="${DFLASH_MID_WEIGHT:-0.0}"                          # norm-hidden mid loss 权重，0 表示关闭
+
+
 case "${DFLASH_DISTILL_STAGE}" in
-    stage1)
-        EFFECTIVE_LOSS_DECAY_GAMMA="${DFLASH_STAGE1_LOSS_DECAY_GAMMA}"
-        ;;
-    stage2)
-        EFFECTIVE_LOSS_DECAY_GAMMA="${DFLASH_STAGE2_LOSS_DECAY_GAMMA}"
-        ;;
-    *)
-        EFFECTIVE_LOSS_DECAY_GAMMA="${BASE_LOSS_DECAY_GAMMA}"
-        ;;
+    stage1) EFFECTIVE_LOSS_DECAY_GAMMA="${DFLASH_STAGE1_LOSS_DECAY_GAMMA}" ;;
+    stage2) EFFECTIVE_LOSS_DECAY_GAMMA="${DFLASH_STAGE2_LOSS_DECAY_GAMMA}" ;;
+    *)      EFFECTIVE_LOSS_DECAY_GAMMA="${BASE_LOSS_DECAY_GAMMA}" ;;
 esac
 
+# 用于 OUTPUT_DIR / WandB run id 的蒸馏配置摘要
 DFLASH_DISTILL_TAG="dnone"
 if [ "${DFLASH_DISTILL_STAGE}" != "none" ]; then
     DFLASH_DISTILL_TAG="d${DFLASH_DISTILL_STAGE}_dklw${DFLASH_DISTILL_WEIGHT}_top${DFLASH_DISTILL_TOP_K}_g${EFFECTIVE_LOSS_DECAY_GAMMA}"
     if [ "${DFLASH_DISTILL_STAGE}" = "stage2" ]; then
         DFLASH_DISTILL_TAG="${DFLASH_DISTILL_TAG}_ce${DFLASH_STAGE2_CE_GATE}"
     fi
+    if [ "${DFLASH_ALIGN_MODE}" = "final+mid" ]; then
+        DFLASH_DISTILL_TAG="${DFLASH_DISTILL_TAG}_mid${DFLASH_MID_ALIGN}_mw${DFLASH_MID_WEIGHT}_m${DFLASH_MILESTONE_EPOCH}_floor${DFLASH_DISTILL_MIN_SCALE}"
+    fi
 fi
 
 # ========================================
-# 默认参数（通常不需要修改）
+# 日志 / 保存 / Tracker
 # ========================================
-
-# GPU 设置
-MASTER_PORT="${MASTER_PORT:-29501}"
-TP_SIZE="${TP_SIZE:-1}"
-DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
-
-# 模型参数（OUTPUT_DIR 依赖 BLOCK_SIZE，须早于 dt 分支）
-BLOCK_SIZE="${BLOCK_SIZE:-16}"
-
-if [ "$DT" = "qz" ]; then
-    # export NNODES=2
-    # export NODE_RANK=${RANK:-0}
-    export WANDB_MODE=offline
-    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${W1_MSE_TAG}_${DFLASH_DISTILL_TAG}}"
-    TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
-elif [ "$DT" = "h100" ]; then
-    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-../training_data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_${PIVOT_FUSE_MODE}_fuse$((NUM_MIDDLE_LAYERS_N + 2))_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${W1_MSE_TAG}_${DFLASH_DISTILL_TAG}}"
-    TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
-else
-    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${W1_MSE_TAG}_${DFLASH_DISTILL_TAG}}"
-    TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
-fi
-
-
-TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
-
-# 训练参数
-BATCH_SIZE="${BATCH_SIZE:-1}"
-ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
-LEARNING_RATE="${LEARNING_RATE:-6e-4}"
-WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
-MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
-
-EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
-CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
-
-ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
-# teacher-match cap 开关见上方 LOSS_TEACHER_MATCH_CAP（默认 false）
-
-# 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-5000}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-5000}"
-
-# Tracker 参数
 REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-exp}"
-WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
-# 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${W1_MSE_TAG}_${DFLASH_DISTILL_TAG}}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}_${LOCAL_POSITION_TAG}_${TEACHER_MATCH_CAP_TAG}_${W1_MSE_TAG}_${DFLASH_DISTILL_TAG}}"
+WANDB_DIR="${WANDB_DIR:-./wandb}"
 
-# 数据参数
-CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen}"
-IS_PREFORMATTED="${IS_PREFORMATTED:-}"
-DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
-BUILD_DATASET_NUM_PROC="${BUILD_DATASET_NUM_PROC:-8}"
+# ========================================
+# 环境相关默认路径 (--dt)
+# ========================================
+RUN_SUFFIX="${LOCAL_POSITION_TAG}_${DFLASH_DISTILL_TAG}"
 
+if [ "$DT" = "qz" ]; then
+    export WANDB_MODE=offline
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${RUN_SUFFIX}}"
+    TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
+elif [ "$DT" = "h100" ]; then
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-../training_data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_${PIVOT_FUSE_MODE}_fuse$((NUM_MIDDLE_LAYERS_N + 2))_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${RUN_SUFFIX}}"
+    TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
+else
+    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${RUN_SUFFIX}}"
+    TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
+fi
+
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}_${RUN_SUFFIX}}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}_${RUN_SUFFIX}}"
 
 # ========================================
 # 显示配置
@@ -185,14 +183,18 @@ echo "  样本数量: ${DATA_NUM_SAMPLES}"
 echo "  思考模式: ${ENABLE_THINKING}"
 echo "  数据子目录: ${CHS_CONCAT_MODE}"
 echo "  Pivot 融合: ${PIVOT_FUSE_MODE} (中间层数 N=${NUM_MIDDLE_LAYERS_N})"
-echo "  local_position: ${LOCAL_POSITION} (tag ${LOCAL_POSITION_TAG}; draft 1..block, CHS rope 0)"
-echo "  loss_teacher_match_cap: ${LOSS_TEACHER_MATCH_CAP} (tag ${TEACHER_MATCH_CAP_TAG})"
-echo "  w1_mse: ${W1_MSE} (tag ${W1_MSE_TAG}; first-pred hidden MSE weight)"
+echo "  local_position: ${LOCAL_POSITION} (tag ${LOCAL_POSITION_TAG})"
 echo "  dflash_distill_stage: ${DFLASH_DISTILL_STAGE} (tag ${DFLASH_DISTILL_TAG})"
 if [ "${DFLASH_DISTILL_STAGE}" != "none" ]; then
     echo "  dflash_teacher_path: ${DFLASH_TEACHER_PATH}"
     echo "  dflash_distill: weight=${DFLASH_DISTILL_WEIGHT}, temperature=${DFLASH_DISTILL_TEMPERATURE}, top_k=${DFLASH_DISTILL_TOP_K}"
     echo "  dflash_stage2_ce_gate: ${DFLASH_STAGE2_CE_GATE}"
+    echo "  dflash_align_mode: ${DFLASH_ALIGN_MODE}"
+    echo "  dflash_mid_align: ${DFLASH_MID_ALIGN}"
+    echo "  dflash_mid_weight: ${DFLASH_MID_WEIGHT}"
+    echo "  dflash_ce_weight: ${DFLASH_CE_WEIGHT}"
+    echo "  dflash_milestone_epoch: ${DFLASH_MILESTONE_EPOCH}"
+    echo "  dflash_distill_min_scale: ${DFLASH_DISTILL_MIN_SCALE}"
     echo "  dflash_stage1_loss_decay_gamma: ${DFLASH_STAGE1_LOSS_DECAY_GAMMA}"
     echo "  dflash_stage2_loss_decay_gamma: ${DFLASH_STAGE2_LOSS_DECAY_GAMMA}"
 fi
@@ -243,7 +245,7 @@ fi
 echo "=========================================="
 echo ""
 
-# 如果输出目录已存在，自动添加数字后缀
+# 输出目录冲突时自动追加数字后缀
 original_output_dir="${OUTPUT_DIR}"
 suffix=1
 while [ -d "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null)" ]; do
@@ -254,22 +256,11 @@ if [ "${OUTPUT_DIR}" != "${original_output_dir}" ]; then
     echo "警告: 输出目录 ${original_output_dir} 已存在且非空，自动切换到: ${OUTPUT_DIR}"
 fi
 
-# 创建输出目录
-mkdir -p ${OUTPUT_DIR}
-mkdir -p ${CACHE_DIR}
-mkdir -p ${WANDB_DIR}
+mkdir -p "${OUTPUT_DIR}" "${CACHE_DIR}" "${WANDB_DIR}"
 
 # ========================================
-# 训练
+# 构建可选 CLI 参数
 # ========================================
-echo ""
-echo "==> 开始训练 FlashMTP"
-echo ""
-
-# train_flashmtp.py 始终 init_distributed()，需 torchrun 提供 RANK/WORLD_SIZE/LOCAL_RANK
-LAUNCHER=(torchrun --nproc_per_node "${NPROC_PER_NODE}" --master_port "${MASTER_PORT}")
-
-# 构建可选参数
 OPTIONAL_ARGS=""
 
 if [ -n "${EVAL_DATA_PATH}" ]; then
@@ -313,14 +304,6 @@ if [ "${LOCAL_POSITION_TAG}" = "lp1" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --local-position"
 fi
 
-if [ "${TEACHER_MATCH_CAP_TAG}" = "tmc1" ]; then
-    OPTIONAL_ARGS="${OPTIONAL_ARGS} --loss-teacher-match-cap"
-fi
-
-if awk "BEGIN {exit !(${W1_MSE} > 0)}"; then
-    OPTIONAL_ARGS="${OPTIONAL_ARGS} --w1-mse ${W1_MSE}"
-fi
-
 if [ "${DFLASH_DISTILL_STAGE}" != "none" ]; then
     if [ -z "${DFLASH_TEACHER_PATH}" ]; then
         echo "错误: DFLASH_DISTILL_STAGE=${DFLASH_DISTILL_STAGE} 时必须设置 DFLASH_TEACHER_PATH"
@@ -332,42 +315,55 @@ if [ "${DFLASH_DISTILL_STAGE}" != "none" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-temperature ${DFLASH_DISTILL_TEMPERATURE}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-top-k ${DFLASH_DISTILL_TOP_K}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-stage2-ce-gate ${DFLASH_STAGE2_CE_GATE}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-align-mode ${DFLASH_ALIGN_MODE}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-mid-align ${DFLASH_MID_ALIGN}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-mid-weight ${DFLASH_MID_WEIGHT}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-ce-weight ${DFLASH_CE_WEIGHT}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-milestone-epoch ${DFLASH_MILESTONE_EPOCH}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-min-scale ${DFLASH_DISTILL_MIN_SCALE}"
 fi
 
-# 运行训练
+# ========================================
+# 启动训练
+# ========================================
+echo ""
+echo "==> 开始训练 FlashMTP"
+echo ""
+
+LAUNCHER=(torchrun --nproc_per_node "${NPROC_PER_NODE}" --master_port "${MASTER_PORT}")
+
 EXIT_CODE=0
 "${LAUNCHER[@]}" ./scripts/train_flashmtp.py \
-    --target-model-path ${TARGET_MODEL} \
-    --target-model-backend ${TARGET_MODEL_BACKEND} \
+    --target-model-path "${TARGET_MODEL}" \
+    --target-model-backend "${TARGET_MODEL_BACKEND}" \
     --train-data-path "${TRAIN_DATA_PATH}" \
-    --output-dir ${OUTPUT_DIR} \
-    --cache-dir ${CACHE_DIR} \
-    --num-draft-layers ${NUM_DRAFT_LAYERS} \
-    --block-size ${BLOCK_SIZE} \
-    --num-anchors ${NUM_ANCHORS} \
-    --attention-backend ${ATTENTION_BACKEND} \
-    --learning-rate ${LEARNING_RATE} \
-    --warmup-ratio ${WARMUP_RATIO} \
-    --num-epochs ${NUM_EPOCHS} \
-    --batch-size ${BATCH_SIZE} \
-    --accumulation-steps ${ACCUMULATION_STEPS} \
-    --max-grad-norm ${MAX_GRAD_NORM} \
-    --max-length ${MAX_LENGTH} \
-    --log-interval ${LOG_INTERVAL} \
-    --save-interval ${SAVE_INTERVAL} \
-    --eval-interval ${EVAL_INTERVAL} \
-    --chat-template ${CHAT_TEMPLATE} \
-    --dataloader-num-workers ${DATALOADER_NUM_WORKERS} \
-    --build-dataset-num-proc ${BUILD_DATASET_NUM_PROC} \
-    --tp-size ${TP_SIZE} \
-    --dist-timeout ${DIST_TIMEOUT} \
-    --chs-concat-mode ${CHS_CONCAT_MODE} \
-    --pivot-fuse-mode ${PIVOT_FUSE_MODE} \
-    --num-middle-layers-n ${NUM_MIDDLE_LAYERS_N} \
+    --output-dir "${OUTPUT_DIR}" \
+    --cache-dir "${CACHE_DIR}" \
+    --num-draft-layers "${NUM_DRAFT_LAYERS}" \
+    --block-size "${BLOCK_SIZE}" \
+    --num-anchors "${NUM_ANCHORS}" \
+    --attention-backend "${ATTENTION_BACKEND}" \
+    --learning-rate "${LEARNING_RATE}" \
+    --warmup-ratio "${WARMUP_RATIO}" \
+    --num-epochs "${NUM_EPOCHS}" \
+    --batch-size "${BATCH_SIZE}" \
+    --accumulation-steps "${ACCUMULATION_STEPS}" \
+    --max-grad-norm "${MAX_GRAD_NORM}" \
+    --max-length "${MAX_LENGTH}" \
+    --log-interval "${LOG_INTERVAL}" \
+    --save-interval "${SAVE_INTERVAL}" \
+    --eval-interval "${EVAL_INTERVAL}" \
+    --chat-template "${CHAT_TEMPLATE}" \
+    --dataloader-num-workers "${DATALOADER_NUM_WORKERS}" \
+    --build-dataset-num-proc "${BUILD_DATASET_NUM_PROC}" \
+    --tp-size "${TP_SIZE}" \
+    --dist-timeout "${DIST_TIMEOUT}" \
+    --chs-concat-mode "${CHS_CONCAT_MODE}" \
+    --pivot-fuse-mode "${PIVOT_FUSE_MODE}" \
+    --num-middle-layers-n "${NUM_MIDDLE_LAYERS_N}" \
     --seed 42 \
     ${OPTIONAL_ARGS} 2>&1 || EXIT_CODE=$?
 
-# 检查训练是否成功
 if [ $EXIT_CODE -ne 0 ]; then
     echo ""
     echo "=========================================="

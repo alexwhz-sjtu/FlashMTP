@@ -441,9 +441,11 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
         rotary_position_ids: Optional[torch.LongTensor] = None,
+        output_hidden_states: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
+        all_hidden_states = [] if output_hidden_states else None
         assert target_hidden is not None and target_hidden.ndim == 4
         noise_len = hidden_states.shape[1]
         if position_ids.shape[1] != noise_len:
@@ -469,7 +471,12 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-        return self.norm(hidden_states)
+            if output_hidden_states:
+                all_hidden_states.append(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        if output_hidden_states:
+            return hidden_states, tuple(all_hidden_states)
+        return hidden_states
 
     @staticmethod
     def _format_token_topk(

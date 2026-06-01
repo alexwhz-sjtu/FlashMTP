@@ -249,9 +249,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         target_hidden: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
+        output_hidden_states: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
+        all_hidden_states = [] if output_hidden_states else None
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
@@ -265,7 +267,12 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-        return self.norm(hidden_states)
+            if output_hidden_states:
+                all_hidden_states.append(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        if output_hidden_states:
+            return hidden_states, tuple(all_hidden_states)
+        return hidden_states
 
     @torch.inference_mode()
     def spec_generate(

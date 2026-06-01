@@ -95,23 +95,10 @@ def parse_args():
         "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
     )
     model_group.add_argument(
-        "--loss-teacher-match-cap",
-        action="store_true",
-        help="When p_draft(y*)/max(p_teacher(y*),0.5) > 1, set that slot's CE weight to the "
-        "last speculative slot's weight within the same parallel block (after decay).",
-    )
-    model_group.add_argument(
         "--local-position",
         action="store_true",
         help="Draft uses block-local position ids 1..block_size (repeated per parallel "
         "block in training). CHS rotary prefix uses zeros. Target model still uses global ids.",
-    )
-    model_group.add_argument(
-        "--w1-mse",
-        type=float,
-        default=0.0,
-        help="Weight for MSE between draft last-layer hidden and target last-layer "
-        "hidden at the first predicted token (block position 1). 0 disables.",
     )
     model_group.add_argument(
         "--dflash-teacher-path",
@@ -151,6 +138,46 @@ def parse_args():
         choices=["all", "correct_only"],
         help="Stage2 CE mask policy. all keeps CE on every valid slot; "
         "correct_only applies CE only where DFlash top1 equals the true label.",
+    )
+    model_group.add_argument(
+        "--dflash-align-mode",
+        type=str,
+        default="final",
+        choices=["final", "final+mid"],
+        help="DFlash alignment mode. final keeps existing final-logit distillation; "
+        "final+mid adds teacher-correct norm-hidden middle-layer alignment.",
+    )
+    model_group.add_argument(
+        "--dflash-mid-align",
+        type=str,
+        default="half",
+        choices=["full", "half"],
+        help="Middle-layer hidden alignment policy for --dflash-align-mode final+mid.",
+    )
+    model_group.add_argument(
+        "--dflash-mid-weight",
+        type=float,
+        default=0.0,
+        help="Weight for teacher-correct normalized hidden MSE in final+mid mode.",
+    )
+    model_group.add_argument(
+        "--dflash-ce-weight",
+        type=float,
+        default=1.0,
+        help="Target CE weight reached after the final+mid cosine transition.",
+    )
+    model_group.add_argument(
+        "--dflash-milestone-epoch",
+        type=float,
+        default=0.0,
+        help="Milestone epoch for final+mid cosine transition from distillation to CE.",
+    )
+    model_group.add_argument(
+        "--dflash-distill-min-scale",
+        type=float,
+        default=0.0,
+        help="Minimum cosine scale for KL/mid weights during DFlash distillation. "
+        "0.1 keeps 10%% of DFlash distill/mid weights at the end.",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -416,10 +443,13 @@ def record_metrics(
     train_dataloader=None,
     mode: str = "train",
     prefix_acc: float | None = None,
-    mse_loss: float | None = None,
     ce_loss: float | None = None,
     dflash_kl_loss: float | None = None,
     dflash_kl_active_ratio: float | None = None,
+    dflash_mid_loss: float | None = None,
+    dflash_kl_weight: float | None = None,
+    dflash_mid_weight: float | None = None,
+    dflash_ce_weight: float | None = None,
 ) -> None:
     logdict = {}
 
@@ -430,26 +460,38 @@ def record_metrics(
     logdict[f"{mode}/accuracy"] = accuracy
     if prefix_acc is not None:
         logdict[f"{mode}/prefix_acc"] = prefix_acc
-    if mse_loss is not None:
-        logdict[f"{mode}/w1_mse_loss"] = mse_loss
     if ce_loss is not None:
         logdict[f"{mode}/ce_loss"] = ce_loss
     if dflash_kl_loss is not None:
         logdict[f"{mode}/dflash_kl_loss"] = dflash_kl_loss
     if dflash_kl_active_ratio is not None:
         logdict[f"{mode}/dflash_kl_active_ratio"] = dflash_kl_active_ratio
+    if dflash_mid_loss is not None:
+        logdict[f"{mode}/dflash_mid_loss"] = dflash_mid_loss
+    if dflash_kl_weight is not None:
+        logdict[f"{mode}/dflash_kl_weight"] = dflash_kl_weight
+    if dflash_mid_weight is not None:
+        logdict[f"{mode}/dflash_mid_weight"] = dflash_mid_weight
+    if dflash_ce_weight is not None:
+        logdict[f"{mode}/dflash_ce_weight"] = dflash_ce_weight
 
     extra = ""
     if prefix_acc is not None:
         extra = f", PrefixAcc: {prefix_acc:.4f}"
-    if mse_loss is not None:
-        extra += f", W1MSE: {mse_loss:.4f}"
     if ce_loss is not None:
         extra += f", CE: {ce_loss:.4f}"
     if dflash_kl_loss is not None:
         extra += f", DFlashKL: {dflash_kl_loss:.4f}"
     if dflash_kl_active_ratio is not None:
         extra += f", DFlashActive: {dflash_kl_active_ratio:.4f}"
+    if dflash_mid_loss is not None:
+        extra += f", DFlashMid: {dflash_mid_loss:.4f}"
+    if dflash_kl_weight is not None:
+        extra += f", Wkl: {dflash_kl_weight:.4f}"
+    if dflash_mid_weight is not None:
+        extra += f", Wmid: {dflash_mid_weight:.4f}"
+    if dflash_ce_weight is not None:
+        extra += f", Wce: {dflash_ce_weight:.4f}"
     print_on_rank0(
         f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}{extra}"
     )
@@ -567,10 +609,6 @@ def main():
     draft_model.config.flashmtp_config["local_position"] = bool(
         getattr(draft_model, "local_position", False)
     )
-    draft_model.config.flashmtp_config["loss_teacher_match_cap"] = bool(
-        args.loss_teacher_match_cap
-    )
-    draft_model.config.flashmtp_config["w1_mse"] = float(args.w1_mse)
     draft_model.config.flashmtp_config["dflash_distill_stage"] = args.dflash_distill_stage
     draft_model.config.flashmtp_config["dflash_distill_weight"] = float(
         args.dflash_distill_weight
@@ -583,6 +621,20 @@ def main():
     )
     draft_model.config.flashmtp_config["dflash_stage2_ce_gate"] = (
         args.dflash_stage2_ce_gate
+    )
+    draft_model.config.flashmtp_config["dflash_align_mode"] = args.dflash_align_mode
+    draft_model.config.flashmtp_config["dflash_mid_align"] = args.dflash_mid_align
+    draft_model.config.flashmtp_config["dflash_mid_weight"] = float(
+        args.dflash_mid_weight
+    )
+    draft_model.config.flashmtp_config["dflash_ce_weight"] = float(
+        args.dflash_ce_weight
+    )
+    draft_model.config.flashmtp_config["dflash_milestone_epoch"] = float(
+        args.dflash_milestone_epoch
+    )
+    draft_model.config.flashmtp_config["dflash_distill_min_scale"] = float(
+        args.dflash_distill_min_scale
     )
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
@@ -619,6 +671,12 @@ def main():
             f"temperature={args.dflash_distill_temperature}, "
             f"top_k={args.dflash_distill_top_k}, "
             f"stage2_ce_gate={args.dflash_stage2_ce_gate}, "
+            f"align_mode={args.dflash_align_mode}, "
+            f"mid_align={args.dflash_mid_align}, "
+            f"mid_weight={args.dflash_mid_weight}, "
+            f"ce_weight={args.dflash_ce_weight}, "
+            f"milestone_epoch={args.dflash_milestone_epoch}, "
+            f"distill_min_scale={args.dflash_distill_min_scale}, "
             f"attention_backend={dflash_teacher_model.config._attn_implementation}, "
             f"teacher_layers={dflash_teacher_model.target_layer_ids}"
         )
@@ -633,19 +691,20 @@ def main():
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
         chs_concat_mode="feature",
-        loss_teacher_match_cap=args.loss_teacher_match_cap,
-        w1_mse=args.w1_mse,
         dflash_teacher_model=dflash_teacher_model,
         dflash_distill_stage=args.dflash_distill_stage,
         dflash_distill_weight=args.dflash_distill_weight,
         dflash_distill_temperature=args.dflash_distill_temperature,
         dflash_distill_top_k=args.dflash_distill_top_k,
         dflash_stage2_ce_gate=args.dflash_stage2_ce_gate,
+        dflash_align_mode=args.dflash_align_mode,
+        dflash_mid_align=args.dflash_mid_align,
+        dflash_mid_weight=args.dflash_mid_weight,
+        dflash_ce_weight=args.dflash_ce_weight,
+        dflash_milestone_epoch=args.dflash_milestone_epoch,
+        dflash_distill_min_scale=args.dflash_distill_min_scale,
+        dflash_total_epochs=args.num_epochs,
     )
-    print_on_rank0(
-        f"w1_mse={args.w1_mse}"
-    )
-
     flashmtp_model = FSDP(
         flashmtp_model,
         use_orig_params=True,
@@ -715,14 +774,18 @@ def main():
                 loss,
                 accuracy,
                 prefix_acc,
-                mse_loss,
                 ce_loss,
                 dflash_kl_loss,
                 dflash_kl_active_ratio,
+                dflash_mid_loss,
+                dflash_kl_weight,
+                dflash_mid_weight,
+                dflash_ce_weight,
             ) = flashmtp_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
+                current_epoch=epoch + (step_in_epoch / max(len(train_dataloader), 1)),
             )
 
             (loss / args.accumulation_steps).backward()
@@ -734,24 +797,33 @@ def main():
                 loss_log = loss.clone()
                 acc_log = accuracy.clone()
                 pfx_log = prefix_acc.clone()
-                mse_log = mse_loss.clone()
                 ce_log = ce_loss.clone()
                 dflash_kl_log = dflash_kl_loss.clone()
                 dflash_active_log = dflash_kl_active_ratio.clone()
+                dflash_mid_log = dflash_mid_loss.clone()
+                dflash_kl_weight_log = dflash_kl_weight.clone()
+                dflash_mid_weight_log = dflash_mid_weight.clone()
+                dflash_ce_weight_log = dflash_ce_weight.clone()
                 dist.all_reduce(loss_log)
                 dist.all_reduce(acc_log)
                 dist.all_reduce(pfx_log)
-                dist.all_reduce(mse_log)
                 dist.all_reduce(ce_log)
                 dist.all_reduce(dflash_kl_log)
                 dist.all_reduce(dflash_active_log)
+                dist.all_reduce(dflash_mid_log)
+                dist.all_reduce(dflash_kl_weight_log)
+                dist.all_reduce(dflash_mid_weight_log)
+                dist.all_reduce(dflash_ce_weight_log)
                 loss_log = loss_log / dist.get_world_size()
                 acc_log = acc_log / dist.get_world_size()
                 pfx_log = pfx_log / dist.get_world_size()
-                mse_log = mse_log / dist.get_world_size()
                 ce_log = ce_log / dist.get_world_size()
                 dflash_kl_log = dflash_kl_log / dist.get_world_size()
                 dflash_active_log = dflash_active_log / dist.get_world_size()
+                dflash_mid_log = dflash_mid_log / dist.get_world_size()
+                dflash_kl_weight_log = dflash_kl_weight_log / dist.get_world_size()
+                dflash_mid_weight_log = dflash_mid_weight_log / dist.get_world_size()
+                dflash_ce_weight_log = dflash_ce_weight_log / dist.get_world_size()
 
                 record_metrics(
                     args,
@@ -763,7 +835,6 @@ def main():
                     train_dataloader,
                     mode="train",
                     prefix_acc=pfx_log.item(),
-                    mse_loss=mse_log.item() if args.w1_mse > 0 else None,
                     ce_loss=ce_log.item(),
                     dflash_kl_loss=(
                         dflash_kl_log.item()
@@ -772,6 +843,26 @@ def main():
                     ),
                     dflash_kl_active_ratio=(
                         dflash_active_log.item()
+                        if args.dflash_distill_stage != "none"
+                        else None
+                    ),
+                    dflash_mid_loss=(
+                        dflash_mid_log.item()
+                        if args.dflash_align_mode == "final+mid"
+                        else None
+                    ),
+                    dflash_kl_weight=(
+                        dflash_kl_weight_log.item()
+                        if args.dflash_distill_stage != "none"
+                        else None
+                    ),
+                    dflash_mid_weight=(
+                        dflash_mid_weight_log.item()
+                        if args.dflash_align_mode == "final+mid"
+                        else None
+                    ),
+                    dflash_ce_weight=(
+                        dflash_ce_weight_log.item()
                         if args.dflash_distill_stage != "none"
                         else None
                     ),
@@ -785,6 +876,8 @@ def main():
                         "loss": f"{loss.item():.4f}",
                         "ce": f"{ce_loss.item():.4f}",
                         "dkl": f"{dflash_kl_loss.item():.4f}",
+                        "dmid": f"{dflash_mid_loss.item():.4f}",
+                        "wce": f"{dflash_ce_weight.item():.3f}",
                         "acc": f"{accuracy.item():.4f}",
                         "pfx": f"{prefix_acc.item():.4f}",
                         "iter_time": f"{elapsed:.2f}s",
