@@ -102,7 +102,7 @@ DFLASH_MID_ALIGN="${DFLASH_MID_ALIGN:-half}"                           # half: �
 
 # 初始权重
 DFLASH_DISTILL_WEIGHT="${DFLASH_DISTILL_WEIGHT:-1.0}"                  # KL 蒸馏损失权重
-DFLASH_DISTILL_TEMPERATURE="${DFLASH_DISTILL_TEMPERATURE:-2.0}"        # KL 温度，越大 teacher 分布越平滑
+DFLASH_DISTILL_TEMPERATURE="${DFLASH_DISTILL_TEMPERATURE:-1.0}"        # KL 温度，越大 teacher 分布越平滑
 DFLASH_DISTILL_TOP_K="${DFLASH_DISTILL_TOP_K:-128}"                    # KL 候选 token 数：teacher top-k + true label
 
 # CE 位置衰减权重（paper Eq.4）；0/空表示不启用
