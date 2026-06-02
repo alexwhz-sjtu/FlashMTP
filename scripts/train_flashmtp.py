@@ -125,14 +125,6 @@ def parse_args():
         help="Teacher top-k candidates for KL; true label is forced into the set.",
     )
     model_group.add_argument(
-        "--dflash-ce-gate",
-        type=str,
-        default="all",
-        choices=["all", "correct_only"],
-        help="CE mask policy during DFlash distillation. all keeps CE on every valid slot; "
-        "correct_only applies CE only where DFlash top1 equals the true label.",
-    )
-    model_group.add_argument(
         "--dflash-ce-wrong-weight",
         type=float,
         default=1.0,
@@ -200,6 +192,14 @@ def parse_args():
         default=0.0,
         help="Minimum cosine scale for KL/mid weights during DFlash distillation. "
         "0.1 keeps 10%% of DFlash distill/mid weights at the end.",
+    )
+    model_group.add_argument(
+        "--dflash-ce-min-scale",
+        type=float,
+        default=0.0,
+        help="Minimum scale for CE weight during DFlash distillation. Before the "
+        "milestone, CE weight is dflash_ce_weight * this value; after it, CE "
+        "cosine-rises from this floor to dflash_ce_weight.",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -638,7 +638,6 @@ def main():
     draft_model.config.flashmtp_config["dflash_distill_top_k"] = int(
         args.dflash_distill_top_k
     )
-    draft_model.config.flashmtp_config["dflash_ce_gate"] = args.dflash_ce_gate
     draft_model.config.flashmtp_config["dflash_ce_wrong_weight"] = float(
         args.dflash_ce_wrong_weight
     )
@@ -664,6 +663,9 @@ def main():
     )
     draft_model.config.flashmtp_config["dflash_distill_min_scale"] = float(
         args.dflash_distill_min_scale
+    )
+    draft_model.config.flashmtp_config["dflash_ce_min_scale"] = float(
+        args.dflash_ce_min_scale
     )
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
@@ -698,7 +700,6 @@ def main():
             f"weight={args.dflash_distill_weight}, "
             f"temperature={args.dflash_distill_temperature}, "
             f"top_k={args.dflash_distill_top_k}, "
-            f"ce_gate={args.dflash_ce_gate}, "
             f"ce_wrong_weight={args.dflash_ce_wrong_weight}, "
             f"distill_pos_mode={args.dflash_distill_pos_mode}, "
             f"ce_pos_mode={args.dflash_ce_pos_mode}, "
@@ -709,6 +710,7 @@ def main():
             f"ce_weight={args.dflash_ce_weight}, "
             f"milestone_epoch={args.dflash_milestone_epoch}, "
             f"distill_min_scale={args.dflash_distill_min_scale}, "
+            f"ce_min_scale={args.dflash_ce_min_scale}, "
             f"attention_backend={dflash_teacher_model.config._attn_implementation}, "
             f"teacher_layers={dflash_teacher_model.target_layer_ids}"
         )
@@ -727,7 +729,6 @@ def main():
         dflash_distill_weight=args.dflash_distill_weight,
         dflash_distill_temperature=args.dflash_distill_temperature,
         dflash_distill_top_k=args.dflash_distill_top_k,
-        dflash_ce_gate=args.dflash_ce_gate,
         dflash_ce_wrong_weight=args.dflash_ce_wrong_weight,
         dflash_distill_pos_mode=args.dflash_distill_pos_mode,
         dflash_ce_pos_mode=args.dflash_ce_pos_mode,
@@ -738,6 +739,7 @@ def main():
         dflash_ce_weight=args.dflash_ce_weight,
         dflash_milestone_epoch=args.dflash_milestone_epoch,
         dflash_distill_min_scale=args.dflash_distill_min_scale,
+        dflash_ce_min_scale=args.dflash_ce_min_scale,
         dflash_total_epochs=args.num_epochs,
     )
     flashmtp_model = FSDP(

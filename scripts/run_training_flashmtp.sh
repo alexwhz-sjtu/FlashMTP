@@ -109,7 +109,6 @@ DFLASH_DISTILL_TOP_K="${DFLASH_DISTILL_TOP_K:-128}"                    # KL 候�
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA-7}"
 DFLASH_DISTILL_DECAY_GAMMA="${DFLASH_DISTILL_DECAY_GAMMA:-0}"          # KL/mid 位置衰减 gamma，0/空表示不开
 
-DFLASH_CE_GATE="${DFLASH_CE_GATE:-all}"                                # CE 位置：all / correct_only
 DFLASH_CE_WRONG_WEIGHT="${DFLASH_CE_WRONG_WEIGHT:-1.0}"                # CE_POS_MODE=all 时，DFlash 错误 slot 的 CE 额外权重
 DFLASH_DISTILL_POS_MODE="${DFLASH_DISTILL_POS_MODE:-prefix}"           # distill 位置：prefix / all
 DFLASH_CE_POS_MODE="${DFLASH_CE_POS_MODE:-all}"                        # CE 位置：prefix / all
@@ -119,14 +118,15 @@ DFLASH_CE_POS_MODE="${DFLASH_CE_POS_MODE:-all}"                        # CE 位�
 DFLASH_MILESTONE_EPOCH="${DFLASH_MILESTONE_EPOCH:-0.0}"                # DFlash 蒸馏中余弦切换开始的 epoch
 DFLASH_CE_WEIGHT="${DFLASH_CE_WEIGHT:-0.8}"                            # milestone 后 CE 最终目标权重
 DFLASH_DISTILL_MIN_SCALE="${DFLASH_DISTILL_MIN_SCALE:-0.2}"            # KL/mid 余弦衰减的最小保留比例，0 表示降到 0
+DFLASH_CE_MIN_SCALE="${DFLASH_CE_MIN_SCALE:-0.0}"                      # CE 初始/最小保留比例，0 表示 milestone 前 CE=0
 DFLASH_MID_WEIGHT="${DFLASH_MID_WEIGHT:-0.0}"                          # norm-hidden mid loss 权重，0 表示关闭
 
 # 用于 OUTPUT_DIR / WandB run id 的蒸馏配置摘要
 DFLASH_DISTILL_TAG="dnone"
 if [ -n "${DFLASH_TEACHER_PATH}" ]; then
-    DFLASH_DISTILL_TAG="dflash_dklw${DFLASH_DISTILL_WEIGHT}_top${DFLASH_DISTILL_TOP_K}_ceg${LOSS_DECAY_GAMMA:-none}_dkg${DFLASH_DISTILL_DECAY_GAMMA:-none}_dpos${DFLASH_DISTILL_POS_MODE}_cepos${DFLASH_CE_POS_MODE}_cw${DFLASH_CE_WRONG_WEIGHT}"
+    DFLASH_DISTILL_TAG="dflash_dklw${DFLASH_DISTILL_WEIGHT}_top${DFLASH_DISTILL_TOP_K}_ceg${LOSS_DECAY_GAMMA:-none}_dkg${DFLASH_DISTILL_DECAY_GAMMA:-none}_dpos${DFLASH_DISTILL_POS_MODE}_cepos${DFLASH_CE_POS_MODE}_cw${DFLASH_CE_WRONG_WEIGHT}_mep${DFLASH_MILESTONE_EPOCH}_dfloor${DFLASH_DISTILL_MIN_SCALE}_cefloor${DFLASH_CE_MIN_SCALE}"
     if [ "${DFLASH_ALIGN_MODE}" = "final+mid" ]; then
-        DFLASH_DISTILL_TAG="${DFLASH_DISTILL_TAG}_mid${DFLASH_MID_ALIGN}_mw${DFLASH_MID_WEIGHT}_mep${DFLASH_MILESTONE_EPOCH}_floor${DFLASH_DISTILL_MIN_SCALE}"
+        DFLASH_DISTILL_TAG="${DFLASH_DISTILL_TAG}_mid${DFLASH_MID_ALIGN}_mw${DFLASH_MID_WEIGHT}"
     fi
 fi
 
@@ -181,7 +181,6 @@ if [ -n "${DFLASH_TEACHER_PATH}" ]; then
     echo "  dflash_teacher_path: ${DFLASH_TEACHER_PATH}"
     echo "  dflash_distill: weight=${DFLASH_DISTILL_WEIGHT}, temperature=${DFLASH_DISTILL_TEMPERATURE}, top_k=${DFLASH_DISTILL_TOP_K}"
     echo "  dflash_distill_decay_gamma: ${DFLASH_DISTILL_DECAY_GAMMA:-未设置(不启用)}"
-    echo "  dflash_ce_gate: ${DFLASH_CE_GATE}"
     echo "  dflash_ce_wrong_weight: ${DFLASH_CE_WRONG_WEIGHT}"
     echo "  dflash_distill_pos_mode: ${DFLASH_DISTILL_POS_MODE}"
     echo "  dflash_ce_pos_mode: ${DFLASH_CE_POS_MODE}"
@@ -191,6 +190,7 @@ if [ -n "${DFLASH_TEACHER_PATH}" ]; then
     echo "  dflash_ce_weight: ${DFLASH_CE_WEIGHT}"
     echo "  dflash_milestone_epoch: ${DFLASH_MILESTONE_EPOCH}"
     echo "  dflash_distill_min_scale: ${DFLASH_DISTILL_MIN_SCALE}"
+    echo "  dflash_ce_min_scale: ${DFLASH_CE_MIN_SCALE}"
 fi
 echo "------------------------------------------"
 echo "目标模型: ${TARGET_MODEL}"
@@ -306,7 +306,6 @@ if [ -n "${DFLASH_TEACHER_PATH}" ]; then
     if [ -n "${DFLASH_DISTILL_DECAY_GAMMA}" ]; then
         OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-decay-gamma ${DFLASH_DISTILL_DECAY_GAMMA}"
     fi
-    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-ce-gate ${DFLASH_CE_GATE}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-ce-wrong-weight ${DFLASH_CE_WRONG_WEIGHT}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-pos-mode ${DFLASH_DISTILL_POS_MODE}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-ce-pos-mode ${DFLASH_CE_POS_MODE}"
@@ -316,6 +315,7 @@ if [ -n "${DFLASH_TEACHER_PATH}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-ce-weight ${DFLASH_CE_WEIGHT}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-milestone-epoch ${DFLASH_MILESTONE_EPOCH}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-min-scale ${DFLASH_DISTILL_MIN_SCALE}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-ce-min-scale ${DFLASH_CE_MIN_SCALE}"
 fi
 
 # ========================================

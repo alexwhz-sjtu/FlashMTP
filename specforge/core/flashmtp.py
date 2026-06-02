@@ -191,7 +191,6 @@ class OnlineFlashMTPModel(nn.Module):
             dflash_distill_weight: float = 1.0,
             dflash_distill_temperature: float = 2.0,
             dflash_distill_top_k: int = 128,
-            dflash_ce_gate: str = "all",
             dflash_ce_wrong_weight: float = 1.0,
             dflash_distill_pos_mode: str = "prefix",
             dflash_ce_pos_mode: str = "all",
@@ -202,6 +201,7 @@ class OnlineFlashMTPModel(nn.Module):
             dflash_ce_weight: float = 1.0,
             dflash_milestone_epoch: float = 0.0,
             dflash_distill_min_scale: float = 0.0,
+            dflash_ce_min_scale: float = 0.0,
             dflash_total_epochs: int = 1,
     ):
         super().__init__()
@@ -218,7 +218,6 @@ class OnlineFlashMTPModel(nn.Module):
         self.dflash_distill_weight = float(dflash_distill_weight)
         self.dflash_distill_temperature = float(dflash_distill_temperature)
         self.dflash_distill_top_k = int(dflash_distill_top_k)
-        self.dflash_ce_gate = dflash_ce_gate
         self.dflash_ce_wrong_weight = max(float(dflash_ce_wrong_weight), 0.0)
         self.dflash_distill_pos_mode = dflash_distill_pos_mode
         self.dflash_ce_pos_mode = dflash_ce_pos_mode
@@ -233,12 +232,11 @@ class OnlineFlashMTPModel(nn.Module):
         self.dflash_ce_weight = float(dflash_ce_weight)
         self.dflash_milestone_epoch = float(dflash_milestone_epoch)
         self.dflash_distill_min_scale = min(max(float(dflash_distill_min_scale), 0.0), 1.0)
+        self.dflash_ce_min_scale = min(max(float(dflash_ce_min_scale), 0.0), 1.0)
         self.dflash_total_epochs = max(float(dflash_total_epochs), 1.0)
         self.chs_concat_mode = "feature"
         self.draft_model.chs_concat_mode = "feature"
 
-        if self.dflash_ce_gate not in ("all", "correct_only"):
-            raise ValueError("dflash_ce_gate must be one of all, correct_only")
         if self.dflash_align_mode not in ("final", "final+mid"):
             raise ValueError("dflash_align_mode must be one of final, final+mid")
         if self.dflash_mid_align not in ("full", "half"):
@@ -626,7 +624,11 @@ class OnlineFlashMTPModel(nn.Module):
         epoch_value = 0.0 if current_epoch is None else float(current_epoch)
         if epoch_value < self.dflash_milestone_epoch:
             mid_weight = self.dflash_mid_weight if self.dflash_align_mode == "final+mid" else 0.0
-            return self.dflash_distill_weight, mid_weight, 0.0
+            return (
+                self.dflash_distill_weight,
+                mid_weight,
+                self.dflash_ce_weight * self.dflash_ce_min_scale,
+            )
 
         denom = max(self.dflash_total_epochs - self.dflash_milestone_epoch, 1e-6)
         t = min(max((epoch_value - self.dflash_milestone_epoch) / denom, 0.0), 1.0)
@@ -634,7 +636,9 @@ class OnlineFlashMTPModel(nn.Module):
         distill_scale = self.dflash_distill_min_scale + (
             1.0 - self.dflash_distill_min_scale
         ) * cosine_scale
-        ce_scale = 1.0 - cosine_scale
+        ce_scale = self.dflash_ce_min_scale + (
+            1.0 - self.dflash_ce_min_scale
+        ) * (1.0 - cosine_scale)
         mid_weight = self.dflash_mid_weight if self.dflash_align_mode == "final+mid" else 0.0
         return (
             self.dflash_distill_weight * distill_scale,
@@ -786,7 +790,6 @@ class OnlineFlashMTPModel(nn.Module):
             and (
                 self.dflash_distill_weight > 0
                 or need_mid_hidden
-                or self.dflash_ce_gate == "correct_only"
                 or self.dflash_ce_pos_mode == "prefix"
                 or (
                     self.dflash_ce_pos_mode == "all"
@@ -814,13 +817,6 @@ class OnlineFlashMTPModel(nn.Module):
                 valid_mask=weight_mask,
             )
             weight_mask = weight_mask * ce_prefix_mask.float()
-        elif self.use_dflash_distill and self.dflash_ce_gate == "correct_only":
-            dflash_correct_mask = self._compute_dflash_correct_mask(
-                teacher_logits=teacher_logits,
-                target_ids=target_ids,
-                valid_mask=distill_weight_mask,
-            )
-            weight_mask = weight_mask * dflash_correct_mask.float()
         elif (
             self.use_dflash_distill
             and self.dflash_ce_pos_mode == "all"
