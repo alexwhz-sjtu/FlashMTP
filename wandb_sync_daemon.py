@@ -10,7 +10,7 @@ import sys
 import time
 
 # ==================== 配置区域 ====================
-WANDB_DIR = "/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP_v1.3/wandb/offline-run-20260601_110359-flashmtp_qz_prefix_condition_n16_nlayers5_block_16_n40000_feature_epochs12_lp1_dflash_dklw1.0_top128_ceg7_dkg0_ceall"
+WANDB_DIR = "/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP_v1.3/wandb/offline-run-20260602_104459-flashmtp_n16_nlayers5_block_16_n40000_ep8_lp1_dflash_dklw1.0_top64_ceg7_dkg14_ceall_midhalf_mw1000_mep2_floor0.2"
 WANDB_PROJECT = "flashmtp-training-exp"
 SYNC_INTERVAL = 5 * 60  # 秒
 # ================================================
