@@ -110,6 +110,9 @@ LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA-7}"
 DFLASH_DISTILL_DECAY_GAMMA="${DFLASH_DISTILL_DECAY_GAMMA:-0}"          # KL/mid 位置衰减 gamma，0/空表示不开
 
 DFLASH_CE_GATE="${DFLASH_CE_GATE:-all}"                                # CE 位置：all / correct_only
+DFLASH_CE_WRONG_WEIGHT="${DFLASH_CE_WRONG_WEIGHT:-1.0}"                # CE_POS_MODE=all 时，DFlash 错误 slot 的 CE 额外权重
+DFLASH_DISTILL_POS_MODE="${DFLASH_DISTILL_POS_MODE:-prefix}"           # distill 位置：prefix / all
+DFLASH_CE_POS_MODE="${DFLASH_CE_POS_MODE:-all}"                        # CE 位置：prefix / all
 
 
 # 中间衰减
@@ -121,7 +124,7 @@ DFLASH_MID_WEIGHT="${DFLASH_MID_WEIGHT:-0.0}"                          # norm-hi
 # 用于 OUTPUT_DIR / WandB run id 的蒸馏配置摘要
 DFLASH_DISTILL_TAG="dnone"
 if [ -n "${DFLASH_TEACHER_PATH}" ]; then
-    DFLASH_DISTILL_TAG="dflash_dklw${DFLASH_DISTILL_WEIGHT}_top${DFLASH_DISTILL_TOP_K}_ceg${LOSS_DECAY_GAMMA:-none}_dkg${DFLASH_DISTILL_DECAY_GAMMA:-none}_ce${DFLASH_CE_GATE}"
+    DFLASH_DISTILL_TAG="dflash_dklw${DFLASH_DISTILL_WEIGHT}_top${DFLASH_DISTILL_TOP_K}_ceg${LOSS_DECAY_GAMMA:-none}_dkg${DFLASH_DISTILL_DECAY_GAMMA:-none}_dpos${DFLASH_DISTILL_POS_MODE}_cepos${DFLASH_CE_POS_MODE}_cw${DFLASH_CE_WRONG_WEIGHT}"
     if [ "${DFLASH_ALIGN_MODE}" = "final+mid" ]; then
         DFLASH_DISTILL_TAG="${DFLASH_DISTILL_TAG}_mid${DFLASH_MID_ALIGN}_mw${DFLASH_MID_WEIGHT}_mep${DFLASH_MILESTONE_EPOCH}_floor${DFLASH_DISTILL_MIN_SCALE}"
     fi
@@ -179,6 +182,9 @@ if [ -n "${DFLASH_TEACHER_PATH}" ]; then
     echo "  dflash_distill: weight=${DFLASH_DISTILL_WEIGHT}, temperature=${DFLASH_DISTILL_TEMPERATURE}, top_k=${DFLASH_DISTILL_TOP_K}"
     echo "  dflash_distill_decay_gamma: ${DFLASH_DISTILL_DECAY_GAMMA:-未设置(不启用)}"
     echo "  dflash_ce_gate: ${DFLASH_CE_GATE}"
+    echo "  dflash_ce_wrong_weight: ${DFLASH_CE_WRONG_WEIGHT}"
+    echo "  dflash_distill_pos_mode: ${DFLASH_DISTILL_POS_MODE}"
+    echo "  dflash_ce_pos_mode: ${DFLASH_CE_POS_MODE}"
     echo "  dflash_align_mode: ${DFLASH_ALIGN_MODE}"
     echo "  dflash_mid_align: ${DFLASH_MID_ALIGN}"
     echo "  dflash_mid_weight: ${DFLASH_MID_WEIGHT}"
@@ -301,6 +307,9 @@ if [ -n "${DFLASH_TEACHER_PATH}" ]; then
         OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-decay-gamma ${DFLASH_DISTILL_DECAY_GAMMA}"
     fi
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-ce-gate ${DFLASH_CE_GATE}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-ce-wrong-weight ${DFLASH_CE_WRONG_WEIGHT}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-pos-mode ${DFLASH_DISTILL_POS_MODE}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-ce-pos-mode ${DFLASH_CE_POS_MODE}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-align-mode ${DFLASH_ALIGN_MODE}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-mid-align ${DFLASH_MID_ALIGN}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-mid-weight ${DFLASH_MID_WEIGHT}"
