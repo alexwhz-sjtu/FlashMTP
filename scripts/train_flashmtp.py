@@ -125,14 +125,6 @@ def parse_args():
         help="Teacher top-k candidates for KL; true label is forced into the set.",
     )
     model_group.add_argument(
-        "--dflash-ce-wrong-weight",
-        type=float,
-        default=1.0,
-        help="Extra CE multiplier for slots where DFlash top1 is wrong when "
-        "--dflash-ce-pos-mode=all. Set 0.2 to keep weak true-label supervision on "
-        "teacher-wrong slots.",
-    )
-    model_group.add_argument(
         "--dflash-distill-pos-mode",
         type=str,
         default="prefix",
@@ -142,10 +134,12 @@ def parse_args():
     model_group.add_argument(
         "--dflash-ce-pos-mode",
         type=str,
-        default="all",
-        choices=["prefix", "all"],
+        default="student_wrong",
+        choices=["prefix", "student_wrong"],
         help="Position mode for true-label CE. prefix uses teacher continuous-correct "
-        "prefix, plus one student frontier error if student catches up to teacher.",
+        "prefix, plus one student frontier error if student catches up to teacher. "
+        "student_wrong supervises slots where teacher top1 is correct but student "
+        "top1 is wrong.",
     )
     model_group.add_argument(
         "--dflash-distill-decay-gamma",
@@ -638,9 +632,6 @@ def main():
     draft_model.config.flashmtp_config["dflash_distill_top_k"] = int(
         args.dflash_distill_top_k
     )
-    draft_model.config.flashmtp_config["dflash_ce_wrong_weight"] = float(
-        args.dflash_ce_wrong_weight
-    )
     draft_model.config.flashmtp_config["dflash_distill_pos_mode"] = (
         args.dflash_distill_pos_mode
     )
@@ -700,7 +691,6 @@ def main():
             f"weight={args.dflash_distill_weight}, "
             f"temperature={args.dflash_distill_temperature}, "
             f"top_k={args.dflash_distill_top_k}, "
-            f"ce_wrong_weight={args.dflash_ce_wrong_weight}, "
             f"distill_pos_mode={args.dflash_distill_pos_mode}, "
             f"ce_pos_mode={args.dflash_ce_pos_mode}, "
             f"distill_decay_gamma={args.dflash_distill_decay_gamma}, "
@@ -729,7 +719,6 @@ def main():
         dflash_distill_weight=args.dflash_distill_weight,
         dflash_distill_temperature=args.dflash_distill_temperature,
         dflash_distill_top_k=args.dflash_distill_top_k,
-        dflash_ce_wrong_weight=args.dflash_ce_wrong_weight,
         dflash_distill_pos_mode=args.dflash_distill_pos_mode,
         dflash_ce_pos_mode=args.dflash_ce_pos_mode,
         dflash_distill_decay_gamma=args.dflash_distill_decay_gamma,

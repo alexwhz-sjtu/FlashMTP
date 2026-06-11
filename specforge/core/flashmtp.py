@@ -191,9 +191,8 @@ class OnlineFlashMTPModel(nn.Module):
             dflash_distill_weight: float = 1.0,
             dflash_distill_temperature: float = 2.0,
             dflash_distill_top_k: int = 128,
-            dflash_ce_wrong_weight: float = 1.0,
             dflash_distill_pos_mode: str = "prefix",
-            dflash_ce_pos_mode: str = "all",
+            dflash_ce_pos_mode: str = "student_wrong",
             dflash_distill_decay_gamma: Optional[float] = None,
             dflash_align_mode: str = "final",
             dflash_mid_align: str = "half",
@@ -218,7 +217,6 @@ class OnlineFlashMTPModel(nn.Module):
         self.dflash_distill_weight = float(dflash_distill_weight)
         self.dflash_distill_temperature = float(dflash_distill_temperature)
         self.dflash_distill_top_k = int(dflash_distill_top_k)
-        self.dflash_ce_wrong_weight = max(float(dflash_ce_wrong_weight), 0.0)
         self.dflash_distill_pos_mode = dflash_distill_pos_mode
         self.dflash_ce_pos_mode = dflash_ce_pos_mode
         self.dflash_distill_decay_gamma = (
@@ -243,8 +241,10 @@ class OnlineFlashMTPModel(nn.Module):
             raise ValueError("dflash_mid_align must be one of full, half")
         if self.dflash_distill_pos_mode not in ("prefix", "all"):
             raise ValueError("dflash_distill_pos_mode must be one of prefix, all")
-        if self.dflash_ce_pos_mode not in ("prefix", "all"):
-            raise ValueError("dflash_ce_pos_mode must be one of prefix, all")
+        if self.dflash_ce_pos_mode not in ("prefix", "student_wrong"):
+            raise ValueError(
+                "dflash_ce_pos_mode must be one of prefix, student_wrong"
+            )
         if self.dflash_teacher_model is not None:
             self.dflash_teacher_model.eval()
             for param in self.dflash_teacher_model.parameters():
@@ -571,6 +571,22 @@ class OnlineFlashMTPModel(nn.Module):
 
         return teacher_prefix | extra_mask
 
+    def _compute_ce_student_wrong_mask(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Slots where teacher top1 is correct but student top1 is wrong."""
+        teacher_correct = self._compute_dflash_correct_mask(
+            teacher_logits=teacher_logits,
+            target_ids=target_ids,
+            valid_mask=valid_mask,
+        )
+        student_wrong = student_logits.argmax(dim=-1) != target_ids
+        return teacher_correct & student_wrong
+
     def _compute_dflash_mid_loss(
         self,
         student_layer_hidden: tuple[torch.Tensor, ...],
@@ -790,11 +806,7 @@ class OnlineFlashMTPModel(nn.Module):
             and (
                 self.dflash_distill_weight > 0
                 or need_mid_hidden
-                or self.dflash_ce_pos_mode == "prefix"
-                or (
-                    self.dflash_ce_pos_mode == "all"
-                    and self.dflash_ce_wrong_weight != 1.0
-                )
+                or self.dflash_ce_pos_mode in ("prefix", "student_wrong")
             )
         )
         if needs_dflash_teacher:
@@ -817,27 +829,16 @@ class OnlineFlashMTPModel(nn.Module):
                 valid_mask=weight_mask,
             )
             weight_mask = weight_mask * ce_prefix_mask.float()
-        elif (
-            self.use_dflash_distill
-            and self.dflash_ce_pos_mode == "all"
-            and self.dflash_ce_wrong_weight != 1.0
-        ):
-            dflash_correct_mask = self._compute_dflash_correct_mask(
+        elif self.use_dflash_distill and self.dflash_ce_pos_mode == "student_wrong":
+            ce_student_wrong_mask = self._compute_ce_student_wrong_mask(
+                student_logits=logits.view(
+                    bsz, anchor_positions.size(1), self.block_size, -1
+                ),
                 teacher_logits=teacher_logits,
                 target_ids=target_ids,
-                valid_mask=distill_weight_mask,
+                valid_mask=weight_mask,
             )
-            ce_teacher_weight = torch.where(
-                dflash_correct_mask,
-                torch.ones((), device=device, dtype=weight_mask.dtype),
-                torch.full(
-                    (),
-                    self.dflash_ce_wrong_weight,
-                    device=device,
-                    dtype=weight_mask.dtype,
-                ),
-            )
-            weight_mask = weight_mask * ce_teacher_weight
+            weight_mask = weight_mask * ce_student_wrong_mask.float()
 
         # --- Cross entropy ---
         flat_logits = logits.view(-1, logits.size(-1))

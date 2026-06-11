@@ -97,7 +97,7 @@ fi
 # ========================================
 DFLASH_TEACHER_PATH="${DFLASH_TEACHER_PATH:-}"                         # DFlash teacher checkpoint 路径
 
-DFLASH_ALIGN_MODE="${DFLASH_ALIGN_MODE:-final}"                        # final: 只蒸馏 logits; final+mid: 额外蒸馏中间层 hidden
+DFLASH_ALIGN_MODE="${DFLASH_ALIGN_MODE:-all}"                        # final: 只蒸馏 logits; final+mid: 额外蒸馏中间层 hidden
 DFLASH_MID_ALIGN="${DFLASH_MID_ALIGN:-half}"                           # half: 中间一层; full: 除末层外所有层
 
 # 初始权重
@@ -109,9 +109,8 @@ DFLASH_DISTILL_TOP_K="${DFLASH_DISTILL_TOP_K:-128}"                    # KL 候�
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA-7}"
 DFLASH_DISTILL_DECAY_GAMMA="${DFLASH_DISTILL_DECAY_GAMMA:-0}"          # KL/mid 位置衰减 gamma，0/空表示不开
 
-DFLASH_CE_WRONG_WEIGHT="${DFLASH_CE_WRONG_WEIGHT:-1.0}"                # CE_POS_MODE=all 时，DFlash 错误 slot 的 CE 额外权重
-DFLASH_DISTILL_POS_MODE="${DFLASH_DISTILL_POS_MODE:-prefix}"           # distill 位置：prefix / all
-DFLASH_CE_POS_MODE="${DFLASH_CE_POS_MODE:-all}"                        # CE 位置：prefix / all
+DFLASH_DISTILL_POS_MODE="${DFLASH_DISTILL_POS_MODE:-all}"           # distill 位置：prefix / all
+DFLASH_CE_POS_MODE="${DFLASH_CE_POS_MODE:-student_wrong}"              # CE 位置：prefix / student_wrong（teacher 对且 student 错的 slot）
 
 
 # 中间衰减
@@ -181,7 +180,6 @@ if [ -n "${DFLASH_TEACHER_PATH}" ]; then
     echo "  dflash_teacher_path: ${DFLASH_TEACHER_PATH}"
     echo "  dflash_distill: weight=${DFLASH_DISTILL_WEIGHT}, temperature=${DFLASH_DISTILL_TEMPERATURE}, top_k=${DFLASH_DISTILL_TOP_K}"
     echo "  dflash_distill_decay_gamma: ${DFLASH_DISTILL_DECAY_GAMMA:-未设置(不启用)}"
-    echo "  dflash_ce_wrong_weight: ${DFLASH_CE_WRONG_WEIGHT}"
     echo "  dflash_distill_pos_mode: ${DFLASH_DISTILL_POS_MODE}"
     echo "  dflash_ce_pos_mode: ${DFLASH_CE_POS_MODE}"
     echo "  dflash_align_mode: ${DFLASH_ALIGN_MODE}"
@@ -306,7 +304,6 @@ if [ -n "${DFLASH_TEACHER_PATH}" ]; then
     if [ -n "${DFLASH_DISTILL_DECAY_GAMMA}" ]; then
         OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-decay-gamma ${DFLASH_DISTILL_DECAY_GAMMA}"
     fi
-    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-ce-wrong-weight ${DFLASH_CE_WRONG_WEIGHT}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-pos-mode ${DFLASH_DISTILL_POS_MODE}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-ce-pos-mode ${DFLASH_CE_POS_MODE}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-align-mode ${DFLASH_ALIGN_MODE}"
