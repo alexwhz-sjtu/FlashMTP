@@ -125,73 +125,53 @@ def parse_args():
         help="Teacher top-k candidates for KL; true label is forced into the set.",
     )
     model_group.add_argument(
-        "--dflash-ce-wrong-weight",
-        type=float,
-        default=1.0,
-        help="Extra CE multiplier for slots where DFlash top1 is wrong when "
-        "--dflash-ce-pos-mode=all. Set 0.2 to keep weak true-label supervision on "
-        "teacher-wrong slots.",
-    )
-    model_group.add_argument(
         "--dflash-distill-pos-mode",
         type=str,
         default="prefix",
         choices=["prefix", "all"],
-        help="Position mode shared by DFlash KL and hidden-state distill losses.",
-    )
-    model_group.add_argument(
-        "--dflash-ce-pos-mode",
-        type=str,
-        default="all",
-        choices=["prefix", "all"],
-        help="Position mode for true-label CE. prefix uses teacher continuous-correct "
-        "prefix, plus one student frontier error if student catches up to teacher.",
+        help="Position mode for the DFlash KL distill loss.",
     )
     model_group.add_argument(
         "--dflash-distill-decay-gamma",
         type=float,
         default=None,
-        help="Gamma for KL/mid hidden-loss position decay. None or <=0 disables.",
-    )
-    model_group.add_argument(
-        "--dflash-align-mode",
-        type=str,
-        default="final",
-        choices=["final", "final+mid"],
-        help="DFlash alignment mode. final keeps existing final-logit distillation; "
-        "final+mid adds teacher-correct norm-hidden middle-layer alignment.",
-    )
-    model_group.add_argument(
-        "--dflash-mid-align",
-        type=str,
-        default="half",
-        choices=["full", "half"],
-        help="Middle-layer hidden alignment policy for --dflash-align-mode final+mid.",
-    )
-    model_group.add_argument(
-        "--dflash-mid-weight",
-        type=float,
-        default=0.0,
-        help="Weight for teacher-correct normalized hidden MSE in final+mid mode.",
+        help="Gamma for KL loss position decay. None or <=0 disables.",
     )
     model_group.add_argument(
         "--dflash-ce-weight",
         type=float,
         default=1.0,
-        help="Target CE weight reached after the final+mid cosine transition.",
+        help="Target CE weight reached after the cosine transition.",
+    )
+    model_group.add_argument(
+        "--dflash-ce-prefix-weight",
+        type=float,
+        default=0.0,
+        help="CE weight for slots before the student's first error (its correct "
+        "prefix); KL is the main supervision there. The first error slot gets "
+        "weight 1.0 and later slots decay with loss-decay-gamma.",
+    )
+    model_group.add_argument(
+        "--dflash-ce-norm",
+        type=str,
+        default="block",
+        choices=["block", "global"],
+        help="CE normalization. block: per-block weighted mean then average over "
+        "active blocks (equal block contribution). global: single weighted mean "
+        "over all slots, so blocks with earlier first errors weigh more.",
     )
     model_group.add_argument(
         "--dflash-milestone-epoch",
         type=float,
         default=0.0,
-        help="Milestone epoch for final+mid cosine transition from distillation to CE.",
+        help="Milestone epoch for the cosine transition from distillation to CE.",
     )
     model_group.add_argument(
         "--dflash-distill-min-scale",
         type=float,
         default=0.0,
-        help="Minimum cosine scale for KL/mid weights during DFlash distillation. "
-        "0.1 keeps 10%% of DFlash distill/mid weights at the end.",
+        help="Minimum cosine scale for the KL weight during DFlash distillation. "
+        "0.1 keeps 10%% of the DFlash distill weight at the end.",
     )
     model_group.add_argument(
         "--dflash-ce-min-scale",
@@ -468,9 +448,7 @@ def record_metrics(
     ce_loss: float | None = None,
     dflash_kl_loss: float | None = None,
     dflash_kl_active_ratio: float | None = None,
-    dflash_mid_loss: float | None = None,
     dflash_kl_weight: float | None = None,
-    dflash_mid_weight: float | None = None,
     dflash_ce_weight: float | None = None,
 ) -> None:
     logdict = {}
@@ -488,12 +466,8 @@ def record_metrics(
         logdict[f"{mode}/dflash_kl_loss"] = dflash_kl_loss
     if dflash_kl_active_ratio is not None:
         logdict[f"{mode}/dflash_kl_active_ratio"] = dflash_kl_active_ratio
-    if dflash_mid_loss is not None:
-        logdict[f"{mode}/dflash_mid_loss"] = dflash_mid_loss
     if dflash_kl_weight is not None:
         logdict[f"{mode}/dflash_kl_weight"] = dflash_kl_weight
-    if dflash_mid_weight is not None:
-        logdict[f"{mode}/dflash_mid_weight"] = dflash_mid_weight
     if dflash_ce_weight is not None:
         logdict[f"{mode}/dflash_ce_weight"] = dflash_ce_weight
 
@@ -506,12 +480,8 @@ def record_metrics(
         extra += f", DFlashKL: {dflash_kl_loss:.4f}"
     if dflash_kl_active_ratio is not None:
         extra += f", DFlashActive: {dflash_kl_active_ratio:.4f}"
-    if dflash_mid_loss is not None:
-        extra += f", DFlashMid: {dflash_mid_loss:.4f}"
     if dflash_kl_weight is not None:
         extra += f", Wkl: {dflash_kl_weight:.4f}"
-    if dflash_mid_weight is not None:
-        extra += f", Wmid: {dflash_mid_weight:.4f}"
     if dflash_ce_weight is not None:
         extra += f", Wce: {dflash_ce_weight:.4f}"
     print_on_rank0(
@@ -638,26 +608,21 @@ def main():
     draft_model.config.flashmtp_config["dflash_distill_top_k"] = int(
         args.dflash_distill_top_k
     )
-    draft_model.config.flashmtp_config["dflash_ce_wrong_weight"] = float(
-        args.dflash_ce_wrong_weight
-    )
     draft_model.config.flashmtp_config["dflash_distill_pos_mode"] = (
         args.dflash_distill_pos_mode
     )
-    draft_model.config.flashmtp_config["dflash_ce_pos_mode"] = args.dflash_ce_pos_mode
     draft_model.config.flashmtp_config["dflash_distill_decay_gamma"] = (
         None
         if args.dflash_distill_decay_gamma is None
         else float(args.dflash_distill_decay_gamma)
     )
-    draft_model.config.flashmtp_config["dflash_align_mode"] = args.dflash_align_mode
-    draft_model.config.flashmtp_config["dflash_mid_align"] = args.dflash_mid_align
-    draft_model.config.flashmtp_config["dflash_mid_weight"] = float(
-        args.dflash_mid_weight
-    )
     draft_model.config.flashmtp_config["dflash_ce_weight"] = float(
         args.dflash_ce_weight
     )
+    draft_model.config.flashmtp_config["dflash_ce_prefix_weight"] = float(
+        args.dflash_ce_prefix_weight
+    )
+    draft_model.config.flashmtp_config["dflash_ce_norm"] = args.dflash_ce_norm
     draft_model.config.flashmtp_config["dflash_milestone_epoch"] = float(
         args.dflash_milestone_epoch
     )
@@ -700,14 +665,11 @@ def main():
             f"weight={args.dflash_distill_weight}, "
             f"temperature={args.dflash_distill_temperature}, "
             f"top_k={args.dflash_distill_top_k}, "
-            f"ce_wrong_weight={args.dflash_ce_wrong_weight}, "
             f"distill_pos_mode={args.dflash_distill_pos_mode}, "
-            f"ce_pos_mode={args.dflash_ce_pos_mode}, "
             f"distill_decay_gamma={args.dflash_distill_decay_gamma}, "
-            f"align_mode={args.dflash_align_mode}, "
-            f"mid_align={args.dflash_mid_align}, "
-            f"mid_weight={args.dflash_mid_weight}, "
             f"ce_weight={args.dflash_ce_weight}, "
+            f"ce_prefix_weight={args.dflash_ce_prefix_weight}, "
+            f"ce_norm={args.dflash_ce_norm}, "
             f"milestone_epoch={args.dflash_milestone_epoch}, "
             f"distill_min_scale={args.dflash_distill_min_scale}, "
             f"ce_min_scale={args.dflash_ce_min_scale}, "
@@ -729,14 +691,11 @@ def main():
         dflash_distill_weight=args.dflash_distill_weight,
         dflash_distill_temperature=args.dflash_distill_temperature,
         dflash_distill_top_k=args.dflash_distill_top_k,
-        dflash_ce_wrong_weight=args.dflash_ce_wrong_weight,
         dflash_distill_pos_mode=args.dflash_distill_pos_mode,
-        dflash_ce_pos_mode=args.dflash_ce_pos_mode,
         dflash_distill_decay_gamma=args.dflash_distill_decay_gamma,
-        dflash_align_mode=args.dflash_align_mode,
-        dflash_mid_align=args.dflash_mid_align,
-        dflash_mid_weight=args.dflash_mid_weight,
         dflash_ce_weight=args.dflash_ce_weight,
+        dflash_ce_prefix_weight=args.dflash_ce_prefix_weight,
+        dflash_ce_norm=args.dflash_ce_norm,
         dflash_milestone_epoch=args.dflash_milestone_epoch,
         dflash_distill_min_scale=args.dflash_distill_min_scale,
         dflash_ce_min_scale=args.dflash_ce_min_scale,
@@ -814,9 +773,7 @@ def main():
                 ce_loss,
                 dflash_kl_loss,
                 dflash_kl_active_ratio,
-                dflash_mid_loss,
                 dflash_kl_weight,
-                dflash_mid_weight,
                 dflash_ce_weight,
             ) = flashmtp_model(
                 input_ids=input_ids,
@@ -837,9 +794,7 @@ def main():
                 ce_log = ce_loss.clone()
                 dflash_kl_log = dflash_kl_loss.clone()
                 dflash_active_log = dflash_kl_active_ratio.clone()
-                dflash_mid_log = dflash_mid_loss.clone()
                 dflash_kl_weight_log = dflash_kl_weight.clone()
-                dflash_mid_weight_log = dflash_mid_weight.clone()
                 dflash_ce_weight_log = dflash_ce_weight.clone()
                 dist.all_reduce(loss_log)
                 dist.all_reduce(acc_log)
@@ -847,9 +802,7 @@ def main():
                 dist.all_reduce(ce_log)
                 dist.all_reduce(dflash_kl_log)
                 dist.all_reduce(dflash_active_log)
-                dist.all_reduce(dflash_mid_log)
                 dist.all_reduce(dflash_kl_weight_log)
-                dist.all_reduce(dflash_mid_weight_log)
                 dist.all_reduce(dflash_ce_weight_log)
                 loss_log = loss_log / dist.get_world_size()
                 acc_log = acc_log / dist.get_world_size()
@@ -857,9 +810,7 @@ def main():
                 ce_log = ce_log / dist.get_world_size()
                 dflash_kl_log = dflash_kl_log / dist.get_world_size()
                 dflash_active_log = dflash_active_log / dist.get_world_size()
-                dflash_mid_log = dflash_mid_log / dist.get_world_size()
                 dflash_kl_weight_log = dflash_kl_weight_log / dist.get_world_size()
-                dflash_mid_weight_log = dflash_mid_weight_log / dist.get_world_size()
                 dflash_ce_weight_log = dflash_ce_weight_log / dist.get_world_size()
 
                 record_metrics(
@@ -883,19 +834,9 @@ def main():
                         if dflash_enabled
                         else None
                     ),
-                    dflash_mid_loss=(
-                        dflash_mid_log.item()
-                        if dflash_enabled and args.dflash_align_mode == "final+mid"
-                        else None
-                    ),
                     dflash_kl_weight=(
                         dflash_kl_weight_log.item()
                         if dflash_enabled
-                        else None
-                    ),
-                    dflash_mid_weight=(
-                        dflash_mid_weight_log.item()
-                        if dflash_enabled and args.dflash_align_mode == "final+mid"
                         else None
                     ),
                     dflash_ce_weight=(
@@ -913,7 +854,6 @@ def main():
                         "loss": f"{loss.item():.4f}",
                         "ce": f"{ce_loss.item():.4f}",
                         "dkl": f"{dflash_kl_loss.item():.4f}",
-                        "dmid": f"{dflash_mid_loss.item():.4f}",
                         "wce": f"{dflash_ce_weight.item():.3f}",
                         "acc": f"{accuracy.item():.4f}",
                         "pfx": f"{prefix_acc.item():.4f}",
