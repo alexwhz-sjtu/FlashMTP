@@ -124,7 +124,7 @@ DFLASH_MID_WEIGHT="${DFLASH_MID_WEIGHT:-0.0}"                          # norm-hi
 # 用于 OUTPUT_DIR / WandB run id 的蒸馏配置摘要
 DFLASH_DISTILL_TAG="dnone"
 if [ -n "${DFLASH_TEACHER_PATH}" ]; then
-    DFLASH_DISTILL_TAG="dflash_dklw${DFLASH_DISTILL_WEIGHT}_top${DFLASH_DISTILL_TOP_K}_ceg${LOSS_DECAY_GAMMA:-none}_dkg${DFLASH_DISTILL_DECAY_GAMMA:-none}_dpos${DFLASH_DISTILL_POS_MODE}_cepos${DFLASH_CE_POS_MODE}_cw${DFLASH_CE_WRONG_WEIGHT}_mep${DFLASH_MILESTONE_EPOCH}_dfloor${DFLASH_DISTILL_MIN_SCALE}_cefloor${DFLASH_CE_MIN_SCALE}"
+    DFLASH_DISTILL_TAG="klw${DFLASH_DISTILL_WEIGHT}_top${DFLASH_DISTILL_TOP_K}_ceg${LOSS_DECAY_GAMMA:-none}_dkg${DFLASH_DISTILL_DECAY_GAMMA:-none}_dpos${DFLASH_DISTILL_POS_MODE}_cepos${DFLASH_CE_POS_MODE}"
     if [ "${DFLASH_ALIGN_MODE}" = "final+mid" ]; then
         DFLASH_DISTILL_TAG="${DFLASH_DISTILL_TAG}_mid${DFLASH_MID_ALIGN}_mw${DFLASH_MID_WEIGHT}"
     fi
@@ -143,7 +143,7 @@ WANDB_DIR="${WANDB_DIR:-./wandb}"
 # ========================================
 # 环境相关默认路径 (--dt)
 # ========================================
-RUN_SUFFIX="${LOCAL_POSITION_TAG}_${DFLASH_DISTILL_TAG}"
+RUN_SUFFIX="${DFLASH_DISTILL_TAG}"
 
 if [ "$DT" = "qz" ]; then
     export WANDB_MODE=offline
@@ -161,7 +161,7 @@ else
 fi
 
 WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_ep${NUM_EPOCHS}_${RUN_SUFFIX}}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}_${RUN_SUFFIX}}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${RUN_SUFFIX}}"
 
 # ========================================
 # 显示配置
