@@ -139,6 +139,16 @@ def _build_and_process_dataset(data_key: str):
         prompt_fmt = "{problem}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
         dataset = dataset.map(lambda x: {"turns": [prompt_fmt.format(**x)]})
 
+    elif data_key == "apex25":
+        dataset = load_dataset("MathArena/apex_2025", split="train")
+        prompt_fmt = "{problem}"
+        dataset = dataset.map(lambda x: {"turns": [prompt_fmt.format(**x)]})
+        
+    elif data_key == "arxivmath":
+        dataset = load_dataset("MathArena/arxivmath-0226", split="train")
+        prompt_fmt = "{problem}"
+        dataset = dataset.map(lambda x: {"turns": [prompt_fmt.format(**x)]})
+
     # Chat datasets 
     elif data_key == "alpaca":
         dataset = load_dataset("tatsu-lab/alpaca", split="train")

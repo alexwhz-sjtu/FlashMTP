@@ -4,6 +4,7 @@ import random
 import re
 import sys
 import time
+from collections import defaultdict
 from itertools import chain
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,8 +51,30 @@ def format_longbench_v2_prompt(data: dict) -> str:
     return f"{data['context']}\n\nQuestion: {data['question']}"
 
 
+LONGBENCH_V2_ALIAS_LENGTH_BUCKETS: dict[str, tuple[int, int]] = {
+    "longbench_v2_32k_64k": (32000, 64000),
+}
+
+
+def parse_longbench_v2_length_bucket(
+    dataset_path: Path, dataset_alias: str = ""
+) -> tuple[int, int] | None:
+    """Parse ``longbench_v2_{max}_{min}`` shard names into ``(min_len, max_len)`` token bounds."""
+    alias = dataset_alias.strip().lower()
+    if alias in LONGBENCH_V2_ALIAS_LENGTH_BUCKETS:
+        return LONGBENCH_V2_ALIAS_LENGTH_BUCKETS[alias]
+
+    for name in (alias, *dataset_path.parts):
+        pl = str(name).lower()
+        m = re.fullmatch(r"longbench_v2_(\d+)_(\d+)(?:_.*)?", pl)
+        if m:
+            upper, lower = int(m.group(1)), int(m.group(2))
+            return min(lower, upper), max(lower, upper)
+    return None
+
+
 def is_longbench_v2_dataset_path(dataset_path: Path) -> bool:
-    """Match LongBench v2 shards: folders named ``longbench_v2`` or ``longbench_v2_*`` (context length in path)."""
+    """Match LongBench v2 shards: ``longbench_v2`` or ``longbench_v2_*`` (e.g. ``64000_32000`` = 32k–64k)."""
     try:
         resolved = dataset_path.resolve()
     except OSError:
@@ -63,10 +86,54 @@ def is_longbench_v2_dataset_path(dataset_path: Path) -> bool:
     return False
 
 
-def load_longbench_v2_json_records(data: list, dataset_path: Path) -> list[dict]:
+def _filter_longbench_v2_by_length(
+    data: list, min_len: int, max_len: int, dataset_path: Path
+) -> list:
+    filtered = [
+        item
+        for item in data
+        if isinstance(item, dict)
+        and (
+            item.get("length") is None
+            or min_len <= int(item["length"]) <= max_len
+        )
+    ]
+    if not filtered and data:
+        raise ValueError(
+            f"No LongBench v2 samples in length range [{min_len}, {max_len}] "
+            f"from {dataset_path} (had {len(data)} records)"
+        )
+    return filtered
+
+
+def load_longbench_v2_json_records(
+    data: list, dataset_path: Path, dataset_alias: str = ""
+) -> list[dict]:
     if not isinstance(data, list):
         raise ValueError(f"{dataset_path} must contain a JSON list")
+    bucket = parse_longbench_v2_length_bucket(dataset_path, dataset_alias)
+    if bucket is not None:
+        min_len, max_len = bucket
+        data = _filter_longbench_v2_by_length(data, min_len, max_len, dataset_path)
     return [{"turns": [format_longbench_v2_prompt(item)]} for item in data]
+
+
+def load_longbench_v2_shard_directory(
+    shard_dir: Path, dataset_alias: str = ""
+) -> list[dict]:
+    json_files = sorted(p for p in shard_dir.glob("*.json") if p.is_file())
+    if not json_files:
+        raise FileNotFoundError(f"No JSON files under LongBench v2 shard dir: {shard_dir}")
+    instances: list[dict] = []
+    for json_file in json_files:
+        with json_file.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        instances.extend(
+            load_longbench_v2_json_records(data, json_file, dataset_alias)
+        )
+    if not instances:
+        raise ValueError(f"No LongBench v2 samples loaded from shard dir: {shard_dir}")
+    return instances
 
 
 def is_multifieldqa_en_mixup_dataset_path(dataset_path: Path) -> bool:
@@ -281,7 +348,14 @@ def load_specbench_question_jsonl(dataset_path: Path, original_dataset_name: str
             flat = flatten_specbench_turns(turns)
             if not flat:
                 continue
-            instances.append({"turns": flat, "specbench_chain_turns": True})
+            instances.append(
+                {
+                    "turns": flat,
+                    "specbench_chain_turns": True,
+                    "category": str(obj.get("category", "unknown")),
+                    "question_id": obj.get("question_id"),
+                }
+            )
     if not instances:
         hint = f" for category={category!r}" if category else " (all categories)"
         raise ValueError(f"No Spec-Bench samples{hint} in {dataset_path}")
@@ -304,6 +378,15 @@ def load_benchmark_dataset(dataset_name: str):
 
     dataset_name = resolve_dataset_path(original_dataset_name)
     dataset_path = Path(dataset_name)
+    if dataset_path.is_dir():
+        if (
+            original_dataset_name.lower() == "longbench_v2"
+            or is_longbench_v2_dataset_path(dataset_path)
+            or original_dataset_name.lower().startswith("longbench_v2_")
+        ):
+            return load_longbench_v2_shard_directory(dataset_path, original_dataset_name)
+        raise ValueError(f"Unsupported dataset directory: {dataset_path}")
+
     if dataset_path.is_file() and dataset_path.suffix == ".json":
         with dataset_path.open("r", encoding="utf-8") as f:
             data = json.load(f)
@@ -313,8 +396,11 @@ def load_benchmark_dataset(dataset_name: str):
         if (
             original_dataset_name.lower() == "longbench_v2"
             or is_longbench_v2_dataset_path(dataset_path)
+            or original_dataset_name.lower().startswith("longbench_v2_")
         ):
-            return load_longbench_v2_json_records(data, dataset_path)
+            return load_longbench_v2_json_records(
+                data, dataset_path, original_dataset_name
+            )
 
         if should_load_as_multifieldqa_en_mixup(data, dataset_path, original_dataset_name):
             return load_multifieldqa_en_mixup_json_records(data, dataset_path)
@@ -338,8 +424,11 @@ def load_benchmark_dataset(dataset_name: str):
                 if (
                     original_dataset_name.lower() == "longbench_v2"
                     or is_longbench_v2_dataset_path(dataset_path)
+                    or original_dataset_name.lower().startswith("longbench_v2_")
                 ):
-                    return load_longbench_v2_json_records(data, dataset_path)
+                    return load_longbench_v2_json_records(
+                        data, dataset_path, original_dataset_name
+                    )
                 if should_load_as_multifieldqa_en_mixup(data, dataset_path, original_dataset_name):
                     return load_multifieldqa_en_mixup_json_records(data, dataset_path)
                 if is_swe_bench_style_json(data, dataset_path, original_dataset_name):
@@ -398,6 +487,78 @@ def decode_weight(run) -> int:
 
 def decode_wall_seconds(run) -> float:
     return float(run.time_per_output_token) * decode_weight(run)
+
+
+def compute_benchmark_stats(responses: list, block_size: int) -> dict:
+    """Aggregate decode speedup and acceptance length over benchmark turn responses."""
+    if not responses:
+        return {
+            "num_turns": 0,
+            "token_weighted_speedup": 0.0,
+            "throughput_ratio": 0.0,
+            "baseline_s_per_token": 0.0,
+            "flashmtp_s_per_token": 0.0,
+            "unweighted_speedup": 0.0,
+            "avg_accept_length": 0.0,
+            "histogram": [0.0] * (block_size + 1),
+        }
+
+    w1 = sum(decode_weight(r[1]) for r in responses)
+    wb = sum(decode_weight(r[block_size]) for r in responses)
+    d1 = sum(decode_wall_seconds(r[1]) for r in responses)
+    db = sum(decode_wall_seconds(r[block_size]) for r in responses)
+    t1 = d1 / max(w1, 1)
+    tb = db / max(wb, 1)
+    throughput1 = w1 / max(d1, 1e-30)
+    throughputb = wb / max(db, 1e-30)
+    t1_unweighted = float(np.mean([r[1].time_per_output_token for r in responses]))
+    tb_unweighted = float(np.mean([r[block_size].time_per_output_token for r in responses]))
+
+    acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
+    if acceptance_lengths:
+        histogram = [
+            acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)
+        ]
+        avg_accept = float(sum(index * prob for index, prob in enumerate(histogram)))
+    else:
+        histogram = [0.0] * (block_size + 1)
+        avg_accept = 0.0
+
+    return {
+        "num_turns": len(responses),
+        "token_weighted_speedup": t1 / max(tb, 1e-30),
+        "throughput_ratio": throughputb / max(throughput1, 1e-30),
+        "baseline_s_per_token": t1,
+        "flashmtp_s_per_token": tb,
+        "unweighted_speedup": t1_unweighted / max(tb_unweighted, 1e-30),
+        "avg_accept_length": avg_accept,
+        "histogram": histogram,
+    }
+
+
+def group_responses_by_category(responses: list) -> dict[str, list]:
+    groups: dict[str, list] = defaultdict(list)
+    for response in responses:
+        groups[str(response.get("category", "unknown"))].append(response)
+    return dict(groups)
+
+
+def print_benchmark_stats(stats: dict, block_size: int, title: str) -> None:
+    print(f"\n=== {title} ===")
+    print(f"  turns: {stats['num_turns']}")
+    print(
+        f"  token-weighted speedup: {stats['token_weighted_speedup']:.2f}x | "
+        f"throughput ratio: {stats['throughput_ratio']:.2f}x | "
+        f"unweighted speedup: {stats['unweighted_speedup']:.2f}x"
+    )
+    print(
+        f"  decode s/token baseline={stats['baseline_s_per_token']:.6f} "
+        f"flashmtp={stats['flashmtp_s_per_token']:.6f}"
+    )
+    histogram = stats["histogram"]
+    hist_text = ", ".join(f"{x * 100:.1f}%" for x in histogram)
+    print(f"  acceptance length histogram: [{hist_text}]")
+    print(f"  average acceptance length: {stats['avg_accept_length']:.2f}")
 
 
 @torch.inference_mode()
@@ -772,6 +933,7 @@ def main() -> None:
         messages = []
         chain_turns = bool(instance.get("specbench_chain_turns"))
         decode_after_first = chain_turns
+        sample_category = instance.get("category")
         prev_assistant = ""
         for turn_index, turn_q in enumerate(instance["turns"]):
             if chain_turns:
@@ -779,12 +941,13 @@ def main() -> None:
             else:
                 user_content = turn_q
             messages.append({"role": "user", "content": user_content})
-            input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+            input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
             input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
             if args.batch_size > 1:
                 input_ids = input_ids.expand(args.batch_size, -1).contiguous()
+            category_suffix = f" | category={sample_category}" if sample_category else ""
             print(
-                f"\n[Sample {idx} | Turn {turn_index}] Input length: "
+                f"\n[Sample {idx} | Turn {turn_index}{category_suffix}] Input length: "
                 f"{input_ids.shape[1]} tokens ({len(user_content)} chars), "
                 f"batch_size={input_ids.shape[0]}"
             )
@@ -840,6 +1003,10 @@ def main() -> None:
             messages.append({"role": "assistant", "content": output_text})
             if chain_turns:
                 prev_assistant = output_text
+            if sample_category is not None:
+                response["category"] = sample_category
+            if instance.get("question_id") is not None:
+                response["question_id"] = instance["question_id"]
             responses.append(response)
 
     if dist.size() > 1:
@@ -848,34 +1015,21 @@ def main() -> None:
             return
         responses = list(chain(*responses))
 
-    w1 = sum(decode_weight(r[1]) for r in responses)
-    wb = sum(decode_weight(r[block_size]) for r in responses)
-    d1 = sum(decode_wall_seconds(r[1]) for r in responses)
-    db = sum(decode_wall_seconds(r[block_size]) for r in responses)
-    t1 = d1 / max(w1, 1)
-    tb = db / max(wb, 1)
-    throughput1 = w1 / d1
-    throughputb = wb / db
-    t1_unweighted = float(np.mean([r[1].time_per_output_token for r in responses]))
-    tb_unweighted = float(np.mean([r[block_size].time_per_output_token for r in responses]))
-    print(
-        f"Decoding speedup (token-weighted:) and throughput ratio "
-        f"batch_size={args.batch_size}): {t1 / max(tb, 1e-30):.2f}  |  naive:{throughput1}; dflash:{throughputb}; ratio:{throughputb/throughput1}:.2f"
-    )
-    print(
-        f"  Global decode s/token baseline={t1:.6f} flashmtp={tb:.6f} | "
-        f"per-sample unweighted mean {t1_unweighted:.6f} / {tb_unweighted:.6f} "
-        f"(ratio {t1_unweighted / max(tb_unweighted, 1e-30):.2f})"
+    overall_stats = compute_benchmark_stats(responses, block_size)
+    print_benchmark_stats(
+        overall_stats,
+        block_size,
+        title=f"Overall (batch_size={args.batch_size})",
     )
 
-    acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
-    histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
-    print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
-    
-    tau = 0
-    for index, num in enumerate(histogram): 
-        tau += index * num 
-    print(f"Average Acceptance length: {tau:.2f}")
+    category_groups = group_responses_by_category(responses)
+    if len(category_groups) > 1 or (
+        len(category_groups) == 1 and "unknown" not in category_groups
+    ):
+        print("\n=== Per-category breakdown ===")
+        for category in sorted(category_groups):
+            cat_stats = compute_benchmark_stats(category_groups[category], block_size)
+            print_benchmark_stats(cat_stats, block_size, title=f"category={category}")
 
     total_elapsed_time = cuda_time() - benchmark_start
     print(f"Total elapsed time: {total_elapsed_time:.2f}s")

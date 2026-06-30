@@ -110,7 +110,7 @@ def create_flashmtp_block_mask(
 
     Rules:
       1. Block_i only sees CHS_i (its own feature-concat context token).
-      2. Intra-block attention is bidirectional.
+      2. Intra-block draft attention is bidirectional.
       3. Different blocks are invisible to each other.
       4. Invalid blocks (block_keep_mask=False) see nothing.
     """

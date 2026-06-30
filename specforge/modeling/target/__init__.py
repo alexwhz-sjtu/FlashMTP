@@ -1,16 +1,4 @@
-from .eagle3_target_model import (
-    CustomEagle3TargetModel,
-    Eagle3TargetModel,
-    HFEagle3TargetModel,
-    SGLangEagle3TargetModel,
-    get_eagle3_target_model,
-)
-from .flashmtp_target_model import (
-    FlashMTPTargetModel,
-    HFFlashMTPTargetModel,
-    get_flashmtp_target_model,
-)
-from .target_head import TargetHead
+# Lazy package init — import submodules directly to avoid pulling sglang when unused.
 
 __all__ = [
     "Eagle3TargetModel",

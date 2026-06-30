@@ -5,21 +5,9 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from transformers import AutoModelForCausalLM
 
 from specforge.distributed import get_tp_group
-
-from .sglang_backend import SGLangRunner
 
 
 @dataclass
@@ -65,7 +53,7 @@ class FlashMTPTargetModel(ABC):
 
 
 class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
-    def __init__(self, model_runner: SGLangRunner):
+    def __init__(self, model_runner):
         super().__init__()
         self.model_runner = model_runner
 
@@ -79,6 +67,11 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         trust_remote_code: bool = False,
         **kwargs,
     ) -> "SGLangFlashMTPTargetModel":
+        from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.server_args import ServerArgs
+
+        from .sglang_backend import SGLangRunner
+
         tp_size = dist.get_world_size(get_tp_group())
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
@@ -132,6 +125,17 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
 
     @torch.no_grad
     def _extend(self, reqs):
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardBatch,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
+
         cache_params = CacheInitParams(
             disable=False,
             req_to_token_pool=self.model_runner.req_to_token_pool,
@@ -199,6 +203,9 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
     ) -> FlashMTPTargetOutput:
+        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
         reqs, data_cache = [], []
 
@@ -302,6 +309,7 @@ def get_flashmtp_target_model(
     **kwargs,
 ) -> FlashMTPTargetModel:
     if backend == "sglang":
+        # Import sglang only when the sglang backend is requested.
         return SGLangFlashMTPTargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
