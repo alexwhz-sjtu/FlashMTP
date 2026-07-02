@@ -30,7 +30,6 @@ done
 
 # ---------------------------------------------------------------------------
 # 1. 运行环境（集群 / 机器类型）
-#    qz: 启智离线 WandB；h100: WHZ 开发机；a800: 默认 A800 共享路径
 # ---------------------------------------------------------------------------
 DT="${DT:-a800}"
 if [[ "$DT" != "qz" && "$DT" != "a800" && "$DT" != "h100" ]]; then
@@ -51,15 +50,15 @@ DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
 # 3. 模型结构（draft / teacher pivot / block）
 # ---------------------------------------------------------------------------
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"       # draft transformer 层数
-NUM_MIDDLE_LAYERS_N="${NUM_MIDDLE_LAYERS_N:-5}"  # teacher 中间层数（首尾各 1 层 + N 中间层）
+NUM_MIDDLE_LAYERS_N="${NUM_MIDDLE_LAYERS_N:-16}"  # teacher 中间层数（首尾各 1 层 + N 中间层）
 BLOCK_SIZE="${BLOCK_SIZE:-16}"                   # 每块 speculative token 数
 NUM_ANCHORS="${NUM_ANCHORS:-512}"                # 每条序列随机采样的 anchor 块数
-CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"    # CHS 拼接方式（当前固定 feature）
+CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"    # 虽然名字为feature，但是序列维度拼接
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 
 # local_position=true: draft 用块内 1..block_size，CHS prefix RoPE 全 0
 # local_position=false: draft 用全局 anchor 位置（默认）
-LOCAL_POSITION="${LOCAL_POSITION:-false}"
+LOCAL_POSITION="${LOCAL_POSITION:-true}"
 LOCAL_POSITION_TAG="lp0"
 case "$(echo "${LOCAL_POSITION}" | tr '[:upper:]' '[:lower:]')" in
     true|1|yes) LOCAL_POSITION_TAG="lp1" ;;
@@ -72,7 +71,7 @@ DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}"
 ENABLE_THINKING="${ENABLE_THINKING:-off}"        # on | off，影响 regen 数据文件名
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen}"
-IS_PREFORMATTED="${IS_PREFORMATTED:-}"           # 非空则传 --is-preformatted
+IS_PREFORMATTED="${IS_PREFORMATTED:-}"         
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
 BUILD_DATASET_NUM_PROC="${BUILD_DATASET_NUM_PROC:-8}"
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"             # 留空则不评估
