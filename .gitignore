@@ -208,3 +208,6 @@ evaluation/run_cmd.ipynb
 wandb_sync_daemon.py
 
 log/
+/log_1.6M
+/log_2.3M
+/log_aug

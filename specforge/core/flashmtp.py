@@ -174,7 +174,6 @@ class OnlineFlashMTPModel(nn.Module):
             num_anchors: int = 512,
             loss_decay_gamma: Optional[float] = None,
             chs_concat_mode: str = "feature",
-            loss_teacher_match_cap: bool = False,
             add_noise: bool = False,
             target_hidden_noise_ratio: float = 0.1,
             w1_mse: float = 0.0,
@@ -188,7 +187,6 @@ class OnlineFlashMTPModel(nn.Module):
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
-        self.loss_teacher_match_cap = loss_teacher_match_cap
         self.add_noise = add_noise
         self.target_hidden_noise_ratio = target_hidden_noise_ratio
         self.w1_mse = w1_mse
@@ -409,38 +407,6 @@ class OnlineFlashMTPModel(nn.Module):
             decay_weights = torch.exp(-(k - 1).clamp(min=0).float() /
                                       self.loss_decay_gamma)
             weight_mask = weight_mask * decay_weights
-
-        # --- Optional: down-weight slots where draft already exceeds teacher on y* ---
-        if self.loss_teacher_match_cap:
-            n_blk = anchor_positions.size(1)
-            nk = n_blk * self.block_size
-            h_dim = hidden_states[-1].size(-1)
-            seq_h = hidden_states[-1].size(1)
-            pred_idx = (safe_label_indices - 1).clamp(min=0).clamp(max=seq_h - 1)
-            flat_pred = pred_idx.reshape(bsz, nk)
-            idx_h = flat_pred.unsqueeze(-1).expand(bsz, nk, h_dim)
-            teacher_h = torch.gather(hidden_states[-1], 1, idx_h)
-            teacher_logits = self.lm_head(teacher_h)
-            p_teacher = torch.gather(
-                F.softmax(teacher_logits.float(), dim=-1),
-                2,
-                target_ids.reshape(bsz, nk, 1),
-            ).squeeze(-1)
-            p_teacher = p_teacher.view(bsz, n_blk, self.block_size)
-            p_den = torch.clamp(p_teacher, min=0.6)
-
-            p_draft = torch.gather(
-                F.softmax(logits.reshape(bsz, nk, -1).float(), dim=-1),
-                2,
-                target_ids.reshape(bsz, nk, 1),
-            ).squeeze(-1)
-            p_draft = p_draft.view(bsz, n_blk, self.block_size)
-
-            with torch.no_grad():
-                ratio = (p_draft / p_den).detach()
-            over = (ratio > 1.0) & (weight_mask > 0)
-            w_tail = weight_mask[:, :, -1:].expand_as(weight_mask)
-            weight_mask = torch.where(over, w_tail, weight_mask)
 
         # --- Cross entropy ---
         flat_logits = logits.view(-1, logits.size(-1))
