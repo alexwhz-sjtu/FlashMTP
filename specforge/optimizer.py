@@ -1,6 +1,6 @@
 import torch
 
-from specforge.lr_scheduler import CosineAnnealingWarmupLR
+from specforge.lr_scheduler import CosineAnnealingWarmupLR, WarmupDelayerScheduler, CosineAnnealingLR, ThreeStageDistillScheduler
 from specforge.utils import print_on_rank0
 
 
@@ -13,6 +13,16 @@ class BF16Optimizer:
         max_grad_norm=0.5,
         total_steps=800_000,
         warmup_ratio=0.015,
+        delay_steps=0,
+        use_three_stage=False,
+        distill_steps=None,
+        transition_steps=None,
+        distill_ratio=0.3,
+        transition_ratio=0.2,
+        distill_end_lr_ratio=0.9,
+        transition_lr_ratio=0.2,
+        ce_start_lr_ratio=0.9,
+        eta_min_ratio=0.0,
     ):
         # TODO: For now, we only support cosine annealing warmup lr scheduler and AdamW optimizer
         # TODO: We should make these parameters configurable
@@ -29,11 +39,58 @@ class BF16Optimizer:
         self.optimizer = torch.optim.AdamW(
             self.fp32_params, lr=lr, weight_decay=weight_decay
         )
-        self.scheduler = CosineAnnealingWarmupLR(
-            self.optimizer,
-            total_steps=total_steps,
-            warmup_steps=int(warmup_ratio * total_steps),
-        )
+
+        if use_three_stage:
+            # Use three-stage scheduler for DFlash distillation with built-in warmup
+            # Note: When use_three_stage=True, warmup_ratio is used inside ThreeStageDistillScheduler
+            self.scheduler = ThreeStageDistillScheduler(
+                self.optimizer,
+                total_steps=total_steps,
+                warmup_ratio=warmup_ratio,
+                distill_steps=distill_steps,
+                transition_steps=transition_steps,
+                distill_ratio=distill_ratio,
+                transition_ratio=transition_ratio,
+                distill_end_lr_ratio=distill_end_lr_ratio,
+                transition_lr_ratio=transition_lr_ratio,
+                ce_start_lr_ratio=ce_start_lr_ratio,
+                eta_min_ratio=eta_min_ratio,
+            )
+            print_on_rank0(
+                f"Using ThreeStageDistillScheduler: warmup={self.scheduler.warmup_steps} steps, "
+                f"distill={self.scheduler.distill_steps} steps, "
+                f"transition={self.scheduler.transition_steps} steps, "
+                f"ce={self.scheduler.ce_steps} steps"
+            )
+        elif delay_steps > 0:
+            # Use WarmupDelayerScheduler: warmup -> constant -> cosine decay
+            warmup_steps = int(warmup_ratio * total_steps)
+            # The total_steps is used for the cosine annealing part after delay
+            cosine_steps = total_steps - warmup_steps - delay_steps
+            if cosine_steps <= 0:
+                raise ValueError(
+                    f"Invalid schedule: warmup_steps ({warmup_steps}) + delay_steps ({delay_steps}) "
+                    f"must be less than total_steps ({total_steps})"
+                )
+            base_scheduler = CosineAnnealingLR(
+                self.optimizer,
+                total_steps=cosine_steps,
+                eta_min=0.0,
+            )
+            self.scheduler = WarmupDelayerScheduler(
+                self.optimizer,
+                warmup_epochs=warmup_steps,
+                delay_epochs=delay_steps,
+                after_scheduler=base_scheduler,
+            )
+        else:
+            # Use original CosineAnnealingWarmupLR: warmup -> cosine decay
+            warmup_steps = int(warmup_ratio * total_steps)
+            self.scheduler = CosineAnnealingWarmupLR(
+                self.optimizer,
+                total_steps=total_steps,
+                warmup_steps=warmup_steps,
+            )
 
     def step(self):
         with torch.no_grad():

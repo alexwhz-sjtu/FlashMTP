@@ -135,11 +135,12 @@ def parse_args():
         "--dflash-ce-pos-mode",
         type=str,
         default="student_wrong",
-        choices=["prefix", "student_wrong"],
+        choices=["prefix", "student_wrong", "all"],
         help="Position mode for true-label CE. prefix uses teacher continuous-correct "
         "prefix, plus one student frontier error if student catches up to teacher. "
         "student_wrong supervises slots where teacher top1 is correct but student "
-        "top1 is wrong.",
+        "top1 is wrong. all uses every valid position in the block, weighted by "
+        "loss-decay-gamma.",
     )
     model_group.add_argument(
         "--dflash-distill-decay-gamma",
@@ -181,6 +182,14 @@ def parse_args():
         help="Milestone epoch for final+mid cosine transition from distillation to CE.",
     )
     model_group.add_argument(
+        "--dflash-milestone-end-epoch",
+        type=float,
+        default=None,
+        help="End epoch of the cosine transition interval. If unset, defaults to num_epochs. "
+        "Before dflash_milestone_epoch weights are constant; between the two milestones "
+        "they cosine-transition; after the end epoch they stay at the final value.",
+    )
+    model_group.add_argument(
         "--dflash-distill-min-scale",
         type=float,
         default=0.0,
@@ -216,6 +225,62 @@ def parse_args():
     training_group.add_argument("--max-length", type=int, default=3072)
     training_group.add_argument("--warmup-ratio", type=float, default=0.04)
     training_group.add_argument("--max-grad-norm", type=float, default=1.0)
+    training_group.add_argument(
+        "--use-three-stage-lr",
+        action="store_true",
+        help="Use three-stage learning rate scheduler for DFlash distillation. "
+        "Stage 1 (distill): cosine decay from initial to distill-end-lr-ratio. "
+        "Stage 2 (transition): constant lr at transition-lr-ratio. "
+        "Stage 3 (ce): cosine decay from ce-start-lr-ratio to eta-min.",
+    )
+    training_group.add_argument(
+        "--distill-steps",
+        type=int,
+        default=None,
+        help="Number of steps for stage 1 (distill phase). If not set, uses --distill-ratio * total_steps.",
+    )
+    training_group.add_argument(
+        "--transition-steps",
+        type=int,
+        default=None,
+        help="Number of steps for stage 2 (transition phase). If not set, uses --transition-ratio * total_steps.",
+    )
+    training_group.add_argument(
+        "--distill-ratio",
+        type=float,
+        default=0.3,
+        help="Ratio of total steps for distill stage (default: 0.3). Used when --distill-steps not set.",
+    )
+    training_group.add_argument(
+        "--transition-ratio",
+        type=float,
+        default=0.2,
+        help="Ratio of total steps for transition stage (default: 0.2). Used when --transition-steps not set.",
+    )
+    training_group.add_argument(
+        "--distill-end-lr-ratio",
+        type=float,
+        default=0.9,
+        help="Ending lr ratio for distill stage (default: 0.9).",
+    )
+    training_group.add_argument(
+        "--transition-lr-ratio",
+        type=float,
+        default=0.2,
+        help="Constant lr ratio for transition stage (default: 0.2).",
+    )
+    training_group.add_argument(
+        "--ce-start-lr-ratio",
+        type=float,
+        default=0.9,
+        help="Starting lr ratio for ce stage (default: 0.9).",
+    )
+    training_group.add_argument(
+        "--eta-min-ratio",
+        type=float,
+        default=0.0,
+        help="Minimum lr ratio for cosine annealing in ce stage (default: 0.0).",
+    )
     training_group.add_argument("--accumulation-steps", type=int, default=1)
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
@@ -556,7 +621,11 @@ def main():
     if args.ckpt_dir is not None:
         if os.path.isdir(args.ckpt_dir):
             draft_model_last_checkpoint = args.ckpt_dir
-            print_on_rank0(f"Using checkpoint: {draft_model_last_checkpoint}")
+            print_on_rank0("\n" + "="*80)
+            print_on_rank0("🚀 RESUMING TRAINING FROM SPECIFIED CHECKPOINT 🚀")
+            print_on_rank0("="*80)
+            print_on_rank0(f"Checkpoint path: {draft_model_last_checkpoint}")
+            print_on_rank0("="*80 + "\n")
         else:
             raise ValueError(
                 f"Provided ckpt dir {args.ckpt_dir} is not a valid directory."
@@ -564,7 +633,7 @@ def main():
 
     if args.resume and os.path.isdir(args.output_dir):
         draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(
-            args.output_dir, prefix=r"epoch_\d+_step"
+            args.output_dir, prefix="epoch"
         )
         print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
 
@@ -652,6 +721,11 @@ def main():
     draft_model.config.flashmtp_config["dflash_milestone_epoch"] = float(
         args.dflash_milestone_epoch
     )
+    draft_model.config.flashmtp_config["dflash_milestone_end_epoch"] = (
+        None
+        if args.dflash_milestone_end_epoch is None
+        else float(args.dflash_milestone_end_epoch)
+    )
     draft_model.config.flashmtp_config["dflash_distill_min_scale"] = float(
         args.dflash_distill_min_scale
     )
@@ -699,6 +773,7 @@ def main():
             f"mid_weight={args.dflash_mid_weight}, "
             f"ce_weight={args.dflash_ce_weight}, "
             f"milestone_epoch={args.dflash_milestone_epoch}, "
+            f"milestone_end_epoch={args.dflash_milestone_end_epoch}, "
             f"distill_min_scale={args.dflash_distill_min_scale}, "
             f"ce_min_scale={args.dflash_ce_min_scale}, "
             f"attention_backend={dflash_teacher_model.config._attn_implementation}, "
@@ -727,6 +802,7 @@ def main():
         dflash_mid_weight=args.dflash_mid_weight,
         dflash_ce_weight=args.dflash_ce_weight,
         dflash_milestone_epoch=args.dflash_milestone_epoch,
+        dflash_milestone_end_epoch=args.dflash_milestone_end_epoch,
         dflash_distill_min_scale=args.dflash_distill_min_scale,
         dflash_ce_min_scale=args.dflash_ce_min_scale,
         dflash_total_epochs=args.num_epochs,
@@ -742,12 +818,25 @@ def main():
     )
     print_with_rank("Initialized FSDP")
 
+    # Learning rate scheduler: warmup -> cosine decay (no delay)
+    delay_steps = 0
+
     optimizer = BF16Optimizer(
         draft_model,
         lr=args.learning_rate,
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.warmup_ratio,
         total_steps=total_steps,
+        delay_steps=delay_steps,
+        use_three_stage=args.use_three_stage_lr,
+        distill_steps=args.distill_steps,
+        transition_steps=args.transition_steps,
+        distill_ratio=args.distill_ratio,
+        transition_ratio=args.transition_ratio,
+        distill_end_lr_ratio=args.distill_end_lr_ratio,
+        transition_lr_ratio=args.transition_lr_ratio,
+        ce_start_lr_ratio=args.ce_start_lr_ratio,
+        eta_min_ratio=args.eta_min_ratio,
     )
     skip_steps=0
     start_epoch = 0

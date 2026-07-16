@@ -7,6 +7,7 @@ import time
 from itertools import chain
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Callable
 from loguru import logger
 import numpy as np
 import torch
@@ -452,6 +453,7 @@ def target_generate(
     stop_token_ids: list[int],
     temperature: float = 0.0,
     decode_timing_after_first_token: bool = False,
+    stream_callback: Callable[[torch.Tensor], None] | None = None,
 ) -> SimpleNamespace:
     batch_size_dim = input_ids.shape[0]
     num_input_tokens = input_ids.shape[1]
@@ -487,6 +489,9 @@ def target_generate(
     while start < max_length:
         output_ids[:, start : start + 1] = next_token
         start += 1
+
+        if stream_callback is not None:
+            stream_callback(output_ids[:, :start])
 
         if decode_timing_after_first_token and decode_start is None:
             decode_start = cuda_time()
@@ -543,6 +548,7 @@ def flashmtp_generate(
     stop_token_ids: list[int],
     temperature: float = 0.0,
     decode_timing_after_first_token: bool = False,
+    stream_callback: Callable[[torch.Tensor], None] | None = None,
     *,
     use_draft_tree: bool = False,
     draft_tree_trunc_thres: float = 0.2,
@@ -565,6 +571,7 @@ def flashmtp_generate(
                 tree_width=draft_tree_width,
                 entropy_ratio=draft_tree_entropy_ratio,
                 decode_timing_after_first_token=decode_timing_after_first_token,
+                stream_callback=stream_callback,
             )
         else:
             output_ids = model.spec_generate(
@@ -574,6 +581,7 @@ def flashmtp_generate(
                 stop_token_ids=stop_token_ids,
                 temperature=temperature,
                 decode_timing_after_first_token=decode_timing_after_first_token,
+                stream_callback=stream_callback,
             )
     finally:
         model.block_size = original_block_size

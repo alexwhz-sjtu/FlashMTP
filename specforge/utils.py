@@ -85,8 +85,8 @@ def get_last_checkpoint(folder, prefix="epoch"):
         prefix: The prefix for checkpoint directories, default is "epoch".
 
     Returns:
-        tuple: (checkpoint_path, epoch, step)
-               - Returns (None, None, None) if no checkpoint is found.
+        tuple: (checkpoint_path, (epoch, step))
+               - Returns (None, None) if no checkpoint is found.
                - step is 0 if not present in the directory name.
     """
     content = os.listdir(folder)
@@ -101,7 +101,7 @@ def get_last_checkpoint(folder, prefix="epoch"):
     ]
 
     if len(checkpoints) == 0:
-        return None, None, None
+        return None, None
 
     # Sort key: (epoch, step), step=0 when not present
     def sort_key(x):

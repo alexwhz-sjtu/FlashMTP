@@ -199,6 +199,7 @@ class OnlineFlashMTPModel(nn.Module):
             dflash_mid_weight: float = 0.0,
             dflash_ce_weight: float = 1.0,
             dflash_milestone_epoch: float = 0.0,
+            dflash_milestone_end_epoch: Optional[float] = None,
             dflash_distill_min_scale: float = 0.0,
             dflash_ce_min_scale: float = 0.0,
             dflash_total_epochs: int = 1,
@@ -229,6 +230,11 @@ class OnlineFlashMTPModel(nn.Module):
         self.dflash_mid_weight = float(dflash_mid_weight)
         self.dflash_ce_weight = float(dflash_ce_weight)
         self.dflash_milestone_epoch = float(dflash_milestone_epoch)
+        self.dflash_milestone_end_epoch = (
+            float(dflash_milestone_end_epoch)
+            if dflash_milestone_end_epoch is not None
+            else max(float(dflash_total_epochs), 1.0)
+        )
         self.dflash_distill_min_scale = min(max(float(dflash_distill_min_scale), 0.0), 1.0)
         self.dflash_ce_min_scale = min(max(float(dflash_ce_min_scale), 0.0), 1.0)
         self.dflash_total_epochs = max(float(dflash_total_epochs), 1.0)
@@ -241,9 +247,9 @@ class OnlineFlashMTPModel(nn.Module):
             raise ValueError("dflash_mid_align must be one of full, half")
         if self.dflash_distill_pos_mode not in ("prefix", "all"):
             raise ValueError("dflash_distill_pos_mode must be one of prefix, all")
-        if self.dflash_ce_pos_mode not in ("prefix", "student_wrong"):
+        if self.dflash_ce_pos_mode not in ("prefix", "student_wrong", "all"):
             raise ValueError(
-                "dflash_ce_pos_mode must be one of prefix, student_wrong"
+                "dflash_ce_pos_mode must be one of prefix, student_wrong, all"
             )
         if self.dflash_teacher_model is not None:
             self.dflash_teacher_model.eval()
@@ -638,16 +644,29 @@ class OnlineFlashMTPModel(nn.Module):
             return 0.0, 0.0, 1.0
 
         epoch_value = 0.0 if current_epoch is None else float(current_epoch)
-        if epoch_value < self.dflash_milestone_epoch:
-            mid_weight = self.dflash_mid_weight if self.dflash_align_mode == "final+mid" else 0.0
+        start = self.dflash_milestone_epoch
+        end = self.dflash_milestone_end_epoch
+        mid_weight = self.dflash_mid_weight if self.dflash_align_mode == "final+mid" else 0.0
+
+        if epoch_value <= start:
+            # 区间前：KL 保持完整，CE 保持 floor
             return (
                 self.dflash_distill_weight,
                 mid_weight,
                 self.dflash_ce_weight * self.dflash_ce_min_scale,
             )
 
-        denom = max(self.dflash_total_epochs - self.dflash_milestone_epoch, 1e-6)
-        t = min(max((epoch_value - self.dflash_milestone_epoch) / denom, 0.0), 1.0)
+        if epoch_value >= end:
+            # 区间后：KL 降到 floor，CE 升到完整
+            return (
+                self.dflash_distill_weight * self.dflash_distill_min_scale,
+                mid_weight * self.dflash_distill_min_scale,
+                self.dflash_ce_weight,
+            )
+
+        # 区间 [start, end] 内做余弦过渡
+        denom = max(end - start, 1e-6)
+        t = min(max((epoch_value - start) / denom, 0.0), 1.0)
         cosine_scale = 0.5 * (1.0 + math.cos(math.pi * t))
         distill_scale = self.dflash_distill_min_scale + (
             1.0 - self.dflash_distill_min_scale
@@ -655,7 +674,6 @@ class OnlineFlashMTPModel(nn.Module):
         ce_scale = self.dflash_ce_min_scale + (
             1.0 - self.dflash_ce_min_scale
         ) * (1.0 - cosine_scale)
-        mid_weight = self.dflash_mid_weight if self.dflash_align_mode == "final+mid" else 0.0
         return (
             self.dflash_distill_weight * distill_scale,
             mid_weight * distill_scale,
@@ -839,6 +857,9 @@ class OnlineFlashMTPModel(nn.Module):
                 valid_mask=weight_mask,
             )
             weight_mask = weight_mask * ce_student_wrong_mask.float()
+        elif self.use_dflash_distill and self.dflash_ce_pos_mode == "all":
+            # 使用全部有效位置；LOSS_DECAY_GAMMA 已在上面统一乘到 weight_mask
+            pass
 
         # --- Cross entropy ---
         flat_logits = logits.view(-1, logits.size(-1))

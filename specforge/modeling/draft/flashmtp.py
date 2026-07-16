@@ -823,6 +823,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         tree_width: int = 4,
         entropy_ratio: float = 0.4,
         decode_timing_after_first_token: bool = False,
+        stream_callback: Callable[[torch.Tensor], None] | None = None,
     ) -> torch.LongTensor:
         """Speculative decode with dynamic draft tree (``block_size`` from model config).
 
@@ -873,6 +874,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
             output.logits, temperature
         )
+        if stream_callback is not None:
+            stream_callback(output_ids[:, : num_input_tokens + 1])
         target_hidden = gather_pivot_multilayer_inference(
             output.hidden_states,
             self.target_layer_ids,
@@ -974,6 +977,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 )
 
             start += acceptance_length + 1
+            if stream_callback is not None:
+                stream_callback(output_ids[:, :start])
             past_key_values_target.crop(start)
             target_hidden = gather_pivot_multilayer_inference(
                 output.hidden_states,
@@ -1024,6 +1029,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         stop_token_ids: list[int],
         temperature: float,
         decode_timing_after_first_token: bool = False,
+        stream_callback: Callable[[torch.Tensor], None] | None = None,
     ):
         self.eval()
         self._last_decode_stats = {
@@ -1064,6 +1070,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
             output.logits, temperature
         )
+        if stream_callback is not None:
+            stream_callback(output_ids[:, : num_input_tokens + 1])
         target_hidden = gather_pivot_multilayer_inference(
             output.hidden_states,
             self.target_layer_ids,
@@ -1132,6 +1140,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 :, acceptance_length
             ]
             start += acceptance_length + 1
+            if stream_callback is not None:
+                stream_callback(output_ids[:, :start])
             past_key_values_target.crop(start)
             pivot_index = min(
                 acceptance_length, output.hidden_states[0].shape[1] - 1

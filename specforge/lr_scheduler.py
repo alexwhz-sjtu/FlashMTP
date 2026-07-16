@@ -1,3 +1,4 @@
+import math
 from warnings import warn
 
 from torch.optim.lr_scheduler import CosineAnnealingLR as _CosineAnnealingLR
@@ -258,3 +259,138 @@ class CosineAnnealingWarmupLR(WarmupScheduler):
             last_epoch=last_epoch,
         )
         super().__init__(optimizer, warmup_steps, base_scheduler, last_epoch=last_epoch)
+
+
+class ThreeStageDistillScheduler(_LRScheduler):
+    """Three-stage learning rate scheduler for DFlash distillation training with optional warmup.
+
+    Stage 0 (Warmup, optional): Linear warmup from 0 to initial_lr
+    Stage 1 (Distill): Cosine decay from initial_lr to distill_end_lr_ratio * initial_lr
+    Stage 2 (Transition): Constant lr at transition_lr_ratio * initial_lr
+    Stage 3 (CE): Cosine annealing from ce_start_lr_ratio * initial_lr down to eta_min
+
+    Supports both absolute steps and relative ratios for flexible configuration.
+    If stage steps are not provided, uses automatic allocation based on ratios.
+
+    Args:
+        optimizer (:class:`torch.optim.Optimizer`): Wrapped optimizer.
+        total_steps (int): Number of total training steps.
+        warmup_steps (int, optional): Number of warmup steps. If None, uses warmup_ratio.
+        warmup_ratio (float): Ratio of total_steps for warmup (default: 0.04).
+        distill_steps (int, optional): Number of steps for stage 1. If None, uses distill_ratio.
+        transition_steps (int, optional): Number of steps for stage 2. If None, uses transition_ratio.
+        distill_ratio (float): Ratio of remaining steps (after warmup) for stage 1 (default: 0.3).
+        transition_ratio (float): Ratio of remaining steps for stage 2 (default: 0.2).
+        distill_end_lr_ratio (float): Ending lr ratio for stage 1 (default: 0.9).
+        transition_lr_ratio (float): Constant lr ratio for stage 2 (default: 0.2).
+        ce_start_lr_ratio (float): Starting lr ratio for stage 3 (default: 0.9).
+        eta_min_ratio (float): Minimum lr ratio for cosine annealing (default: 0.0).
+        last_epoch (int, optional): The index of last epoch, defaults to -1.
+    """
+
+    def __init__(
+        self,
+        optimizer,
+        total_steps: int,
+        warmup_steps: int = None,
+        warmup_ratio: float = 0.04,
+        distill_steps: int = None,
+        transition_steps: int = None,
+        distill_ratio: float = 0.3,
+        transition_ratio: float = 0.2,
+        distill_end_lr_ratio: float = 0.9,
+        transition_lr_ratio: float = 0.2,
+        ce_start_lr_ratio: float = 0.9,
+        eta_min_ratio: float = 0.0,
+        last_epoch: int = -1,
+    ):
+        # Calculate warmup steps
+        if warmup_steps is None:
+            warmup_steps = int(total_steps * warmup_ratio)
+        self.warmup_steps = max(0, warmup_steps)
+
+        # Remaining steps after warmup
+        remaining_steps = total_steps - self.warmup_steps
+
+        # Auto-calculate steps from ratios if not explicitly provided
+        if distill_steps is None:
+            distill_steps = int(remaining_steps * distill_ratio)
+        if transition_steps is None:
+            transition_steps = int(remaining_steps * transition_ratio)
+
+        if distill_steps < 0:
+            raise ValueError(f"distill_steps must >= 0, got {distill_steps}")
+        if transition_steps < 0:
+            raise ValueError(f"transition_steps must >= 0, got {transition_steps}")
+
+        self.distill_steps = distill_steps
+        self.transition_steps = transition_steps
+        self.ce_steps = remaining_steps - distill_steps - transition_steps
+
+        # Ensure ce_steps is non-negative
+        if self.ce_steps < 0:
+            # Auto-adjust: prioritize distill, then transition, rest for ce
+            self.distill_steps = int(remaining_steps * 0.3)
+            self.transition_steps = int(remaining_steps * 0.2)
+            self.ce_steps = remaining_steps - self.distill_steps - self.transition_steps
+            import warnings
+            warnings.warn(
+                f"Steps exceed remaining_steps, auto-adjusted to: "
+                f"distill={self.distill_steps}, transition={self.transition_steps}, ce={self.ce_steps}"
+            )
+
+        self.distill_end_lr_ratio = distill_end_lr_ratio
+        self.transition_lr_ratio = transition_lr_ratio
+        self.ce_start_lr_ratio = ce_start_lr_ratio
+        self.eta_min_ratio = eta_min_ratio
+        self.total_steps = total_steps
+
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        current_step = self.last_epoch
+
+        # Stage 0: Warmup - linear increase from 0 to base_lr
+        if current_step < self.warmup_steps:
+            if self.warmup_steps == 0:
+                return list(self.base_lrs)
+            progress = current_step / self.warmup_steps
+            return [base_lr * progress for base_lr in self.base_lrs]
+
+        # Adjust step for post-warmup stages
+        step_after_warmup = current_step - self.warmup_steps
+
+        # Stage 1: Distill - cosine decay from 1.0 to distill_end_lr_ratio
+        if step_after_warmup < self.distill_steps:
+            if self.distill_steps == 0:
+                ratio = self.distill_end_lr_ratio
+            else:
+                progress = step_after_warmup / self.distill_steps
+                cosine_factor = (1 + math.cos(math.pi * progress)) / 2
+                ratio = self.distill_end_lr_ratio + (1.0 - self.distill_end_lr_ratio) * cosine_factor
+            return [base_lr * ratio for base_lr in self.base_lrs]
+
+        # Stage 2: Transition - constant at transition_lr_ratio
+        elif step_after_warmup < self.distill_steps + self.transition_steps:
+            return [base_lr * self.transition_lr_ratio for base_lr in self.base_lrs]
+
+        # Stage 3: CE - cosine annealing from ce_start_lr_ratio to eta_min_ratio
+        else:
+            ce_step = step_after_warmup - self.distill_steps - self.transition_steps
+            if self.ce_steps > 0:
+                # Cosine annealing: eta_min + (eta_max - eta_min) * (1 + cos(pi * T_cur / T_max)) / 2
+                progress = ce_step / self.ce_steps
+                cosine_factor = (1 + math.cos(math.pi * progress)) / 2
+                ratio = self.eta_min_ratio + (self.ce_start_lr_ratio - self.eta_min_ratio) * cosine_factor
+            else:
+                ratio = self.ce_start_lr_ratio
+            return [base_lr * ratio for base_lr in self.base_lrs]
+
+    def step(self, epoch=None):
+        if epoch is None:
+            self.last_epoch += 1
+        else:
+            self.last_epoch = epoch
+        self._last_lr = self.get_lr()
+        for param_group, lr in zip(self.optimizer.param_groups, self._last_lr):
+            param_group["lr"] = lr

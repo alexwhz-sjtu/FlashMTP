@@ -93,6 +93,19 @@ if [ -n "${INIT_CKPT_DIR}" ] && { [ -n "${CKPT_DIR}" ] || [ -n "${RESUME}" ]; };
 fi
 
 # ========================================
+# 三阶段学习率调度器 (用于 DFlash 蒸馏)
+# ========================================
+USE_THREE_STAGE_LR="${USE_THREE_STAGE_LR:-}"                      # 启用三阶段调度器
+# 自动根据 DFLASH_MILESTONE_EPOCH 和 DFLASH_MILESTONE_END_EPOCH 计算各阶段比例:
+#   - distill:   0 ~ DFLASH_MILESTONE_EPOCH              (余弦衰减)
+#   - transition: DFLASH_MILESTONE_EPOCH ~ DFLASH_MILESTONE_END_EPOCH  (固定 lr)
+#   - ce: DFLASH_MILESTONE_END_EPOCH ~ NUM_EPOCHS        (余弦衰减)
+DISTILL_END_LR_RATIO="${DISTILL_END_LR_RATIO:-0.9}"               # stage 1 结束 lr 比例（余弦衰减到该比例）
+TRANSITION_LR_RATIO="${TRANSITION_LR_RATIO:-0.2}"                 # stage 2 固定 lr 比例
+CE_START_LR_RATIO="${CE_START_LR_RATIO:-0.6}"                     # stage 3 起始 lr 比例
+ETA_MIN_RATIO="${ETA_MIN_RATIO:-0.0}"                             # stage 3 最终 lr 比例（余弦下降到该比例）
+
+# ========================================
 # DFlash 蒸馏（设置 DFLASH_TEACHER_PATH 即启用）
 # ========================================
 DFLASH_TEACHER_PATH="${DFLASH_TEACHER_PATH:-}"                         # DFlash teacher checkpoint 路径
@@ -110,11 +123,12 @@ LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA-7}"
 DFLASH_DISTILL_DECAY_GAMMA="${DFLASH_DISTILL_DECAY_GAMMA:-0}"          # KL/mid 位置衰减 gamma，0/空表示不开
 
 DFLASH_DISTILL_POS_MODE="${DFLASH_DISTILL_POS_MODE:-all}"           # distill 位置：prefix / all
-DFLASH_CE_POS_MODE="${DFLASH_CE_POS_MODE:-student_wrong}"              # CE 位置：prefix / student_wrong（teacher 对且 student 错的 slot）
+DFLASH_CE_POS_MODE="${DFLASH_CE_POS_MODE:-student_wrong}"              # CE 位置：prefix / student_wrong / all（teacher 对且 student 错的 slot）
 
 
 # 中间衰减
 DFLASH_MILESTONE_EPOCH="${DFLASH_MILESTONE_EPOCH:-0.0}"                # DFlash 蒸馏中余弦切换开始的 epoch
+DFLASH_MILESTONE_END_EPOCH="${DFLASH_MILESTONE_END_EPOCH:-${NUM_EPOCHS}}" # 余弦切换结束 epoch，默认到训练结束
 DFLASH_CE_WEIGHT="${DFLASH_CE_WEIGHT:-0.8}"                            # milestone 后 CE 最终目标权重
 DFLASH_DISTILL_MIN_SCALE="${DFLASH_DISTILL_MIN_SCALE:-0.2}"            # KL/mid 余弦衰减的最小保留比例，0 表示降到 0
 DFLASH_CE_MIN_SCALE="${DFLASH_CE_MIN_SCALE:-0.0}"                      # CE 初始/最小保留比例，0 表示 milestone 前 CE=0
@@ -123,7 +137,7 @@ DFLASH_MID_WEIGHT="${DFLASH_MID_WEIGHT:-0.0}"                          # norm-hi
 # 用于 OUTPUT_DIR / WandB run id 的蒸馏配置摘要
 DFLASH_DISTILL_TAG="dnone"
 if [ -n "${DFLASH_TEACHER_PATH}" ]; then
-    DFLASH_DISTILL_TAG="klw${DFLASH_DISTILL_WEIGHT}_top${DFLASH_DISTILL_TOP_K}_ceg${LOSS_DECAY_GAMMA:-none}_dkg${DFLASH_DISTILL_DECAY_GAMMA:-none}_dpos${DFLASH_DISTILL_POS_MODE}_cepos${DFLASH_CE_POS_MODE}"
+    DFLASH_DISTILL_TAG="klw${DFLASH_DISTILL_WEIGHT}_top${DFLASH_DISTILL_TOP_K}_ceg${LOSS_DECAY_GAMMA:-none}_dkg${DFLASH_DISTILL_DECAY_GAMMA:-none}"
     if [ "${DFLASH_ALIGN_MODE}" = "final+mid" ]; then
         DFLASH_DISTILL_TAG="${DFLASH_DISTILL_TAG}_mid${DFLASH_MID_ALIGN}_mw${DFLASH_MID_WEIGHT}"
     fi
@@ -147,7 +161,7 @@ RUN_SUFFIX="${DFLASH_DISTILL_TAG}"
 if [ "$DT" = "qz" ]; then
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_fuse${NUM_MIDDLE_LAYERS_N}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${RUN_SUFFIX}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_lrt_${NUM_MIDDLE_LAYERS_N}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_ms_${DFLASH_MILESTONE_EPOCH}_${RUN_SUFFIX}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 elif [ "$DT" = "h100" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-../training_data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
@@ -159,8 +173,8 @@ else
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_ep${NUM_EPOCHS}_${RUN_SUFFIX}}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${RUN_SUFFIX}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_lrt_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_ep${NUM_EPOCHS}_${RUN_SUFFIX}}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_lrt_${DT}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${RUN_SUFFIX}}"
 
 # ========================================
 # 显示配置
@@ -187,6 +201,7 @@ if [ -n "${DFLASH_TEACHER_PATH}" ]; then
     echo "  dflash_mid_weight: ${DFLASH_MID_WEIGHT}"
     echo "  dflash_ce_weight: ${DFLASH_CE_WEIGHT}"
     echo "  dflash_milestone_epoch: ${DFLASH_MILESTONE_EPOCH}"
+    echo "  dflash_milestone_end_epoch: ${DFLASH_MILESTONE_END_EPOCH}"
     echo "  dflash_distill_min_scale: ${DFLASH_DISTILL_MIN_SCALE}"
     echo "  dflash_ce_min_scale: ${DFLASH_CE_MIN_SCALE}"
 fi
@@ -237,15 +252,19 @@ fi
 echo "=========================================="
 echo ""
 
-# 输出目录冲突时自动追加数字后缀
-original_output_dir="${OUTPUT_DIR}"
-suffix=1
-while [ -d "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null)" ]; do
-    OUTPUT_DIR="${original_output_dir}_${suffix}"
-    suffix=$((suffix + 1))
-done
-if [ "${OUTPUT_DIR}" != "${original_output_dir}" ]; then
-    echo "警告: 输出目录 ${original_output_dir} 已存在且非空，自动切换到: ${OUTPUT_DIR}"
+# 输出目录冲突时自动追加数字后缀（仅在非恢复训练模式下）
+if [ -z "${RESUME}" ] && [ -z "${CKPT_DIR}" ]; then
+    original_output_dir="${OUTPUT_DIR}"
+    suffix=1
+    while [ -d "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null)" ]; do
+        OUTPUT_DIR="${original_output_dir}_${suffix}"
+        suffix=$((suffix + 1))
+    done
+    if [ "${OUTPUT_DIR}" != "${original_output_dir}" ]; then
+        echo "警告: 输出目录 ${original_output_dir} 已存在且非空，自动切换到: ${OUTPUT_DIR}"
+    fi
+else
+    echo "恢复训练模式: 使用输出目录 ${OUTPUT_DIR}"
 fi
 
 mkdir -p "${OUTPUT_DIR}" "${CACHE_DIR}" "${WANDB_DIR}"
@@ -311,8 +330,46 @@ if [ -n "${DFLASH_TEACHER_PATH}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-mid-weight ${DFLASH_MID_WEIGHT}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-ce-weight ${DFLASH_CE_WEIGHT}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-milestone-epoch ${DFLASH_MILESTONE_EPOCH}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-milestone-end-epoch ${DFLASH_MILESTONE_END_EPOCH}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-distill-min-scale ${DFLASH_DISTILL_MIN_SCALE}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --dflash-ce-min-scale ${DFLASH_CE_MIN_SCALE}"
+fi
+
+# 三阶段学习率调度器参数 (自动根据 milestone epoch 计算)
+if [ -n "${USE_THREE_STAGE_LR}" ]; then
+    # 自动计算各阶段比例
+    # warmup: 0 ~ warmup_ratio
+    # distill: warmup_end ~ DFLASH_MILESTONE_EPOCH
+    # transition: DFLASH_MILESTONE_EPOCH ~ DFLASH_MILESTONE_END_EPOCH
+    # ce: DFLASH_MILESTONE_END_EPOCH ~ NUM_EPOCHS
+
+    # 使用 Python 计算比例
+    RATIOS=$(python3 -c "
+num_epochs = ${NUM_EPOCHS}
+warmup_ratio = ${WARMUP_RATIO:-0.04}
+milestone = ${DFLASH_MILESTONE_EPOCH}
+milestone_end = ${DFLASH_MILESTONE_END_EPOCH:-num_epochs}
+remaining_epochs = num_epochs * (1 - warmup_ratio)
+distill_ratio = (milestone - num_epochs * warmup_ratio) / remaining_epochs if milestone > num_epochs * warmup_ratio else 0
+transition_ratio = (milestone_end - milestone) / remaining_epochs if milestone_end > milestone else 0
+print(f'{distill_ratio:.6f} {transition_ratio:.6f}')
+")
+    DISTILL_RATIO=$(echo "$RATIOS" | awk '{print $1}')
+    TRANSITION_RATIO=$(echo "$RATIOS" | awk '{print $2}')
+
+    echo "三阶段学习率调度器配置 (含warmup):"
+    echo "  warmup:   0-${WARMUP_RATIO} of total steps"
+    echo "  distill:  ${DFLASH_MILESTONE_EPOCH} epoch (ratio=${DISTILL_RATIO}, 余弦衰减)"
+    echo "  transition: ${DFLASH_MILESTONE_EPOCH}-${DFLASH_MILESTONE_END_EPOCH:-${NUM_EPOCHS}} epoch (ratio=${TRANSITION_RATIO}, 固定lr)"
+    echo "  ce: ${DFLASH_MILESTONE_END_EPOCH:-${NUM_EPOCHS}}-${NUM_EPOCHS} epoch (余弦衰减)"
+
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --use-three-stage-lr"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --distill-ratio ${DISTILL_RATIO}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --transition-ratio ${TRANSITION_RATIO}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --distill-end-lr-ratio ${DISTILL_END_LR_RATIO}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --transition-lr-ratio ${TRANSITION_LR_RATIO}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --ce-start-lr-ratio ${CE_START_LR_RATIO}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --eta-min-ratio ${ETA_MIN_RATIO}"
 fi
 
 # ========================================
