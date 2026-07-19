@@ -265,9 +265,11 @@ class ThreeStageDistillScheduler(_LRScheduler):
     """Three-stage learning rate scheduler for DFlash distillation training with optional warmup.
 
     Stage 0 (Warmup, optional): Linear warmup from 0 to initial_lr
-    Stage 1 (Distill): Cosine decay from initial_lr to distill_end_lr_ratio * initial_lr
-    Stage 2 (Transition): Constant lr at transition_lr_ratio * initial_lr
-    Stage 3 (CE): Cosine annealing from ce_start_lr_ratio * initial_lr down to eta_min
+    Stage 1 (Distill): Full cosine-annealing half-wave (phase 0 -> pi),
+        from initial_lr to transition_lr_ratio * initial_lr
+    Stage 2 (Transition): Constant lr at the junction of the two cosine halves
+    Stage 3 (CE): Full cosine-annealing half-wave (phase 0 -> pi),
+        from transition_lr_ratio * initial_lr down to eta_min
 
     Supports both absolute steps and relative ratios for flexible configuration.
     If stage steps are not provided, uses automatic allocation based on ratios.
@@ -281,9 +283,11 @@ class ThreeStageDistillScheduler(_LRScheduler):
         transition_steps (int, optional): Number of steps for stage 2. If None, uses transition_ratio.
         distill_ratio (float): Ratio of remaining steps (after warmup) for stage 1 (default: 0.3).
         transition_ratio (float): Ratio of remaining steps for stage 2 (default: 0.2).
-        distill_end_lr_ratio (float): Ending lr ratio for stage 1 (default: 0.9).
+        distill_end_lr_ratio (float): Deprecated compatibility argument. The
+            distill stage now ends at transition_lr_ratio.
         transition_lr_ratio (float): Constant lr ratio for stage 2 (default: 0.2).
-        ce_start_lr_ratio (float): Starting lr ratio for stage 3 (default: 0.9).
+        ce_start_lr_ratio (float): Deprecated compatibility argument. The CE
+            stage now starts at transition_lr_ratio.
         eta_min_ratio (float): Minimum lr ratio for cosine annealing (default: 0.0).
         last_epoch (int, optional): The index of last epoch, defaults to -1.
     """
@@ -360,30 +364,31 @@ class ThreeStageDistillScheduler(_LRScheduler):
         # Adjust step for post-warmup stages
         step_after_warmup = current_step - self.warmup_steps
 
-        # Stage 1: Distill - cosine decay from 1.0 to distill_end_lr_ratio
+        # Stage 1: full cosine-annealing half-wave (phase 0 -> pi).  Its slope
+        # is zero at both ends, so it joins warmup/transition smoothly.
         if step_after_warmup < self.distill_steps:
             if self.distill_steps == 0:
-                ratio = self.distill_end_lr_ratio
+                ratio = self.transition_lr_ratio
             else:
                 progress = step_after_warmup / self.distill_steps
-                cosine_factor = (1 + math.cos(math.pi * progress)) / 2
-                ratio = self.distill_end_lr_ratio + (1.0 - self.distill_end_lr_ratio) * cosine_factor
+                cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+                ratio = self.transition_lr_ratio + (1.0 - self.transition_lr_ratio) * cosine_factor
             return [base_lr * ratio for base_lr in self.base_lrs]
 
         # Stage 2: Transition - constant at transition_lr_ratio
         elif step_after_warmup < self.distill_steps + self.transition_steps:
             return [base_lr * self.transition_lr_ratio for base_lr in self.base_lrs]
 
-        # Stage 3: CE - cosine annealing from ce_start_lr_ratio to eta_min_ratio
+        # Stage 3: full cosine-annealing half-wave (phase 0 -> pi).  Its slope
+        # is zero at both ends, so it joins transition/eta_min smoothly.
         else:
             ce_step = step_after_warmup - self.distill_steps - self.transition_steps
             if self.ce_steps > 0:
-                # Cosine annealing: eta_min + (eta_max - eta_min) * (1 + cos(pi * T_cur / T_max)) / 2
                 progress = ce_step / self.ce_steps
-                cosine_factor = (1 + math.cos(math.pi * progress)) / 2
-                ratio = self.eta_min_ratio + (self.ce_start_lr_ratio - self.eta_min_ratio) * cosine_factor
+                cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+                ratio = self.eta_min_ratio + (self.transition_lr_ratio - self.eta_min_ratio) * cosine_factor
             else:
-                ratio = self.ce_start_lr_ratio
+                ratio = self.eta_min_ratio
             return [base_lr * ratio for base_lr in self.base_lrs]
 
     def step(self, epoch=None):

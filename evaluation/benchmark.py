@@ -19,8 +19,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from specforge.modeling.auto import AutoEagle3DraftModel
+from specforge.modeling.draft.dflash import (
+    DFlashDraftModel,
+    extract_context_feature,
+    sample,
+)
 from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
-from specforge.modeling.draft.flashmtp import sample
+from specforge.modeling.draft.llama3_eagle import LlamaForCausalLMEagle3
 
 from evaluation import distributed as dist
 from evaluation.utils import load_and_process_dataset
@@ -282,11 +288,59 @@ def load_specbench_question_jsonl(dataset_path: Path, original_dataset_name: str
             flat = flatten_specbench_turns(turns)
             if not flat:
                 continue
-            instances.append({"turns": flat, "specbench_chain_turns": True})
+            instances.append(
+                {
+                    "turns": flat,
+                    "specbench_chain_turns": True,
+                    "category": str(obj.get("category", "")).strip() or None,
+                }
+            )
     if not instances:
         hint = f" for category={category!r}" if category else " (all categories)"
         raise ValueError(f"No Spec-Bench samples{hint} in {dataset_path}")
     return instances
+
+
+def acceptance_length_tau(acceptance_lengths: list[int], block_size: int) -> float:
+    if not acceptance_lengths:
+        return float("nan")
+    histogram = [
+        acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)
+    ]
+    return sum(index * frac for index, frac in enumerate(histogram))
+
+
+def print_specbench_category_acceptance_summary(
+    responses: list[dict],
+    categories: list[str | None],
+    block_size: int,
+) -> None:
+    from collections import defaultdict
+
+    by_category_steps: dict[str, list[int]] = defaultdict(list)
+    by_category_turns: dict[str, list[float]] = defaultdict(list)
+    for response, category in zip(responses, categories, strict=True):
+        if not category:
+            continue
+        lengths = response[block_size].acceptance_lengths
+        by_category_steps[category].extend(lengths)
+        if lengths:
+            by_category_turns[category].append(float(np.mean(lengths)))
+    if not by_category_steps:
+        return
+
+    print("\nSpec-Bench acceptance length by category:")
+    print(f"{'Category':<18} {'Turns':>6} {'Avg(step)':>10} {'Avg(turn)':>10}")
+    print("-" * 48)
+    for category in sorted(
+        by_category_steps,
+        key=lambda c: -acceptance_length_tau(by_category_steps[c], block_size),
+    ):
+        steps = by_category_steps[category]
+        turns = by_category_turns[category]
+        step_avg = acceptance_length_tau(steps, block_size)
+        turn_avg = float(np.mean(turns)) if turns else float("nan")
+        print(f"{category:<18} {len(turns):>6} {step_avg:>10.2f} {turn_avg:>10.2f}")
 
 
 def load_benchmark_dataset(dataset_name: str):
@@ -327,6 +381,10 @@ def load_benchmark_dataset(dataset_name: str):
 
     if dataset_path.is_file() and dataset_path.suffix == ".jsonl":
         task_name = infer_infinitebench_task(original_dataset_name, dataset_path)
+        is_longbench_v2 = (
+            original_dataset_name.lower() == "longbench_v2"
+            or is_longbench_v2_dataset_path(dataset_path)
+        )
         instances = []
         with dataset_path.open("r", encoding="utf-8") as f:
             # Some exports use a ``.jsonl`` name but store one pretty-printed JSON array.
@@ -355,6 +413,9 @@ def load_benchmark_dataset(dataset_name: str):
                     continue
 
                 data = json.loads(line)
+                if is_longbench_v2:
+                    instances.append({"turns": [format_longbench_v2_prompt(data)]})
+                    continue
                 if "input" not in data:
                     raise ValueError(
                         f"Missing 'input' field in {dataset_path} at line {line_number}"
@@ -399,6 +460,376 @@ def decode_weight(run) -> int:
 
 def decode_wall_seconds(run) -> float:
     return float(run.time_per_output_token) * decode_weight(run)
+
+
+def resolve_mask_token_id(draft_model: DFlashDraftModel, tokenizer: AutoTokenizer) -> int:
+    mask_token_id = draft_model.mask_token_id
+    if mask_token_id is None:
+        mask_token_id = tokenizer.mask_token_id
+    if mask_token_id is None:
+        raise ValueError(
+            "mask_token_id is None. Please use a draft checkpoint whose config contains "
+            "dflash_config['mask_token_id'], or pass/load a tokenizer with mask_token_id."
+        )
+    return int(mask_token_id)
+
+
+def resolve_eagle_target_layer_ids(
+    draft_model: LlamaForCausalLMEagle3,
+    target: AutoModelForCausalLM,
+) -> list[int]:
+    if getattr(draft_model, "target_layer_ids", None):
+        return [int(layer_id) for layer_id in draft_model.target_layer_ids]
+    eagle_cfg = getattr(draft_model.config, "eagle_config", None) or {}
+    layer_ids = eagle_cfg.get("eagle_aux_hidden_state_layer_ids")
+    if layer_ids is not None:
+        return [int(layer_id) for layer_id in layer_ids]
+    # Match SpecForge Eagle3TargetModel.set_aux_hidden_states_layers defaults.
+    num_layers = int(target.config.num_hidden_layers)
+    return [1, num_layers // 2 - 1, num_layers - 4]
+
+
+def resolve_eagle_block_size(
+    draft_model: LlamaForCausalLMEagle3,
+    block_size: int | None,
+) -> int:
+    if block_size is not None:
+        return int(block_size)
+    for attr in ("ttt_length", "length"):
+        value = getattr(draft_model, attr, None)
+        if value is None:
+            value = getattr(draft_model.config, attr, None)
+        if value is not None:
+            return int(value)
+    return 7
+
+
+def draft_tokens_to_target(
+    draft_model: LlamaForCausalLMEagle3,
+    draft_token_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Map draft-vocab ids to target-vocab ids.
+
+    SpecForge stores ``d2t[i] = target_id - i``, so the target id is
+    ``draft_id + d2t[draft_id]``.
+    """
+    draft_token_ids = draft_token_ids.long()
+    if hasattr(draft_model, "d2t"):
+        return draft_token_ids + draft_model.d2t[draft_token_ids]
+    return draft_token_ids
+
+
+@torch.inference_mode()
+def eagle_generate(
+    model: LlamaForCausalLMEagle3,
+    target: AutoModelForCausalLM,
+    input_ids: torch.Tensor,
+    max_new_tokens: int,
+    block_size: int,
+    temperature: float,
+    stop_token_ids: list[int],
+    stream_callback: Callable[[torch.Tensor], None] | None = None,
+) -> SimpleNamespace:
+    """Decode with Eagle3 speculative decoding and optional streaming callback."""
+    if input_ids.shape[0] != 1:
+        raise ValueError("eagle_generate currently supports batch_size=1")
+
+    target_layer_ids = resolve_eagle_target_layer_ids(model, target)
+    device = model.device
+    num_input_tokens = input_ids.shape[1]
+    max_length = num_input_tokens + max_new_tokens
+
+    output_ids = torch.empty((1, max_length + block_size), dtype=torch.long, device=device)
+    position_ids = torch.arange(output_ids.shape[1], device=device).unsqueeze(0)
+    past_key_values_target = DynamicCache()
+    draft_cache = DynamicCache()
+
+    prefill_start = cuda_time()
+    output = target(
+        input_ids,
+        position_ids=position_ids[:, :num_input_tokens],
+        past_key_values=past_key_values_target,
+        use_cache=True,
+        output_hidden_states=True,
+        logits_to_keep=1,
+    )
+    output_ids[:, :num_input_tokens] = input_ids
+    output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature)
+    prefill_wall = cuda_time() - prefill_start
+    time_to_first_token = prefill_wall
+
+    if stream_callback is not None:
+        stream_callback(output_ids[:, : num_input_tokens + 1])
+
+    target_hidden = extract_context_feature(output.hidden_states, target_layer_ids)
+    shifted_prompt_ids = torch.cat(
+        [
+            output_ids[:, 1:num_input_tokens],
+            output_ids[:, num_input_tokens : num_input_tokens + 1],
+        ],
+        dim=1,
+    )
+    draft_hidden = model.extend_draft_cache(
+        hidden_states=target_hidden,
+        input_ids=shifted_prompt_ids,
+        position_ids=position_ids[:, :num_input_tokens],
+        past_key_values=draft_cache,
+    )
+    cache_len_before = 0
+
+    decode_start = cuda_time()
+    start = num_input_tokens
+    acceptance_lengths: list[int] = []
+
+    while start < max_length:
+        cache_len_before = draft_cache.get_seq_length()
+        candidate_ids = [output_ids[:, start : start + 1]]
+        proposal_hidden = draft_hidden
+        next_position = start
+
+        for _ in range(block_size):
+            draft_logits = model.compute_logits(proposal_hidden)
+            draft_token = sample(draft_logits, temperature)
+            target_token = draft_tokens_to_target(model, draft_token)
+            candidate_ids.append(target_token[:, -1:])
+            if stop_token_ids and int(target_token[0, -1].item()) in stop_token_ids:
+                break
+            proposal_hidden = model.draft_forward_step(
+                hidden_states=proposal_hidden,
+                input_ids=target_token[:, -1:],
+                position_ids=position_ids[:, next_position : next_position + 1],
+                past_key_values=draft_cache,
+            )
+            next_position += 1
+
+        verify_input_ids = torch.cat(candidate_ids, dim=1)
+        verify_len = verify_input_ids.shape[1]
+        verify_output = target(
+            verify_input_ids,
+            position_ids=position_ids[:, start : start + verify_len],
+            past_key_values=past_key_values_target,
+            use_cache=True,
+            output_hidden_states=True,
+        )
+        posterior = sample(verify_output.logits, temperature)
+        acceptance_length = int(
+            (verify_input_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+        )
+        output_ids[:, start : start + acceptance_length + 1] = verify_input_ids[
+            :, : acceptance_length + 1
+        ]
+        output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
+        acceptance_lengths.append(acceptance_length + 1)
+        start += acceptance_length + 1
+        past_key_values_target.crop(start)
+
+        if stream_callback is not None:
+            stream_callback(output_ids[:, :start])
+
+        if stop_token_ids and any(
+            stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
+        ):
+            break
+
+        draft_cache.crop(cache_len_before)
+        # Accepted draft tokens plus the target-sampled bonus token.
+        committed_tokens = torch.cat(
+            [
+                verify_input_ids[:, 1 : acceptance_length + 1],
+                posterior[:, acceptance_length : acceptance_length + 1],
+            ],
+            dim=1,
+        )
+        committed_length = int(committed_tokens.shape[1])
+        committed_hidden = extract_context_feature(
+            verify_output.hidden_states,
+            target_layer_ids,
+        )[:, :committed_length, :]
+        draft_hidden = model.extend_draft_cache(
+            hidden_states=committed_hidden,
+            input_ids=committed_tokens,
+            position_ids=position_ids[:, start - committed_length : start],
+            past_key_values=draft_cache,
+        )
+
+    output_ids = output_ids[:, :max_length]
+    if stop_token_ids:
+        stop_tensor = torch.tensor(stop_token_ids, device=output_ids.device)
+        stop_token_indices = torch.isin(
+            output_ids[0][num_input_tokens:], stop_tensor
+        ).nonzero(as_tuple=True)[0]
+        if stop_token_indices.numel() > 0:
+            output_ids = output_ids[:, : num_input_tokens + stop_token_indices[0] + 1]
+
+    num_output_tokens = output_ids.shape[1] - num_input_tokens
+    decode_wall_time = cuda_time() - decode_start
+    time_per_output_token = decode_wall_time / max(num_output_tokens, 1)
+    throughput_tokens_per_sec = num_output_tokens / max(decode_wall_time, 1e-9)
+
+    return SimpleNamespace(
+        output_ids=output_ids,
+        num_input_tokens=num_input_tokens,
+        num_output_tokens=num_output_tokens,
+        batch_size=1,
+        time_to_first_token=time_to_first_token,
+        time_per_output_token=time_per_output_token,
+        throughput_tokens_per_sec=float(throughput_tokens_per_sec),
+        decode_wall_time=decode_wall_time,
+        acceptance_lengths=acceptance_lengths,
+    )
+
+
+@torch.inference_mode()
+def dflash_generate(
+    model: DFlashDraftModel,
+    target: AutoModelForCausalLM,
+    input_ids: torch.Tensor,
+    mask_token_id: int,
+    max_new_tokens: int,
+    block_size: int,
+    stop_token_ids: list[int],
+    temperature: float = 0.0,
+    batch_size: int = 1,
+    stream_callback: Callable[[torch.Tensor], None] | None = None,
+) -> SimpleNamespace:
+    """Decode with DFlash speculative decoding and optional streaming callback."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    if input_ids.dim() != 2:
+        raise ValueError("input_ids must be [batch, seq_len]")
+    if input_ids.shape[0] == 1 and batch_size > 1:
+        input_ids = input_ids.expand(batch_size, -1).contiguous()
+    elif input_ids.shape[0] != batch_size:
+        raise ValueError(
+            f"input_ids batch {input_ids.shape[0]} does not match batch_size={batch_size}"
+        )
+    if batch_size > 1 and temperature >= 1e-5:
+        raise ValueError(
+            "batch_size>1 requires temperature≈0 so replicated streams stay synchronized."
+        )
+
+    bsz = int(input_ids.shape[0])
+    num_input_tokens = input_ids.shape[1]
+    max_length = num_input_tokens + max_new_tokens
+
+    output_ids = torch.full(
+        (bsz, max_length + block_size),
+        mask_token_id,
+        dtype=torch.long,
+        device=model.device,
+    )
+    position_ids = torch.arange(output_ids.shape[1], device=model.device).unsqueeze(0).expand(bsz, -1)
+    past_key_values_target = DynamicCache()
+    past_key_values_draft = DynamicCache()
+
+    prefill_start = cuda_time()
+    output = target(
+        input_ids,
+        position_ids=position_ids[:, :num_input_tokens],
+        past_key_values=past_key_values_target,
+        use_cache=True,
+        logits_to_keep=1,
+        output_hidden_states=block_size > 1,
+    )
+
+    output_ids[:, :num_input_tokens] = input_ids
+    output_ids[:, num_input_tokens:num_input_tokens + 1] = sample(output.logits, temperature)
+    if block_size > 1:
+        target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
+
+    prefill_wall = cuda_time() - prefill_start
+    time_to_first_token = prefill_wall / bsz
+
+    if stream_callback is not None:
+        stream_callback(output_ids[:, : num_input_tokens + 1])
+
+    decode_start = cuda_time()
+    start = num_input_tokens
+    acceptance_lengths = []
+
+    while start < max_length:
+        block_output_ids = output_ids[:, start : start + block_size].clone()
+        block_position_ids = position_ids[:, start : start + block_size]
+        if block_size > 1:
+            noise_embedding = target.model.embed_tokens(block_output_ids)
+            draft_logits = target.lm_head(
+                model(
+                    target_hidden=target_hidden,
+                    noise_embedding=noise_embedding,
+                    position_ids=position_ids[
+                        :, past_key_values_draft.get_seq_length() : start + block_size
+                    ],
+                    past_key_values=past_key_values_draft,
+                    use_cache=True,
+                    is_causal=False,
+                )[:, -block_size + 1 :, :]
+            )
+            past_key_values_draft.crop(start)
+            block_output_ids[:, 1:] = sample(draft_logits, temperature)
+
+        output = target(
+            block_output_ids,
+            position_ids=block_position_ids,
+            past_key_values=past_key_values_target,
+            use_cache=True,
+            output_hidden_states=block_size > 1,
+        )
+
+        posterior = sample(output.logits, temperature)
+        acc_per_row = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)
+        if not bool(torch.all(acc_per_row == acc_per_row[0])):
+            raise RuntimeError(
+                "Per-row acceptance lengths differ under batched decode. "
+                "Use batch_size=1 with sampling, or temperature=0 with identical prompts."
+            )
+        acceptance_length = int(acc_per_row[0].item())
+        output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
+            :, : acceptance_length + 1
+        ]
+        output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
+
+        acceptance_lengths.append(acceptance_length + 1)
+        start += acceptance_length + 1
+        past_key_values_target.crop(start)
+        if block_size > 1:
+            target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[
+                :, : acceptance_length + 1, :
+            ]
+
+        if stream_callback is not None:
+            stream_callback(output_ids[:, :start])
+
+        if stop_token_ids is not None and any(
+            stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
+        ):
+            break
+
+    output_ids = output_ids[:, :max_length]
+    output_ids = output_ids[:, output_ids[0] != mask_token_id]
+    if stop_token_ids is not None:
+        stop_tensor = torch.tensor(stop_token_ids, device=output_ids.device)
+        stop_token_indices = torch.isin(
+            output_ids[0][num_input_tokens:], stop_tensor
+        ).nonzero(as_tuple=True)[0]
+        if stop_token_indices.numel() > 0:
+            output_ids = output_ids[:, : num_input_tokens + stop_token_indices[0] + 1]
+
+    num_output_tokens = output_ids.shape[1] - num_input_tokens
+    decode_wall_time = cuda_time() - decode_start
+    time_per_output_token = decode_wall_time / (bsz * max(num_output_tokens, 1))
+    throughput_tokens_per_sec = (bsz * num_output_tokens) / max(decode_wall_time, 1e-9)
+
+    return SimpleNamespace(
+        output_ids=output_ids,
+        num_input_tokens=num_input_tokens,
+        num_output_tokens=num_output_tokens,
+        batch_size=bsz,
+        time_to_first_token=time_to_first_token,
+        time_per_output_token=time_per_output_token,
+        throughput_tokens_per_sec=float(throughput_tokens_per_sec),
+        decode_wall_time=decode_wall_time,
+        acceptance_lengths=acceptance_lengths,
+    )
 
 
 @torch.inference_mode()
@@ -774,6 +1205,7 @@ def main() -> None:
 
     benchmark_start = cuda_time()
     responses = []
+    response_categories: list[str | None] = []
     indices = range(dist.rank(), len(dataset), dist.size())
     for idx in tqdm(indices, disable=not dist.is_main()):
         instance = dataset[idx]
@@ -849,12 +1281,15 @@ def main() -> None:
             if chain_turns:
                 prev_assistant = output_text
             responses.append(response)
+            response_categories.append(instance.get("category"))
 
     if dist.size() > 1:
         responses = dist.gather(responses, dst=0)
+        response_categories = dist.gather(response_categories, dst=0)
         if not dist.is_main():
             return
         responses = list(chain(*responses))
+        response_categories = list(chain(*response_categories))
 
     w1 = sum(decode_weight(r[1]) for r in responses)
     wb = sum(decode_weight(r[block_size]) for r in responses)
@@ -879,11 +1314,9 @@ def main() -> None:
     acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
     histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
     print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
-    
-    tau = 0
-    for index, num in enumerate(histogram): 
-        tau += index * num 
+    tau = acceptance_length_tau(acceptance_lengths, block_size)
     print(f"Average Acceptance length: {tau:.2f}")
+    print_specbench_category_acceptance_summary(responses, response_categories, block_size)
 
     total_elapsed_time = cuda_time() - benchmark_start
     print(f"Total elapsed time: {total_elapsed_time:.2f}s")

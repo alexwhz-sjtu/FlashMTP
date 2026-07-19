@@ -229,9 +229,9 @@ def parse_args():
         "--use-three-stage-lr",
         action="store_true",
         help="Use three-stage learning rate scheduler for DFlash distillation. "
-        "Stage 1 (distill): cosine decay from initial to distill-end-lr-ratio. "
-        "Stage 2 (transition): constant lr at transition-lr-ratio. "
-        "Stage 3 (ce): cosine decay from ce-start-lr-ratio to eta-min.",
+        "Stage 1 (distill): full cosine decay from initial lr to transition-lr-ratio. "
+        "Stage 2 (transition): constant lr at the cosine junction. "
+        "Stage 3 (ce): full cosine decay from the junction to eta-min.",
     )
     training_group.add_argument(
         "--distill-steps",
@@ -261,7 +261,7 @@ def parse_args():
         "--distill-end-lr-ratio",
         type=float,
         default=0.9,
-        help="Ending lr ratio for distill stage (default: 0.9).",
+        help="Deprecated compatibility option; distill now ends at transition-lr-ratio.",
     )
     training_group.add_argument(
         "--transition-lr-ratio",
@@ -273,7 +273,7 @@ def parse_args():
         "--ce-start-lr-ratio",
         type=float,
         default=0.9,
-        help="Starting lr ratio for ce stage (default: 0.9).",
+        help="Deprecated compatibility option; CE now starts at transition-lr-ratio.",
     )
     training_group.add_argument(
         "--eta-min-ratio",

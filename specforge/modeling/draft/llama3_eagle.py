@@ -643,6 +643,15 @@ class LlamaAttention(nn.Module):
         ).transpose(1, 2)
 
         if cache_hidden is None:
+            past_seen_tokens = (
+                past_key_values.get_seq_length() if past_key_values is not None else 0
+            )
+            # DynamicCache inference uses absolute position_ids.  Do not apply the
+            # TTT-style ``position_ids + past // q_len`` offset used in training.
+            if position_ids is not None:
+                rope_seq_len = int(position_ids.max().item()) + 1
+            else:
+                rope_seq_len = past_seen_tokens + q_len
             if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
                 cos, sin = self.rotary_emb(query_states, position_ids)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
@@ -654,21 +663,38 @@ class LlamaAttention(nn.Module):
                     self.config.rope_scaling["mrope_section"],
                 )
             else:
-                cos, sin = self.rotary_emb(query_states, seq_len=q_len)
+                cos, sin = self.rotary_emb(query_states, seq_len=rope_seq_len)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
                 query_states, key_states = apply_rotary_pos_emb(
                     query_states, key_states, cos, sin, position_ids
                 )
 
+            if past_key_values is not None and use_cache:
+                cache_position = torch.arange(
+                    past_seen_tokens,
+                    past_seen_tokens + q_len,
+                    device=hidden_states.device,
+                )
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states, value_states = past_key_values.update(
+                    key_states,
+                    value_states,
+                    layer_idx=0,
+                    cache_kwargs=cache_kwargs,
+                )
+
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+            sdpa_mask = attention_mask
+            if sdpa_mask is not None and not sdpa_mask.is_contiguous():
+                sdpa_mask = sdpa_mask.contiguous()
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 query_states,
                 key_states,
                 value_states,
-                attn_mask=attention_mask,
-                is_causal=attention_mask is None,
+                attn_mask=sdpa_mask,
+                is_causal=sdpa_mask is None and past_seen_tokens == 0,
                 dropout_p=0.0,
             )
 
@@ -1425,5 +1451,51 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             position_ids=position_ids,
             past_key_values=past_key_values,
             output_attentions=False,
-            use_cache=False,
+            use_cache=use_cache,
         )
+
+    @torch.no_grad()
+    def extend_draft_cache(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_values: Cache,
+    ) -> torch.Tensor:
+        """Prefill or extend the Eagle draft KV cache with target hidden states."""
+        if hidden_states.shape[-1] != self.config.hidden_size:
+            hidden_states = self.project_hidden_states(hidden_states)
+        input_embeds = self.embed_input_ids(input_ids)
+        # No padding in speculative decode: let SDPA use causal for prefill and
+        # full-cache attention for cached decode steps (avoid non-contiguous 4D masks).
+        hidden_states = self.backbone(
+            input_embeds=input_embeds,
+            hidden_states=hidden_states,
+            cache_hidden=None,
+            attention_mask=None,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        return hidden_states[:, -1:, :]
+
+    @torch.no_grad()
+    def draft_forward_step(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_values: Cache,
+    ) -> torch.Tensor:
+        """Run one Eagle draft decode step and return the last hidden state."""
+        input_embeds = self.embed_input_ids(input_ids)
+        hidden_states = self.backbone(
+            input_embeds=input_embeds,
+            hidden_states=hidden_states,
+            cache_hidden=None,
+            attention_mask=None,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        return hidden_states[:, -1:, :]

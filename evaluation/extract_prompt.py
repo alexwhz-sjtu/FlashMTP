@@ -17,7 +17,7 @@ def main():
     parser.add_argument("--dataset", type=str, required=True, help="Dataset name or path")
     parser.add_argument("--max-samples", type=int, default=50,
                         help="Number of samples selected by benchmark (seed=0).")
-    parser.add_argument("--sample-idx", type=int, default=21,
+    parser.add_argument("--sample-idx", type=int, default=14,
                         help="Zero-based sample index to extract.")
     args = parser.parse_args()
 

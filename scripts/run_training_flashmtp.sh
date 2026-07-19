@@ -24,7 +24,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 DT="${DT:-a800}"
-if [[ "$DT" != "qz" && "$DT" != "a800" && "$DT" != "h100" ]]; then
+if [[ "$DT" != "qz" && "$DT" != "a800" && "$DT" != "h800" ]]; then
     echo "错误: --dt 须为 qz、a800 或 h100"
     exit 1
 fi
@@ -77,7 +77,7 @@ MAX_LENGTH="${MAX_LENGTH:-4096}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
 LEARNING_RATE="${LEARNING_RATE:-6e-4}"
-WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.02}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
 
@@ -97,12 +97,12 @@ fi
 # ========================================
 USE_THREE_STAGE_LR="${USE_THREE_STAGE_LR:-}"                      # 启用三阶段调度器
 # 自动根据 DFLASH_MILESTONE_EPOCH 和 DFLASH_MILESTONE_END_EPOCH 计算各阶段比例:
-#   - distill:   0 ~ DFLASH_MILESTONE_EPOCH              (余弦衰减)
+#   - distill:   0 ~ DFLASH_MILESTONE_EPOCH              (完整余弦下降)
 #   - transition: DFLASH_MILESTONE_EPOCH ~ DFLASH_MILESTONE_END_EPOCH  (固定 lr)
-#   - ce: DFLASH_MILESTONE_END_EPOCH ~ NUM_EPOCHS        (余弦衰减)
-DISTILL_END_LR_RATIO="${DISTILL_END_LR_RATIO:-0.9}"               # stage 1 结束 lr 比例（余弦衰减到该比例）
-TRANSITION_LR_RATIO="${TRANSITION_LR_RATIO:-0.2}"                 # stage 2 固定 lr 比例
-CE_START_LR_RATIO="${CE_START_LR_RATIO:-0.6}"                     # stage 3 起始 lr 比例
+#   - ce: DFLASH_MILESTONE_END_EPOCH ~ NUM_EPOCHS        (完整余弦下降)
+DISTILL_END_LR_RATIO="${DISTILL_END_LR_RATIO:-0.5}"               # 兼容旧参数；当前由 TRANSITION_LR_RATIO 决定
+TRANSITION_LR_RATIO="${TRANSITION_LR_RATIO:-0.5}"                 # 两段余弦的连续交界点，stage 2 固定 lr 比例
+CE_START_LR_RATIO="${CE_START_LR_RATIO:-0.5}"                     # 兼容旧参数；当前由 TRANSITION_LR_RATIO 决定
 ETA_MIN_RATIO="${ETA_MIN_RATIO:-0.0}"                             # stage 3 最终 lr 比例（余弦下降到该比例）
 
 # ========================================
@@ -161,20 +161,20 @@ RUN_SUFFIX="${DFLASH_DISTILL_TAG}"
 if [ "$DT" = "qz" ]; then
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_lrt_${NUM_MIDDLE_LAYERS_N}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_ms_${DFLASH_MILESTONE_EPOCH}_${RUN_SUFFIX}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_lrnew_${NUM_MIDDLE_LAYERS_N}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_ms_${DFLASH_MILESTONE_EPOCH}_${RUN_SUFFIX}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
-elif [ "$DT" = "h100" ]; then
+elif [ "$DT" = "h800" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-../training_data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_${PIVOT_FUSE_MODE}_fuse$((NUM_MIDDLE_LAYERS_N + 2))_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${RUN_SUFFIX}}"
-    TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h800_${PIVOT_FUSE_MODE}_fuse$((NUM_MIDDLE_LAYERS_N + 2))_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${RUN_SUFFIX}}"
+    TARGET_MODEL="${TARGET_MODEL:-$WHZ_HOME/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
     OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${RUN_SUFFIX}}"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_lrt_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_ep${NUM_EPOCHS}_${RUN_SUFFIX}}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_lrt_${DT}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${RUN_SUFFIX}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_lrnew2_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_ep${NUM_EPOCHS}_${RUN_SUFFIX}}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_lrnew2_${DT}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${RUN_SUFFIX}}"
 
 # ========================================
 # 显示配置
@@ -343,10 +343,10 @@ if [ -n "${USE_THREE_STAGE_LR}" ]; then
     # transition: DFLASH_MILESTONE_EPOCH ~ DFLASH_MILESTONE_END_EPOCH
     # ce: DFLASH_MILESTONE_END_EPOCH ~ NUM_EPOCHS
 
-    # 使用 Python 计算比例
+    # 使用 Python 计算比例（-c 字符串内不能有意外缩进）
     RATIOS=$(python3 -c "
 num_epochs = ${NUM_EPOCHS}
-warmup_ratio = ${WARMUP_RATIO:-0.04}
+warmup_ratio = ${WARMUP_RATIO:-0.02}
 milestone = ${DFLASH_MILESTONE_EPOCH}
 milestone_end = ${DFLASH_MILESTONE_END_EPOCH:-num_epochs}
 remaining_epochs = num_epochs * (1 - warmup_ratio)
@@ -359,9 +359,9 @@ print(f'{distill_ratio:.6f} {transition_ratio:.6f}')
 
     echo "三阶段学习率调度器配置 (含warmup):"
     echo "  warmup:   0-${WARMUP_RATIO} of total steps"
-    echo "  distill:  ${DFLASH_MILESTONE_EPOCH} epoch (ratio=${DISTILL_RATIO}, 余弦衰减)"
+    echo "  distill:  ${DFLASH_MILESTONE_EPOCH} epoch (ratio=${DISTILL_RATIO}, 完整余弦下降)"
     echo "  transition: ${DFLASH_MILESTONE_EPOCH}-${DFLASH_MILESTONE_END_EPOCH:-${NUM_EPOCHS}} epoch (ratio=${TRANSITION_RATIO}, 固定lr)"
-    echo "  ce: ${DFLASH_MILESTONE_END_EPOCH:-${NUM_EPOCHS}}-${NUM_EPOCHS} epoch (余弦衰减)"
+    echo "  ce: ${DFLASH_MILESTONE_END_EPOCH:-${NUM_EPOCHS}}-${NUM_EPOCHS} epoch (完整余弦下降)"
 
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --use-three-stage-lr"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --distill-ratio ${DISTILL_RATIO}"
