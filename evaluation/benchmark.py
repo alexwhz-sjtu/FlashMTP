@@ -51,28 +51,6 @@ def format_longbench_v2_prompt(data: dict) -> str:
     return f"{data['context']}\n\nQuestion: {data['question']}"
 
 
-LONGBENCH_V2_ALIAS_LENGTH_BUCKETS: dict[str, tuple[int, int]] = {
-    "longbench_v2_32k_64k": (32000, 64000),
-}
-
-
-def parse_longbench_v2_length_bucket(
-    dataset_path: Path, dataset_alias: str = ""
-) -> tuple[int, int] | None:
-    """Parse ``longbench_v2_{max}_{min}`` shard names into ``(min_len, max_len)`` token bounds."""
-    alias = dataset_alias.strip().lower()
-    if alias in LONGBENCH_V2_ALIAS_LENGTH_BUCKETS:
-        return LONGBENCH_V2_ALIAS_LENGTH_BUCKETS[alias]
-
-    for name in (alias, *dataset_path.parts):
-        pl = str(name).lower()
-        m = re.fullmatch(r"longbench_v2_(\d+)_(\d+)(?:_.*)?", pl)
-        if m:
-            upper, lower = int(m.group(1)), int(m.group(2))
-            return min(lower, upper), max(lower, upper)
-    return None
-
-
 def is_longbench_v2_dataset_path(dataset_path: Path) -> bool:
     """Match LongBench v2 shards: ``longbench_v2`` or ``longbench_v2_*`` (e.g. ``64000_32000`` = 32k–64k)."""
     try:
@@ -86,35 +64,11 @@ def is_longbench_v2_dataset_path(dataset_path: Path) -> bool:
     return False
 
 
-def _filter_longbench_v2_by_length(
-    data: list, min_len: int, max_len: int, dataset_path: Path
-) -> list:
-    filtered = [
-        item
-        for item in data
-        if isinstance(item, dict)
-        and (
-            item.get("length") is None
-            or min_len <= int(item["length"]) <= max_len
-        )
-    ]
-    if not filtered and data:
-        raise ValueError(
-            f"No LongBench v2 samples in length range [{min_len}, {max_len}] "
-            f"from {dataset_path} (had {len(data)} records)"
-        )
-    return filtered
-
-
 def load_longbench_v2_json_records(
     data: list, dataset_path: Path, dataset_alias: str = ""
 ) -> list[dict]:
     if not isinstance(data, list):
         raise ValueError(f"{dataset_path} must contain a JSON list")
-    bucket = parse_longbench_v2_length_bucket(dataset_path, dataset_alias)
-    if bucket is not None:
-        min_len, max_len = bucket
-        data = _filter_longbench_v2_by_length(data, min_len, max_len, dataset_path)
     return [{"turns": [format_longbench_v2_prompt(item)]} for item in data]
 
 
@@ -489,7 +443,9 @@ def decode_wall_seconds(run) -> float:
     return float(run.time_per_output_token) * decode_weight(run)
 
 
-def compute_benchmark_stats(responses: list, block_size: int) -> dict:
+def compute_benchmark_stats(
+    responses: list, block_size: int, verify_block_size: int
+) -> dict:
     """Aggregate decode speedup and acceptance length over benchmark turn responses."""
     if not responses:
         return {
@@ -500,7 +456,7 @@ def compute_benchmark_stats(responses: list, block_size: int) -> dict:
             "flashmtp_s_per_token": 0.0,
             "unweighted_speedup": 0.0,
             "avg_accept_length": 0.0,
-            "histogram": [0.0] * (block_size + 1),
+            "histogram": [0.0] * (verify_block_size + 1),
         }
 
     w1 = sum(decode_weight(r[1]) for r in responses)
@@ -517,11 +473,12 @@ def compute_benchmark_stats(responses: list, block_size: int) -> dict:
     acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
     if acceptance_lengths:
         histogram = [
-            acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)
+            acceptance_lengths.count(b) / len(acceptance_lengths)
+            for b in range(verify_block_size + 1)
         ]
         avg_accept = float(sum(index * prob for index, prob in enumerate(histogram)))
     else:
-        histogram = [0.0] * (block_size + 1)
+        histogram = [0.0] * (verify_block_size + 1)
         avg_accept = 0.0
 
     return {
@@ -567,6 +524,7 @@ def run_benchmark_warmup(
     draft_model: FlashMTPDraftModel,
     tokenizer: AutoTokenizer,
     block_size: int,
+    verify_block_size: int,
     device: torch.device,
     batch_size: int,
     max_new_tokens: int,
@@ -596,6 +554,7 @@ def run_benchmark_warmup(
         input_ids=input_ids,
         max_new_tokens=warmup_new_tokens,
         block_size=block_size,
+        verify_block_size=verify_block_size,
         stop_token_ids=stop_token_ids,
         temperature=temperature,
         decode_timing_after_first_token=False,
@@ -701,6 +660,7 @@ def flashmtp_generate(
     input_ids: torch.Tensor,
     max_new_tokens: int,
     block_size: int,
+    verify_block_size: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
     decode_timing_after_first_token: bool = False,
@@ -721,6 +681,7 @@ def flashmtp_generate(
                 max_new_tokens=max_new_tokens,
                 stop_token_ids=stop_token_ids,
                 temperature=temperature,
+                verify_block_size=verify_block_size,
                 trunc_thres=draft_tree_trunc_thres,
                 expand_thres=draft_tree_expand_thres,
                 tree_width=draft_tree_width,
@@ -735,6 +696,7 @@ def flashmtp_generate(
                 stop_token_ids=stop_token_ids,
                 temperature=temperature,
                 decode_timing_after_first_token=decode_timing_after_first_token,
+                verify_block_size=verify_block_size,
             )
     finally:
         model.block_size = original_block_size
@@ -767,6 +729,17 @@ def main() -> None:
     parser.add_argument("--model-name-or-path", type=str, default='/data/wanghanzhen/models/Qwen/Qwen3-8B')
     parser.add_argument("--draft-name-or-path", type=str, default='/data/wanghanzhen/Projects/MTP/NIPS26/FlashMTP_v5.1/cache/models/flashmtp_v5.1_fix_h100_sample_40000_think_off_nlayers5_block_16_maxlen4096_epochs6/epoch_6_step_29844')
     parser.add_argument("--block-size", type=int, default=None)
+    parser.add_argument(
+        "--verify-block",
+        "--verify_block",
+        dest="verify_block",
+        type=int,
+        default=None,
+        help="Verify only this many positions from the front of each drafted block "
+        "(using the same anchor-inclusive counting as --block-size). "
+        "The draft model still receives the full --block-size mask block. "
+        "Default: verify the full drafted block.",
+    )
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--max-samples", type=int, default=10)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
@@ -887,6 +860,18 @@ def main() -> None:
         f"block_size={draft_model.block_size}"
     )
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
+    verify_block_size = args.verify_block if args.verify_block is not None else block_size
+    if not 1 <= verify_block_size <= block_size:
+        raise ValueError(
+            f"--verify-block must be in [1, {block_size}], got {verify_block_size}"
+        )
+    logger.info(
+        "FlashMTP decode: draft_block_size={} verify_block_size={} "
+        "(discarding {} draft positions before target verification)",
+        block_size,
+        verify_block_size,
+        block_size - verify_block_size,
+    )
     if args.use_draft_tree:
         logger.info(
             "Draft tree decode: trunc_thres={} expand_thres={} width={} entropy_ratio={} "
@@ -918,6 +903,7 @@ def main() -> None:
         draft_model=draft_model,
         tokenizer=tokenizer,
         block_size=block_size,
+        verify_block_size=verify_block_size,
         device=device,
         batch_size=args.batch_size,
         max_new_tokens=args.max_new_tokens,
@@ -941,7 +927,7 @@ def main() -> None:
             else:
                 user_content = turn_q
             messages.append({"role": "user", "content": user_content})
-            input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
+            input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
             input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
             if args.batch_size > 1:
                 input_ids = input_ids.expand(args.batch_size, -1).contiguous()
@@ -967,6 +953,7 @@ def main() -> None:
                 input_ids=input_ids,
                 max_new_tokens=args.max_new_tokens,
                 block_size=block_size,
+                verify_block_size=verify_block_size,
                 stop_token_ids=stop_token_ids,
                 temperature=args.temperature,
                 decode_timing_after_first_token=decode_after_first,
@@ -1015,7 +1002,9 @@ def main() -> None:
             return
         responses = list(chain(*responses))
 
-    overall_stats = compute_benchmark_stats(responses, block_size)
+    overall_stats = compute_benchmark_stats(
+        responses, block_size, verify_block_size
+    )
     print_benchmark_stats(
         overall_stats,
         block_size,
@@ -1028,7 +1017,9 @@ def main() -> None:
     ):
         print("\n=== Per-category breakdown ===")
         for category in sorted(category_groups):
-            cat_stats = compute_benchmark_stats(category_groups[category], block_size)
+            cat_stats = compute_benchmark_stats(
+                category_groups[category], block_size, verify_block_size
+            )
             print_benchmark_stats(cat_stats, block_size, title=f"category={category}")
 
     total_elapsed_time = cuda_time() - benchmark_start

@@ -12,6 +12,8 @@ fi
 
 cd "${PROJECT_DIR}"
 
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -70,18 +72,19 @@ DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
 
 # 模型参数（OUTPUT_DIR 依赖 BLOCK_SIZE，须早于 dt 分支）
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
+MODEL_TAG="${MODEL_TAG:-'Qwen3_8B'}"
 
 if [ "$DT" = "qz" ]; then
     # export NNODES=2
     # export NODE_RANK=${RANK:-0}
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${LOCAL_POSITION_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 elif [ "$DT" = "h100" ]; then
-    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-../training_data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_${PIVOT_FUSE_MODE}_fuse$((NUM_MIDDLE_LAYERS_N + 2))_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${LOCAL_POSITION_TAG}}"
-    TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/share/dai-sys/wanghanzhen/projects/MTP/training_data/nemotron_think_off_samples_40000_qwen3_8b_regen.jsonl}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_${PIVOT_FUSE_MODE}_fuse$((NUM_MIDDLE_LAYERS_N + 2))_sample_${DATA_NUM_SAMPLES}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+    TARGET_MODEL="${TARGET_MODEL:-$WHZ_HOME/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
     OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${LOCAL_POSITION_TAG}}"
@@ -90,10 +93,22 @@ fi
 
 
 TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
+SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.25}"
+SGLANG_MAX_TOTAL_TOKENS="${SGLANG_MAX_TOTAL_TOKENS:-}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-}"
+CE_CHUNK_SIZE="${CE_CHUNK_SIZE:-2048}"
 
 # 训练参数
 BATCH_SIZE="${BATCH_SIZE:-1}"
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
+SHARD_DRAFT_BY_TP="${SHARD_DRAFT_BY_TP:-1}"
+# Per DP rank: target sees TRAIN_BATCH_SIZE samples; each TP rank trains one draft slice.
+TRAIN_BATCH_SIZE="${BATCH_SIZE}"
+if [ "${TP_SIZE}" -gt 1 ] && [ "${SHARD_DRAFT_BY_TP}" = "1" ]; then
+    if [ "${BATCH_SIZE}" -eq 1 ]; then
+        TRAIN_BATCH_SIZE="${TP_SIZE}"
+    fi
+fi
 LEARNING_RATE="${LEARNING_RATE:-6e-4}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
@@ -114,8 +129,8 @@ REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-exp}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}_${LOCAL_POSITION_TAG}}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}_${LOCAL_POSITION_TAG}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}_${MODEL_TAG}}"
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen}"
@@ -154,7 +169,10 @@ echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
 echo "------------------------------------------"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
-echo "  批大小: ${BATCH_SIZE} x ${ACCUMULATION_STEPS} = $((BATCH_SIZE * ACCUMULATION_STEPS))"
+echo "  批大小: ${TRAIN_BATCH_SIZE} x ${ACCUMULATION_STEPS} = $((TRAIN_BATCH_SIZE * ACCUMULATION_STEPS)) (per DP rank)"
+if [ "${TP_SIZE}" -gt 1 ] && [ "${SHARD_DRAFT_BY_TP}" = "1" ]; then
+    echo "  shard-draft-by-tp: on (${TP_SIZE} target samples / TP group, 1 draft sample / TP rank)"
+fi
 echo "  学习率: ${LEARNING_RATE}"
 echo "  最大长度: ${MAX_LENGTH}"
 echo "  预热比例: ${WARMUP_RATIO}"
@@ -246,6 +264,33 @@ if [ "${LOCAL_POSITION_TAG}" = "lp1" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --local-position"
 fi
 
+if [ "${TARGET_MODEL_BACKEND}" = "sglang" ]; then
+    # SGLang profiles KV pool as: free_mem_after_weights - pre_load_mem * (1 - mem_fraction).
+    # With ~14B weights on 80GB H100, mem_fraction < ~0.21 yields negative KV capacity.
+    if awk "BEGIN {exit !(${SGLANG_MEM_FRACTION_STATIC} < 0.22)}"; then
+        echo "WARNING: SGLANG_MEM_FRACTION_STATIC=${SGLANG_MEM_FRACTION_STATIC} is too low for"
+        echo "  SGLang KV profiling (need >=0.22 for MAX_LENGTH=${MAX_LENGTH})."
+        echo "  Override with SGLANG_MEM_FRACTION_STATIC=0.25 (script default)."
+    fi
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION_STATIC}"
+    if [ -z "${SGLANG_MAX_TOTAL_TOKENS}" ]; then
+        SGLANG_MAX_TOTAL_TOKENS=$((TRAIN_BATCH_SIZE * MAX_LENGTH))
+    fi
+    if [ -z "${SGLANG_MAX_RUNNING_REQUESTS}" ]; then
+        SGLANG_MAX_RUNNING_REQUESTS=${TRAIN_BATCH_SIZE}
+    fi
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --sglang-max-total-tokens ${SGLANG_MAX_TOTAL_TOKENS}"
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --sglang-max-running-requests ${SGLANG_MAX_RUNNING_REQUESTS}"
+fi
+
+if [ "${TP_SIZE}" -gt 1 ] && [ "${SHARD_DRAFT_BY_TP}" = "1" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --shard-draft-by-tp"
+else
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --no-shard-draft-by-tp"
+fi
+
+OPTIONAL_ARGS="${OPTIONAL_ARGS} --ce-chunk-size ${CE_CHUNK_SIZE}"
+
 # 运行训练
 EXIT_CODE=0
 "${LAUNCHER[@]}" ./scripts/train_flashmtp.py \
@@ -261,7 +306,7 @@ EXIT_CODE=0
     --learning-rate ${LEARNING_RATE} \
     --warmup-ratio ${WARMUP_RATIO} \
     --num-epochs ${NUM_EPOCHS} \
-    --batch-size ${BATCH_SIZE} \
+    --batch-size ${TRAIN_BATCH_SIZE} \
     --accumulation-steps ${ACCUMULATION_STEPS} \
     --max-grad-norm ${MAX_GRAD_NORM} \
     --max-length ${MAX_LENGTH} \

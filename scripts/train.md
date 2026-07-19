@@ -26,10 +26,15 @@
 
 ```bash
 # ["linear_fuse", "attention_fuse", "prefix_condition"]
-
+cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v1.1
 source .venv/bin/activate
-NUM_MIDDLE_LAYERS_N=16 NUM_EPOCHS=6 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=40000 \
-BLOCK_SIZE=16 LOSS_DECAY_GAMMA=7 LOCAL_POSITION=true CAUSAL_MODE=true NUM_MIDDLE_LAYERS=5 \
+NUM_MIDDLE_LAYERS_N=16 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=8 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=40000 MAX_LENGTH=40960 NUM_ANCHORS=1024 BLOCK_SIZE=8 SHARD_DRAFT_BY_TP=1 \
+NPROC_PER_NODE=8 TP_SIZE=2 CE_CHUNK_SIZE=8192 \
+TRAIN_DATA_PATH="/share/dai-sys/wanghanzhen/projects/MTP/training_data/nemotron_think_off_samples_40000_qwen3_8b_regen.jsonl" \
+TARGET_MODEL_BACKEND=sglang SGLANG_MEM_FRACTION_STATIC=0.25 \
+TARGET_MODEL=/share/dai-sys/wanghanzhen/models/Qwen/Qwen3-14B \
+MODEL_TAG='Qwen3-14B' \
+LOSS_DECAY_GAMMA=7 LOCAL_POSITION=true NUM_MIDDLE_LAYERS=5 \
 bash scripts/run_training_flashmtp.sh --dt h100
 ```
 
@@ -46,7 +51,11 @@ bash scripts/run_training_flashmtp.sh --dt h100
 
 ---
 
+
+
 ## 多机训练
+
+
 
 ### Qwen 模板（900k 混合数据）
 
@@ -59,6 +68,8 @@ export TRAIN_DATA_PATH='/workspace/wanghanzhen/NIPS26/training_data/regen_data/n
 bash scripts/run_training_flashmtp.sh --dt qz \
   > "whz_mtp_logs/train_flashmtp_qz_dist_$(date +%Y%m%d_%H%M%S).log" 2>&1
 ```
+
+
 
 ### Llama3 模板（532k ShareGPT + UltraChat）
 
@@ -74,6 +85,8 @@ bash scripts/run_training_flashmtp.sh --dt qz
 ```
 
 ---
+
+
 
 ## 数据混合与打乱
 
@@ -98,6 +111,8 @@ cat ${NEW_DATA} ${MIX_DIR}/old_replay_50k.jsonl | shuf > ${MIX_DIR}/math_code_1w
 3. 整体 shuffle 后写入混合文件
 
 ---
+
+
 
 ## 继续训练（从 checkpoint 恢复）
 
@@ -149,6 +164,8 @@ bash scripts/run_training_flashmtp.sh --dt h100
 
 
 ---
+
+
 
 ## 常用环境变量速查
 

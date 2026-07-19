@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -12,7 +12,9 @@ from specforge.distributed import get_tp_group
 
 @dataclass
 class FlashMTPTargetOutput:
-    hidden_states: torch.Tensor  # [batch, seq_len, hidden_size]
+    hidden_states: Union[
+        torch.Tensor, Tuple[torch.Tensor, ...], Dict[int, torch.Tensor]
+    ]
     input_ids: torch.Tensor  # [batch, seq_len]
     attention_mask: torch.Tensor  # [batch, seq_len]
     loss_mask: torch.Tensor  # [batch, seq_len]
@@ -70,13 +72,14 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         from sglang.srt.configs.model_config import ModelConfig
         from sglang.srt.server_args import ServerArgs
 
-        from .sglang_backend import SGLangRunner
+        from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
 
         tp_size = dist.get_world_size(get_tp_group())
+        dtype_arg = torch_dtype if torch_dtype is not None else "auto"
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
-            dtype=torch_dtype,
+            dtype=dtype_arg,
             enable_return_hidden_states=True,  # Critical for FlashMTP
             disable_cuda_graph=True,
             tp_size=tp_size,
@@ -100,6 +103,10 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
             pp_size=1,
             server_args=server_args,
             nccl_port=None,
+            is_draft_worker=False,
+        )
+        wrap_eagle3_logits_processors_in_module(
+            model_runner.model, return_full_logits=False
         )
         instance = cls(model_runner)
         # Default: capture all layers for FlashMTP
@@ -122,6 +129,41 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
             self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
 
+    @staticmethod
+    def _unpack_runner_output(runner_output):
+        if isinstance(runner_output, tuple):
+            return runner_output[0]
+        if (
+            hasattr(runner_output, "logits_output")
+            and runner_output.logits_output is not None
+        ):
+            return runner_output.logits_output
+        return runner_output
+
+    def _aux_hidden_to_layer_tuple(
+        self,
+        aux_hidden: torch.Tensor,
+        last_hidden: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Split SGLang concatenated aux hidden states into per-layer tensors."""
+        hidden_size = self.model_runner.model_config.hidden_size
+        bsz, seq_len, total_h = aux_hidden.shape
+        if total_h % hidden_size != 0:
+            raise ValueError(
+                f"Unexpected aux_hidden_states shape {tuple(aux_hidden.shape)}; "
+                f"last dim must be divisible by hidden_size={hidden_size}"
+            )
+        num_layers = total_h // hidden_size
+        reshaped = aux_hidden.view(bsz, seq_len, num_layers, hidden_size)
+        layers = [reshaped[:, :, layer_idx, :] for layer_idx in range(num_layers)]
+        if last_hidden is not None:
+            if last_hidden.shape != (bsz, seq_len, hidden_size):
+                raise ValueError(
+                    f"Unexpected last_hidden_states shape {tuple(last_hidden.shape)}; "
+                    f"expected {(bsz, seq_len, hidden_size)}"
+                )
+            layers.append(last_hidden)
+        return tuple(layers)
 
     @torch.no_grad
     def _extend(self, reqs):
@@ -135,6 +177,13 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         )
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
+
+        from .sglang_backend.utils import LogitsProcessorForEAGLE3
+
+        for _, module in self.model_runner.model.named_modules():
+            if isinstance(module, LogitsProcessorForEAGLE3):
+                module.return_last_hidden_states = True
+                module.return_logits = False
 
         cache_params = CacheInitParams(
             disable=False,
@@ -176,9 +225,11 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
-        output, _ = self.model_runner.forward(forward_batch)
+        runner_output = self.model_runner.forward(forward_batch)
+        output = self._unpack_runner_output(runner_output)
 
         input_lens = [len(req.origin_input_ids) for req in reqs]
+        last_hidden_list = None
         if (
             hasattr(output, "aux_hidden_states")
             and output.aux_hidden_states is not None
@@ -186,6 +237,13 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
             hidden_states_list = torch.split(
                 output.aux_hidden_states, input_lens, dim=0
             )
+            if (
+                hasattr(output, "last_hidden_states")
+                and output.last_hidden_states is not None
+            ):
+                last_hidden_list = torch.split(
+                    output.last_hidden_states, input_lens, dim=0
+                )
         elif hasattr(output, "hidden_states") and output.hidden_states is not None:
             hidden_states_list = torch.split(output.hidden_states, input_lens, dim=0)
         else:
@@ -194,7 +252,7 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         self.model_runner.req_to_token_pool.clear()
         self.model_runner.token_to_kv_pool_allocator.clear()
 
-        return hidden_states_list
+        return hidden_states_list, last_hidden_list
 
     @torch.no_grad()
     def generate_flashmtp_data(
@@ -228,10 +286,45 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
             data_cache.append((curr_ids, curr_attn, curr_loss))
             reqs.append(req)
 
-        hidden_states_list = self._extend(reqs)
+        hidden_states_list, last_hidden_list = self._extend(reqs)
 
-        # Stack back to batch
-        hidden_states = torch.cat([h.unsqueeze(0) for h in hidden_states_list], dim=0)
+        batched_aux = torch.cat([h.unsqueeze(0) for h in hidden_states_list], dim=0)
+        batched_last = None
+        if last_hidden_list is not None:
+            batched_last = torch.cat(
+                [h.unsqueeze(0) for h in last_hidden_list], dim=0
+            )
+
+        hidden_size = self.model_runner.model_config.hidden_size
+        num_transformer_layers = getattr(
+            self.model_runner.model_config, "num_hidden_layers", None
+        )
+        if (
+            batched_aux.ndim == 3
+            and batched_aux.shape[-1] % hidden_size == 0
+            and batched_aux.shape[-1] > hidden_size
+        ):
+            layer_tensors = self._aux_hidden_to_layer_tuple(
+                batched_aux, batched_last
+            )
+            captured_ids = self.capture_layer_ids or []
+            if (
+                num_transformer_layers is not None
+                and len(captured_ids) < num_transformer_layers
+            ):
+                # Partial capture: map absolute layer id -> hidden tensor.
+                hidden_states = {
+                    layer_id: layer_tensors[idx]
+                    for idx, layer_id in enumerate(captured_ids)
+                }
+            else:
+                hidden_states = layer_tensors
+        else:
+            raise ValueError(
+                "SGLang returned single-layer hidden states; expected concatenated "
+                "aux_hidden_states from all captured layers. Ensure "
+                "wrap_eagle3_logits_processors_in_module is applied."
+            )
         input_ids = torch.cat([d[0] for d in data_cache], dim=0)
         attention_mask = torch.cat([d[1] for d in data_cache], dim=0)
         loss_mask = torch.cat([d[2] for d in data_cache], dim=0)

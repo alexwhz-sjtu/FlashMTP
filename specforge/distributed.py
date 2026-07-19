@@ -243,3 +243,11 @@ def is_tp_rank_0():
     if tp_group is None:
         return True
     return dist.get_rank(group=tp_group) == 0
+
+
+def get_tp_data_shard(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+    """Return this TP rank's slice along ``dim`` (for per-rank draft micro-batches)."""
+    tp_group = get_tp_group()
+    if tp_group is None or dist.get_world_size(tp_group) == 1:
+        return tensor
+    return shard_tensor(tensor, process_group=tp_group, dim=dim)

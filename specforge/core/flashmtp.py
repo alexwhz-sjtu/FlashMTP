@@ -1,11 +1,12 @@
 # coding=utf-8
 """FlashMTP Training Wrapper."""
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
 
@@ -40,8 +41,15 @@ def infer_hidden_states_embedding_offset(
     return 1 if lt > num_transformer_layers else 0
 
 
+HiddenStatesInput = Union[
+    tuple[torch.Tensor, ...],
+    list[torch.Tensor],
+    Dict[int, torch.Tensor],
+]
+
+
 def prepare_target_hidden(
-    hidden_states: tuple[torch.Tensor],  # tuple of (B, seq_len, H) per layer (+ optional embed)
+    hidden_states: HiddenStatesInput,
     anchor_positions: torch.Tensor,  # (B, N)
     target_layer_ids: list[int],
     num_transformer_layers: int,
@@ -50,14 +58,23 @@ def prepare_target_hidden(
 
     ``target_layer_ids`` are **0-based transformer layer indices** (shallow=0, deep=L-1).
 
+    ``hidden_states`` may be:
+    - a tuple/list indexed by transformer layer id (+ optional embedding offset), or
+    - a dict mapping layer id -> (B, seq_len, H) (SGLang partial capture).
+
     Returns:
         (B, N, S, H) with ``S = len(target_layer_ids)``, positions ``anchor-1`` per block.
     """
     context_positions = (anchor_positions - 1).clamp(min=0)  # (B, N)
-    off = infer_hidden_states_embedding_offset(hidden_states, num_transformer_layers)
     pieces: list[torch.Tensor] = []
     for layer_id in target_layer_ids:
-        layer_hidden = hidden_states[layer_id + off]
+        if isinstance(hidden_states, dict):
+            layer_hidden = hidden_states[layer_id]
+        else:
+            off = infer_hidden_states_embedding_offset(
+                hidden_states, num_transformer_layers
+            )
+            layer_hidden = hidden_states[layer_id + off]
         layer_selected = torch.gather(
             layer_hidden,
             dim=1,
@@ -177,6 +194,7 @@ class OnlineFlashMTPModel(nn.Module):
             add_noise: bool = False,
             target_hidden_noise_ratio: float = 0.1,
             w1_mse: float = 0.0,
+            ce_chunk_size: int = 2048,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -190,6 +208,7 @@ class OnlineFlashMTPModel(nn.Module):
         self.add_noise = add_noise
         self.target_hidden_noise_ratio = target_hidden_noise_ratio
         self.w1_mse = w1_mse
+        self.ce_chunk_size = max(int(ce_chunk_size), 1)
         self.chs_concat_mode = "feature"
         self.draft_model.chs_concat_mode = "feature"
 
@@ -302,19 +321,152 @@ class OnlineFlashMTPModel(nn.Module):
 
         return self.embed_tokens(noise_ids)
 
+    @torch.no_grad()
+    def prepare_training_tensors(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: HiddenStatesInput,
+        loss_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample anchors and gather teacher pivots; frees full-seq hidden states afterward."""
+        bsz, seq_len = input_ids.shape
+        device = input_ids.device
+        anchor_positions, block_keep_mask = self._sample_anchor_positions(
+            seq_len, loss_mask, device
+        )
+        target_hidden = prepare_target_hidden(
+            hidden_states,
+            anchor_positions,
+            self.draft_model.target_layer_ids,
+            self.draft_model.config.num_target_layers,
+        )
+        if self.add_noise:
+            target_hidden = add_noise_to_target_hidden(
+                target_hidden, noise_ratio=self.target_hidden_noise_ratio
+            )
+        return anchor_positions, block_keep_mask, target_hidden
+
+    def _lm_head_module(self, output_hidden: torch.Tensor) -> nn.Module:
+        if self.draft_model.draft_lm_head is not None:
+            return self.draft_model.draft_lm_head
+        return self.lm_head
+
+    def _chunked_weighted_ce_and_metrics(
+        self,
+        output_hidden: torch.Tensor,
+        target_ids: torch.Tensor,
+        weight_mask: torch.Tensor,
+        binary_eval_mask: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+        bsz: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Chunk lm_head + CE to avoid materializing [T, vocab] logits at once."""
+        device = output_hidden.device
+        flat_hidden = output_hidden.reshape(-1, output_hidden.size(-1))
+        num_tokens = flat_hidden.size(0)
+        flat_targets = target_ids.reshape(-1)
+        flat_weights = weight_mask.reshape(-1)
+        valid_token_count = flat_weights.sum() + 1e-6
+        lm_head = self._lm_head_module(output_hidden)
+
+        def _chunk_ce(oh: torch.Tensor, targets_chunk: torch.Tensor, weights_chunk: torch.Tensor):
+            logits_chunk = lm_head(oh)
+            loss_chunk = F.cross_entropy(
+                logits_chunk, targets_chunk, reduction="none"
+            )
+            return (loss_chunk * weights_chunk).sum()
+
+        loss_num = output_hidden.new_zeros(())
+        correct_sum = output_hidden.new_zeros((), dtype=torch.float32)
+        pred_chunks: list[torch.Tensor] = []
+        chunk_size = self.ce_chunk_size
+
+        for start in range(0, num_tokens, chunk_size):
+            end = min(start + chunk_size, num_tokens)
+            oh = flat_hidden[start:end]
+            targets_chunk = flat_targets[start:end]
+            weights_chunk = flat_weights[start:end]
+            eval_mask_chunk = binary_eval_mask[start:end]
+
+            chunk_sum = checkpoint(
+                _chunk_ce,
+                oh,
+                targets_chunk,
+                weights_chunk,
+                use_reentrant=False,
+            )
+            loss_num = loss_num + chunk_sum
+
+            with torch.no_grad():
+                logits_chunk = lm_head(oh)
+                pred_chunk = logits_chunk.argmax(dim=-1)
+                pred_chunks.append(pred_chunk)
+                correct_sum = correct_sum + (
+                    (pred_chunk == targets_chunk) & (eval_mask_chunk > 0.5)
+                ).sum().float()
+
+        loss = loss_num / valid_token_count
+        pred_ids = torch.cat(pred_chunks, dim=0)
+        actual_token_count = binary_eval_mask.sum() + 1e-6
+        accuracy = correct_sum / actual_token_count
+
+        with torch.no_grad():
+            pred_ids_by_block = pred_ids.view(
+                bsz, anchor_positions.size(1), self.block_size
+            )
+            correct_by_block = pred_ids_by_block == target_ids
+            valid_by_block = binary_eval_mask.view(
+                bsz, anchor_positions.size(1), self.block_size
+            ) > 0.5
+            prefix_correct = (
+                correct_by_block[:, :, 1:] & valid_by_block[:, :, 1:]
+            ).cumprod(dim=-1)
+            prefix_lengths = prefix_correct.sum(dim=-1).float() + 1.0
+            valid_blocks = block_keep_mask & valid_by_block[:, :, 1:].any(dim=-1)
+            prefix_count = valid_blocks.sum().float()
+            prefix_sum = (
+                prefix_lengths[valid_blocks].sum()
+                if valid_blocks.any()
+                else torch.zeros((), device=device, dtype=torch.float32)
+            )
+            prefix_acc = prefix_sum / prefix_count.clamp(min=1.0)
+
+        return loss, accuracy, prefix_acc
+
     def forward(
         self,
         input_ids: torch.Tensor,
-        hidden_states: tuple,
         loss_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_states: Optional[HiddenStatesInput] = None,
+        anchor_positions: Optional[torch.Tensor] = None,
+        block_keep_mask: Optional[torch.Tensor] = None,
+        target_hidden: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Parallel block-wise training forward pass."""
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        # TODO: keep_mask meaning: Valid anchor position
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device)
+        if target_hidden is None:
+            if hidden_states is None:
+                raise ValueError("Either hidden_states or target_hidden must be provided.")
+            anchor_positions, block_keep_mask = self._sample_anchor_positions(
+                seq_len, loss_mask, device
+            )
+            target_hidden = prepare_target_hidden(
+                hidden_states,
+                anchor_positions,
+                self.draft_model.target_layer_ids,
+                self.draft_model.config.num_target_layers,
+            )
+            if self.add_noise:
+                target_hidden = add_noise_to_target_hidden(
+                    target_hidden, noise_ratio=self.target_hidden_noise_ratio
+                )
+        elif anchor_positions is None or block_keep_mask is None:
+            raise ValueError(
+                "anchor_positions and block_keep_mask are required when target_hidden is precomputed."
+            )
 
         noise_embedding = self._create_noise_embed(input_ids, anchor_positions,
                                                    block_keep_mask)
@@ -346,17 +498,6 @@ class OnlineFlashMTPModel(nn.Module):
             device=device,
         )
 
-        target_hidden = prepare_target_hidden(
-            hidden_states,
-            anchor_positions,
-            self.draft_model.target_layer_ids,
-            self.draft_model.config.num_target_layers,
-        )
-        if self.add_noise:
-            target_hidden = add_noise_to_target_hidden(
-                target_hidden, noise_ratio=self.target_hidden_noise_ratio
-            )
-
         output_hidden = self.draft_model(
             position_ids=draft_position_ids,
             noise_embedding=noise_embedding,
@@ -364,11 +505,6 @@ class OnlineFlashMTPModel(nn.Module):
             attention_mask=flashmtp_attn_mask,
             rotary_position_ids=full_rotary_position_ids,
         )
-
-        if self.draft_model.draft_lm_head is not None:
-            logits = self.draft_model.draft_lm_head(output_hidden)
-        else:
-            logits = self.lm_head(output_hidden)
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
         label_offsets = torch.arange(0, self.block_size,
@@ -408,20 +544,21 @@ class OnlineFlashMTPModel(nn.Module):
                                       self.loss_decay_gamma)
             weight_mask = weight_mask * decay_weights
 
-        # --- Cross entropy ---
-        flat_logits = logits.view(-1, logits.size(-1))
-        flat_targets = target_ids.view(-1)
-        flat_weights = weight_mask.view(-1)
-
-        loss_per_token = F.cross_entropy(flat_logits,
-                                         flat_targets,
-                                         reduction="none")
-        valid_token_count = flat_weights.sum() + 1e-6
-        loss = (loss_per_token * flat_weights).sum() / valid_token_count
+        loss, accuracy, prefix_acc = self._chunked_weighted_ce_and_metrics(
+            output_hidden=output_hidden,
+            target_ids=target_ids,
+            weight_mask=weight_mask,
+            binary_eval_mask=binary_eval_mask,
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            bsz=bsz,
+        )
 
         # --- First predicted token hidden MSE (block pos 1 -> teacher last layer at anchor) ---
         mse_loss = torch.zeros((), device=device, dtype=loss.dtype)
         if self.w1_mse > 0:
+            if hidden_states is None:
+                raise ValueError("hidden_states required when w1_mse > 0.")
             n_blk = anchor_positions.size(1)
             h_dim = output_hidden.size(-1)
             draft_first_h = output_hidden.view(
@@ -429,8 +566,16 @@ class OnlineFlashMTPModel(nn.Module):
             )[:, :, 1, :]
             first_label_indices = (anchor_positions + 1).clamp(max=seq_len - 1)
             teacher_pos = (first_label_indices - 1).clamp(min=0)
+            if isinstance(hidden_states, dict):
+                last_layer_id = self.draft_model.config.num_target_layers - 1
+                teacher_seq_hidden = hidden_states[last_layer_id]
+            else:
+                off = infer_hidden_states_embedding_offset(
+                    hidden_states, self.draft_model.config.num_target_layers
+                )
+                teacher_seq_hidden = hidden_states[-1 + off]
             teacher_first_h = torch.gather(
-                hidden_states[-1],
+                teacher_seq_hidden,
                 1,
                 teacher_pos.unsqueeze(-1).expand(-1, -1, h_dim),
             )
@@ -448,35 +593,5 @@ class OnlineFlashMTPModel(nn.Module):
             ).mean(dim=-1)
             mse_loss = (mse_per_block * mse_mask).sum() / (mse_mask.sum() + 1e-6)
             loss = loss + self.w1_mse * mse_loss
-
-        # --- Accuracy ---
-        with torch.no_grad():
-            pred_ids = torch.argmax(flat_logits, dim=-1)
-            correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
-            actual_token_count = binary_eval_mask.sum() + 1e-6
-            accuracy = correct.sum().float() / actual_token_count
-
-            # --- prefix metric (aligned with FlashMTP_exp): mean per-block acceptance length ---
-            # cumprod only on in-block indices 1: (exclude anchor); +1.0; average over blocks
-            # that are kept and have at least one valid speculative position.
-            pred_ids_by_block = logits.argmax(dim=-1).view(
-                bsz, anchor_positions.size(1), self.block_size
-            )
-            correct_by_block = pred_ids_by_block == target_ids
-            valid_by_block = binary_eval_mask.view(
-                bsz, anchor_positions.size(1), self.block_size
-            ) > 0.5
-            prefix_correct = (
-                correct_by_block[:, :, 1:] & valid_by_block[:, :, 1:]
-            ).cumprod(dim=-1)
-            prefix_lengths = prefix_correct.sum(dim=-1).float() + 1.0
-            valid_blocks = block_keep_mask & valid_by_block[:, :, 1:].any(dim=-1)
-            prefix_count = valid_blocks.sum().float()
-            prefix_sum = (
-                prefix_lengths[valid_blocks].sum()
-                if valid_blocks.any()
-                else torch.zeros((), device=device, dtype=torch.float32)
-            )
-            prefix_acc = prefix_sum / prefix_count.clamp(min=1.0)
 
         return loss, accuracy, prefix_acc, mse_loss

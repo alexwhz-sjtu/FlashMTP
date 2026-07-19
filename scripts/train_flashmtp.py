@@ -24,7 +24,12 @@ from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.flashmtp import OnlineFlashMTPModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
-from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
+from specforge.distributed import (
+    destroy_distributed,
+    get_dp_group,
+    get_tp_data_shard,
+    init_distributed,
+)
 from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
 from specforge.modeling.target.flashmtp_target_model import (
     FlashMTPTargetModel,
@@ -141,11 +146,24 @@ def parse_args():
     training_group = parser.add_argument_group("training")
     training_group.add_argument("--num-epochs", type=int, default=6)
     training_group.add_argument("--batch-size", type=int, default=1)
+    training_group.add_argument(
+        "--shard-draft-by-tp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="After target prefill on the full DP batch, each TP rank trains draft "
+        "on its own sample (batch dim 0 / tp_size). Default: on when tp_size > 1.",
+    )
     training_group.add_argument("--learning-rate", type=float, default=6e-4)
     training_group.add_argument("--max-length", type=int, default=3072)
     training_group.add_argument("--warmup-ratio", type=float, default=0.04)
     training_group.add_argument("--max-grad-norm", type=float, default=1.0)
     training_group.add_argument("--accumulation-steps", type=int, default=1)
+    training_group.add_argument(
+        "--ce-chunk-size",
+        type=int,
+        default=2048,
+        help="Chunk size for lm_head + CE to reduce peak activation memory.",
+    )
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
     training_group.add_argument(
@@ -484,6 +502,29 @@ def main():
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
 
+    if args.shard_draft_by_tp is None:
+        args.shard_draft_by_tp = args.tp_size > 1
+    if args.shard_draft_by_tp:
+        if args.tp_size == 1:
+            args.shard_draft_by_tp = False
+        elif args.batch_size % args.tp_size != 0:
+            raise ValueError(
+                f"batch_size ({args.batch_size}) must be divisible by tp_size "
+                f"({args.tp_size}) when --shard-draft-by-tp is enabled."
+            )
+    if args.shard_draft_by_tp:
+        print_on_rank0(
+            f"shard-draft-by-tp: target batch={args.batch_size} per DP rank "
+            f"({args.batch_size // args.tp_size} draft sample per TP rank), "
+            f"global unique samples/step="
+            f"{args.batch_size * dist.get_world_size(get_dp_group())}"
+        )
+    else:
+        print_on_rank0(
+            "shard-draft-by-tp disabled: all TP ranks train draft on the full batch."
+        )
+
+    args.target_batch_size = args.batch_size
     target_model, draft_model = build_models(args)
 
     draft_model_last_checkpoint = None
@@ -611,12 +652,15 @@ def main():
         add_noise=args.add_noise,
         target_hidden_noise_ratio=args.target_hidden_noise_ratio,
         w1_mse=args.w1_mse,
+        ce_chunk_size=args.ce_chunk_size,
     )
     print_on_rank0(
         f"target hidden noise: add_noise={args.add_noise}, "
-        f"ratio={args.target_hidden_noise_ratio}, w1_mse={args.w1_mse}"
+        f"ratio={args.target_hidden_noise_ratio}, w1_mse={args.w1_mse}, "
+        f"ce_chunk_size={args.ce_chunk_size}"
     )
 
+    online_flashmtp = flashmtp_model
     flashmtp_model = FSDP(
         flashmtp_model,
         use_orig_params=True,
@@ -678,15 +722,48 @@ def main():
             target_output = target_model.generate_flashmtp_data(
                 input_ids, attention_mask, loss_mask
             )
-            
-            hidden_states = tuple(h.cuda() for h in target_output.hidden_states)
-            # hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
+
+            hidden_states = target_output.hidden_states
+            if isinstance(hidden_states, dict):
+                hidden_states = {
+                    layer_id: h.cuda() if not h.is_cuda else h
+                    for layer_id, h in hidden_states.items()
+                }
+            else:
+                hidden_states = tuple(
+                    h.cuda() if not h.is_cuda else h for h in hidden_states
+                )
+
+            seq_len = int(input_ids.shape[1])
+            if dist.get_rank() == 0 and global_step <= 10:
+                print_on_rank0(
+                    f"step {global_step}: seq_len={seq_len}, "
+                    f"num_captured_layers="
+                    f"{len(hidden_states) if isinstance(hidden_states, dict) else len(hidden_states)}"
+                )
+
+            anchor_positions, block_keep_mask, target_hidden = (
+                online_flashmtp.prepare_training_tensors(
+                    input_ids, hidden_states, loss_mask
+                )
+            )
+            del target_output, hidden_states
+
+            if args.shard_draft_by_tp:
+                input_ids = get_tp_data_shard(input_ids)
+                loss_mask = get_tp_data_shard(loss_mask)
+                anchor_positions = get_tp_data_shard(anchor_positions)
+                block_keep_mask = get_tp_data_shard(block_keep_mask)
+                target_hidden = get_tp_data_shard(target_hidden)
 
             loss, accuracy, prefix_acc, mse_loss = flashmtp_model(
                 input_ids=input_ids,
-                hidden_states=hidden_states,
                 loss_mask=loss_mask,
+                anchor_positions=anchor_positions,
+                block_keep_mask=block_keep_mask,
+                target_hidden=target_hidden,
             )
+            del target_hidden, anchor_positions, block_keep_mask
 
             (loss / args.accumulation_steps).backward()
 

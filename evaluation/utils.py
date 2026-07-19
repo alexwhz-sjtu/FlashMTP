@@ -6,6 +6,7 @@ import torch
 from typing import Optional
 from pathlib import Path
 from datasets import Dataset, load_dataset, load_from_disk, Features, Sequence, Value
+from huggingface_hub import hf_hub_download
 
 
 NEMOTRON_LOCAL_DATA_DIR = Path(
@@ -25,6 +26,24 @@ DATASET_CACHE_ROOT = Path(
     "../../processed_dataset_cache"
 )
 DATASET_CACHE_VERSION = "v1"
+
+def _load_livecodebench_jsonl_dataset():
+    """Download LiveCodeBench lite JSONL shards via HF Hub (datasets no longer runs loading scripts)."""
+    repo_id = "livecodebench/code_generation_lite"
+    allowed_files = [
+        "test.jsonl",
+        "test2.jsonl",
+        "test3.jsonl",
+        "test4.jsonl",
+        "test5.jsonl",
+        "test6.jsonl",
+    ]
+    local_paths = [
+        hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset")
+        for filename in allowed_files
+    ]
+    return load_dataset("json", data_files={"test": local_paths})["test"]
+
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
     if num_draft_layers == 1:
@@ -269,10 +288,7 @@ def _build_and_process_dataset(data_key: str):
         )
     
     elif data_key == "livecodebench":
-        base = "https://huggingface.co/datasets/livecodebench/code_generation_lite/resolve/main/"
-        allowed_files = ["test.jsonl", "test2.jsonl", "test3.jsonl", "test4.jsonl", "test5.jsonl", "test6.jsonl"]
-        urls = [base + fn for fn in allowed_files]
-        dataset = load_dataset("json", data_files={"test": urls})["test"]
+        dataset = _load_livecodebench_jsonl_dataset()
         def format_lcb(doc):
             system_prompt = (
                 "You are an expert Python programmer. You will be given a question (problem specification) "

@@ -823,6 +823,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         stop_token_ids: list[int],
         temperature: float = 0.0,
         *,
+        verify_block_size: Optional[int] = None,
         trunc_thres: float = 0.2,
         expand_thres: float = 0.5,
         tree_width: int = 4,
@@ -833,10 +834,19 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
 
         Draft tree with truncation/expansion; one target forward over all nodes using
         ancestor attention mask and shared ``position_ids`` per depth. Acceptance walks
-        the path: ``logits[accepted_{d-1}]`` vs candidates at depth ``d``.
+        the path: ``logits[accepted_{d-1}]`` vs candidates at depth ``d``. The draft
+        forward always uses the full block; ``verify_block_size`` only caps tree depth.
         """
         self.eval()
         block_size = int(self.block_size)
+        verify_block_size = (
+            block_size if verify_block_size is None else int(verify_block_size)
+        )
+        if not 1 <= verify_block_size <= block_size:
+            raise ValueError(
+                f"verify_block_size must be in [1, {block_size}], got "
+                f"{verify_block_size}"
+            )
         self._last_decode_stats = {
             "accept_lengths": [],
             "decode_wall_time": 0.0,
@@ -933,7 +943,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             tree_spec = build_draft_tree_from_logits(
                 draft_logits[0],
                 anchor_id,
-                block_size,
+                verify_block_size,
                 tree_width,
                 trunc_thres,
                 expand_thres,
@@ -1032,6 +1042,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         stop_token_ids: list[int],
         temperature: float,
         decode_timing_after_first_token: bool = False,
+        verify_block_size: Optional[int] = None,
     ):
         self.eval()
         self._last_decode_stats = {
@@ -1046,6 +1057,14 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         max_length = num_input_tokens + max_new_tokens
 
         block_size = self.block_size
+        verify_block_size = (
+            block_size if verify_block_size is None else int(verify_block_size)
+        )
+        if not 1 <= verify_block_size <= block_size:
+            raise ValueError(
+                f"verify_block_size must be in [1, {block_size}], got "
+                f"{verify_block_size}"
+            )
         output_ids = torch.full(
             (bsz, max_length + block_size),
             self.mask_token_id,
@@ -1123,9 +1142,14 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 draft_logits = target.lm_head(draft_hidden)
             block_output_ids[:, 1:] = sample(draft_logits)
 
+            # The draft always consumes and predicts the full configured block.  Only
+            # the requested prefix is sent to the target; the remaining draft tokens
+            # are deliberately discarded before verification.
+            verify_output_ids = block_output_ids[:, :verify_block_size]
+            verify_position_ids = target_block_pos[:, :verify_block_size]
             output = target(
-                block_output_ids,
-                position_ids=target_block_pos,
+                verify_output_ids,
+                position_ids=verify_position_ids,
                 past_key_values=past_key_values_target,
                 use_cache=True,
                 output_hidden_states=True,
@@ -1133,7 +1157,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
 
             posterior = sample(output.logits, temperature)
             acceptance_lengths_per_row = (
-                (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)
+                (verify_output_ids[:, 1:] == posterior[:, :-1])
+                .cumprod(dim=1)
+                .sum(dim=1)
             )
             acceptance_length = int(acceptance_lengths_per_row.min().item())
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
