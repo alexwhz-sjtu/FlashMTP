@@ -20,6 +20,29 @@
 
 ---
 
+## 串行 Head
+
+训练脚本支持在并行 FlashMTP backbone 后增加低秩串行 head：
+
+| 环境变量 | 可选值 | 默认值 |
+| --- | --- | --- |
+| `MARKOV_HEAD_TYPE` | `none` / `vanilla` / `gated` / `rnn` | `none` |
+| `MARKOV_OUTPUT_MODE` | `additive` / `direct` | `additive` |
+| `MARKOV_RANK` | 正整数 | `256` |
+
+`additive` 将 head 输出作为 logit bias 加到并行 base logits；`direct`
+直接将 head 输出作为最终 logits。训练使用真实前驱 token 做 teacher forcing，
+推理时按块内位置串行采样。
+
+示例：
+
+```bash
+MARKOV_HEAD_TYPE=rnn MARKOV_OUTPUT_MODE=additive MARKOV_RANK=256 \
+bash scripts/run_training_flashmtp.sh --dt h100
+```
+
+---
+
 ## 单机训练
 
 适用于本地 / 单节点 H100 等环境，快速验证配置：

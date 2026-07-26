@@ -105,6 +105,27 @@ def parse_args():
         "embeddings with the target. Default: share frozen target lm_head as today.",
     )
     model_group.add_argument(
+        "--markov-head-type",
+        type=str,
+        default="none",
+        choices=["none", "vanilla", "gated", "rnn"],
+        help="Optional serial head applied after the parallel FlashMTP backbone.",
+    )
+    model_group.add_argument(
+        "--markov-output-mode",
+        type=str,
+        default="additive",
+        choices=["additive", "direct"],
+        help="'additive' adds the serial-head logits to base LM-head logits; "
+        "'direct' uses serial-head logits as the final logits.",
+    )
+    model_group.add_argument(
+        "--markov-rank",
+        type=int,
+        default=256,
+        help="Low-rank token embedding/state dimension for the serial head.",
+    )
+    model_group.add_argument(
         "--local-position",
         action="store_true",
         help="Draft uses block-local position ids 1..block_size (repeated per parallel "
@@ -203,7 +224,10 @@ def parse_args():
 
 def _sync_config_layer_types_to_draft_depth(draft_config) -> None:
     """Make ``layer_types`` length match ``num_hidden_layers`` for saved config / attention metadata."""
-    if not hasattr(draft_config, "num_hidden_layers") or draft_config.num_hidden_layers is None:
+    if (
+        not hasattr(draft_config, "num_hidden_layers")
+        or draft_config.num_hidden_layers is None
+    ):
         return
     n = int(draft_config.num_hidden_layers)
     lt = getattr(draft_config, "layer_types", None)
@@ -222,6 +246,19 @@ def _sync_config_layer_types_to_draft_depth(draft_config) -> None:
 
 def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     """Build target model (backend wrapper) and draft model."""
+    if args.markov_rank <= 0:
+        raise ValueError(f"--markov-rank must be positive, got {args.markov_rank}.")
+    if args.markov_head_type == "none" and args.markov_output_mode == "direct":
+        raise ValueError(
+            "--markov-output-mode direct requires --markov-head-type "
+            "vanilla, gated, or rnn."
+        )
+    if args.markov_output_mode == "direct" and args.train_lm_head:
+        raise ValueError(
+            "--train-lm-head cannot be used with --markov-output-mode direct "
+            "because the draft LM head is bypassed."
+        )
+
     print_on_rank0(
         f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
     )
@@ -250,13 +287,19 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         draft_config.num_target_layers = target_config.num_hidden_layers
         print_on_rank0("Auto-generated draft config from target model")
 
-    if not hasattr(draft_config, "flashmtp_config") or draft_config.flashmtp_config is None:
+    if (
+        not hasattr(draft_config, "flashmtp_config")
+        or draft_config.flashmtp_config is None
+    ):
         draft_config.flashmtp_config = {}
 
     draft_config.flashmtp_config["chs_concat_mode"] = "feature"
     draft_config.flashmtp_config["pivot_fuse_mode"] = args.pivot_fuse_mode
     draft_config.flashmtp_config["num_middle_layers_n"] = args.num_middle_layers_n
     draft_config.flashmtp_config["local_position"] = bool(args.local_position)
+    draft_config.flashmtp_config["markov_head_type"] = args.markov_head_type
+    draft_config.flashmtp_config["markov_output_mode"] = args.markov_output_mode
+    draft_config.flashmtp_config["markov_rank"] = int(args.markov_rank)
     if args.train_lm_head:
         draft_config.flashmtp_config["train_lm_head"] = True
     elif "train_lm_head" not in draft_config.flashmtp_config:
@@ -282,7 +325,10 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     print_on_rank0(
         f"train_lm_head={getattr(draft_model, 'train_lm_head', False)} "
         f"(draft_lm_head={'on' if draft_model.draft_lm_head is not None else 'off'}), "
-        f"local_position={getattr(draft_model, 'local_position', False)}"
+        f"local_position={getattr(draft_model, 'local_position', False)}, "
+        f"markov_head_type={draft_model.markov_head_type}, "
+        f"markov_output_mode={draft_model.markov_output_mode}, "
+        f"markov_rank={draft_model.markov_rank}"
     )
 
     return target_model, draft_model
@@ -312,9 +358,7 @@ def _ensure_embed_vocab_for_mask(
     with torch.no_grad():
         new_emb.weight[:cur].copy_(old_emb.weight)
         init_row = old_emb.weight.mean(dim=0)
-        new_emb.weight[cur:].copy_(
-            init_row.unsqueeze(0).expand(needed - cur, -1)
-        )
+        new_emb.weight[cur:].copy_(init_row.unsqueeze(0).expand(needed - cur, -1))
     target_components.embed_tokens = new_emb
 
     lm = target_components.lm_head
@@ -329,9 +373,7 @@ def _ensure_embed_vocab_for_mask(
         with torch.no_grad():
             new_lm.weight[:cur].copy_(lm.weight)
             init_row = lm.weight.mean(dim=0)
-            new_lm.weight[cur:].copy_(
-                init_row.unsqueeze(0).expand(needed - cur, -1)
-            )
+            new_lm.weight[cur:].copy_(init_row.unsqueeze(0).expand(needed - cur, -1))
             if lm.bias is not None:
                 new_lm.bias[:cur].copy_(lm.bias)
                 new_lm.bias[cur:].zero_()
@@ -441,6 +483,17 @@ def save_checkpoint(args, epoch, step, flashmtp_model, draft_model, optimizer):
             modeling_dst = os.path.join(save_dir, "flashmtp.py")
             if os.path.exists(modeling_src):
                 shutil.copy(modeling_src, modeling_dst)
+            markov_src = os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "specforge",
+                "modeling",
+                "draft",
+                "flashmtp_markov_head.py",
+            )
+            markov_dst = os.path.join(save_dir, "flashmtp_markov_head.py")
+            if os.path.exists(markov_src):
+                shutil.copy(markov_src, markov_dst)
 
             print_on_rank0(f"Saved checkpoint to {save_dir}")
 
@@ -549,6 +602,22 @@ def main():
         loaded_model = FlashMTPDraftModel.from_pretrained(
             draft_model_last_checkpoint, torch_dtype=torch.bfloat16
         )
+        requested_markov = (
+            draft_model.markov_head_type,
+            draft_model.markov_output_mode,
+            draft_model.markov_rank,
+        )
+        checkpoint_markov = (
+            loaded_model.markov_head_type,
+            loaded_model.markov_output_mode,
+            loaded_model.markov_rank,
+        )
+        if requested_markov != checkpoint_markov:
+            raise ValueError(
+                "Checkpoint serial-head configuration does not match the "
+                "current training arguments: "
+                f"requested={requested_markov}, checkpoint={checkpoint_markov}."
+            )
         draft_model.load_state_dict(loaded_model.state_dict())
         del loaded_model
         draft_weights_from_checkpoint = True
@@ -575,23 +644,35 @@ def main():
     else:
         tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
         mask_token_id = tokenizer.mask_token_id
-        
-    print_on_rank0(f"****** Important: Make sure using the same mask_token_id with inference.***** \n Using mask_token_id: {mask_token_id} \n")
 
+    print_on_rank0(
+        f"****** Important: Make sure using the same mask_token_id with inference.***** \n Using mask_token_id: {mask_token_id} \n"
+    )
 
     draft_model.mask_token_id = mask_token_id
-    
+
     draft_model.config.flashmtp_config["chs_concat_mode"] = "feature"
     draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
-    draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
+    draft_model.config.flashmtp_config["target_layer_ids"] = (
+        draft_model.target_layer_ids
+    )
     draft_model.config.flashmtp_config["pivot_fuse_mode"] = draft_model.pivot_fuse_mode
-    draft_model.config.flashmtp_config["num_middle_layers_n"] = draft_model.num_middle_layers_n
+    draft_model.config.flashmtp_config["num_middle_layers_n"] = (
+        draft_model.num_middle_layers_n
+    )
     draft_model.config.flashmtp_config["train_lm_head"] = bool(
         getattr(draft_model, "train_lm_head", False)
     )
     draft_model.config.flashmtp_config["local_position"] = bool(
         getattr(draft_model, "local_position", False)
     )
+    draft_model.config.flashmtp_config["markov_head_type"] = (
+        draft_model.markov_head_type
+    )
+    draft_model.config.flashmtp_config["markov_output_mode"] = (
+        draft_model.markov_output_mode
+    )
+    draft_model.config.flashmtp_config["markov_rank"] = int(draft_model.markov_rank)
     draft_model.config.flashmtp_config["add_noise"] = bool(args.add_noise)
     draft_model.config.flashmtp_config["target_hidden_noise_ratio"] = float(
         args.target_hidden_noise_ratio
@@ -679,7 +760,7 @@ def main():
         warmup_ratio=args.warmup_ratio,
         total_steps=total_steps,
     )
-    skip_steps=0
+    skip_steps = 0
     start_epoch = 0
     global_step = 0
     if resume_state is not None:

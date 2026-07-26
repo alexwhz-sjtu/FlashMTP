@@ -72,7 +72,9 @@ def profile_flashmtp_generate(
             f"input_ids batch {input_ids.shape[0]} does not match batch_size={batch_size}"
         )
     if batch_size > 1 and temperature >= 1e-5:
-        raise ValueError("batch_size>1 requires temperature≈0 for synchronized streams.")
+        raise ValueError(
+            "batch_size>1 requires temperature≈0 for synchronized streams."
+        )
 
     device = target.device
     bsz = int(input_ids.shape[0])
@@ -111,7 +113,9 @@ def profile_flashmtp_generate(
     ev_tp1.record()
 
     output_ids[:, :num_input_tokens] = input_ids
-    output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature)
+    output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
+        output.logits, temperature
+    )
     target_hidden = gather_pivot_multilayer_inference(
         output.hidden_states,
         model.target_layer_ids,
@@ -128,9 +132,11 @@ def profile_flashmtp_generate(
         block_output_ids = output_ids[:, start : start + block_size].clone()
         target_block_pos = position_ids[:, start : start + block_size]
         if model.local_position:
-            draft_block_pos = torch.arange(
-                1, block_size + 1, device=device, dtype=torch.long
-            ).unsqueeze(0).expand(bsz, -1)
+            draft_block_pos = (
+                torch.arange(1, block_size + 1, device=device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(bsz, -1)
+            )
         else:
             draft_block_pos = target_block_pos
 
@@ -155,15 +161,20 @@ def profile_flashmtp_generate(
             use_cache=False,
             is_causal=False,
         )[:, -block_size + 1 :, :]
-        if model.draft_lm_head is not None:
-            draft_logits = model.draft_lm_head(draft_hidden)
-        else:
-            draft_logits = target.lm_head(draft_hidden)
+        lm_head = (
+            model.draft_lm_head if model.draft_lm_head is not None else target.lm_head
+        )
+        sampled_draft_tokens, _ = model.sample_draft_tokens(
+            draft_hidden=draft_hidden,
+            lm_head=lm_head,
+            first_prev_token_ids=block_output_ids[:, 0],
+            temperature=temperature,
+        )
         ev_df1.record()
         ev_df1.synchronize()
         draft_forward_times_ms.append(_elapsed_ms(ev_df0, ev_df1))
 
-        block_output_ids[:, 1:] = sample(draft_logits, temperature)
+        block_output_ids[:, 1:] = sampled_draft_tokens
 
         _sync(device)
         ev_tv0.record()
@@ -182,8 +193,12 @@ def profile_flashmtp_generate(
         acceptance_lengths_per_row = (
             (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)
         )
-        if not bool(torch.all(acceptance_lengths_per_row == acceptance_lengths_per_row[0])):
-            raise RuntimeError("Per-row acceptance lengths differ under batched decode.")
+        if not bool(
+            torch.all(acceptance_lengths_per_row == acceptance_lengths_per_row[0])
+        ):
+            raise RuntimeError(
+                "Per-row acceptance lengths differ under batched decode."
+            )
         acceptance_length = int(acceptance_lengths_per_row[0].item())
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
             :, : acceptance_length + 1

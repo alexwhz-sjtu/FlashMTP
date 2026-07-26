@@ -46,6 +46,11 @@ from .flashmtp_draft_tree import (
     greedy_accept_tree_causal,
     target_forward_tree_verify,
 )
+from .flashmtp_markov_head import (
+    FlashMTPMarkovHead,
+    MARKOV_HEAD_TYPES,
+    MARKOV_OUTPUT_MODES,
+)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -146,8 +151,10 @@ class PivotAttentionFuse(nn.Module):
         # x: (B, N, S, H)
         bsz, n_blk, s_len, h = x.shape
         flat = x.view(bsz * n_blk, s_len, h)
-        pos = torch.arange(s_len, device=x.device, dtype=torch.long).unsqueeze(0).expand(
-            bsz * n_blk, -1
+        pos = (
+            torch.arange(s_len, device=x.device, dtype=torch.long)
+            .unsqueeze(0)
+            .expand(bsz * n_blk, -1)
         )
         pos_emb = self.rotary(flat, pos)
         attn_out, _ = self.attention(
@@ -163,7 +170,11 @@ class Qwen3FlashMTPAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(
-        self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str, pivot_fuse_mode: str
+        self,
+        config: Qwen3Config,
+        layer_idx: int,
+        chs_concat_mode: str,
+        pivot_fuse_mode: str,
     ):
         super().__init__()
         self.config = config
@@ -205,7 +216,7 @@ class Qwen3FlashMTPAttention(nn.Module):
             if config.layer_types[layer_idx] == "sliding_attention"
             else None
         )
-        
+
         self.chs_concat_mode = chs_concat_mode
 
     def forward(
@@ -275,11 +286,20 @@ class Qwen3FlashMTPAttention(nn.Module):
 
 
 class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str, pivot_fuse_mode: str):
+    def __init__(
+        self,
+        config: Qwen3Config,
+        layer_idx: int,
+        chs_concat_mode: str,
+        pivot_fuse_mode: str,
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = Qwen3FlashMTPAttention(
-            config=config, layer_idx=layer_idx, chs_concat_mode=chs_concat_mode, pivot_fuse_mode=pivot_fuse_mode
+            config=config,
+            layer_idx=layer_idx,
+            chs_concat_mode=chs_concat_mode,
+            pivot_fuse_mode=pivot_fuse_mode,
         )
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -366,12 +386,57 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         flashmtp_config["train_lm_head"] = self.train_lm_head
         self.local_position = bool(flashmtp_config.get("local_position", False))
         flashmtp_config["local_position"] = self.local_position
+        self.markov_head_type = str(
+            flashmtp_config.get("markov_head_type", "none")
+        ).lower()
+        self.markov_output_mode = str(
+            flashmtp_config.get("markov_output_mode", "additive")
+        ).lower()
+        configured_markov_rank = int(flashmtp_config.get("markov_rank", 0))
+        self.markov_rank = (
+            configured_markov_rank if self.markov_head_type != "none" else 0
+        )
+        if self.markov_head_type not in ("none", *MARKOV_HEAD_TYPES):
+            raise ValueError(
+                f"Unknown markov_head_type={self.markov_head_type!r}; expected "
+                f"none or one of {MARKOV_HEAD_TYPES}."
+            )
+        if self.markov_output_mode not in MARKOV_OUTPUT_MODES:
+            raise ValueError(
+                f"Unknown markov_output_mode={self.markov_output_mode!r}; "
+                f"expected one of {MARKOV_OUTPUT_MODES}."
+            )
+        if self.markov_head_type != "none" and self.markov_rank <= 0:
+            raise ValueError(
+                f"markov_rank must be positive when a Markov head is enabled, "
+                f"got {self.markov_rank}."
+            )
+        if self.markov_head_type == "none" and self.markov_output_mode == "direct":
+            raise ValueError("markov_output_mode='direct' requires a Markov head.")
+        if self.markov_output_mode == "direct" and self.train_lm_head:
+            raise ValueError(
+                "train_lm_head is incompatible with direct Markov output: "
+                "the draft LM head would be unused."
+            )
+        flashmtp_config["markov_head_type"] = self.markov_head_type
+        flashmtp_config["markov_output_mode"] = self.markov_output_mode
+        flashmtp_config["markov_rank"] = self.markov_rank
         if self.train_lm_head:
             self.draft_lm_head = nn.Linear(
                 config.hidden_size, config.vocab_size, bias=False
             )
         else:
             self.draft_lm_head = None
+        self.markov_head = (
+            None
+            if self.markov_head_type == "none"
+            else FlashMTPMarkovHead(
+                head_type=self.markov_head_type,
+                vocab_size=config.vocab_size,
+                markov_rank=self.markov_rank,
+                hidden_size=config.hidden_size,
+            )
+        )
         config.flashmtp_config = flashmtp_config
 
         self.layers = nn.ModuleList(
@@ -412,14 +477,21 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             f"num_middle_layers_n={self.num_middle_layers_n}, "
             f"target_layer_ids={self.target_layer_ids}, "
             f"train_lm_head={self.train_lm_head}, "
-            f"local_position={self.local_position}"
+            f"local_position={self.local_position}, "
+            f"markov_head_type={self.markov_head_type}, "
+            f"markov_output_mode={self.markov_output_mode}, "
+            f"markov_rank={self.markov_rank}"
         )
 
         self.post_init()
 
     @property
     def chs_len_per_block(self) -> int:
-        return len(self.target_layer_ids) if self.pivot_fuse_mode == "prefix_condition" else 1
+        return (
+            len(self.target_layer_ids)
+            if self.pivot_fuse_mode == "prefix_condition"
+            else 1
+        )
 
     def get_last_decode_stats(self) -> dict:
         return dict(self._last_decode_stats)
@@ -461,7 +533,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             draft_pos = position_ids
 
         target_hidden = self._fuse_target_hidden(target_hidden)
-        rotary_pos = rotary_position_ids if rotary_position_ids is not None else draft_pos
+        rotary_pos = (
+            rotary_position_ids if rotary_position_ids is not None else draft_pos
+        )
         total_len = rotary_pos.shape[1]
         dummy = hidden_states.new_zeros(
             hidden_states.shape[0], total_len, hidden_states.shape[-1]
@@ -480,6 +554,29 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             )
         return self.norm(hidden_states)
 
+    def sample_draft_tokens(
+        self,
+        *,
+        draft_hidden: torch.Tensor,
+        lm_head: nn.Module,
+        first_prev_token_ids: torch.Tensor,
+        temperature: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample standard FlashMTP draft positions using configured head semantics."""
+        base_logits = None
+        if self.markov_head is None or self.markov_output_mode == "additive":
+            base_logits = lm_head(draft_hidden)
+        if self.markov_head is None:
+            assert base_logits is not None
+            return sample(base_logits, temperature), base_logits
+        return self.markov_head.sample_block_tokens(
+            hidden_states=draft_hidden,
+            first_prev_token_ids=first_prev_token_ids,
+            output_mode=self.markov_output_mode,
+            base_logits=base_logits,
+            temperature=temperature,
+        )
+
     @staticmethod
     def _format_token_topk(
         logits: torch.Tensor,
@@ -488,9 +585,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
     ) -> list[dict]:
         probs = torch.softmax(logits.float(), dim=-1)
         top_k = max(int(top_k), 1)
-        top_probs, top_ids = torch.topk(
-            probs, k=min(top_k, probs.shape[-1]), dim=-1
-        )
+        top_probs, top_ids = torch.topk(probs, k=min(top_k, probs.shape[-1]), dim=-1)
         entries = []
         for token_id, prob in zip(top_ids.tolist(), top_probs.tolist()):
             entries.append(
@@ -578,7 +673,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         )
         if target.device.type == "cuda":
             torch.cuda.synchronize(target.device)
-        self._last_decode_stats["target_total_time"] += time.perf_counter() - target_start
+        self._last_decode_stats["target_total_time"] += (
+            time.perf_counter() - target_start
+        )
 
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
@@ -645,13 +742,20 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 use_cache=False,
                 is_causal=False,
             )[:, -block_size + 1 :, :]
-            if self.draft_lm_head is not None:
-                draft_logits = self.draft_lm_head(draft_hidden)
-            else:
-                draft_logits = target.lm_head(draft_hidden)
+            lm_head = (
+                self.draft_lm_head if self.draft_lm_head is not None else target.lm_head
+            )
+            sampled_draft_tokens, draft_logits = self.sample_draft_tokens(
+                draft_hidden=draft_hidden,
+                lm_head=lm_head,
+                first_prev_token_ids=block_output_ids[:, 0],
+                temperature=temperature,
+            )
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)
-            self._last_decode_stats["draft_total_time"] += time.perf_counter() - draft_start
+            self._last_decode_stats["draft_total_time"] += (
+                time.perf_counter() - draft_start
+            )
 
             draft_topk_by_slot: dict[int, list[dict]] = {}
             for slot in range(1, block_size):
@@ -659,13 +763,15 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                     draft_logits[0, slot - 1], tokenizer, top_k
                 )
                 if profile_records is not None:
-                    draft_topk_by_slot[slot] = self._serialize_topk_entries(topk_entries)
+                    draft_topk_by_slot[slot] = self._serialize_topk_entries(
+                        topk_entries
+                    )
                 print_fn(
                     f"  [Draft slot {slot} | abs_pos={start + slot}] "
                     f"top{top_k}={topk_entries}"
                 )
 
-            block_output_ids[:, 1:] = sample(draft_logits, temperature)
+            block_output_ids[:, 1:] = sampled_draft_tokens
 
             draft_probs_on_logits: Optional[torch.Tensor] = None
             if profile_records is not None:
@@ -703,9 +809,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                         "sampled_token_id": sampled_tid,
                         "sampled_token": tokenizer.decode([sampled_tid]),
                         "draft_p_sampled": round(
-                            float(
-                                draft_probs_on_logits[0, s - 1, sampled_tid].item()
-                            ),
+                            float(draft_probs_on_logits[0, s - 1, sampled_tid].item()),
                             4,
                         ),
                     }
@@ -723,7 +827,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             )
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)
-            self._last_decode_stats["target_total_time"] += time.perf_counter() - target_start
+            self._last_decode_stats["target_total_time"] += (
+                time.perf_counter() - target_start
+            )
 
             posterior = sample(output.logits, temperature)
             acceptance_length = (
@@ -772,9 +878,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             ]
             start += acceptance_length + 1
             past_key_values_target.crop(start)
-            pivot_index = min(
-                acceptance_length, output.hidden_states[0].shape[1] - 1
-            )
+            pivot_index = min(acceptance_length, output.hidden_states[0].shape[1] - 1)
             target_hidden = gather_pivot_multilayer_inference(
                 output.hidden_states,
                 self.target_layer_ids,
@@ -861,7 +965,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         }
         bsz = input_ids.shape[0]
         if bsz != 1:
-            raise ValueError("spec_generate_with_draft_tree currently supports batch_size=1")
+            raise ValueError(
+                "spec_generate_with_draft_tree currently supports batch_size=1"
+            )
 
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
@@ -871,9 +977,11 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             dtype=torch.long,
             device=target.device,
         )
-        position_ids = torch.arange(
-            output_ids.shape[1], device=target.device
-        ).unsqueeze(0).expand(bsz, -1)
+        position_ids = (
+            torch.arange(output_ids.shape[1], device=target.device)
+            .unsqueeze(0)
+            .expand(bsz, -1)
+        )
 
         past_key_values_target = DynamicCache()
         output = target(
@@ -906,9 +1014,13 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             block_output_ids = output_ids[:, start : start + block_size].clone()
             target_block_pos = position_ids[:, start : start + block_size]
             if self.local_position:
-                draft_block_pos = torch.arange(
-                    1, block_size + 1, device=target.device, dtype=torch.long
-                ).unsqueeze(0).expand(bsz, -1)
+                draft_block_pos = (
+                    torch.arange(
+                        1, block_size + 1, device=target.device, dtype=torch.long
+                    )
+                    .unsqueeze(0)
+                    .expand(bsz, -1)
+                )
             else:
                 draft_block_pos = target_block_pos
             noise_embedding = target.model.embed_tokens(block_output_ids)
@@ -969,9 +1081,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 noise_embedding.dtype,
             )
             accepted_prefix, correction, acceptance_length, accepted_node = (
-                greedy_accept_tree_causal(
-                    tree_spec, output.logits[0], temperature
-                )
+                greedy_accept_tree_causal(tree_spec, output.logits[0], temperature)
             )
             n_prefix = len(accepted_prefix)
             output_ids[:, start : start + n_prefix] = torch.tensor(
@@ -979,17 +1089,13 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             ).unsqueeze(0)
             if correction is not None:
                 output_ids[:, start + n_prefix] = correction
-                pivot_index = min(
-                    accepted_node, output.hidden_states[0].shape[1] - 1
-                )
+                pivot_index = min(accepted_node, output.hidden_states[0].shape[1] - 1)
             else:
                 output_ids[:, start + n_prefix] = sample(
                     output.logits[:, accepted_node : accepted_node + 1],
                     temperature,
                 ).squeeze(-1)
-                pivot_index = min(
-                    accepted_node, output.hidden_states[0].shape[1] - 1
-                )
+                pivot_index = min(accepted_node, output.hidden_states[0].shape[1] - 1)
 
             start += acceptance_length + 1
             past_key_values_target.crop(start)
@@ -1071,9 +1177,11 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             dtype=torch.long,
             device=target.device,
         )
-        position_ids = torch.arange(
-            output_ids.shape[1], device=target.device
-        ).unsqueeze(0).expand(bsz, -1)
+        position_ids = (
+            torch.arange(output_ids.shape[1], device=target.device)
+            .unsqueeze(0)
+            .expand(bsz, -1)
+        )
 
         past_key_values_target = DynamicCache()
 
@@ -1108,9 +1216,13 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             block_output_ids = output_ids[:, start : start + block_size].clone()
             target_block_pos = position_ids[:, start : start + block_size]
             if self.local_position:
-                draft_block_pos = torch.arange(
-                    1, block_size + 1, device=target.device, dtype=torch.long
-                ).unsqueeze(0).expand(bsz, -1)
+                draft_block_pos = (
+                    torch.arange(
+                        1, block_size + 1, device=target.device, dtype=torch.long
+                    )
+                    .unsqueeze(0)
+                    .expand(bsz, -1)
+                )
             else:
                 draft_block_pos = target_block_pos
             noise_embedding = target.model.embed_tokens(block_output_ids)
@@ -1136,11 +1248,16 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 use_cache=False,
                 is_causal=False,
             )[:, -block_size + 1 :, :]
-            if self.draft_lm_head is not None:
-                draft_logits = self.draft_lm_head(draft_hidden)
-            else:
-                draft_logits = target.lm_head(draft_hidden)
-            block_output_ids[:, 1:] = sample(draft_logits)
+            lm_head = (
+                self.draft_lm_head if self.draft_lm_head is not None else target.lm_head
+            )
+            sampled_draft_tokens, _ = self.sample_draft_tokens(
+                draft_hidden=draft_hidden,
+                lm_head=lm_head,
+                first_prev_token_ids=block_output_ids[:, 0],
+                temperature=0.0,
+            )
+            block_output_ids[:, 1:] = sampled_draft_tokens
 
             # The draft always consumes and predicts the full configured block.  Only
             # the requested prefix is sent to the target; the remaining draft tokens
@@ -1170,9 +1287,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             ]
             start += acceptance_length + 1
             past_key_values_target.crop(start)
-            pivot_index = min(
-                acceptance_length, output.hidden_states[0].shape[1] - 1
-            )
+            pivot_index = min(acceptance_length, output.hidden_states[0].shape[1] - 1)
             target_hidden = gather_pivot_multilayer_inference(
                 output.hidden_states,
                 self.target_layer_ids,
