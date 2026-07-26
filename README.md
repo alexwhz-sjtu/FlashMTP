@@ -18,103 +18,329 @@
 
 ## v2: Improved structure
 
-加入最新一段kvcache
+加入低秩串行头。在保留 FlashMTP backbone 一次并行计算整个 block 的基础上，
+串行头通过前一个真实/采样 token 恢复块内自回归依赖。
 
-## v3: Diffusion-based draft model
+### 1. 记号与整体数据流
 
-### 1. previous version
+以下使用：
 
-事实上之前的版本并没有基于扩散原理。仅仅是输入B个mask直接映射到干净token
+| 符号 | 含义 |
+| --- | --- |
+| \(B\) | batch size |
+| \(A\) | 每条序列采样的 anchor/block 数 |
+| \(L\) | `block_size`，包含 slot 0 的已知 anchor |
+| \(K=L-1\) | 真正需要预测的 draft token 数 |
+| \(D\) | FlashMTP backbone hidden size |
+| \(R\) | `markov_rank`，串行头中间维度 |
+| \(V\) | vocabulary size |
 
-### 2. Consistency distillation [[2511.19269] CDLM: Consistency Diffusion Language Models For Faster Sampling](https://arxiv.org/abs/2511.19269)
+训练时 FlashMTP backbone 的完整输出为：
 
-base on base structure
+\[
+H_{\mathrm{all}}\in\mathbb{R}^{B\times A\times L\times D}.
+\]
 
-### 1. 模型原理（Model Principle）
+slot 0 是已知 anchor，不参与 token 预测。串行头实际接收：
 
-本方案将**每次 draft 的 B 个 token** 视为一个独立的短序列（长度 L = 16），并将 Inner block size 设置为 B_in = 1。
+\[
+H=H_{\mathrm{all}}[:,:,1:,:]
+\in\mathbb{R}^{B\times A\times K\times D}.
+\]
 
-- **核心思想**：模型在一次前向传播中，只负责预测当前连续的 16 个 token，不预测后续内容。下一次预测属于新的独立 forward。
-- **Teacher**：原始自回归模型，用于生成高质量轨迹。
-- **Student**：我们要训练的 draft 模型。输入条件是大模型bonus token之前的融合hiddenstates。bonustoken拼接上noiseembedding作为Query
-- **训练目标**：让学生模型从任意中间状态 y，稳定地一次性预测出高质量的 16 个 token（即实现可靠的 multi-token draft）。
+Teacher forcing 使用的前驱 token 和监督目标分别是：
 
-通过将 B=16 视为完整序列、B_in=1 视为最小块，模型可以同时利用：
+\[
+X_{\mathrm{prev}}
+=[x_{\mathrm{anchor}},x_1,\ldots,x_{K-1}]
+\in\mathbb{N}^{B\times A\times K},
+\]
 
-- Distillation Loss：学习 Teacher 的正确预测
-- Consistency Loss：学会从“部分完成”到“全部完成”的稳定跳跃
+\[
+Y=[x_1,x_2,\ldots,x_K]
+\in\mathbb{N}^{B\times A\times K}.
+\]
 
-这样训练出的模型适合作为投机解码（Speculative Decoding）的 draft 模型，一次 forward 即可输出 16 个 draft token。
+推理时没有 anchor 维度 \(A\)，对应张量为
+\(H\in\mathbb{R}^{B\times K\times D}\)。第 \(k\) 步生成的 token 会作为
+第 \(k+1\) 步串行头的输入。
 
-两个状态：
+三种 head 共享两个低秩映射：
 
-- **y**：**当前采样的解码中间状态**（部分完成的草稿）
-- **y**：当前 innerblock token 被 unmask  后的状态。B长度内在这之后的token还是mask着的。（inner_block completion states）
+1. 前驱 token embedding：
 
-### 2. 损失函数（Loss Functions）
+   \[
+   E:\mathbb{N}\rightarrow\mathbb{R}^{R},
+   \qquad E\in\mathbb{R}^{V\times R}.
+   \]
 
-#### 2.1 Distillation Loss（蒸馏损失，主损失）
+2. 词表投影：
 
-$L_{\text{Distillation}} = \mathbb{E} \frac{1}{|U_y|} \sum_{i \in U_y} D_{KL} \left( p_i^{(T)} \parallel q_\phi(\cdot | y, x)_i \right)$
+   \[
+   W_{\mathrm{out}}:\mathbb{R}^{R}\rightarrow\mathbb{R}^{V},
+   \qquad W_{\mathrm{out}}\in\mathbb{R}^{V\times R}.
+   \]
 
-- $U_y$ ：当前 B=16 个位置中，从 y 到 y* 之间**新被 unmask** 的 token 位置。一次B_in个token（即1）
-- ( $p_i^{(T)}$ ：Teacher 使用 hidden state 重建的 softmax 预测。
-- **作用**：强制学生在看到部分 token 的情况下，预测出 Teacher 会最终选择的 16 个 token。
+`markov_rank` 就是这里的 \(R\)，可以通过训练脚本自由指定。
 
-#### 2.2 Consistency Loss（一致性损失，关键稳定损失）
+### 2. Vanilla head
 
-$$
-L_{\text{Consistency}} = \mathbb{E} \frac{1}{|S_y|} \sum_{i \in S_y} D_{KL} \left( q_\phi^-(\cdot | y^*, x)*i \parallel q*\phi(\cdot | y, x)_i \right)
-$$
+Vanilla head 的串行分支只读取前一个 token ID，不读取当前位置 hidden state：
 
-- $S_y$ ：在 y* 中仍然保持 masked 的位置（即当前 B 个序列中尚未 final 的 token）。
-- $q_\phi^-$ ：带 stop-gradient 的目标（防止训练不稳定）。
-- **作用**：让学生在 “少信息状态 y” 和 “innerblock completion 状态 y* ” 之间保持预测一致，实现稳定跳跃。
+\[
+e_{k-1}=E[x_{k-1}]\in\mathbb{R}^{R},
+\]
 
-#### 2.3 总损失函数
+\[
+\ell^{\mathrm{head}}_k
+=W_{\mathrm{out}}e_{k-1}
+\in\mathbb{R}^{V}.
+\]
 
-$$
-L = w_{\text{distill}} \cdot L_{\text{Distillation}} + w_{\text{cons}} \cdot L_{\text{Consistency}}
-$$
+训练阶段的维度变化为：
 
-**推荐权重**（B=16, L=1）：
+```text
+previous token IDs       [B, A, K]
+    ↓ Embedding(V, R)
+previous token features  [B, A, K, R]
+    ↓ Linear(R, V)
+head logits              [B, A, K, V]
+```
 
-- $w_{\text{distill}}$ = 1.0 
-- $w_{\text{cons}} $= 0.6
+Vanilla 没有额外的 hidden/state 中间层。Teacher forcing 时所有前驱 token
+已知，因此训练可以沿 \(K\) 个位置并行；推理时必须等待上一步采样结果。
 
-这里有一个问题，$q_\phi^-$ 需要学生模型自己来预测。但我是从零初始化，因此需要先训练一个多步迭代扩散草稿模型（纯蒸馏损失），再加入一致性损失。上面的两个权重给出调整接口。
+需要注意：在 `direct` 模式下，Vanilla 最终分布只依赖前一个 token，
+等价于一个低秩 bigram head，不再使用当前位置的 backbone hidden state。
 
-## 3. 训练流程（Training Procedure）
+### 3. Gated head
 
-### 3.1 准备阶段（Offline Trajectory Collection）
+Gated head 同时读取前一个 token embedding 和当前位置 backbone hidden：
 
-1. 使用 自回归目标模型 模型对大量 prompt 生成轨迹。（已完成）
-2. 每条轨迹记录：
-  - 人为构建 块内 B 内的 Token 序列轨迹 ($\mathcal{T}_x$。按照从左到右的因果顺序。也就是说，解码轨迹模拟自回归生成的轨迹。
-  - 对应 hidden state buffer（用于重建 Teacher logits）*这个在线生成
+\[
+e_{k-1}=E[x_{k-1}]\in\mathbb{R}^{R},
+\qquad h_k\in\mathbb{R}^{D}.
+\]
 
-### 3.2 训练阶段（每一次迭代）
+首先拼接为：
 
-1. 基于base structure，我们已经采样了一个anchor token。那么后面的目标就是预测此锚点块的解码轨迹 $\mathcal{T}_{x}$）。
-2. **随机采样中间状态 y**：
-  - 在轨迹中随机选择步骤 k。在这里，因为轨迹是因果的，因此可以直接采样一个块内位置p，其之前p个token看作已生成的轨迹，后面的都是mask。
-  - y = $\mathcal{T}_x$)
-  - y* = $\mathcal{T}_x'$) 即当前B_in中被全部unmask后的状态。这里就是第p+1个token被unmask
-3. 计算两个损失（所有计算均限制在当前 B=16 个 token 范围内）：
-  - Distillation Loss（在 Uy 上）
-  - Consistency Loss（在 Sy 上）
-4. 计算总损失并反向传播，更新学生模型参数。
-5. 重复上述过程直到收敛。
+\[
+z_k=[h_k;e_{k-1}]
+\in\mathbb{R}^{D+R}.
+\]
 
-### 3.3 推理阶段（Inference / Drafting）
+然后产生 \(R\) 维 gate：
 
-- 输入：大模型融合hiddenstates + 当前需要 draft 的 16 个 masked 位置。
-- 一次前向传播：模型直接预测当前 16 个 token。
+\[
+g_k=\sigma(W_g z_k+b_g)
+\in\mathbb{R}^{R},
+\]
 
-## TODO：
+\[
+u_k=g_k\odot e_{k-1}
+\in\mathbb{R}^{R},
+\]
 
-1. 修改loss
-2. diffusion based distillation
+\[
+\ell^{\mathrm{head}}_k
+=W_{\mathrm{out}}u_k
+\in\mathbb{R}^{V}.
+\]
+
+维度变化为：
+
+```text
+previous token IDs       [B, A, K]
+    ↓ Embedding(V, R)
+token features           [B, A, K, R]
+
+backbone hidden          [B, A, K, D]
+    ↓ concatenate
+gate input               [B, A, K, D + R]
+    ↓ Linear(D + R, R) + sigmoid
+gate                     [B, A, K, R]
+    ↓ gate * token features
+head latent              [B, A, K, R]
+    ↓ Linear(R, V)
+head logits              [B, A, K, V]
+```
+
+Gated head 没有跨位置 recurrent state。Teacher forcing 时所有位置也可以并行。
+
+### 4. RNN head
+
+RNN head 在前一个 token 和当前位置 hidden 之外，维护一个跨位置传递的
+\(R\) 维状态：
+
+\[
+s_{k-1}\in\mathbb{R}^{R},
+\qquad s_0=0.
+\]
+
+单步输入拼接为：
+
+\[
+z_k=[s_{k-1};E[x_{k-1}];h_k]
+\in\mathbb{R}^{2R+D}.
+\]
+
+使用一个联合线性层一次产生三个 \(R\) 维向量：
+
+\[
+[a_k,c_k,o_k]
+=W_{\mathrm{joint}}z_k+b_{\mathrm{joint}}
+\in\mathbb{R}^{3R}.
+\]
+
+状态更新为：
+
+\[
+g_k=\sigma(a_k),\qquad
+\widetilde{s}_k=\tanh(c_k),
+\]
+
+\[
+s_k=g_k\odot s_{k-1}
+ +(1-g_k)\odot\widetilde{s}_k
+\in\mathbb{R}^{R}.
+\]
+
+用于生成 logits 的低秩表示为：
+
+\[
+u_k=\tanh(o_k)\in\mathbb{R}^{R},
+\]
+
+\[
+\ell^{\mathrm{head}}_k
+=W_{\mathrm{out}}u_k
+\in\mathbb{R}^{V}.
+\]
+
+单个位置的维度变化为：
+
+```text
+previous state           [B, A, R]
+previous token feature   [B, A, R]
+current hidden           [B, A, D]
+    ↓ concatenate
+joint input              [B, A, D + 2R]
+    ↓ Linear(D + 2R, 3R)
+joint output             [B, A, 3R]
+    ↓ split
+gate/candidate/output    3 × [B, A, R]
+    ↓ state update
+new state                [B, A, R]
+    ↓ output latent + Linear(R, V)
+head logits              [B, A, V]
+```
+
+RNN 训练仍使用真实前驱 token 做 teacher forcing，但由于
+\(s_k\) 依赖 \(s_{k-1}\)，必须沿 block 的 \(K\) 个位置串行展开。
+不同 batch、不同 anchor/block 之间的 state 相互独立，并在每个 block
+开始时清零。
+
+### 5. 两种 logits 输出模式
+
+并行 backbone hidden 经过共享 target LM head 或可训练 draft LM head，
+得到基础 logits：
+
+\[
+\ell^{\mathrm{base}}
+\in\mathbb{R}^{B\times A\times K\times V}.
+\]
+
+支持两种最终输出方式：
+
+#### `additive`
+
+串行 head 生成 logit bias：
+
+\[
+\ell^{\mathrm{final}}_k
+=\ell^{\mathrm{base}}_k+\ell^{\mathrm{head}}_k.
+\]
+
+维度为：
+
+```text
+base logits  [B, A, K, V]
+head logits  [B, A, K, V]
+    ↓ element-wise addition
+final logits [B, A, K, V]
+```
+
+#### `direct`
+
+跳过 base LM head，串行 head 直接产生最终 logits：
+
+\[
+\ell^{\mathrm{final}}_k=\ell^{\mathrm{head}}_k.
+\]
+
+```text
+head latent  [B, A, K, R]
+    ↓ Linear(R, V)
+final logits [B, A, K, V]
+```
+
+`direct` 不使用 draft LM head，因此不能和 `--train-lm-head` 同时开启。
+
+实际训练中不会长期物化完整的
+\([B,A,K,V]\) 张量。模型先保存较小的
+\([B,A,K,R]\) head latent，再按 `ce_chunk_size` 分块投影到词表并计算 CE，
+从而控制 full-vocabulary logits 的峰值显存。
+
+### 6. 参数规模
+
+三种 head 都包含 token embedding 和输出投影，共约：
+
+\[
+2VR
+\]
+
+个参数。额外参数为：
+
+| Head | 额外参数量 |
+| --- | ---: |
+| Vanilla | \(0\) |
+| Gated | \(R(D+R)+R\) |
+| RNN | \(3R(D+2R)+3R\) |
+
+例如 Qwen3-8B 使用 \(D=4096\)、\(V=151936\)、\(R=256\) 时：
+
+| 模块 | 参数量 |
+| --- | ---: |
+| Token embedding \(V\times R\) | 38,895,616 |
+| Output projection \(R\rightarrow V\) | 38,895,616 |
+| Gated 额外部分 | 1,114,368 |
+| RNN 额外部分 | 3,539,712 |
+
+### 7. 训练接口
+
+Python 训练入口支持：
+
+```bash
+--markov-head-type none|vanilla|gated|rnn
+--markov-output-mode additive|direct
+--markov-rank 256
+```
+
+Shell 启动脚本使用：
+
+```bash
+MARKOV_HEAD_TYPE=rnn \
+MARKOV_OUTPUT_MODE=additive \
+MARKOV_RANK=256 \
+bash scripts/run_training_flashmtp.sh --dt h100
+```
+
+关闭串行 head、保持原始 FlashMTP 行为：
+
+```bash
+MARKOV_HEAD_TYPE=none \
+bash scripts/run_training_flashmtp.sh --dt h100
+```
 
 > \# git clone the source code
 > 
