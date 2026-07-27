@@ -10,14 +10,14 @@ import sys
 import time
 
 # ==================== 配置区域 ====================
-WANDB_DIR = "/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP_v1.1/wandb/offline-run-20260517_080403-flashmtp_qz_linear_fuse_n34_nlayers5_block_16_n40000_feature_epochs6"
+WANDB_DIR = "/data/wanghanzhen/FlashMTP_v2/wandb/run-20260726_174925-flashmtp_v1.1_n16_nlayers5_block_16_mhrnn_direct_r256_n40000_epochs6_Qwen3-8B"
 WANDB_PROJECT = "flashmtp-training-exp"
 SYNC_INTERVAL = 5 * 60  # 秒
 # ================================================
 
 
 def sync_wandb() -> bool:
-    cmd = f"wandb sync --project {WANDB_PROJECT} {WANDB_DIR}"
+    cmd = f"wandb sync --no-skip-online --project {WANDB_PROJECT} {WANDB_DIR}"
     try:
         result = subprocess.run(
             cmd,

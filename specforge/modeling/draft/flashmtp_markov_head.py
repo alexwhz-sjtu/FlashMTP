@@ -54,21 +54,58 @@ class FlashMTPMarkovHead(nn.Module):
         self.output_proj = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
 
         self.gate_proj: Optional[nn.Linear] = None
-        self.joint_proj: Optional[nn.Linear] = None
+        self.state_proj: Optional[nn.Linear] = None
+        self.state_out_proj: Optional[nn.Linear] = None
+        self.hidden_proj: Optional[nn.Linear] = None
+        self.hidden_fuse_gate_proj: Optional[nn.Linear] = None
         if self.head_type == "gated":
             self.gate_proj = nn.Linear(
                 self.hidden_size + self.markov_rank,
                 self.markov_rank,
             )
+            self.hidden_proj = nn.Linear(self.hidden_size, self.markov_rank, bias=False)
+            self.hidden_fuse_gate_proj = nn.Linear(
+                2 * self.markov_rank,
+                self.markov_rank,
+            )
         elif self.head_type == "rnn":
-            self.joint_proj = nn.Linear(
-                self.hidden_size + 2 * self.markov_rank,
-                3 * self.markov_rank,
+            self.state_proj = nn.Linear(2 * self.markov_rank, 2 * self.markov_rank)
+            self.state_out_proj = nn.Linear(
+                self.markov_rank,
+                self.markov_rank,
+                bias=False,
+            )
+            self.hidden_proj = nn.Linear(self.hidden_size, self.markov_rank, bias=False)
+            self.hidden_fuse_gate_proj = nn.Linear(
+                2 * self.markov_rank,
+                self.markov_rank,
             )
 
     def project_logits(self, latent_states: torch.Tensor) -> torch.Tensor:
         """Project low-rank head states to full-vocabulary logits."""
         return self.output_proj(latent_states)
+
+    def _hidden_latent_contribution(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        output_mode: str,
+    ) -> Optional[torch.Tensor]:
+        if output_mode != "direct" or self.hidden_proj is None:
+            return None
+        return self.hidden_proj(hidden_states)
+
+    def _fuse_serial_and_hidden(
+        self,
+        serial_latent: torch.Tensor,
+        hidden_latent: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if hidden_latent is None:
+            return serial_latent
+        assert self.hidden_fuse_gate_proj is not None
+        fuse_inputs = torch.cat([serial_latent, hidden_latent], dim=-1)
+        fuse_gate = torch.sigmoid(self.hidden_fuse_gate_proj(fuse_inputs))
+        return fuse_gate * serial_latent + (1.0 - fuse_gate) * hidden_latent
 
     def _compute_step_latent(
         self,
@@ -76,8 +113,13 @@ class FlashMTPMarkovHead(nn.Module):
         prev_token_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         state: Optional[torch.Tensor],
+        output_mode: str,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         prev_embeddings = self.prev_token_embedding(prev_token_ids.long())
+        hidden_latent = self._hidden_latent_contribution(
+            hidden_states,
+            output_mode=output_mode,
+        )
 
         if self.head_type == "vanilla":
             return prev_embeddings, None
@@ -86,25 +128,26 @@ class FlashMTPMarkovHead(nn.Module):
             assert self.gate_proj is not None
             gate_inputs = torch.cat([hidden_states, prev_embeddings], dim=-1)
             gate = torch.sigmoid(self.gate_proj(gate_inputs))
-            return gate.to(prev_embeddings.dtype) * prev_embeddings, None
+            serial_latent = gate.to(prev_embeddings.dtype) * prev_embeddings
+            return self._fuse_serial_and_hidden(serial_latent, hidden_latent), None
 
-        assert self.joint_proj is not None
+        assert self.state_proj is not None
+        assert self.state_out_proj is not None
         if state is None:
             state = torch.zeros_like(prev_embeddings)
-        joint_inputs = torch.cat([state, prev_embeddings, hidden_states], dim=-1)
-        gate_raw, candidate_raw, output_raw = self.joint_proj(joint_inputs).chunk(
-            3, dim=-1
-        )
+        mem_inputs = torch.cat([state, prev_embeddings], dim=-1)
+        gate_raw, candidate_raw = self.state_proj(mem_inputs).chunk(2, dim=-1)
         gate = torch.sigmoid(gate_raw)
-        candidate = torch.tanh(candidate_raw)
-        new_state = gate * state + (1.0 - gate) * candidate
-        return torch.tanh(output_raw), new_state
+        new_state = gate * state + (1.0 - gate) * torch.tanh(candidate_raw)
+        serial_latent = torch.tanh(self.state_out_proj(new_state))
+        return self._fuse_serial_and_hidden(serial_latent, hidden_latent), new_state
 
     def forward_teacher_forcing(
         self,
         *,
         hidden_states: torch.Tensor,
         prev_token_ids: torch.Tensor,
+        output_mode: str = "additive",
     ) -> torch.Tensor:
         """Return low-rank states for teacher-forced block predictions.
 
@@ -125,12 +168,20 @@ class FlashMTPMarkovHead(nn.Module):
                 f"got {hidden_states.size(-1)}."
             )
 
+        output_mode = str(output_mode).lower()
+        if output_mode not in MARKOV_OUTPUT_MODES:
+            raise ValueError(
+                f"Unknown markov output mode {output_mode!r}; "
+                f"expected one of {MARKOV_OUTPUT_MODES}."
+            )
+
         prediction_length = hidden_states.size(-2)
         if self.head_type != "rnn":
             latent, _ = self._compute_step_latent(
                 prev_token_ids=prev_token_ids,
                 hidden_states=hidden_states,
                 state=None,
+                output_mode=output_mode,
             )
             return latent
 
@@ -146,6 +197,7 @@ class FlashMTPMarkovHead(nn.Module):
                 prev_token_ids=prev_token_ids[..., position],
                 hidden_states=hidden_states[..., position, :],
                 state=state,
+                output_mode=output_mode,
             )
             outputs.append(latent.unsqueeze(-2))
         if not outputs:
@@ -202,6 +254,7 @@ class FlashMTPMarkovHead(nn.Module):
                 prev_token_ids=prev_token_ids,
                 hidden_states=hidden_states[:, position, :],
                 state=state,
+                output_mode=output_mode,
             )
             step_logits = self.project_logits(latent)
             if output_mode == "additive":

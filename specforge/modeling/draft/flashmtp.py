@@ -40,12 +40,6 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
 
 
-from .flashmtp_draft_tree import (
-    DraftTreeSpec,
-    build_draft_tree_from_logits,
-    greedy_accept_tree_causal,
-    target_forward_tree_verify,
-)
 from .flashmtp_markov_head import (
     FlashMTPMarkovHead,
     MARKOV_HEAD_TYPES,
@@ -382,8 +376,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         flashmtp_config.setdefault("pivot_fuse_mode", self.pivot_fuse_mode)
         flashmtp_config.setdefault("num_middle_layers_n", self.num_middle_layers_n)
         flashmtp_config["target_layer_ids"] = self.target_layer_ids
-        self.train_lm_head = bool(flashmtp_config.get("train_lm_head", False))
-        flashmtp_config["train_lm_head"] = self.train_lm_head
         self.local_position = bool(flashmtp_config.get("local_position", False))
         flashmtp_config["local_position"] = self.local_position
         self.markov_head_type = str(
@@ -413,20 +405,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             )
         if self.markov_head_type == "none" and self.markov_output_mode == "direct":
             raise ValueError("markov_output_mode='direct' requires a Markov head.")
-        if self.markov_output_mode == "direct" and self.train_lm_head:
-            raise ValueError(
-                "train_lm_head is incompatible with direct Markov output: "
-                "the draft LM head would be unused."
-            )
         flashmtp_config["markov_head_type"] = self.markov_head_type
         flashmtp_config["markov_output_mode"] = self.markov_output_mode
         flashmtp_config["markov_rank"] = self.markov_rank
-        if self.train_lm_head:
-            self.draft_lm_head = nn.Linear(
-                config.hidden_size, config.vocab_size, bias=False
-            )
-        else:
-            self.draft_lm_head = None
         self.markov_head = (
             None
             if self.markov_head_type == "none"
@@ -476,7 +457,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             f"FlashMTP: pivot_fuse_mode={self.pivot_fuse_mode}, "
             f"num_middle_layers_n={self.num_middle_layers_n}, "
             f"target_layer_ids={self.target_layer_ids}, "
-            f"train_lm_head={self.train_lm_head}, "
             f"local_position={self.local_position}, "
             f"markov_head_type={self.markov_head_type}, "
             f"markov_output_mode={self.markov_output_mode}, "
@@ -742,9 +722,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 use_cache=False,
                 is_causal=False,
             )[:, -block_size + 1 :, :]
-            lm_head = (
-                self.draft_lm_head if self.draft_lm_head is not None else target.lm_head
-            )
+            lm_head = target.lm_head
             sampled_draft_tokens, draft_logits = self.sample_draft_tokens(
                 draft_hidden=draft_hidden,
                 lm_head=lm_head,
@@ -919,227 +897,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         return output_ids
 
     @torch.inference_mode()
-    def spec_generate_with_draft_tree(
-        self,
-        target: nn.Module,
-        input_ids: torch.LongTensor,
-        max_new_tokens: int,
-        stop_token_ids: list[int],
-        temperature: float = 0.0,
-        *,
-        verify_block_size: Optional[int] = None,
-        trunc_thres: float = 0.2,
-        expand_thres: float = 0.5,
-        tree_width: int = 4,
-        entropy_ratio: float = 0.4,
-        decode_timing_after_first_token: bool = False,
-    ) -> torch.LongTensor:
-        """Speculative decode with dynamic draft tree (``block_size`` from model config).
-
-        Draft tree with truncation/expansion; one target forward over all nodes using
-        ancestor attention mask and shared ``position_ids`` per depth. Acceptance walks
-        the path: ``logits[accepted_{d-1}]`` vs candidates at depth ``d``. The draft
-        forward always uses the full block; ``verify_block_size`` only caps tree depth.
-        """
-        self.eval()
-        block_size = int(self.block_size)
-        verify_block_size = (
-            block_size if verify_block_size is None else int(verify_block_size)
-        )
-        if not 1 <= verify_block_size <= block_size:
-            raise ValueError(
-                f"verify_block_size must be in [1, {block_size}], got "
-                f"{verify_block_size}"
-            )
-        self._last_decode_stats = {
-            "accept_lengths": [],
-            "decode_wall_time": 0.0,
-            "target_total_time": 0.0,
-            "draft_total_time": 0.0,
-            "steps": 0,
-            "tree_chain_steps": 0,
-            "tree_branch_steps": 0,
-            "tree_trunc_steps": 0,
-            "tree_expand_steps": 0,
-            "tree_avg_nodes": 0.0,
-        }
-        bsz = input_ids.shape[0]
-        if bsz != 1:
-            raise ValueError(
-                "spec_generate_with_draft_tree currently supports batch_size=1"
-            )
-
-        num_input_tokens = input_ids.shape[1]
-        max_length = num_input_tokens + max_new_tokens
-        output_ids = torch.full(
-            (bsz, max_length + block_size),
-            self.mask_token_id,
-            dtype=torch.long,
-            device=target.device,
-        )
-        position_ids = (
-            torch.arange(output_ids.shape[1], device=target.device)
-            .unsqueeze(0)
-            .expand(bsz, -1)
-        )
-
-        past_key_values_target = DynamicCache()
-        output = target(
-            input_ids,
-            position_ids=position_ids[:, :num_input_tokens],
-            past_key_values=past_key_values_target,
-            use_cache=True,
-            logits_to_keep=1,
-            output_hidden_states=True,
-        )
-        output_ids[:, :num_input_tokens] = input_ids
-        output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
-            output.logits, temperature
-        )
-        target_hidden = gather_pivot_multilayer_inference(
-            output.hidden_states,
-            self.target_layer_ids,
-            -1,
-            self.config.num_target_layers,
-        )
-
-        decode_start: float | None = (
-            None if decode_timing_after_first_token else _cuda_sync_time(target.device)
-        )
-        acceptance_lengths: list[int] = []
-        tree_node_total = 0
-        start = input_ids.shape[1]
-
-        while start < max_length:
-            block_output_ids = output_ids[:, start : start + block_size].clone()
-            target_block_pos = position_ids[:, start : start + block_size]
-            if self.local_position:
-                draft_block_pos = (
-                    torch.arange(
-                        1, block_size + 1, device=target.device, dtype=torch.long
-                    )
-                    .unsqueeze(0)
-                    .expand(bsz, -1)
-                )
-            else:
-                draft_block_pos = target_block_pos
-            noise_embedding = target.model.embed_tokens(block_output_ids)
-            chs = self.chs_len_per_block
-            if self.local_position:
-                ctx_pos_part = torch.zeros(
-                    bsz, chs, dtype=torch.long, device=target.device
-                )
-            else:
-                ctx_pos_part = torch.full(
-                    (bsz, chs),
-                    start - 1,
-                    dtype=torch.long,
-                    device=target.device,
-                )
-            full_rotary = torch.cat([ctx_pos_part, draft_block_pos], dim=-1)
-            draft_hidden = self(
-                target_hidden=target_hidden,
-                noise_embedding=noise_embedding,
-                position_ids=draft_block_pos,
-                rotary_position_ids=full_rotary,
-                past_key_values=None,
-                use_cache=False,
-                is_causal=False,
-            )[:, -block_size + 1 :, :]
-            if self.draft_lm_head is not None:
-                draft_logits = self.draft_lm_head(draft_hidden)
-            else:
-                draft_logits = target.lm_head(draft_hidden)
-
-            anchor_id = int(block_output_ids[0, 0].item())
-            tree_spec = build_draft_tree_from_logits(
-                draft_logits[0],
-                anchor_id,
-                verify_block_size,
-                tree_width,
-                trunc_thres,
-                expand_thres,
-                entropy_ratio,
-            )
-            tree_node_total += len(tree_spec.token_ids)
-            if tree_spec.trunc_depth is not None:
-                self._last_decode_stats["tree_trunc_steps"] += 1
-            if tree_spec.expand_start_depth is not None:
-                self._last_decode_stats["tree_expand_steps"] += 1
-
-            if tree_spec.is_chain:
-                self._last_decode_stats["tree_chain_steps"] += 1
-            else:
-                self._last_decode_stats["tree_branch_steps"] += 1
-
-            output = target_forward_tree_verify(
-                target,
-                tree_spec,
-                start,
-                past_key_values_target,
-                target.device,
-                noise_embedding.dtype,
-            )
-            accepted_prefix, correction, acceptance_length, accepted_node = (
-                greedy_accept_tree_causal(tree_spec, output.logits[0], temperature)
-            )
-            n_prefix = len(accepted_prefix)
-            output_ids[:, start : start + n_prefix] = torch.tensor(
-                accepted_prefix, device=target.device, dtype=torch.long
-            ).unsqueeze(0)
-            if correction is not None:
-                output_ids[:, start + n_prefix] = correction
-                pivot_index = min(accepted_node, output.hidden_states[0].shape[1] - 1)
-            else:
-                output_ids[:, start + n_prefix] = sample(
-                    output.logits[:, accepted_node : accepted_node + 1],
-                    temperature,
-                ).squeeze(-1)
-                pivot_index = min(accepted_node, output.hidden_states[0].shape[1] - 1)
-
-            start += acceptance_length + 1
-            past_key_values_target.crop(start)
-            target_hidden = gather_pivot_multilayer_inference(
-                output.hidden_states,
-                self.target_layer_ids,
-                pivot_index,
-                self.config.num_target_layers,
-            )
-            acceptance_lengths.append(acceptance_length + 1)
-            self._last_decode_stats["accept_lengths"].append(acceptance_length + 1)
-            self._last_decode_stats["steps"] += 1
-
-            if decode_timing_after_first_token and decode_start is None:
-                decode_start = _cuda_sync_time(target.device)
-            if stop_token_ids is not None and any(
-                stop_token_id in output_ids[:, num_input_tokens:]
-                for stop_token_id in stop_token_ids
-            ):
-                break
-
-        steps = max(self._last_decode_stats["steps"], 1)
-        self._last_decode_stats["tree_avg_nodes"] = tree_node_total / steps
-        if decode_start is None:
-            decode_start = _cuda_sync_time(target.device)
-        decode_wall_time = _cuda_sync_time(target.device) - decode_start
-        self._last_decode_stats["decode_wall_time"] = decode_wall_time
-        self._last_decode_stats["target_total_time"] = decode_wall_time
-        self._last_decode_stats["draft_total_time"] = 0.0
-
-        output_ids = output_ids[:, :max_length]
-        output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
-        if stop_token_ids is not None:
-            stop_token_ids_t = torch.tensor(stop_token_ids, device=output_ids.device)
-            stop_token_indices = torch.isin(
-                output_ids[0][num_input_tokens:], stop_token_ids_t
-            ).nonzero(as_tuple=True)[0]
-            if stop_token_indices.numel() > 0:
-                output_ids = output_ids[
-                    :, : num_input_tokens + stop_token_indices[0] + 1
-                ]
-        return output_ids
-
-    @torch.inference_mode()
     def spec_generate(
         self,
         target: nn.Module,
@@ -1248,9 +1005,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 use_cache=False,
                 is_causal=False,
             )[:, -block_size + 1 :, :]
-            lm_head = (
-                self.draft_lm_head if self.draft_lm_head is not None else target.lm_head
-            )
+            lm_head = target.lm_head
             sampled_draft_tokens, _ = self.sample_draft_tokens(
                 draft_hidden=draft_hidden,
                 lm_head=lm_head,

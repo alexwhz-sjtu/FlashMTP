@@ -161,9 +161,7 @@ def profile_flashmtp_generate(
             use_cache=False,
             is_causal=False,
         )[:, -block_size + 1 :, :]
-        lm_head = (
-            model.draft_lm_head if model.draft_lm_head is not None else target.lm_head
-        )
+        lm_head = target.lm_head
         sampled_draft_tokens, _ = model.sample_draft_tokens(
             draft_hidden=draft_hidden,
             lm_head=lm_head,

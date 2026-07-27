@@ -42,6 +42,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         teacher_latent = head.forward_teacher_forcing(
             hidden_states=hidden,
             prev_token_ids=teacher_prev,
+            output_mode=output_mode,
         )
         teacher_logits = head.project_logits(teacher_latent)
         if output_mode == "additive":
@@ -57,13 +58,89 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertIsNotNone(head.prev_token_embedding.weight.grad)
         self.assertIsNotNone(head.output_proj.weight.grad)
         if head_type != "vanilla":
-            self.assertIsNotNone(hidden.grad)
+            if head_type == "gated" or (
+                head_type == "rnn" and output_mode == "direct"
+            ):
+                self.assertIsNotNone(hidden.grad)
+            else:
+                self.assertIsNone(hidden.grad)
+        if head_type in ("gated", "rnn"):
+            self.assertIsNotNone(head.hidden_proj)
+            if output_mode == "direct":
+                self.assertIsNotNone(head.hidden_proj.weight.grad)
+            else:
+                self.assertIsNone(head.hidden_proj.weight.grad)
+
+    def test_direct_hidden_latent_changes_gated_and_rnn_outputs(self) -> None:
+        torch.manual_seed(11)
+        hidden_size, vocab_size, rank = 12, 23, 5
+        hidden = torch.randn(1, 3, hidden_size)
+        prev_token_ids = torch.tensor([[1, 2, 3]])
+
+        for head_type in ("gated", "rnn"):
+            with self.subTest(head_type=head_type):
+                head = FlashMTPMarkovHead(
+                    head_type=head_type,
+                    vocab_size=vocab_size,
+                    markov_rank=rank,
+                    hidden_size=hidden_size,
+                )
+                direct_latent = head.forward_teacher_forcing(
+                    hidden_states=hidden,
+                    prev_token_ids=prev_token_ids,
+                    output_mode="direct",
+                )
+                additive_latent = head.forward_teacher_forcing(
+                    hidden_states=hidden,
+                    prev_token_ids=prev_token_ids,
+                    output_mode="additive",
+                )
+                self.assertFalse(torch.allclose(direct_latent, additive_latent))
 
     def test_all_head_and_output_modes(self) -> None:
         for head_type in ("vanilla", "gated", "rnn"):
             for output_mode in ("additive", "direct"):
                 with self.subTest(head_type=head_type, output_mode=output_mode):
                     self._assert_teacher_forcing_matches_serial(head_type, output_mode)
+
+    def test_rnn_state_update_does_not_depend_on_hidden(self) -> None:
+        torch.manual_seed(3)
+        hidden_size, vocab_size, rank = 12, 23, 5
+        head = FlashMTPMarkovHead(
+            head_type="rnn",
+            vocab_size=vocab_size,
+            markov_rank=rank,
+            hidden_size=hidden_size,
+        )
+        state = torch.zeros(2, rank, requires_grad=False)
+        prev_token_ids = torch.tensor([4, 5])
+        hidden = torch.randn(2, hidden_size, requires_grad=True)
+
+        _, new_state = head._compute_step_latent(
+            prev_token_ids=prev_token_ids,
+            hidden_states=hidden,
+            state=state,
+            output_mode="direct",
+        )
+        grads = torch.autograd.grad(
+            new_state.sum(),
+            hidden,
+            retain_graph=True,
+            allow_unused=True,
+        )[0]
+        self.assertTrue(
+            grads is None or torch.allclose(grads, torch.zeros_like(hidden))
+        )
+
+        latent, _ = head._compute_step_latent(
+            prev_token_ids=prev_token_ids,
+            hidden_states=hidden,
+            state=state,
+            output_mode="direct",
+        )
+        latent_grads = torch.autograd.grad(latent.sum(), hidden)[0]
+        self.assertIsNotNone(latent_grads)
+        self.assertFalse(torch.allclose(latent_grads, torch.zeros_like(hidden)))
 
     def test_model_config_round_trip(self) -> None:
         config = Qwen3Config(
@@ -165,7 +242,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         binary_eval_mask = torch.ones(2, 2, 3, dtype=torch.bool)
         block_keep_mask = torch.ones(2, 2, dtype=torch.bool)
 
-        loss, accuracy, prefix_acc = wrapper._chunked_weighted_ce_and_metrics(
+        loss, accuracy, prefix_acc, base_ce_loss = wrapper._chunked_weighted_ce_and_metrics(
             prediction_hidden=prediction_hidden,
             prev_token_ids=prev_token_ids,
             labels=labels,
@@ -174,11 +251,68 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             block_keep_mask=block_keep_mask,
         )
         self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(float(base_ce_loss), 0.0)
         self.assertTrue(0.0 <= float(accuracy) <= 1.0)
         self.assertTrue(1.0 <= float(prefix_acc) <= 4.0)
         loss.backward()
         self.assertIsNotNone(prediction_hidden.grad)
         self.assertIsNotNone(draft_model.markov_head.output_proj.weight.grad)
+
+    def test_base_lm_ce_auxiliary_loss(self) -> None:
+        config = Qwen3Config(
+            vocab_size=31,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 4
+        config.block_size = 4
+        config.flashmtp_config = {
+            "target_layer_ids": [0, 3],
+            "pivot_fuse_mode": "linear_fuse",
+            "markov_head_type": "rnn",
+            "markov_output_mode": "direct",
+            "markov_rank": 6,
+        }
+        draft_model = FlashMTPDraftModel(config)
+        wrapper = OnlineFlashMTPModel(
+            draft_model=draft_model,
+            target_lm_head=nn.Linear(16, 31, bias=False),
+            target_embed_tokens=nn.Embedding(31, 16),
+            mask_token_id=30,
+            block_size=4,
+            num_anchors=2,
+            ce_chunk_size=3,
+            base_lm_ce_weight=0.5,
+            base_lm_ce_decay_gamma=2.0,
+        )
+        prediction_hidden = torch.randn(2, 2, 3, 16, requires_grad=True)
+        prev_token_ids = torch.randint(0, 31, (2, 2, 3))
+        labels = torch.randint(0, 31, (2, 2, 3))
+        weight_mask = torch.ones(2, 2, 3)
+        base_weight_mask = torch.tensor(
+            [[[1.0, 0.5, 0.25], [1.0, 0.5, 0.25]], [[1.0, 0.5, 0.25], [1.0, 0.5, 0.25]]]
+        )
+        binary_eval_mask = torch.ones(2, 2, 3, dtype=torch.bool)
+        block_keep_mask = torch.ones(2, 2, dtype=torch.bool)
+
+        loss, _, _, base_ce_loss = wrapper._chunked_weighted_ce_and_metrics(
+            prediction_hidden=prediction_hidden,
+            prev_token_ids=prev_token_ids,
+            labels=labels,
+            weight_mask=weight_mask,
+            binary_eval_mask=binary_eval_mask,
+            block_keep_mask=block_keep_mask,
+            base_weight_mask=base_weight_mask,
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(torch.isfinite(base_ce_loss))
+        self.assertGreater(float(base_ce_loss), 0.0)
+        loss.backward()
+        self.assertIsNotNone(prediction_hidden.grad)
 
 
 if __name__ == "__main__":

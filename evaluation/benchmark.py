@@ -23,6 +23,7 @@ from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
 from specforge.modeling.draft.flashmtp import sample
 
 from evaluation import distributed as dist
+from evaluation.model_loading import load_flashmtp_benchmark_models
 from evaluation.utils import load_and_process_dataset
 
 DATASET_PATH_FILE = Path(__file__).resolve().with_name("dataset_path.json")
@@ -664,40 +665,19 @@ def flashmtp_generate(
     stop_token_ids: list[int],
     temperature: float = 0.0,
     decode_timing_after_first_token: bool = False,
-    *,
-    use_draft_tree: bool = False,
-    draft_tree_trunc_thres: float = 0.2,
-    draft_tree_expand_thres: float = 0.5,
-    draft_tree_width: int = 4,
-    draft_tree_entropy_ratio: float = 0.4,
 ) -> SimpleNamespace:
     original_block_size = model.block_size
     model.block_size = block_size
     try:
-        if use_draft_tree:
-            output_ids = model.spec_generate_with_draft_tree(
-                target=target,
-                input_ids=input_ids,
-                max_new_tokens=max_new_tokens,
-                stop_token_ids=stop_token_ids,
-                temperature=temperature,
-                verify_block_size=verify_block_size,
-                trunc_thres=draft_tree_trunc_thres,
-                expand_thres=draft_tree_expand_thres,
-                tree_width=draft_tree_width,
-                entropy_ratio=draft_tree_entropy_ratio,
-                decode_timing_after_first_token=decode_timing_after_first_token,
-            )
-        else:
-            output_ids = model.spec_generate(
-                target=target,
-                input_ids=input_ids,
-                max_new_tokens=max_new_tokens,
-                stop_token_ids=stop_token_ids,
-                temperature=temperature,
-                decode_timing_after_first_token=decode_timing_after_first_token,
-                verify_block_size=verify_block_size,
-            )
+        output_ids = model.spec_generate(
+            target=target,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            stop_token_ids=stop_token_ids,
+            temperature=temperature,
+            decode_timing_after_first_token=decode_timing_after_first_token,
+            verify_block_size=verify_block_size,
+        )
     finally:
         model.block_size = original_block_size
 
@@ -766,33 +746,15 @@ def main() -> None:
         "false = global positions. Default: use checkpoint flashmtp_config.",
     )
     parser.add_argument(
-        "--use-draft-tree",
-        action="store_true",
-        help="Use FlashMTPDraftModel.spec_generate_with_draft_tree (block_size from model config).",
-    )
-    parser.add_argument(
-        "--draft-tree-trunc-thres",
-        type=float,
-        default=0.2,
-        help="Truncate spine when two consecutive top1 probs are below this.",
-    )
-    parser.add_argument(
-        "--draft-tree-expand-thres",
-        type=float,
-        default=0.5,
-        help="Top1 prob threshold for the first expandable depth.",
-    )
-    parser.add_argument(
-        "--draft-tree-width",
+        "--mask-token-id",
         type=int,
-        default=4,
-        help="Fixed branch width w (includes top1) after expansion starts.",
+        default=None,
+        help="Override mask token id (default: checkpoint flashmtp_config, then tokenizer).",
     )
     parser.add_argument(
-        "--draft-tree-entropy-ratio",
-        type=float,
-        default=0.4,
-        help="Require top-w normalized entropy / log(w) > this to start expansion.",
+        "--trust-remote-code",
+        action="store_true",
+        help="Pass trust_remote_code=True when loading target/draft/tokenizer.",
     )
     args = parser.parse_args()
 
@@ -807,30 +769,17 @@ def main() -> None:
     torch.cuda.set_device(dist.local_rank())
     device = torch.device(f"cuda:{dist.local_rank()}")
 
-    def has_flash_attn():
-        try:
-            import flash_attn
-            return True
-        except ImportError:
-            logger.warning("flash_attn is not installed. Falling back to torch.sdpa. The speedup will be lower.")
-            return False
-
-    installed_flash_attn = has_flash_attn()
-    print(f"flash attention installed: {installed_flash_attn}")
-
-    target = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
-        dtype=torch.bfloat16,
-    ).to(device).eval()
-
-    draft_model = FlashMTPDraftModel.from_pretrained(
-        args.draft_name_or_path,
-        attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
-        dtype=torch.bfloat16,
-    ).to(device).eval()
+    target, draft_model, tokenizer, draft_summary = load_flashmtp_benchmark_models(
+        args, device
+    )
 
     fcfg = getattr(draft_model.config, "flashmtp_config", None) or {}
+    block_size = args.block_size if args.block_size is not None else draft_model.block_size
+    verify_block_size = args.verify_block if args.verify_block is not None else block_size
+    if not 1 <= verify_block_size <= block_size:
+        raise ValueError(
+            f"--verify-block must be in [1, {block_size}], got {verify_block_size}"
+        )
     if args.sink_num is not None and fcfg.get("sink_num") is not None:
         eff_sink = args.sink_num
         if draft_model.config.flashmtp_config is None:
@@ -839,32 +788,17 @@ def main() -> None:
         if hasattr(draft_model, "sink_num"):
             draft_model.sink_num = int(eff_sink)
         logger.info(f"Overriding sink_num={eff_sink} (legacy)")
-    if args.local_position is not None:
-        lp = args.local_position == "true"
-        draft_model.local_position = lp
-        if draft_model.config.flashmtp_config is None:
-            draft_model.config.flashmtp_config = {}
-        draft_model.config.flashmtp_config["local_position"] = lp
-        logger.info(f"Overriding local_position={lp} (from --local-position {args.local_position})")
     if fcfg.get("sink_num") is not None and hasattr(draft_model, "sink_num"):
         logger.info(
             f"FlashMTP draft (legacy): sink_num={draft_model.sink_num}, "
             f"block_size={draft_model.block_size}"
         )
     logger.info(
-        f"FlashMTP draft: pivot_fuse_mode={getattr(draft_model, 'pivot_fuse_mode', fcfg.get('pivot_fuse_mode'))}, "
-        f"num_middle_layers_n={fcfg.get('num_middle_layers_n', 'n/a')}, "
-        f"target_layer_ids={getattr(draft_model, 'target_layer_ids', None)}, "
-        f"train_lm_head={fcfg.get('train_lm_head', getattr(draft_model, 'train_lm_head', False))}, "
-        f"local_position={getattr(draft_model, 'local_position', fcfg.get('local_position', False))}, "
-        f"block_size={draft_model.block_size}"
+        "Decode config: markov_head_type={} markov_output_mode={} markov_rank={}",
+        draft_summary["markov_head_type"],
+        draft_summary["markov_output_mode"],
+        draft_summary["markov_rank"],
     )
-    block_size = args.block_size if args.block_size is not None else draft_model.block_size
-    verify_block_size = args.verify_block if args.verify_block is not None else block_size
-    if not 1 <= verify_block_size <= block_size:
-        raise ValueError(
-            f"--verify-block must be in [1, {block_size}], got {verify_block_size}"
-        )
     logger.info(
         "FlashMTP decode: draft_block_size={} verify_block_size={} "
         "(discarding {} draft positions before target verification)",
@@ -872,16 +806,6 @@ def main() -> None:
         verify_block_size,
         block_size - verify_block_size,
     )
-    if args.use_draft_tree:
-        logger.info(
-            "Draft tree decode: trunc_thres={} expand_thres={} width={} entropy_ratio={} "
-            "(block_size={} from model)",
-            args.draft_tree_trunc_thres,
-            args.draft_tree_expand_thres,
-            args.draft_tree_width,
-            args.draft_tree_entropy_ratio,
-            draft_model.block_size,
-        )
 
     if args.batch_size < 1:
         raise ValueError("--batch-size must be >= 1")
@@ -957,11 +881,6 @@ def main() -> None:
                 stop_token_ids=stop_token_ids,
                 temperature=args.temperature,
                 decode_timing_after_first_token=decode_after_first,
-                use_draft_tree=args.use_draft_tree,
-                draft_tree_trunc_thres=args.draft_tree_trunc_thres,
-                draft_tree_expand_thres=args.draft_tree_expand_thres,
-                draft_tree_width=args.draft_tree_width,
-                draft_tree_entropy_ratio=args.draft_tree_entropy_ratio,
             )
             
             spec_response = response[block_size]

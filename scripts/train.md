@@ -24,11 +24,13 @@
 
 训练脚本支持在并行 FlashMTP backbone 后增加低秩串行 head：
 
-| 环境变量 | 可选值 | 默认值 |
-| --- | --- | --- |
-| `MARKOV_HEAD_TYPE` | `none` / `vanilla` / `gated` / `rnn` | `none` |
-| `MARKOV_OUTPUT_MODE` | `additive` / `direct` | `additive` |
-| `MARKOV_RANK` | 正整数 | `256` |
+
+| 环境变量                 | 可选值                                  | 默认值        |
+| -------------------- | ------------------------------------ | ---------- |
+| `MARKOV_HEAD_TYPE`   | `none` / `vanilla` / `gated` / `rnn` | `none`     |
+| `MARKOV_OUTPUT_MODE` | `additive` / `direct`                | `additive` |
+| `MARKOV_RANK`        | 正整数                                  | `256`      |
+
 
 `additive` 将 head 输出作为 logit bias 加到并行 base logits；`direct`
 直接将 head 输出作为最终 logits。训练使用真实前驱 token 做 teacher forcing，
@@ -43,15 +45,34 @@ bash scripts/run_training_flashmtp.sh --dt h100
 
 ---
 
+
+
 ## 单机训练
 
 适用于本地 / 单节点 H100 等环境，快速验证配置：
 
 ```bash
 # ["linear_fuse", "attention_fuse", "prefix_condition"]
+cd /data/wanghanzhen/FlashMTP_v2
+source .venv/bin/activate
+NUM_MIDDLE_LAYERS_N=16 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=6 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=40000 MAX_LENGTH=4096 NUM_ANCHORS=512 BLOCK_SIZE=16 LOCAL_POSITION=true \
+LOSS_DECAY_GAMMA=7 BASE_LM_CE_DECAY_GAMMA=14 BASE_LM_CE_WEIGHT=0.1 \
+MARKOV_HEAD_TYPE=rnn MARKOV_OUTPUT_MODE=additive MARKOV_RANK=512 \
+NPROC_PER_NODE=8 TP_SIZE=1 SHARD_DRAFT_BY_TP=1 CE_CHUNK_SIZE=8192 \
+TRAIN_DATA_PATH="/data/wanghanzhen/training_data/nemotron_think_off_samples_40000_qwen3_8b_regen.jsonl" \
+TARGET_MODEL_BACKEND=sglang SGLANG_MEM_FRACTION_STATIC=0.25 \
+TARGET_MODEL=/data/wanghanzhen/models/Qwen3-8B \
+MODEL_TAG='Qwen3-8B' \
+bash scripts/run_training_flashmtp.sh --dt h100
+```
+
+Qwen-14B
+
+```bash
+# ["linear_fuse", "attention_fuse", "prefix_condition"]
 cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v1.1
 source .venv/bin/activate
-NUM_MIDDLE_LAYERS_N=16 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=8 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=40000 MAX_LENGTH=40960 NUM_ANCHORS=1024 BLOCK_SIZE=8 SHARD_DRAFT_BY_TP=1 \
+NUM_MIDDLE_LAYERS_N=16 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=8 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=40000 MAX_LENGTH=40960 NUM_ANCHORS=1024 BLOCK_SIZE=8 SHARD_DRAFT_BY_TP=2 \
 NPROC_PER_NODE=8 TP_SIZE=2 CE_CHUNK_SIZE=8192 \
 TRAIN_DATA_PATH="/share/dai-sys/wanghanzhen/projects/MTP/training_data/nemotron_think_off_samples_40000_qwen3_8b_regen.jsonl" \
 TARGET_MODEL_BACKEND=sglang SGLANG_MEM_FRACTION_STATIC=0.25 \
@@ -69,7 +90,6 @@ bash scripts/run_training_flashmtp.sh --dt h100
 - `BLOCK_SIZE=16`：草稿块大小
 - `LOSS_DECAY_GAMMA=7`：块内 CE 衰减系数
 - `LOCAL_POSITION=true`：草稿侧使用块内局部位置编码
-- `W1_MSE=0.1`：MSE 辅助损失权重
 - `--dt h100`：设备类型（可选 `qz` / `a800` / `h100`）
 
 ---
@@ -163,7 +183,6 @@ PIVOT_FUSE_MODE=prefix_condition \
 NUM_MIDDLE_LAYERS_N=16 \
 CHS_CONCAT_MODE=feature \
 LOCAL_POSITION=true \
-TRAIN_LM_HEAD=false \
 LOSS_DECAY_GAMMA=7 \
 SAVE_INTERVAL=5000 \
 LOG_INTERVAL=20 \
@@ -193,21 +212,22 @@ bash scripts/run_training_flashmtp.sh --dt h100
 ## 常用环境变量速查
 
 
-| 变量                    | 默认值（脚本内）      | 说明                          |
-| --------------------- | ------------- | --------------------------- |
-| `NUM_EPOCHS`          | 6             | 训练 epoch 数                  |
-| `MAX_LENGTH`          | 4096          | 最大序列长度                      |
-| `NUM_DRAFT_LAYERS`    | 5             | 草稿模型层数                      |
-| `NUM_MIDDLE_LAYERS_N` | 5             | target 中间选取层数               |
-| `BLOCK_SIZE`          | —             | 草稿块大小                       |
-| `PIVOT_FUSE_MODE`     | `linear_fuse` | pivot 融合模式                  |
-| `CHS_CONCAT_MODE`     | `feature`     | CHS 拼接模式                    |
-| `LOCAL_POSITION`      | false         | 块内局部位置编码                    |
-| `TRAIN_LM_HEAD`       | false         | 是否单独训练草稿 lm_head            |
-| `LOSS_DECAY_GAMMA`    | —             | 块内 CE 衰减系数                  |
-| `CHAT_TEMPLATE`       | —             | 对话模板（`qwen` / `llama3`）     |
-| `DATA_NUM_SAMPLES`    | 40000         | 训练样本数                       |
-| `--dt`                | a800          | 设备类型：`qz` / `a800` / `h100` |
+| 变量                       | 默认值（脚本内）      | 说明                                     |
+| ------------------------ | ------------- | -------------------------------------- |
+| `NUM_EPOCHS`             | 6             | 训练 epoch 数                             |
+| `MAX_LENGTH`             | 4096          | 最大序列长度                                 |
+| `NUM_DRAFT_LAYERS`       | 5             | 草稿模型层数                                 |
+| `NUM_MIDDLE_LAYERS_N`    | 5             | target 中间选取层数                          |
+| `BLOCK_SIZE`             | —             | 草稿块大小                                  |
+| `PIVOT_FUSE_MODE`        | `linear_fuse` | pivot 融合模式                             |
+| `CHS_CONCAT_MODE`        | `feature`     | CHS 拼接模式                               |
+| `LOCAL_POSITION`         | false         | 块内局部位置编码                               |
+| `LOSS_DECAY_GAMMA`       | —             | 最终 CE 块内衰减系数                           |
+| `BASE_LM_CE_WEIGHT`      | 0             | 骨干 hidden 经 target lm_head 的辅助 CE 权重 λ |
+| `BASE_LM_CE_DECAY_GAMMA` | —             | 辅助 CE 独立衰减系数（不设则均匀权重）                  |
+| `CHAT_TEMPLATE`          | —             | 对话模板（`qwen` / `llama3`）                |
+| `DATA_NUM_SAMPLES`       | 40000         | 训练样本数                                  |
+| `--dt`                   | a800          | 设备类型：`qz` / `a800` / `h100`            |
 
 
 更多参数说明见 `scripts/run_training_flashmtp.sh` 与项目根目录 `v1.1.md`。

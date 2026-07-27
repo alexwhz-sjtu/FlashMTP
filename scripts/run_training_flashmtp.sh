@@ -90,7 +90,7 @@ if [ "$DT" = "qz" ]; then
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 elif [ "$DT" = "h100" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/share/dai-sys/wanghanzhen/projects/MTP/training_data/nemotron_think_off_samples_40000_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_${PIVOT_FUSE_MODE}_fuse$((NUM_MIDDLE_LAYERS_N + 2))_sample_${DATA_NUM_SAMPLES}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_${PIVOT_FUSE_MODE}_fuse$((NUM_MIDDLE_LAYERS_N + 2))_sample_${DATA_NUM_SAMPLES}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_HOME/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
@@ -125,6 +125,8 @@ CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
+BASE_LM_CE_WEIGHT="${BASE_LM_CE_WEIGHT:-0}"
+BASE_LM_CE_DECAY_GAMMA="${BASE_LM_CE_DECAY_GAMMA:-}"
 
 # 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
@@ -136,8 +138,8 @@ REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-exp}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}_${MODEL_TAG}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v2.1_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_v2.1_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${MODEL_TAG}}"
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen}"
@@ -173,6 +175,8 @@ echo "  块大小: ${BLOCK_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
+echo "  Base LM CE权重: ${BASE_LM_CE_WEIGHT}"
+echo "  Base LM CE衰减Gamma: ${BASE_LM_CE_DECAY_GAMMA:-未设置(均匀权重)}"
 echo "  串行Head: ${MARKOV_HEAD_TYPE}"
 echo "  Head输出模式: ${MARKOV_OUTPUT_MODE}"
 echo "  Markov维度: ${MARKOV_RANK}"
@@ -241,6 +245,13 @@ fi
 
 if [ -n "${LOSS_DECAY_GAMMA}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --loss-decay-gamma ${LOSS_DECAY_GAMMA}"
+fi
+
+if awk "BEGIN {exit !(${BASE_LM_CE_WEIGHT} > 0)}"; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --base-lm-ce-weight ${BASE_LM_CE_WEIGHT}"
+    if [ -n "${BASE_LM_CE_DECAY_GAMMA}" ]; then
+        OPTIONAL_ARGS="${OPTIONAL_ARGS} --base-lm-ce-decay-gamma ${BASE_LM_CE_DECAY_GAMMA}"
+    fi
 fi
 
 if [ -n "${IS_PREFORMATTED}" ]; then
@@ -360,5 +371,6 @@ echo "  from specforge.modeling.draft.flashmtp import FlashMTPDraftModel"
 echo "  draft_model = FlashMTPDraftModel.from_pretrained('${OUTPUT_DIR}/epoch_${NUM_EPOCHS}_step_<step>')"
 echo ""
 echo "运行推理："
-echo "  python benchmark.py --draft-model ${OUTPUT_DIR}/epoch_${NUM_EPOCHS}_step_<step>"
+echo "  DRAFT_NAME_OR_PATH=${OUTPUT_DIR}/epoch_${NUM_EPOCHS}_step_<step> DATASET=gsm8k \\"
+echo "  bash evaluation/run_benchmark_flashmtp.sh --dt ${DT}"
 echo "=========================================="

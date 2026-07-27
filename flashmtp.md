@@ -73,7 +73,7 @@ FlashMTP 是一种面向投机解码（speculative decoding）的草稿模型训
 
 #### 输出头
 
-默认共享 **冻结的 target `lm_head`** 将草稿最后一层 hidden states 映射为词表 logits；不单独训练 `draft_lm_head`（`TRAIN_LM_HEAD=false`）。
+默认共享 **冻结的 target `lm_head`** 将草稿最后一层 hidden states 映射为词表 logits。
 
 ---
 

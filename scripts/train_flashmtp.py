@@ -99,10 +99,18 @@ def parse_args():
         "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
     )
     model_group.add_argument(
-        "--train-lm-head",
-        action="store_true",
-        help="Add a trainable draft lm_head (init from target head); share only frozen "
-        "embeddings with the target. Default: share frozen target lm_head as today.",
+        "--base-lm-ce-weight",
+        type=float,
+        default=0.0,
+        help="Weight λ for auxiliary CE on target lm_head(backbone hidden). "
+        "Total loss = L_final + λ * L_base. 0 disables.",
+    )
+    model_group.add_argument(
+        "--base-lm-ce-decay-gamma",
+        type=float,
+        default=None,
+        help="Separate gamma for exponential decay on the auxiliary base LM CE. "
+        "None disables decay (uniform weights over valid prediction slots).",
     )
     model_group.add_argument(
         "--markov-head-type",
@@ -142,13 +150,6 @@ def parse_args():
         type=float,
         default=0.1,
         help="Half-width r for uniform noise U(-r, r) when --add-noise is set.",
-    )
-    model_group.add_argument(
-        "--w1-mse",
-        type=float,
-        default=0.0,
-        help="Weight for MSE between draft last-layer hidden and target last-layer "
-        "hidden at the first predicted token (block position 1). 0 disables.",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -253,11 +254,6 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
             "--markov-output-mode direct requires --markov-head-type "
             "vanilla, gated, or rnn."
         )
-    if args.markov_output_mode == "direct" and args.train_lm_head:
-        raise ValueError(
-            "--train-lm-head cannot be used with --markov-output-mode direct "
-            "because the draft LM head is bypassed."
-        )
 
     print_on_rank0(
         f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
@@ -300,10 +296,6 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     draft_config.flashmtp_config["markov_head_type"] = args.markov_head_type
     draft_config.flashmtp_config["markov_output_mode"] = args.markov_output_mode
     draft_config.flashmtp_config["markov_rank"] = int(args.markov_rank)
-    if args.train_lm_head:
-        draft_config.flashmtp_config["train_lm_head"] = True
-    elif "train_lm_head" not in draft_config.flashmtp_config:
-        draft_config.flashmtp_config["train_lm_head"] = False
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
@@ -323,8 +315,6 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}"
     )
     print_on_rank0(
-        f"train_lm_head={getattr(draft_model, 'train_lm_head', False)} "
-        f"(draft_lm_head={'on' if draft_model.draft_lm_head is not None else 'off'}), "
         f"local_position={getattr(draft_model, 'local_position', False)}, "
         f"markov_head_type={draft_model.markov_head_type}, "
         f"markov_output_mode={draft_model.markov_output_mode}, "
@@ -510,7 +500,7 @@ def record_metrics(
     train_dataloader=None,
     mode: str = "train",
     prefix_acc: float | None = None,
-    mse_loss: float | None = None,
+    base_lm_ce_loss: float | None = None,
 ) -> None:
     logdict = {}
 
@@ -521,14 +511,14 @@ def record_metrics(
     logdict[f"{mode}/accuracy"] = accuracy
     if prefix_acc is not None:
         logdict[f"{mode}/prefix_acc"] = prefix_acc
-    if mse_loss is not None:
-        logdict[f"{mode}/w1_mse_loss"] = mse_loss
+    if base_lm_ce_loss is not None:
+        logdict[f"{mode}/base_lm_ce_loss"] = base_lm_ce_loss
 
     extra = ""
     if prefix_acc is not None:
         extra = f", PrefixAcc: {prefix_acc:.4f}"
-    if mse_loss is not None:
-        extra += f", W1MSE: {mse_loss:.4f}"
+    if base_lm_ce_loss is not None:
+        extra += f", BaseCE: {base_lm_ce_loss:.4f}"
     print_on_rank0(
         f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}{extra}"
     )
@@ -660,9 +650,6 @@ def main():
     draft_model.config.flashmtp_config["num_middle_layers_n"] = (
         draft_model.num_middle_layers_n
     )
-    draft_model.config.flashmtp_config["train_lm_head"] = bool(
-        getattr(draft_model, "train_lm_head", False)
-    )
     draft_model.config.flashmtp_config["local_position"] = bool(
         getattr(draft_model, "local_position", False)
     )
@@ -677,7 +664,6 @@ def main():
     draft_model.config.flashmtp_config["target_hidden_noise_ratio"] = float(
         args.target_hidden_noise_ratio
     )
-    draft_model.config.flashmtp_config["w1_mse"] = float(args.w1_mse)
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
@@ -703,23 +689,6 @@ def main():
     )
     _ensure_embed_vocab_for_mask(target_components, mask_token_id)
 
-    if draft_model.draft_lm_head is not None:
-        if not draft_weights_from_checkpoint:
-            with torch.no_grad():
-                draft_model.draft_lm_head.weight.copy_(
-                    target_components.lm_head.weight.to(
-                        device=draft_model.draft_lm_head.weight.device,
-                        dtype=draft_model.draft_lm_head.weight.dtype,
-                    )
-                )
-            print_on_rank0(
-                "Initialized draft_lm_head from target lm_head (trainable; embeddings stay shared/frozen)."
-            )
-        else:
-            print_on_rank0(
-                "draft_lm_head: using weights from checkpoint (skip copy from target)."
-            )
-
     flashmtp_model = OnlineFlashMTPModel(
         draft_model=draft_model,
         target_lm_head=target_components.lm_head,
@@ -729,16 +698,19 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
+        base_lm_ce_weight=args.base_lm_ce_weight,
+        base_lm_ce_decay_gamma=args.base_lm_ce_decay_gamma,
         chs_concat_mode="feature",
         add_noise=args.add_noise,
         target_hidden_noise_ratio=args.target_hidden_noise_ratio,
-        w1_mse=args.w1_mse,
         ce_chunk_size=args.ce_chunk_size,
     )
     print_on_rank0(
         f"target hidden noise: add_noise={args.add_noise}, "
-        f"ratio={args.target_hidden_noise_ratio}, w1_mse={args.w1_mse}, "
-        f"ce_chunk_size={args.ce_chunk_size}"
+        f"ratio={args.target_hidden_noise_ratio}, "
+        f"ce_chunk_size={args.ce_chunk_size}, "
+        f"base_lm_ce_weight={args.base_lm_ce_weight}, "
+        f"base_lm_ce_decay_gamma={args.base_lm_ce_decay_gamma}"
     )
 
     online_flashmtp = flashmtp_model
@@ -837,7 +809,7 @@ def main():
                 block_keep_mask = get_tp_data_shard(block_keep_mask)
                 target_hidden = get_tp_data_shard(target_hidden)
 
-            loss, accuracy, prefix_acc, mse_loss = flashmtp_model(
+            loss, accuracy, prefix_acc, base_ce_loss = flashmtp_model(
                 input_ids=input_ids,
                 loss_mask=loss_mask,
                 anchor_positions=anchor_positions,
@@ -855,15 +827,15 @@ def main():
                 loss_log = loss.clone()
                 acc_log = accuracy.clone()
                 pfx_log = prefix_acc.clone()
-                mse_log = mse_loss.clone()
+                base_ce_log = base_ce_loss.clone()
                 dist.all_reduce(loss_log)
                 dist.all_reduce(acc_log)
                 dist.all_reduce(pfx_log)
-                dist.all_reduce(mse_log)
+                dist.all_reduce(base_ce_log)
                 loss_log = loss_log / dist.get_world_size()
                 acc_log = acc_log / dist.get_world_size()
                 pfx_log = pfx_log / dist.get_world_size()
-                mse_log = mse_log / dist.get_world_size()
+                base_ce_log = base_ce_log / dist.get_world_size()
 
                 record_metrics(
                     args,
@@ -875,7 +847,7 @@ def main():
                     train_dataloader,
                     mode="train",
                     prefix_acc=pfx_log.item(),
-                    mse_loss=mse_log.item() if args.w1_mse > 0 else None,
+                    base_lm_ce_loss=base_ce_log.item(),
                 )
 
             if dist.get_rank() == 0:
