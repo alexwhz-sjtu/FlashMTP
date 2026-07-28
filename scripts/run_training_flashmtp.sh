@@ -135,7 +135,7 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-5000}"
 
 # Tracker 参数
 REPORT_TO="${REPORT_TO:-wandb}"
-WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-exp}"
+WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-v2}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
 WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v2.1_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
