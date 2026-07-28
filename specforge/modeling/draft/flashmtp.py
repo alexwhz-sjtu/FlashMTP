@@ -44,6 +44,7 @@ from .flashmtp_markov_head import (
     FlashMTPMarkovHead,
     MARKOV_HEAD_TYPES,
     MARKOV_OUTPUT_MODES,
+    markov_output_uses_base_lm_head,
 )
 
 
@@ -403,8 +404,17 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 f"markov_rank must be positive when a Markov head is enabled, "
                 f"got {self.markov_rank}."
             )
-        if self.markov_head_type == "none" and self.markov_output_mode == "direct":
-            raise ValueError("markov_output_mode='direct' requires a Markov head.")
+        if self.markov_output_mode == "rnn_h" and self.markov_head_type != "rnn":
+            raise ValueError(
+                "markov_output_mode='rnn_h' requires markov_head_type='rnn'."
+            )
+        if self.markov_head_type == "none" and self.markov_output_mode in (
+            "direct",
+            "rnn_h",
+        ):
+            raise ValueError(
+                f"markov_output_mode={self.markov_output_mode!r} requires a Markov head."
+            )
         flashmtp_config["markov_head_type"] = self.markov_head_type
         flashmtp_config["markov_output_mode"] = self.markov_output_mode
         flashmtp_config["markov_rank"] = self.markov_rank
@@ -416,6 +426,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 vocab_size=config.vocab_size,
                 markov_rank=self.markov_rank,
                 hidden_size=config.hidden_size,
+                markov_output_mode=self.markov_output_mode,
             )
         )
         config.flashmtp_config = flashmtp_config
@@ -544,7 +555,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample standard FlashMTP draft positions using configured head semantics."""
         base_logits = None
-        if self.markov_head is None or self.markov_output_mode == "additive":
+        if self.markov_head is None or markov_output_uses_base_lm_head(
+            self.markov_output_mode
+        ):
             base_logits = lm_head(draft_hidden)
         if self.markov_head is None:
             assert base_logits is not None

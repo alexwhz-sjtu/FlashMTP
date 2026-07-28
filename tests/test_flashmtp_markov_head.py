@@ -22,6 +22,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             vocab_size=vocab_size,
             markov_rank=rank,
             hidden_size=hidden_size,
+            markov_output_mode=output_mode,
         )
         hidden = torch.randn(
             batch_size, prediction_length, hidden_size, requires_grad=True
@@ -59,17 +60,21 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertIsNotNone(head.output_proj.weight.grad)
         if head_type != "vanilla":
             if head_type == "gated" or (
-                head_type == "rnn" and output_mode == "direct"
+                head_type == "rnn" and output_mode in ("direct", "rnn_h")
             ):
                 self.assertIsNotNone(hidden.grad)
             else:
                 self.assertIsNone(hidden.grad)
-        if head_type in ("gated", "rnn"):
+        if head_type == "gated" or (
+            head_type == "rnn" and output_mode == "direct"
+        ):
             self.assertIsNotNone(head.hidden_proj)
             if output_mode == "direct":
                 self.assertIsNotNone(head.hidden_proj.weight.grad)
             else:
                 self.assertIsNone(head.hidden_proj.weight.grad)
+        if head_type == "rnn" and output_mode == "rnn_h":
+            self.assertIsNone(head.hidden_proj)
 
     def test_direct_hidden_latent_changes_gated_and_rnn_outputs(self) -> None:
         torch.manual_seed(11)
@@ -99,9 +104,83 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
 
     def test_all_head_and_output_modes(self) -> None:
         for head_type in ("vanilla", "gated", "rnn"):
-            for output_mode in ("additive", "direct"):
+            output_modes = ("additive", "direct")
+            if head_type == "rnn":
+                output_modes = ("additive", "direct", "rnn_h")
+            for output_mode in output_modes:
                 with self.subTest(head_type=head_type, output_mode=output_mode):
                     self._assert_teacher_forcing_matches_serial(head_type, output_mode)
+
+    def test_rnn_h_state_update_depends_on_hidden(self) -> None:
+        torch.manual_seed(5)
+        hidden_size, vocab_size, rank = 12, 23, 5
+        head = FlashMTPMarkovHead(
+            head_type="rnn",
+            vocab_size=vocab_size,
+            markov_rank=rank,
+            hidden_size=hidden_size,
+            markov_output_mode="rnn_h",
+        )
+        state = torch.zeros(2, rank, requires_grad=False)
+        prev_token_ids = torch.tensor([4, 5])
+        hidden = torch.randn(2, hidden_size, requires_grad=True)
+
+        _, new_state = head._compute_step_latent(
+            prev_token_ids=prev_token_ids,
+            hidden_states=hidden,
+            state=state,
+            output_mode="rnn_h",
+        )
+        grads = torch.autograd.grad(
+            new_state.sum(),
+            hidden,
+            retain_graph=True,
+            allow_unused=True,
+        )[0]
+        self.assertIsNotNone(grads)
+        self.assertFalse(torch.allclose(grads, torch.zeros_like(hidden)))
+
+    def test_rnn_h_requires_rnn_head_type(self) -> None:
+        with self.assertRaises(ValueError):
+            FlashMTPMarkovHead(
+                head_type="gated",
+                vocab_size=23,
+                markov_rank=5,
+                hidden_size=12,
+                markov_output_mode="rnn_h",
+            )
+
+    def test_rnn_h_model_sampling_skips_base_lm_head(self) -> None:
+        class FailingLMHead(nn.Module):
+            def forward(self, hidden_states):
+                raise AssertionError("rnn_h mode must not call the base LM head")
+
+        config = Qwen3Config(
+            vocab_size=29,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 4
+        config.block_size = 4
+        config.flashmtp_config = {
+            "target_layer_ids": [0, 3],
+            "pivot_fuse_mode": "linear_fuse",
+            "markov_head_type": "rnn",
+            "markov_output_mode": "rnn_h",
+            "markov_rank": 5,
+        }
+        model = FlashMTPDraftModel(config)
+        sampled, logits = model.sample_draft_tokens(
+            draft_hidden=torch.randn(2, 3, 16),
+            lm_head=FailingLMHead(),
+            first_prev_token_ids=torch.tensor([1, 2]),
+        )
+        self.assertEqual(tuple(sampled.shape), (2, 3))
+        self.assertEqual(tuple(logits.shape), (2, 3, 29))
 
     def test_rnn_state_update_does_not_depend_on_hidden(self) -> None:
         torch.manual_seed(3)

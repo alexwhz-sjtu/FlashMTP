@@ -98,6 +98,11 @@ def validate_decode_config(draft_model: FlashMTPDraftModel) -> None:
             "Direct serial-head mode: draft logits come from the Markov head only "
             "(base LM head is skipped for draft sampling)."
         )
+    elif markov_output_mode == "rnn_h":
+        logger.info(
+            "RNN-h serial-head mode: draft hidden is fused at the RNN input and "
+            "draft logits come from the Markov head only."
+        )
     elif markov_output_mode == "additive":
         logger.info(
             "Additive serial-head mode: draft logits = base LM head(h) + Markov bias."

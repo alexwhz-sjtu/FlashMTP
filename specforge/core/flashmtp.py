@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
+from specforge.modeling.draft.flashmtp_markov_head import markov_output_uses_base_lm_head
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -396,7 +397,7 @@ class OnlineFlashMTPModel(nn.Module):
                 return lm_head(oh)
             assert latent is not None
             head_logits = markov_head.project_logits(latent)
-            if output_mode == "direct":
+            if not markov_output_uses_base_lm_head(output_mode):
                 return head_logits
             assert lm_head is not None
             return lm_head(oh) + head_logits

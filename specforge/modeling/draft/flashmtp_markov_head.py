@@ -15,7 +15,12 @@ from torch import nn
 
 
 MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn")
-MARKOV_OUTPUT_MODES = ("additive", "direct")
+MARKOV_OUTPUT_MODES = ("additive", "direct", "rnn_h")
+
+
+def markov_output_uses_base_lm_head(output_mode: str) -> bool:
+    """Return True when draft logits include the target LM head."""
+    return str(output_mode).lower() == "additive"
 
 
 def _sample_tokens(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -35,17 +40,28 @@ class FlashMTPMarkovHead(nn.Module):
         vocab_size: int,
         markov_rank: int,
         hidden_size: int,
+        markov_output_mode: str = "additive",
     ) -> None:
         super().__init__()
         self.head_type = str(head_type).lower()
         self.vocab_size = int(vocab_size)
         self.markov_rank = int(markov_rank)
         self.hidden_size = int(hidden_size)
+        self.markov_output_mode = str(markov_output_mode).lower()
 
         if self.head_type not in MARKOV_HEAD_TYPES:
             raise ValueError(
                 f"Unknown markov head type {self.head_type!r}; "
                 f"expected one of {MARKOV_HEAD_TYPES}."
+            )
+        if self.markov_output_mode not in MARKOV_OUTPUT_MODES:
+            raise ValueError(
+                f"Unknown markov output mode {self.markov_output_mode!r}; "
+                f"expected one of {MARKOV_OUTPUT_MODES}."
+            )
+        if self.markov_output_mode == "rnn_h" and self.head_type != "rnn":
+            raise ValueError(
+                "markov_output_mode='rnn_h' requires head_type='rnn'."
             )
         if self.markov_rank <= 0:
             raise ValueError(f"markov_rank must be positive, got {self.markov_rank}.")
@@ -69,21 +85,42 @@ class FlashMTPMarkovHead(nn.Module):
                 self.markov_rank,
             )
         elif self.head_type == "rnn":
-            self.state_proj = nn.Linear(2 * self.markov_rank, 2 * self.markov_rank)
+            if self.markov_output_mode == "rnn_h":
+                self.state_proj = nn.Linear(
+                    2 * self.markov_rank + self.hidden_size,
+                    2 * self.markov_rank,
+                )
+            else:
+                self.state_proj = nn.Linear(2 * self.markov_rank, 2 * self.markov_rank)
+                self.hidden_proj = nn.Linear(
+                    self.hidden_size, self.markov_rank, bias=False
+                )
+                self.hidden_fuse_gate_proj = nn.Linear(
+                    2 * self.markov_rank,
+                    self.markov_rank,
+                )
             self.state_out_proj = nn.Linear(
                 self.markov_rank,
                 self.markov_rank,
                 bias=False,
             )
-            self.hidden_proj = nn.Linear(self.hidden_size, self.markov_rank, bias=False)
-            self.hidden_fuse_gate_proj = nn.Linear(
-                2 * self.markov_rank,
-                self.markov_rank,
-            )
 
     def project_logits(self, latent_states: torch.Tensor) -> torch.Tensor:
         """Project low-rank head states to full-vocabulary logits."""
         return self.output_proj(latent_states)
+
+    def _validate_runtime_output_mode(self, output_mode: str) -> str:
+        output_mode = str(output_mode).lower()
+        if output_mode not in MARKOV_OUTPUT_MODES:
+            raise ValueError(
+                f"Unknown markov output mode {output_mode!r}; "
+                f"expected one of {MARKOV_OUTPUT_MODES}."
+            )
+        if output_mode == "rnn_h" and self.head_type != "rnn":
+            raise ValueError(
+                "markov_output_mode='rnn_h' requires head_type='rnn'."
+            )
+        return output_mode
 
     def _hidden_latent_contribution(
         self,
@@ -91,6 +128,17 @@ class FlashMTPMarkovHead(nn.Module):
         *,
         output_mode: str,
     ) -> Optional[torch.Tensor]:
+        if output_mode != "direct" or self.hidden_proj is None:
+            return None
+        return self.hidden_proj(hidden_states)
+
+    def _precompute_hidden_latents(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        output_mode: str,
+    ) -> Optional[torch.Tensor]:
+        """Project all block hidden states in parallel for direct mode."""
         if output_mode != "direct" or self.hidden_proj is None:
             return None
         return self.hidden_proj(hidden_states)
@@ -114,12 +162,15 @@ class FlashMTPMarkovHead(nn.Module):
         hidden_states: torch.Tensor,
         state: Optional[torch.Tensor],
         output_mode: str,
+        hidden_latent: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        output_mode = self._validate_runtime_output_mode(output_mode)
         prev_embeddings = self.prev_token_embedding(prev_token_ids.long())
-        hidden_latent = self._hidden_latent_contribution(
-            hidden_states,
-            output_mode=output_mode,
-        )
+        if hidden_latent is None:
+            hidden_latent = self._hidden_latent_contribution(
+                hidden_states,
+                output_mode=output_mode,
+            )
 
         if self.head_type == "vanilla":
             return prev_embeddings, None
@@ -135,11 +186,16 @@ class FlashMTPMarkovHead(nn.Module):
         assert self.state_out_proj is not None
         if state is None:
             state = torch.zeros_like(prev_embeddings)
-        mem_inputs = torch.cat([state, prev_embeddings], dim=-1)
+        if output_mode == "rnn_h":
+            mem_inputs = torch.cat([state, prev_embeddings, hidden_states], dim=-1)
+        else:
+            mem_inputs = torch.cat([state, prev_embeddings], dim=-1)
         gate_raw, candidate_raw = self.state_proj(mem_inputs).chunk(2, dim=-1)
         gate = torch.sigmoid(gate_raw)
         new_state = gate * state + (1.0 - gate) * torch.tanh(candidate_raw)
         serial_latent = torch.tanh(self.state_out_proj(new_state))
+        if output_mode == "rnn_h":
+            return serial_latent, new_state
         return self._fuse_serial_and_hidden(serial_latent, hidden_latent), new_state
 
     def forward_teacher_forcing(
@@ -156,6 +212,7 @@ class FlashMTPMarkovHead(nn.Module):
             prev_token_ids: ``[..., prediction_length]``; entry ``k`` is the
                 ground-truth token immediately preceding prediction ``k``.
         """
+        output_mode = self._validate_runtime_output_mode(output_mode)
         if hidden_states.shape[:-1] != prev_token_ids.shape:
             raise ValueError(
                 "hidden_states and prev_token_ids leading shapes must match, "
@@ -168,20 +225,20 @@ class FlashMTPMarkovHead(nn.Module):
                 f"got {hidden_states.size(-1)}."
             )
 
-        output_mode = str(output_mode).lower()
-        if output_mode not in MARKOV_OUTPUT_MODES:
-            raise ValueError(
-                f"Unknown markov output mode {output_mode!r}; "
-                f"expected one of {MARKOV_OUTPUT_MODES}."
-            )
-
         prediction_length = hidden_states.size(-2)
+        hidden_latents = self._precompute_hidden_latents(
+            hidden_states,
+            output_mode=output_mode,
+        )
         if self.head_type != "rnn":
             latent, _ = self._compute_step_latent(
                 prev_token_ids=prev_token_ids,
                 hidden_states=hidden_states,
                 state=None,
                 output_mode=output_mode,
+                hidden_latent=(
+                    None if hidden_latents is None else hidden_latents[..., :]
+                ),
             )
             return latent
 
@@ -198,6 +255,11 @@ class FlashMTPMarkovHead(nn.Module):
                 hidden_states=hidden_states[..., position, :],
                 state=state,
                 output_mode=output_mode,
+                hidden_latent=(
+                    None
+                    if hidden_latents is None
+                    else hidden_latents[..., position, :]
+                ),
             )
             outputs.append(latent.unsqueeze(-2))
         if not outputs:
@@ -220,12 +282,7 @@ class FlashMTPMarkovHead(nn.Module):
         Returns sampled token IDs and the final logits actually used to sample
         them.  ``base_logits`` is required only in additive mode.
         """
-        output_mode = str(output_mode).lower()
-        if output_mode not in MARKOV_OUTPUT_MODES:
-            raise ValueError(
-                f"Unknown markov output mode {output_mode!r}; "
-                f"expected one of {MARKOV_OUTPUT_MODES}."
-            )
+        output_mode = self._validate_runtime_output_mode(output_mode)
         if hidden_states.ndim != 3:
             raise ValueError(
                 "hidden_states must have shape [batch, prediction_length, hidden], "
@@ -248,6 +305,10 @@ class FlashMTPMarkovHead(nn.Module):
         prev_token_ids = first_prev_token_ids.long()
         sampled_tokens: list[torch.Tensor] = []
         final_logits: list[torch.Tensor] = []
+        hidden_latents = self._precompute_hidden_latents(
+            hidden_states,
+            output_mode=output_mode,
+        )
 
         for position in range(prediction_length):
             latent, state = self._compute_step_latent(
@@ -255,6 +316,11 @@ class FlashMTPMarkovHead(nn.Module):
                 hidden_states=hidden_states[:, position, :],
                 state=state,
                 output_mode=output_mode,
+                hidden_latent=(
+                    None
+                    if hidden_latents is None
+                    else hidden_latents[:, position, :]
+                ),
             )
             step_logits = self.project_logits(latent)
             if output_mode == "additive":
@@ -282,4 +348,5 @@ __all__ = [
     "FlashMTPMarkovHead",
     "MARKOV_HEAD_TYPES",
     "MARKOV_OUTPUT_MODES",
+    "markov_output_uses_base_lm_head",
 ]
