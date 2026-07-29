@@ -86,11 +86,11 @@ if [ "$DT" = "qz" ]; then
     # export NODE_RANK=${RANK:-0}
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 elif [ "$DT" = "h100" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/share/dai-sys/wanghanzhen/projects/MTP/training_data/nemotron_think_off_samples_40000_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_${PIVOT_FUSE_MODE}_fuse$((NUM_MIDDLE_LAYERS_N + 2))_sample_${DATA_NUM_SAMPLES}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_${PIVOT_FUSE_MODE}_fuse$((NUM_MIDDLE_LAYERS_N + 2))_sample_${DATA_NUM_SAMPLES}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_HOME/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
@@ -138,8 +138,8 @@ REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-v2}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v2.1_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_v2.1_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${MODEL_TAG}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v2.1_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_v2.1_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${MODEL_TAG}}"
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen}"
