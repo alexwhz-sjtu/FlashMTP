@@ -54,7 +54,7 @@ ENABLE_THINKING="${ENABLE_THINKING:-off}"
 # 草稿层数：默认目录名/ WandB id/ run name 中均带 nlayers${NUM_DRAFT_LAYERS}
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 
-# 低秩串行 head：none | vanilla | gated | rnn
+# 低秩串行 head：none | vanilla | gated | rnn | rnn_easy | mlp
 MARKOV_HEAD_TYPE="${MARKOV_HEAD_TYPE:-none}"
 # additive: 修正并行 base logits；direct: head 直接产生最终 logits
 MARKOV_OUTPUT_MODE="${MARKOV_OUTPUT_MODE:-additive}"

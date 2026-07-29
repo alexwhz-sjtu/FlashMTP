@@ -116,17 +116,16 @@ def parse_args():
         "--markov-head-type",
         type=str,
         default="none",
-        choices=["none", "vanilla", "gated", "rnn"],
+        choices=["none", "vanilla", "gated", "rnn", "rnn_easy", "mlp"],
         help="Optional serial head applied after the parallel FlashMTP backbone.",
     )
     model_group.add_argument(
         "--markov-output-mode",
         type=str,
         default="additive",
-        choices=["additive", "direct", "rnn_h"],
+        choices=["additive", "direct"],
         help="'additive' adds the serial-head logits to base LM-head logits; "
-        "'direct' uses serial-head logits as the final logits; "
-        "'rnn_h' concatenates draft hidden into the RNN input (Scheme A).",
+        "'direct' uses serial-head logits as the final logits.",
     )
     model_group.add_argument(
         "--markov-rank",
@@ -250,16 +249,11 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     """Build target model (backend wrapper) and draft model."""
     if args.markov_rank <= 0:
         raise ValueError(f"--markov-rank must be positive, got {args.markov_rank}.")
-    if args.markov_head_type == "none" and args.markov_output_mode in (
-        "direct",
-        "rnn_h",
-    ):
+    if args.markov_head_type == "none" and args.markov_output_mode == "direct":
         raise ValueError(
             f"--markov-output-mode {args.markov_output_mode} requires "
-            "--markov-head-type vanilla, gated, or rnn."
+            "--markov-head-type vanilla, gated, rnn, rnn_easy, or mlp."
         )
-    if args.markov_output_mode == "rnn_h" and args.markov_head_type != "rnn":
-        raise ValueError("--markov-output-mode rnn_h requires --markov-head-type rnn.")
 
     print_on_rank0(
         f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"

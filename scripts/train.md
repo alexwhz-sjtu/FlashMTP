@@ -25,11 +25,11 @@
 训练脚本支持在并行 FlashMTP backbone 后增加低秩串行 head：
 
 
-| 环境变量                 | 可选值                                  | 默认值        |
-| -------------------- | ------------------------------------ | ---------- |
-| `MARKOV_HEAD_TYPE`   | `none` / `vanilla` / `gated` / `rnn` | `none`     |
-| `MARKOV_OUTPUT_MODE` | `additive` / `direct`                | `additive` |
-| `MARKOV_RANK`        | 正整数                                  | `256`      |
+| 环境变量                 | 可选值                                          | 默认值        |
+| -------------------- | -------------------------------------------- | ---------- |
+| `MARKOV_HEAD_TYPE`   | `none` / `vanilla` / `gated` / `rnn` / `mlp` | `none`     |
+| `MARKOV_OUTPUT_MODE` | `additive` / `direct`                        | `additive` |
+| `MARKOV_RANK`        | 正整数                                          | `256`      |
 
 
 `additive` 将 head 输出作为 logit bias 加到并行 base logits；`direct`
@@ -57,7 +57,7 @@ cd /data/wanghanzhen/FlashMTP_v2
 source .venv/bin/activate
 NUM_MIDDLE_LAYERS_N=16 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=6 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=80000 MAX_LENGTH=4096 NUM_ANCHORS=512 BLOCK_SIZE=16 LOCAL_POSITION=true \
 LOSS_DECAY_GAMMA=7 BASE_LM_CE_DECAY_GAMMA=21 BASE_LM_CE_WEIGHT=0.2 \
-MARKOV_HEAD_TYPE=rnn MARKOV_OUTPUT_MODE=direct MARKOV_RANK=1024 \
+MARKOV_HEAD_TYPE=mlp MARKOV_OUTPUT_MODE=direct MARKOV_RANK=512 \
 NPROC_PER_NODE=8 TP_SIZE=1 SHARD_DRAFT_BY_TP=1 CE_CHUNK_SIZE=8192 \
 TRAIN_DATA_PATH="/data/wanghanzhen/training_data/open_perfectblend_80k_qwen3_8b.jsonl" \
 TARGET_MODEL_BACKEND=sglang SGLANG_MEM_FRACTION_STATIC=0.25 \

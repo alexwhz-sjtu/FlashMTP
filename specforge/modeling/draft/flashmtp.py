@@ -404,13 +404,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 f"markov_rank must be positive when a Markov head is enabled, "
                 f"got {self.markov_rank}."
             )
-        if self.markov_output_mode == "rnn_h" and self.markov_head_type != "rnn":
-            raise ValueError(
-                "markov_output_mode='rnn_h' requires markov_head_type='rnn'."
-            )
-        if self.markov_head_type == "none" and self.markov_output_mode in (
-            "direct",
-            "rnn_h",
+        if (
+            self.markov_head_type == "none"
+            and self.markov_output_mode == "direct"
         ):
             raise ValueError(
                 f"markov_output_mode={self.markov_output_mode!r} requires a Markov head."

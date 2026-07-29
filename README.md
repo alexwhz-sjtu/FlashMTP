@@ -317,7 +317,7 @@ $[B,A,K,R]$ head latent，再按 `ce_chunk_size` 分块投影到词表并计算 
 
 ### 6. 参数规模
 
-三种 head 都包含 token embedding 和输出投影，共约：
+所有 head 都包含 token embedding 和输出投影，共约：
 
 $$
 2VR
@@ -330,6 +330,7 @@ $$
 | Vanilla | $0$ |
 | Gated | $R(D+R)+R+DR+2R^2+R$ |
 | RNN | $7R^2+3R+DR+2R^2+R$ |
+| MLP | $2DR+3R^2+7R$ |
 
 例如 Qwen3-8B 使用 $D=4096$、$V=151936$、$R=256$ 时：
 
@@ -339,13 +340,14 @@ $$
 | Output projection $R\rightarrow V$ | 38,895,616 |
 | Gated 额外部分 | 2,294,272 |
 | RNN 额外部分 | 1,508,096 |
+| MLP 额外部分 | 2,295,552 |
 
 ### 7. 训练接口
 
 Python 训练入口支持：
 
 ```bash
---markov-head-type none|vanilla|gated|rnn
+--markov-head-type none|vanilla|gated|rnn|mlp
 --markov-output-mode additive|direct
 --markov-rank 256
 ```

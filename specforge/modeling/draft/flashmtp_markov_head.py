@@ -12,10 +12,11 @@ from typing import Optional
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
-MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn")
-MARKOV_OUTPUT_MODES = ("additive", "direct", "rnn_h")
+MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn", "rnn_easy", "mlp")
+MARKOV_OUTPUT_MODES = ("additive", "direct")
 
 
 def markov_output_uses_base_lm_head(output_mode: str) -> bool:
@@ -31,7 +32,7 @@ def _sample_tokens(logits: torch.Tensor, temperature: float) -> torch.Tensor:
 
 
 class FlashMTPMarkovHead(nn.Module):
-    """Vanilla, gated, or recurrent low-rank vocabulary head."""
+    """Low-rank serial vocabulary head with optional recurrent state."""
 
     def __init__(
         self,
@@ -59,10 +60,6 @@ class FlashMTPMarkovHead(nn.Module):
                 f"Unknown markov output mode {self.markov_output_mode!r}; "
                 f"expected one of {MARKOV_OUTPUT_MODES}."
             )
-        if self.markov_output_mode == "rnn_h" and self.head_type != "rnn":
-            raise ValueError(
-                "markov_output_mode='rnn_h' requires head_type='rnn'."
-            )
         if self.markov_rank <= 0:
             raise ValueError(f"markov_rank must be positive, got {self.markov_rank}.")
 
@@ -74,6 +71,12 @@ class FlashMTPMarkovHead(nn.Module):
         self.state_out_proj: Optional[nn.Linear] = None
         self.hidden_proj: Optional[nn.Linear] = None
         self.hidden_fuse_gate_proj: Optional[nn.Linear] = None
+        self.state_hidden_mlp: Optional[nn.Linear] = None
+        self.mlp_state_proj: Optional[nn.Linear] = None
+        self.mlp_token_state_scale: Optional[nn.Parameter] = None
+        self.mlp_token_gate_scale: Optional[nn.Parameter] = None
+        self.mlp_token_value_scale: Optional[nn.Parameter] = None
+        self.mlp_state_scale: Optional[nn.Parameter] = None
         if self.head_type == "gated":
             self.gate_proj = nn.Linear(
                 self.hidden_size + self.markov_rank,
@@ -85,25 +88,39 @@ class FlashMTPMarkovHead(nn.Module):
                 self.markov_rank,
             )
         elif self.head_type == "rnn":
-            if self.markov_output_mode == "rnn_h":
-                self.state_proj = nn.Linear(
-                    2 * self.markov_rank + self.hidden_size,
-                    2 * self.markov_rank,
-                )
-            else:
-                self.state_proj = nn.Linear(2 * self.markov_rank, 2 * self.markov_rank)
-                self.hidden_proj = nn.Linear(
-                    self.hidden_size, self.markov_rank, bias=False
-                )
-                self.hidden_fuse_gate_proj = nn.Linear(
-                    2 * self.markov_rank,
-                    self.markov_rank,
-                )
+            self.state_proj = nn.Linear(2 * self.markov_rank, 2 * self.markov_rank)
+            self.hidden_proj = nn.Linear(
+                self.hidden_size, self.markov_rank, bias=False
+            )
+            self.hidden_fuse_gate_proj = nn.Linear(
+                2 * self.markov_rank,
+                self.markov_rank,
+            )
             self.state_out_proj = nn.Linear(
                 self.markov_rank,
                 self.markov_rank,
                 bias=False,
             )
+        elif self.head_type == "rnn_easy":
+            self.state_proj = nn.Linear(2 * self.markov_rank, 2 * self.markov_rank)
+            self.hidden_proj = nn.Linear(
+                self.hidden_size, self.markov_rank, bias=False
+            )
+            self.state_hidden_mlp = nn.Linear(
+                2 * self.markov_rank,
+                self.markov_rank,
+            )
+        elif self.head_type == "mlp":
+            self.hidden_proj = nn.Linear(
+                self.hidden_size, 2 * self.markov_rank, bias=False
+            )
+            self.mlp_state_proj = nn.Linear(
+                self.markov_rank, 3 * self.markov_rank
+            )
+            self.mlp_token_state_scale = nn.Parameter(torch.ones(self.markov_rank))
+            self.mlp_token_gate_scale = nn.Parameter(torch.ones(self.markov_rank))
+            self.mlp_token_value_scale = nn.Parameter(torch.ones(self.markov_rank))
+            self.mlp_state_scale = nn.Parameter(torch.ones(self.markov_rank))
 
     def project_logits(self, latent_states: torch.Tensor) -> torch.Tensor:
         """Project low-rank head states to full-vocabulary logits."""
@@ -116,10 +133,6 @@ class FlashMTPMarkovHead(nn.Module):
                 f"Unknown markov output mode {output_mode!r}; "
                 f"expected one of {MARKOV_OUTPUT_MODES}."
             )
-        if output_mode == "rnn_h" and self.head_type != "rnn":
-            raise ValueError(
-                "markov_output_mode='rnn_h' requires head_type='rnn'."
-            )
         return output_mode
 
     def _hidden_latent_contribution(
@@ -128,7 +141,9 @@ class FlashMTPMarkovHead(nn.Module):
         *,
         output_mode: str,
     ) -> Optional[torch.Tensor]:
-        if output_mode != "direct" or self.hidden_proj is None:
+        if self.hidden_proj is None:
+            return None
+        if self.head_type != "mlp" and output_mode != "direct":
             return None
         return self.hidden_proj(hidden_states)
 
@@ -138,8 +153,10 @@ class FlashMTPMarkovHead(nn.Module):
         *,
         output_mode: str,
     ) -> Optional[torch.Tensor]:
-        """Project all block hidden states in parallel for direct mode."""
-        if output_mode != "direct" or self.hidden_proj is None:
+        """Project all block hidden states before serial decoding."""
+        if self.hidden_proj is None:
+            return None
+        if self.head_type != "mlp" and output_mode != "direct":
             return None
         return self.hidden_proj(hidden_states)
 
@@ -182,21 +199,60 @@ class FlashMTPMarkovHead(nn.Module):
             serial_latent = gate.to(prev_embeddings.dtype) * prev_embeddings
             return self._fuse_serial_and_hidden(serial_latent, hidden_latent), None
 
-        assert self.state_proj is not None
-        assert self.state_out_proj is not None
-        if state is None:
-            state = torch.zeros_like(prev_embeddings)
-        if output_mode == "rnn_h":
-            mem_inputs = torch.cat([state, prev_embeddings, hidden_states], dim=-1)
-        else:
+        if self.head_type == "mlp":
+            assert self.mlp_state_proj is not None
+            assert self.mlp_token_state_scale is not None
+            assert self.mlp_token_gate_scale is not None
+            assert self.mlp_token_value_scale is not None
+            assert self.mlp_state_scale is not None
+            assert hidden_latent is not None
+            if state is None:
+                state = torch.zeros_like(prev_embeddings)
+            state_raw, gate_raw, value_raw = self.mlp_state_proj(state).chunk(
+                3, dim=-1
+            )
+            hidden_gate, hidden_value = hidden_latent.chunk(2, dim=-1)
+            new_state = torch.tanh(
+                state_raw + self.mlp_token_state_scale * prev_embeddings
+            )
+            gate = (
+                gate_raw
+                + self.mlp_token_gate_scale * prev_embeddings
+                + hidden_gate
+            )
+            value = (
+                value_raw
+                + self.mlp_token_value_scale * prev_embeddings
+                + hidden_value
+            )
+            fused = F.silu(gate) * value
+            latent = F.rms_norm(
+                fused + self.mlp_state_scale * new_state,
+                (self.markov_rank,),
+            )
+            return latent, new_state
+
+        if self.head_type in ("rnn", "rnn_easy"):
+            assert self.state_proj is not None
+            if state is None:
+                state = torch.zeros_like(prev_embeddings)
             mem_inputs = torch.cat([state, prev_embeddings], dim=-1)
-        gate_raw, candidate_raw = self.state_proj(mem_inputs).chunk(2, dim=-1)
-        gate = torch.sigmoid(gate_raw)
-        new_state = gate * state + (1.0 - gate) * torch.tanh(candidate_raw)
-        serial_latent = torch.tanh(self.state_out_proj(new_state))
-        if output_mode == "rnn_h":
-            return serial_latent, new_state
-        return self._fuse_serial_and_hidden(serial_latent, hidden_latent), new_state
+            gate_raw, candidate_raw = self.state_proj(mem_inputs).chunk(2, dim=-1)
+            gate = torch.sigmoid(gate_raw)
+            new_state = gate * state + (1.0 - gate) * torch.tanh(candidate_raw)
+            if self.head_type == "rnn_easy":
+                if output_mode == "direct":
+                    assert self.state_hidden_mlp is not None
+                    assert hidden_latent is not None
+                    fused_inputs = torch.cat([new_state, hidden_latent], dim=-1)
+                    return self.state_hidden_mlp(fused_inputs), new_state
+                return new_state, new_state
+
+            assert self.state_out_proj is not None
+            serial_latent = torch.tanh(self.state_out_proj(new_state))
+            return self._fuse_serial_and_hidden(serial_latent, hidden_latent), new_state
+
+        raise RuntimeError(f"Unhandled head type {self.head_type!r}.")
 
     def forward_teacher_forcing(
         self,
@@ -230,7 +286,7 @@ class FlashMTPMarkovHead(nn.Module):
             hidden_states,
             output_mode=output_mode,
         )
-        if self.head_type != "rnn":
+        if self.head_type not in ("rnn", "rnn_easy", "mlp"):
             latent, _ = self._compute_step_latent(
                 prev_token_ids=prev_token_ids,
                 hidden_states=hidden_states,
@@ -299,7 +355,7 @@ class FlashMTPMarkovHead(nn.Module):
         batch_size, prediction_length = hidden_states.shape[:2]
         state = (
             hidden_states.new_zeros(batch_size, self.markov_rank)
-            if self.head_type == "rnn"
+            if self.head_type in ("rnn", "rnn_easy", "mlp")
             else None
         )
         prev_token_ids = first_prev_token_ids.long()
