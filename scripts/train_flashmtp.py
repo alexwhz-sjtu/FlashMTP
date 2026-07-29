@@ -99,6 +99,19 @@ def parse_args():
         "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
     )
     model_group.add_argument(
+        "--final-ce-weight",
+        type=float,
+        default=1.0,
+        help="Weight for the final serial-head cross-entropy loss.",
+    )
+    model_group.add_argument(
+        "--tv-loss-weight",
+        type=float,
+        default=1.0,
+        help="Weight for serial-head L1 total-variation distribution loss. "
+        "The loss is skipped when no serial head is enabled.",
+    )
+    model_group.add_argument(
         "--base-lm-ce-weight",
         type=float,
         default=0.0,
@@ -184,7 +197,7 @@ def parse_args():
         "--ce-chunk-size",
         type=int,
         default=2048,
-        help="Chunk size for lm_head + CE to reduce peak activation memory.",
+        help="Chunk size for lm_head + CE/TV to reduce peak activation memory.",
     )
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
@@ -249,6 +262,14 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     """Build target model (backend wrapper) and draft model."""
     if args.markov_rank <= 0:
         raise ValueError(f"--markov-rank must be positive, got {args.markov_rank}.")
+    if args.final_ce_weight < 0:
+        raise ValueError(
+            f"--final-ce-weight must be non-negative, got {args.final_ce_weight}."
+        )
+    if args.tv_loss_weight < 0:
+        raise ValueError(
+            f"--tv-loss-weight must be non-negative, got {args.tv_loss_weight}."
+        )
     if args.markov_head_type == "none" and args.markov_output_mode == "direct":
         raise ValueError(
             f"--markov-output-mode {args.markov_output_mode} requires "
@@ -304,7 +325,12 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
 
     draft_model = FlashMTPDraftModel(draft_config).cuda().to(torch.bfloat16)
 
-    target_model.set_capture_layers(draft_model.target_layer_ids)
+    capture_layer_ids = list(draft_model.target_layer_ids)
+    if args.tv_loss_weight != 0.0 and draft_model.markov_head is not None:
+        final_target_layer_id = draft_model.config.num_target_layers - 1
+        if final_target_layer_id not in capture_layer_ids:
+            capture_layer_ids.append(final_target_layer_id)
+    target_model.set_capture_layers(capture_layer_ids)
 
     print_on_rank0(
         f"Draft config: block_size={draft_config.block_size}, "
@@ -501,6 +527,7 @@ def record_metrics(
     mode: str = "train",
     prefix_acc: float | None = None,
     base_lm_ce_loss: float | None = None,
+    tv_loss: float | None = None,
 ) -> None:
     logdict = {}
 
@@ -513,12 +540,16 @@ def record_metrics(
         logdict[f"{mode}/prefix_acc"] = prefix_acc
     if base_lm_ce_loss is not None:
         logdict[f"{mode}/base_lm_ce_loss"] = base_lm_ce_loss
+    if tv_loss is not None:
+        logdict[f"{mode}/tv_loss"] = tv_loss
 
     extra = ""
     if prefix_acc is not None:
         extra = f", PrefixAcc: {prefix_acc:.4f}"
     if base_lm_ce_loss is not None:
         extra += f", BaseCE: {base_lm_ce_loss:.4f}"
+    if tv_loss is not None:
+        extra += f", TV: {tv_loss:.4f}"
     print_on_rank0(
         f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}{extra}"
     )
@@ -698,6 +729,8 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
+        final_ce_weight=args.final_ce_weight,
+        tv_loss_weight=args.tv_loss_weight,
         base_lm_ce_weight=args.base_lm_ce_weight,
         base_lm_ce_decay_gamma=args.base_lm_ce_decay_gamma,
         chs_concat_mode="feature",
@@ -709,6 +742,8 @@ def main():
         f"target hidden noise: add_noise={args.add_noise}, "
         f"ratio={args.target_hidden_noise_ratio}, "
         f"ce_chunk_size={args.ce_chunk_size}, "
+        f"final_ce_weight={args.final_ce_weight}, "
+        f"tv_loss_weight={args.tv_loss_weight}, "
         f"base_lm_ce_weight={args.base_lm_ce_weight}, "
         f"base_lm_ce_decay_gamma={args.base_lm_ce_decay_gamma}"
     )
@@ -795,10 +830,13 @@ def main():
                     f"{len(hidden_states) if isinstance(hidden_states, dict) else len(hidden_states)}"
                 )
 
-            anchor_positions, block_keep_mask, target_hidden = (
-                online_flashmtp.prepare_training_tensors(
-                    input_ids, hidden_states, loss_mask
-                )
+            (
+                anchor_positions,
+                block_keep_mask,
+                target_hidden,
+                target_prediction_hidden,
+            ) = online_flashmtp.prepare_training_tensors(
+                input_ids, hidden_states, loss_mask
             )
             del target_output, hidden_states
 
@@ -808,15 +846,25 @@ def main():
                 anchor_positions = get_tp_data_shard(anchor_positions)
                 block_keep_mask = get_tp_data_shard(block_keep_mask)
                 target_hidden = get_tp_data_shard(target_hidden)
+                if target_prediction_hidden is not None:
+                    target_prediction_hidden = get_tp_data_shard(
+                        target_prediction_hidden
+                    )
 
-            loss, accuracy, prefix_acc, base_ce_loss = flashmtp_model(
+            loss, accuracy, prefix_acc, base_ce_loss, tv_loss = flashmtp_model(
                 input_ids=input_ids,
                 loss_mask=loss_mask,
                 anchor_positions=anchor_positions,
                 block_keep_mask=block_keep_mask,
                 target_hidden=target_hidden,
+                target_prediction_hidden=target_prediction_hidden,
             )
-            del target_hidden, anchor_positions, block_keep_mask
+            del (
+                target_hidden,
+                target_prediction_hidden,
+                anchor_positions,
+                block_keep_mask,
+            )
 
             (loss / args.accumulation_steps).backward()
 
@@ -828,14 +876,17 @@ def main():
                 acc_log = accuracy.clone()
                 pfx_log = prefix_acc.clone()
                 base_ce_log = base_ce_loss.clone()
+                tv_loss_log = tv_loss.clone()
                 dist.all_reduce(loss_log)
                 dist.all_reduce(acc_log)
                 dist.all_reduce(pfx_log)
                 dist.all_reduce(base_ce_log)
+                dist.all_reduce(tv_loss_log)
                 loss_log = loss_log / dist.get_world_size()
                 acc_log = acc_log / dist.get_world_size()
                 pfx_log = pfx_log / dist.get_world_size()
                 base_ce_log = base_ce_log / dist.get_world_size()
+                tv_loss_log = tv_loss_log / dist.get_world_size()
 
                 record_metrics(
                     args,
@@ -848,6 +899,7 @@ def main():
                     mode="train",
                     prefix_acc=pfx_log.item(),
                     base_lm_ce_loss=base_ce_log.item(),
+                    tv_loss=tv_loss_log.item(),
                 )
 
             if dist.get_rank() == 0:
@@ -858,6 +910,7 @@ def main():
                         "loss": f"{loss.item():.4f}",
                         "acc": f"{accuracy.item():.4f}",
                         "pfx": f"{prefix_acc.item():.4f}",
+                        "tv": f"{tv_loss.item():.4f}",
                         "iter_time": f"{elapsed:.2f}s",
                     }
                 )

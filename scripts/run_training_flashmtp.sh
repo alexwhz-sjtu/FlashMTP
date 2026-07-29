@@ -59,7 +59,9 @@ MARKOV_HEAD_TYPE="${MARKOV_HEAD_TYPE:-none}"
 # additive: 修正并行 base logits；direct: head 直接产生最终 logits
 MARKOV_OUTPUT_MODE="${MARKOV_OUTPUT_MODE:-additive}"
 MARKOV_RANK="${MARKOV_RANK:-256}"
-MARKOV_TAG="mh${MARKOV_HEAD_TYPE}_${MARKOV_OUTPUT_MODE}_r${MARKOV_RANK}"
+FINAL_CE_WEIGHT="${FINAL_CE_WEIGHT:-1.0}"
+TV_LOSS_WEIGHT="${TV_LOSS_WEIGHT:-1.0}"
+MARKOV_TAG="mh${MARKOV_HEAD_TYPE}_${MARKOV_OUTPUT_MODE}_r${MARKOV_RANK}_ce${FINAL_CE_WEIGHT}_tv${TV_LOSS_WEIGHT}"
 
 # 草稿块内 position_ids：CHS RoPE 前缀全 0，draft 为 1..block_size（默认 false 为全局 anchor 位置）
 LOCAL_POSITION="${LOCAL_POSITION:-false}"
@@ -175,6 +177,8 @@ echo "  块大小: ${BLOCK_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
+echo "  最终CE权重: ${FINAL_CE_WEIGHT}"
+echo "  串行Head TV权重: ${TV_LOSS_WEIGHT}"
 echo "  Base LM CE权重: ${BASE_LM_CE_WEIGHT}"
 echo "  Base LM CE衰减Gamma: ${BASE_LM_CE_DECAY_GAMMA:-未设置(均匀权重)}"
 echo "  串行Head: ${MARKOV_HEAD_TYPE}"
@@ -345,6 +349,8 @@ EXIT_CODE=0
     --markov-head-type ${MARKOV_HEAD_TYPE} \
     --markov-output-mode ${MARKOV_OUTPUT_MODE} \
     --markov-rank ${MARKOV_RANK} \
+    --final-ce-weight ${FINAL_CE_WEIGHT} \
+    --tv-loss-weight ${TV_LOSS_WEIGHT} \
     --seed 42 \
     ${OPTIONAL_ARGS} 2>&1 || EXIT_CODE=$?
 

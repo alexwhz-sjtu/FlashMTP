@@ -3,14 +3,43 @@ import unittest
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from transformers import Qwen3Config
 
-from specforge.core.flashmtp import OnlineFlashMTPModel
+from specforge.core.flashmtp import (
+    OnlineFlashMTPModel,
+    prepare_target_prediction_hidden,
+)
 from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
 from specforge.modeling.draft.flashmtp_markov_head import FlashMTPMarkovHead
 
 
 class FlashMTPMarkovHeadTest(unittest.TestCase):
+    def test_target_prediction_hidden_uses_causal_predecessor_positions(self) -> None:
+        last_hidden = torch.arange(2 * 8 * 3, dtype=torch.float32).view(2, 8, 3)
+        hidden_states = {
+            0: torch.zeros_like(last_hidden),
+            1: torch.zeros_like(last_hidden),
+            2: torch.zeros_like(last_hidden),
+            3: last_hidden,
+        }
+        anchors = torch.tensor([[1, 3], [2, 4]])
+
+        gathered = prepare_target_prediction_hidden(
+            hidden_states=hidden_states,
+            anchor_positions=anchors,
+            block_size=4,
+            num_transformer_layers=4,
+        )
+
+        expected_positions = anchors.unsqueeze(-1) + torch.arange(3)
+        expected = torch.gather(
+            last_hidden.unsqueeze(1).expand(-1, 2, -1, -1),
+            2,
+            expected_positions.unsqueeze(-1).expand(-1, -1, -1, 3),
+        )
+        self.assertTrue(torch.equal(gathered, expected))
+
     def _assert_teacher_forcing_matches_serial(
         self, head_type: str, output_mode: str
     ) -> None:
@@ -378,28 +407,75 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             block_size=4,
             num_anchors=2,
             ce_chunk_size=3,
+            final_ce_weight=0.3,
+            tv_loss_weight=0.7,
         )
         prediction_hidden = torch.randn(2, 2, 3, 16, requires_grad=True)
+        target_prediction_hidden = torch.randn(
+            2, 2, 3, 16, requires_grad=True
+        )
         prev_token_ids = torch.randint(0, 31, (2, 2, 3))
         labels = torch.randint(0, 31, (2, 2, 3))
-        weight_mask = torch.ones(2, 2, 3)
-        binary_eval_mask = torch.ones(2, 2, 3, dtype=torch.bool)
+        weight_mask = torch.tensor(
+            [
+                [[1.0, 0.5, 0.25], [1.0, 0.5, 0.0]],
+                [[1.0, 0.5, 0.25], [1.0, 0.0, 0.0]],
+            ]
+        )
+        binary_eval_mask = weight_mask > 0
         block_keep_mask = torch.ones(2, 2, dtype=torch.bool)
 
-        loss, accuracy, prefix_acc, base_ce_loss = wrapper._chunked_weighted_ce_and_metrics(
-            prediction_hidden=prediction_hidden,
+        loss, accuracy, prefix_acc, base_ce_loss, tv_loss = (
+            wrapper._chunked_weighted_ce_and_metrics(
+                prediction_hidden=prediction_hidden,
+                prev_token_ids=prev_token_ids,
+                labels=labels,
+                weight_mask=weight_mask,
+                binary_eval_mask=binary_eval_mask,
+                block_keep_mask=block_keep_mask,
+                target_prediction_hidden=target_prediction_hidden,
+            )
+        )
+        markov_latent = draft_model.markov_head.forward_teacher_forcing(
+            hidden_states=prediction_hidden,
             prev_token_ids=prev_token_ids,
-            labels=labels,
-            weight_mask=weight_mask,
-            binary_eval_mask=binary_eval_mask,
-            block_keep_mask=block_keep_mask,
+            output_mode="direct",
+        )
+        draft_logits = draft_model.markov_head.project_logits(markov_latent)
+        target_logits = wrapper.lm_head(target_prediction_hidden)
+        manual_tv = (
+            (
+                F.softmax(draft_logits, dim=-1)
+                - F.softmax(target_logits, dim=-1)
+            )
+            .abs()
+            .sum(dim=-1)
+            .mul(weight_mask)
+            .sum()
+            / (binary_eval_mask.sum() + 1e-6)
+        )
+        manual_ce = (
+            F.cross_entropy(
+                draft_logits.reshape(-1, draft_logits.size(-1)),
+                labels.reshape(-1),
+                reduction="none",
+            )
+            .view_as(labels)
+            .mul(weight_mask)
+            .sum()
+            / (weight_mask.sum() + 1e-6)
         )
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(float(base_ce_loss), 0.0)
+        self.assertTrue(torch.allclose(tv_loss, manual_tv))
+        self.assertTrue(
+            torch.allclose(loss, 0.3 * manual_ce + 0.7 * manual_tv)
+        )
         self.assertTrue(0.0 <= float(accuracy) <= 1.0)
         self.assertTrue(1.0 <= float(prefix_acc) <= 4.0)
         loss.backward()
         self.assertIsNotNone(prediction_hidden.grad)
+        self.assertIsNotNone(target_prediction_hidden.grad)
         self.assertIsNotNone(draft_model.markov_head.output_proj.weight.grad)
         self.assertIsNotNone(draft_model.markov_head.hidden_proj.weight.grad)
         self.assertIsNotNone(draft_model.markov_head.mlp_state_proj.weight.grad)
@@ -434,6 +510,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             ce_chunk_size=3,
             base_lm_ce_weight=0.5,
             base_lm_ce_decay_gamma=2.0,
+            tv_loss_weight=0.0,
         )
         prediction_hidden = torch.randn(2, 2, 3, 16, requires_grad=True)
         prev_token_ids = torch.randint(0, 31, (2, 2, 3))
@@ -445,7 +522,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         binary_eval_mask = torch.ones(2, 2, 3, dtype=torch.bool)
         block_keep_mask = torch.ones(2, 2, dtype=torch.bool)
 
-        loss, _, _, base_ce_loss = wrapper._chunked_weighted_ce_and_metrics(
+        loss, _, _, base_ce_loss, tv_loss = wrapper._chunked_weighted_ce_and_metrics(
             prediction_hidden=prediction_hidden,
             prev_token_ids=prev_token_ids,
             labels=labels,
@@ -457,6 +534,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertTrue(torch.isfinite(base_ce_loss))
         self.assertGreater(float(base_ce_loss), 0.0)
+        self.assertEqual(float(tv_loss), 0.0)
         loss.backward()
         self.assertIsNotNone(prediction_hidden.grad)
 

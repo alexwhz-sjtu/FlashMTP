@@ -105,6 +105,8 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
+        final_ce_weight=args.final_ce_weight,
+        tv_loss_weight=args.tv_loss_weight,
         chs_concat_mode="feature",
         add_noise=args.add_noise,
         target_hidden_noise_ratio=args.target_hidden_noise_ratio,
@@ -166,29 +168,39 @@ def main():
             )
         log_mem(f"06_step{step}_after_target_forward")
 
-        anchor_positions, block_keep_mask, target_hidden = (
-            online_flashmtp.prepare_training_tensors(
-                input_ids, hidden_states, loss_mask
-            )
+        (
+            anchor_positions,
+            block_keep_mask,
+            target_hidden,
+            target_prediction_hidden,
+        ) = online_flashmtp.prepare_training_tensors(
+            input_ids, hidden_states, loss_mask
         )
         th_bytes = tensor_nbytes(target_hidden)
+        tph_bytes = (
+            tensor_nbytes(target_prediction_hidden)
+            if target_prediction_hidden is not None
+            else 0
+        )
         del target_output, hidden_states
         gc.collect()
         torch.cuda.empty_cache()
         if dist.get_rank() == 0:
             print(
                 f"[HS] step{step}: target_hidden ~{_gb(th_bytes):.2f} GiB "
-                f"(shape={tuple(target_hidden.shape)})",
+                f"(shape={tuple(target_hidden.shape)}), "
+                f"target_prediction_hidden ~{_gb(tph_bytes):.2f} GiB",
                 flush=True,
             )
         log_mem(f"07_step{step}_after_del_full_hidden_states")
 
-        loss, accuracy, prefix_acc, base_ce_loss = flashmtp_model(
+        loss, accuracy, prefix_acc, base_ce_loss, tv_loss = flashmtp_model(
             input_ids=input_ids,
             loss_mask=loss_mask,
             anchor_positions=anchor_positions,
             block_keep_mask=block_keep_mask,
             target_hidden=target_hidden,
+            target_prediction_hidden=target_prediction_hidden,
         )
         log_mem(f"08_step{step}_after_draft_forward(loss={loss.item():.4f})")
 
@@ -196,8 +208,14 @@ def main():
         log_mem(f"09_step{step}_after_backward")
 
         flashmtp_model.zero_grad(set_to_none=True)
-        del loss, accuracy, prefix_acc, base_ce_loss
-        del target_hidden, anchor_positions, block_keep_mask, input_ids
+        del loss, accuracy, prefix_acc, base_ce_loss, tv_loss
+        del (
+            target_hidden,
+            target_prediction_hidden,
+            anchor_positions,
+            block_keep_mask,
+            input_ids,
+        )
         del attention_mask, loss_mask
         gc.collect()
         torch.cuda.empty_cache()

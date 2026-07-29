@@ -86,6 +86,51 @@ def prepare_target_hidden(
     return torch.stack(pieces, dim=2)  # (B, N, S, H)
 
 
+def prepare_target_prediction_hidden(
+    hidden_states: HiddenStatesInput,
+    anchor_positions: torch.Tensor,
+    block_size: int,
+    num_transformer_layers: int,
+) -> torch.Tensor:
+    """Gather target-model states whose LM logits supervise draft slots 1..B-1.
+
+    The draft label at slot ``k`` is token ``anchor + k``.  A causal target
+    model predicts that token from its hidden state at ``anchor + k - 1``.
+    """
+    if block_size <= 1:
+        raise ValueError(f"block_size must be greater than 1, got {block_size}")
+
+    last_layer_id = num_transformer_layers - 1
+    if isinstance(hidden_states, dict):
+        if last_layer_id not in hidden_states:
+            raise ValueError(
+                "Target model did not return its final hidden layer "
+                f"(layer id {last_layer_id}), which is required for TV loss."
+            )
+        last_hidden = hidden_states[last_layer_id]
+    else:
+        off = infer_hidden_states_embedding_offset(
+            hidden_states, num_transformer_layers
+        )
+        last_hidden = hidden_states[last_layer_id + off]
+
+    offsets = torch.arange(
+        block_size - 1, device=anchor_positions.device
+    ).view(1, 1, -1)
+    target_positions = anchor_positions.unsqueeze(-1) + offsets
+    safe_positions = target_positions.clamp(max=last_hidden.size(1) - 1)
+    expanded_hidden = last_hidden.unsqueeze(1).expand(
+        -1, anchor_positions.size(1), -1, -1
+    )
+    return torch.gather(
+        expanded_hidden,
+        dim=2,
+        index=safe_positions.unsqueeze(-1).expand(
+            -1, -1, -1, last_hidden.size(-1)
+        ),
+    )
+
+
 def add_noise_to_target_hidden(
     target_hidden: torch.Tensor,
     noise_ratio: float = 0.1,
@@ -186,6 +231,8 @@ class OnlineFlashMTPModel(nn.Module):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
+        final_ce_weight: float = 1.0,
+        tv_loss_weight: float = 1.0,
         base_lm_ce_weight: float = 0.0,
         base_lm_ce_decay_gamma: Optional[float] = None,
         chs_concat_mode: str = "feature",
@@ -202,6 +249,8 @@ class OnlineFlashMTPModel(nn.Module):
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
+        self.final_ce_weight = float(final_ce_weight)
+        self.tv_loss_weight = float(tv_loss_weight)
         self.base_lm_ce_weight = float(base_lm_ce_weight)
         self.base_lm_ce_decay_gamma = base_lm_ce_decay_gamma
         self.add_noise = add_noise
@@ -316,14 +365,15 @@ class OnlineFlashMTPModel(nn.Module):
 
         return self.embed_tokens(noise_ids)
 
-    @torch.no_grad()
     def prepare_training_tensors(
         self,
         input_ids: torch.Tensor,
         hidden_states: HiddenStatesInput,
         loss_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample anchors and gather teacher pivots; frees full-seq hidden states afterward."""
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]
+    ]:
+        """Sample anchors and gather teacher pivots/distribution states."""
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
@@ -339,7 +389,20 @@ class OnlineFlashMTPModel(nn.Module):
             target_hidden = add_noise_to_target_hidden(
                 target_hidden, noise_ratio=self.target_hidden_noise_ratio
             )
-        return anchor_positions, block_keep_mask, target_hidden
+        target_prediction_hidden = None
+        if self.tv_loss_weight != 0.0 and self.draft_model.markov_head is not None:
+            target_prediction_hidden = prepare_target_prediction_hidden(
+                hidden_states,
+                anchor_positions,
+                self.block_size,
+                self.draft_model.config.num_target_layers,
+            )
+        return (
+            anchor_positions,
+            block_keep_mask,
+            target_hidden,
+            target_prediction_hidden,
+        )
 
     def _lm_head_module(self, output_hidden: torch.Tensor) -> nn.Module:
         return self.lm_head
@@ -353,11 +416,14 @@ class OnlineFlashMTPModel(nn.Module):
         binary_eval_mask: torch.Tensor,
         block_keep_mask: torch.Tensor,
         base_weight_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Teacher-forced serial head + chunked projection/CE.
+        target_prediction_hidden: Optional[torch.Tensor] = None,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        """Teacher-forced serial head + chunked CE/TV projection.
 
         Low-rank Markov/RNN states are materialized for all prediction
-        positions, while full-vocabulary logits exist only for one CE chunk.
+        positions, while full-vocabulary logits exist only for one loss chunk.
         """
         device = prediction_hidden.device
         flat_hidden = prediction_hidden.reshape(-1, prediction_hidden.size(-1))
@@ -371,8 +437,17 @@ class OnlineFlashMTPModel(nn.Module):
         use_base_lm_ce = (
             self.base_lm_ce_weight > 0.0 and base_weight_mask is not None
         )
+        use_tv_loss = self.tv_loss_weight != 0.0 and markov_head is not None
+        if use_tv_loss and target_prediction_hidden is None:
+            raise ValueError(
+                "target_prediction_hidden is required when serial-head TV loss "
+                "is enabled."
+            )
         base_lm_head = (
             self._lm_head_module(prediction_hidden) if use_base_lm_ce else None
+        )
+        target_lm_head = (
+            self._lm_head_module(prediction_hidden) if use_tv_loss else None
         )
         lm_head = (
             self._lm_head_module(prediction_hidden)
@@ -402,15 +477,26 @@ class OnlineFlashMTPModel(nn.Module):
             assert lm_head is not None
             return lm_head(oh) + head_logits
 
-        def _chunk_ce(
+        def _chunk_ce_and_tv(
             oh: torch.Tensor,
             latent: torch.Tensor,
+            target_oh: torch.Tensor,
             targets_chunk: torch.Tensor,
             weights_chunk: torch.Tensor,
         ):
             logits_chunk = _final_logits(oh, None if markov_head is None else latent)
             loss_chunk = F.cross_entropy(logits_chunk, targets_chunk, reduction="none")
-            return (loss_chunk * weights_chunk).sum()
+            ce_sum = (loss_chunk * weights_chunk).sum()
+            if not use_tv_loss:
+                return ce_sum, ce_sum.new_zeros(())
+
+            assert target_lm_head is not None
+            target_logits_chunk = target_lm_head(target_oh)
+            draft_probs = F.softmax(logits_chunk, dim=-1)
+            target_probs = F.softmax(target_logits_chunk, dim=-1)
+            tv_per_position = (draft_probs - target_probs).abs().sum(dim=-1)
+            tv_sum = (tv_per_position * weights_chunk).sum()
+            return ce_sum, tv_sum
 
         def _base_chunk_ce(
             oh: torch.Tensor,
@@ -423,7 +509,15 @@ class OnlineFlashMTPModel(nn.Module):
             return (loss_chunk * weights_chunk).sum()
 
         loss_num = prediction_hidden.new_zeros(())
+        tv_loss_num = prediction_hidden.new_zeros(())
         base_loss_num = prediction_hidden.new_zeros(())
+        flat_target_prediction_hidden = (
+            target_prediction_hidden.reshape(
+                -1, target_prediction_hidden.size(-1)
+            )
+            if use_tv_loss and target_prediction_hidden is not None
+            else None
+        )
         flat_base_weights = (
             base_weight_mask.reshape(-1) if use_base_lm_ce else None
         )
@@ -445,16 +539,23 @@ class OnlineFlashMTPModel(nn.Module):
                 if flat_markov_latent is not None
                 else oh.new_empty(oh.size(0), 0)
             )
+            target_oh_chunk = (
+                flat_target_prediction_hidden[start:end]
+                if flat_target_prediction_hidden is not None
+                else oh.new_empty(oh.size(0), 0)
+            )
 
-            chunk_sum = checkpoint(
-                _chunk_ce,
+            chunk_ce_sum, chunk_tv_sum = checkpoint(
+                _chunk_ce_and_tv,
                 oh,
                 latent_chunk,
+                target_oh_chunk,
                 targets_chunk,
                 weights_chunk,
                 use_reentrant=False,
             )
-            loss_num = loss_num + chunk_sum
+            loss_num = loss_num + chunk_ce_sum
+            tv_loss_num = tv_loss_num + chunk_tv_sum
 
             if use_base_lm_ce:
                 assert flat_base_weights is not None
@@ -481,14 +582,23 @@ class OnlineFlashMTPModel(nn.Module):
                 )
 
         final_ce_loss = loss_num / valid_token_count
+        actual_token_count = binary_eval_mask.sum() + 1e-6
+        tv_loss = (
+            tv_loss_num / actual_token_count
+            if use_tv_loss
+            else prediction_hidden.new_zeros(())
+        )
         base_ce_loss = (
             base_loss_num / base_valid_token_count
             if use_base_lm_ce and base_valid_token_count is not None
             else prediction_hidden.new_zeros(())
         )
-        loss = final_ce_loss + self.base_lm_ce_weight * base_ce_loss
+        loss = (
+            self.final_ce_weight * final_ce_loss
+            + self.tv_loss_weight * tv_loss
+            + self.base_lm_ce_weight * base_ce_loss
+        )
         pred_ids = torch.cat(pred_chunks, dim=0)
-        actual_token_count = binary_eval_mask.sum() + 1e-6
         accuracy = correct_sum / actual_token_count
 
         with torch.no_grad():
@@ -506,7 +616,7 @@ class OnlineFlashMTPModel(nn.Module):
             )
             prefix_acc = prefix_sum / prefix_count.clamp(min=1.0)
 
-        return loss, accuracy, prefix_acc, base_ce_loss
+        return loss, accuracy, prefix_acc, base_ce_loss, tv_loss
 
     def forward(
         self,
@@ -516,7 +626,10 @@ class OnlineFlashMTPModel(nn.Module):
         anchor_positions: Optional[torch.Tensor] = None,
         block_keep_mask: Optional[torch.Tensor] = None,
         target_hidden: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        target_prediction_hidden: Optional[torch.Tensor] = None,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         """Parallel block-wise training forward pass."""
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -538,6 +651,17 @@ class OnlineFlashMTPModel(nn.Module):
             if self.add_noise:
                 target_hidden = add_noise_to_target_hidden(
                     target_hidden, noise_ratio=self.target_hidden_noise_ratio
+                )
+            if (
+                target_prediction_hidden is None
+                and self.tv_loss_weight != 0.0
+                and self.draft_model.markov_head is not None
+            ):
+                target_prediction_hidden = prepare_target_prediction_hidden(
+                    hidden_states,
+                    anchor_positions,
+                    self.block_size,
+                    self.draft_model.config.num_target_layers,
                 )
         elif anchor_positions is None or block_keep_mask is None:
             raise ValueError(
@@ -649,7 +773,7 @@ class OnlineFlashMTPModel(nn.Module):
             weight_mask = weight_mask * decay_weights
             prediction_weight_mask = weight_mask[:, :, 1:]
 
-        loss, accuracy, prefix_acc, base_ce_loss = (
+        loss, accuracy, prefix_acc, base_ce_loss, tv_loss = (
             self._chunked_weighted_ce_and_metrics(
                 prediction_hidden=prediction_hidden,
                 prev_token_ids=prev_token_ids,
@@ -658,7 +782,8 @@ class OnlineFlashMTPModel(nn.Module):
                 binary_eval_mask=binary_eval_mask,
                 block_keep_mask=block_keep_mask,
                 base_weight_mask=base_prediction_weight_mask,
+                target_prediction_hidden=target_prediction_hidden,
             )
         )
 
-        return loss, accuracy, prefix_acc, base_ce_loss
+        return loss, accuracy, prefix_acc, base_ce_loss, tv_loss

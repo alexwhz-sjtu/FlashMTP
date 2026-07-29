@@ -25,21 +25,27 @@
 训练脚本支持在并行 FlashMTP backbone 后增加低秩串行 head：
 
 
-| 环境变量                 | 可选值                                          | 默认值        |
-| -------------------- | -------------------------------------------- | ---------- |
-| `MARKOV_HEAD_TYPE`   | `none` / `vanilla` / `gated` / `rnn` / `mlp` | `none`     |
-| `MARKOV_OUTPUT_MODE` | `additive` / `direct`                        | `additive` |
-| `MARKOV_RANK`        | 正整数                                          | `256`      |
+| 环境变量                 | 可选值                                                       | 默认值        |
+| -------------------- | --------------------------------------------------------- | ---------- |
+| `MARKOV_HEAD_TYPE`   | `none` / `vanilla` / `gated` / `rnn` / `rnn_easy` / `mlp` | `none`     |
+| `MARKOV_OUTPUT_MODE` | `additive` / `direct`                                     | `additive` |
+| `MARKOV_RANK`        | 正整数                                                       | `256`      |
+| `FINAL_CE_WEIGHT`    | 最终 CE loss 权重                                             | `1.0`      |
+| `TV_LOSS_WEIGHT`     | 串行 head TV loss 权重                                        | `1.0`      |
 
 
 `additive` 将 head 输出作为 logit bias 加到并行 base logits；`direct`
 直接将 head 输出作为最终 logits。训练使用真实前驱 token 做 teacher forcing，
-推理时按块内位置串行采样。
+推理时按块内位置串行采样。启用串行 head 时，总 loss 包含
+`FINAL_CE_WEIGHT * CE + TV_LOSS_WEIGHT * TV`；TV 是串行最终分布与目标模型
+对应 causal 位置分布之间的词表维 L1 距离，不乘 `1/2`，位置权重复用
+`LOSS_DECAY_GAMMA`，最后按有效位置数平均。
 
 示例：
 
 ```bash
 MARKOV_HEAD_TYPE=rnn MARKOV_OUTPUT_MODE=additive MARKOV_RANK=256 \
+FINAL_CE_WEIGHT=1.0 TV_LOSS_WEIGHT=1.0 \
 bash scripts/run_training_flashmtp.sh --dt h100
 ```
 
@@ -53,15 +59,15 @@ bash scripts/run_training_flashmtp.sh --dt h100
 
 ```bash
 # ["linear_fuse", "attention_fuse", "prefix_condition"]
-cd /data/wanghanzhen/FlashMTP_v2
+cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2
 source .venv/bin/activate
 NUM_MIDDLE_LAYERS_N=16 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=6 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=80000 MAX_LENGTH=4096 NUM_ANCHORS=512 BLOCK_SIZE=16 LOCAL_POSITION=true \
-LOSS_DECAY_GAMMA=7 BASE_LM_CE_DECAY_GAMMA=21 BASE_LM_CE_WEIGHT=0.2 \
-MARKOV_HEAD_TYPE=rnn_easy MARKOV_OUTPUT_MODE=direct MARKOV_RANK=512 \
+LOSS_DECAY_GAMMA=7 BASE_LM_CE_DECAY_GAMMA=21 BASE_LM_CE_WEIGHT=0.0 FINAL_CE_WEIGHT=0.1 TV_LOSS_WEIGHT=1.0 \
+MARKOV_HEAD_TYPE=rnn MARKOV_OUTPUT_MODE=direct MARKOV_RANK=512 \
 NPROC_PER_NODE=8 TP_SIZE=1 SHARD_DRAFT_BY_TP=1 CE_CHUNK_SIZE=8192 \
-TRAIN_DATA_PATH="/data/wanghanzhen/training_data/open_perfectblend_80k_qwen3_8b.jsonl" \
+TRAIN_DATA_PATH="/share/dai-sys/wanghanzhen/projects/MTP/training_data/open_perfectblend_80k_qwen3_8b.jsonl" \
 TARGET_MODEL_BACKEND=sglang SGLANG_MEM_FRACTION_STATIC=0.25 \
-TARGET_MODEL=/data/wanghanzhen/models/Qwen3-8B \
+TARGET_MODEL=$WHZ_DIR/models/Qwen/Qwen3-8B \
 MODEL_TAG='Qwen3-8B' \
 bash scripts/run_training_flashmtp.sh --dt h100
 ```
