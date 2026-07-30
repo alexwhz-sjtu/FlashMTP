@@ -425,7 +425,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         binary_eval_mask = weight_mask > 0
         block_keep_mask = torch.ones(2, 2, dtype=torch.bool)
 
-        loss, accuracy, prefix_acc, base_ce_loss, tv_loss = (
+        loss, accuracy, prefix_acc, final_ce_loss, base_ce_loss, tv_loss = (
             wrapper._chunked_weighted_ce_and_metrics(
                 prediction_hidden=prediction_hidden,
                 prev_token_ids=prev_token_ids,
@@ -466,6 +466,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             / (weight_mask.sum() + 1e-6)
         )
         self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(torch.allclose(final_ce_loss, manual_ce))
         self.assertEqual(float(base_ce_loss), 0.0)
         self.assertTrue(torch.allclose(tv_loss, manual_tv))
         self.assertTrue(
@@ -522,16 +523,19 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         binary_eval_mask = torch.ones(2, 2, 3, dtype=torch.bool)
         block_keep_mask = torch.ones(2, 2, dtype=torch.bool)
 
-        loss, _, _, base_ce_loss, tv_loss = wrapper._chunked_weighted_ce_and_metrics(
-            prediction_hidden=prediction_hidden,
-            prev_token_ids=prev_token_ids,
-            labels=labels,
-            weight_mask=weight_mask,
-            binary_eval_mask=binary_eval_mask,
-            block_keep_mask=block_keep_mask,
-            base_weight_mask=base_weight_mask,
+        loss, _, _, final_ce_loss, base_ce_loss, tv_loss = (
+            wrapper._chunked_weighted_ce_and_metrics(
+                prediction_hidden=prediction_hidden,
+                prev_token_ids=prev_token_ids,
+                labels=labels,
+                weight_mask=weight_mask,
+                binary_eval_mask=binary_eval_mask,
+                block_keep_mask=block_keep_mask,
+                base_weight_mask=base_weight_mask,
+            )
         )
         self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(torch.isfinite(final_ce_loss))
         self.assertTrue(torch.isfinite(base_ce_loss))
         self.assertGreater(float(base_ce_loss), 0.0)
         self.assertEqual(float(tv_loss), 0.0)

@@ -418,7 +418,12 @@ class OnlineFlashMTPModel(nn.Module):
         base_weight_mask: Optional[torch.Tensor] = None,
         target_prediction_hidden: Optional[torch.Tensor] = None,
     ) -> Tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
     ]:
         """Teacher-forced serial head + chunked CE/TV projection.
 
@@ -616,7 +621,7 @@ class OnlineFlashMTPModel(nn.Module):
             )
             prefix_acc = prefix_sum / prefix_count.clamp(min=1.0)
 
-        return loss, accuracy, prefix_acc, base_ce_loss, tv_loss
+        return loss, accuracy, prefix_acc, final_ce_loss, base_ce_loss, tv_loss
 
     def forward(
         self,
@@ -628,7 +633,12 @@ class OnlineFlashMTPModel(nn.Module):
         target_hidden: Optional[torch.Tensor] = None,
         target_prediction_hidden: Optional[torch.Tensor] = None,
     ) -> Tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
     ]:
         """Parallel block-wise training forward pass."""
         bsz, seq_len = input_ids.shape
@@ -773,7 +783,7 @@ class OnlineFlashMTPModel(nn.Module):
             weight_mask = weight_mask * decay_weights
             prediction_weight_mask = weight_mask[:, :, 1:]
 
-        loss, accuracy, prefix_acc, base_ce_loss, tv_loss = (
+        loss, accuracy, prefix_acc, final_ce_loss, base_ce_loss, tv_loss = (
             self._chunked_weighted_ce_and_metrics(
                 prediction_hidden=prediction_hidden,
                 prev_token_ids=prev_token_ids,
@@ -786,4 +796,11 @@ class OnlineFlashMTPModel(nn.Module):
             )
         )
 
-        return loss, accuracy, prefix_acc, base_ce_loss, tv_loss
+        return (
+            loss,
+            accuracy,
+            prefix_acc,
+            final_ce_loss,
+            base_ce_loss,
+            tv_loss,
+        )

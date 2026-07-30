@@ -194,7 +194,14 @@ def main():
             )
         log_mem(f"07_step{step}_after_del_full_hidden_states")
 
-        loss, accuracy, prefix_acc, base_ce_loss, tv_loss = flashmtp_model(
+        (
+            loss,
+            accuracy,
+            prefix_acc,
+            final_ce_loss,
+            base_ce_loss,
+            tv_loss,
+        ) = flashmtp_model(
             input_ids=input_ids,
             loss_mask=loss_mask,
             anchor_positions=anchor_positions,
@@ -208,7 +215,7 @@ def main():
         log_mem(f"09_step{step}_after_backward")
 
         flashmtp_model.zero_grad(set_to_none=True)
-        del loss, accuracy, prefix_acc, base_ce_loss, tv_loss
+        del loss, accuracy, prefix_acc, final_ce_loss, base_ce_loss, tv_loss
         del (
             target_hidden,
             target_prediction_hidden,

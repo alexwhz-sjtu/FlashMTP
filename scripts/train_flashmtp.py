@@ -526,6 +526,7 @@ def record_metrics(
     train_dataloader=None,
     mode: str = "train",
     prefix_acc: float | None = None,
+    final_ce_loss: float | None = None,
     base_lm_ce_loss: float | None = None,
     tv_loss: float | None = None,
 ) -> None:
@@ -538,6 +539,8 @@ def record_metrics(
     logdict[f"{mode}/accuracy"] = accuracy
     if prefix_acc is not None:
         logdict[f"{mode}/prefix_acc"] = prefix_acc
+    if final_ce_loss is not None:
+        logdict[f"{mode}/final_ce_loss"] = final_ce_loss
     if base_lm_ce_loss is not None:
         logdict[f"{mode}/base_lm_ce_loss"] = base_lm_ce_loss
     if tv_loss is not None:
@@ -546,6 +549,8 @@ def record_metrics(
     extra = ""
     if prefix_acc is not None:
         extra = f", PrefixAcc: {prefix_acc:.4f}"
+    if final_ce_loss is not None:
+        extra += f", FinalCE: {final_ce_loss:.4f}"
     if base_lm_ce_loss is not None:
         extra += f", BaseCE: {base_lm_ce_loss:.4f}"
     if tv_loss is not None:
@@ -851,7 +856,14 @@ def main():
                         target_prediction_hidden
                     )
 
-            loss, accuracy, prefix_acc, base_ce_loss, tv_loss = flashmtp_model(
+            (
+                loss,
+                accuracy,
+                prefix_acc,
+                final_ce_loss,
+                base_ce_loss,
+                tv_loss,
+            ) = flashmtp_model(
                 input_ids=input_ids,
                 loss_mask=loss_mask,
                 anchor_positions=anchor_positions,
@@ -875,16 +887,19 @@ def main():
                 loss_log = loss.clone()
                 acc_log = accuracy.clone()
                 pfx_log = prefix_acc.clone()
+                final_ce_log = final_ce_loss.clone()
                 base_ce_log = base_ce_loss.clone()
                 tv_loss_log = tv_loss.clone()
                 dist.all_reduce(loss_log)
                 dist.all_reduce(acc_log)
                 dist.all_reduce(pfx_log)
+                dist.all_reduce(final_ce_log)
                 dist.all_reduce(base_ce_log)
                 dist.all_reduce(tv_loss_log)
                 loss_log = loss_log / dist.get_world_size()
                 acc_log = acc_log / dist.get_world_size()
                 pfx_log = pfx_log / dist.get_world_size()
+                final_ce_log = final_ce_log / dist.get_world_size()
                 base_ce_log = base_ce_log / dist.get_world_size()
                 tv_loss_log = tv_loss_log / dist.get_world_size()
 
@@ -898,6 +913,7 @@ def main():
                     train_dataloader,
                     mode="train",
                     prefix_acc=pfx_log.item(),
+                    final_ce_loss=final_ce_log.item(),
                     base_lm_ce_loss=base_ce_log.item(),
                     tv_loss=tv_loss_log.item(),
                 )
@@ -910,6 +926,7 @@ def main():
                         "loss": f"{loss.item():.4f}",
                         "acc": f"{accuracy.item():.4f}",
                         "pfx": f"{prefix_acc.item():.4f}",
+                        "final_ce": f"{final_ce_loss.item():.4f}",
                         "tv": f"{tv_loss.item():.4f}",
                         "iter_time": f"{elapsed:.2f}s",
                     }
