@@ -40,7 +40,19 @@ def load_mtbench101_questions(question_file, begin=None, end=None):
     return questions
 
 
-def multi_turn_dialogue(draft_model, target_model, tokenizer, turns, max_new_tokens=4096, temperature=0.0, log_file=None, thinking=False, debug_dir=None):
+def multi_turn_dialogue(
+    draft_model,
+    target_model,
+    tokenizer,
+    turns,
+    max_new_tokens=4096,
+    temperature=0.0,
+    stochastic_verification_mode="match",
+    compile_serial_head=False,
+    log_file=None,
+    thinking=False,
+    debug_dir=None,
+):
     """
     Execute multi-turn dialogue with the model
     
@@ -87,6 +99,8 @@ def multi_turn_dialogue(draft_model, target_model, tokenizer, turns, max_new_tok
             max_new_tokens=max_new_tokens,
             stop_token_ids=[tokenizer.eos_token_id],
             temperature=temperature,
+            stochastic_verification_mode=stochastic_verification_mode,
+            compile_serial_head=compile_serial_head,
         )
         
         # Decode output (remove input tokens)
@@ -210,6 +224,18 @@ def main():
     parser.add_argument("--end", type=int, default=100)
     parser.add_argument("--max-length", type=int, default=32768)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--stochastic-verification-mode",
+        choices=("match", "rejection"),
+        default="match",
+        help="At temperature > 0, keep exact-token match validation or use "
+        "speculative rejection sampling.",
+    )
+    parser.add_argument(
+        "--compile-serial-head",
+        action="store_true",
+        help="Compile the serial Markov-head sampler with torch.compile.",
+    )
     parser.add_argument("--output-dir", type=str, default="./model_answer")
     parser.add_argument("--debug-dir", type=str, default="./train/debug")
     parser.add_argument("--debug", type=bool, default=False)
@@ -237,11 +263,11 @@ def main():
     # Create output filename
     output_file = os.path.join(
         args.output_dir,
-        f"{target_model_name}-{'think' if args.thinking else ''}-FlashMTP-{dataset_name}-temperature-{args.temperature}-max_length_{args.max_length}.jsonl"
+        f"{target_model_name}-{'think' if args.thinking else ''}-FlashMTP-{dataset_name}-temperature-{args.temperature}-verify-{args.stochastic_verification_mode}-compile-{int(args.compile_serial_head)}-max_length_{args.max_length}.jsonl"
     )
     log_file_path = os.path.join(
         args.output_dir,
-        f"{target_model_name}-{'think' if args.thinking else ''}-FlashMTP-{dataset_name}-temperature-{args.temperature}-max_length_{args.max_length}.log"
+        f"{target_model_name}-{'think' if args.thinking else ''}-FlashMTP-{dataset_name}-temperature-{args.temperature}-verify-{args.stochastic_verification_mode}-compile-{int(args.compile_serial_head)}-max_length_{args.max_length}.log"
     )
 
     draft_model = FlashMTPDraftModel.from_pretrained(
@@ -269,6 +295,10 @@ def main():
         f_log.write(f"Draft Model: {args.draft_model_path}\n")
         f_log.write(f"Dataset: {dataset_name}\n")
         f_log.write(f"Temperature: {args.temperature}\n")
+        f_log.write(
+            f"Stochastic Verification: {args.stochastic_verification_mode}\n"
+        )
+        f_log.write(f"Compile Serial Head: {args.compile_serial_head}\n")
         f_log.write(f"Max Length: {args.max_length}\n\n")
         f_log.flush()
 
@@ -285,6 +315,8 @@ def main():
                 question['turns'],
                 max_new_tokens=args.max_length,
                 temperature=args.temperature,
+                stochastic_verification_mode=args.stochastic_verification_mode,
+                compile_serial_head=args.compile_serial_head,
                 log_file=f_log,
                 thinking=args.thinking,
                 debug_dir=args.debug_dir if args.debug else None

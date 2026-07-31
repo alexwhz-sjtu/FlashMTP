@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 from torch import nn
@@ -10,11 +11,50 @@ from specforge.core.flashmtp import (
     OnlineFlashMTPModel,
     prepare_target_prediction_hidden,
 )
-from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
+from specforge.modeling.draft.flashmtp import (
+    FlashMTPDraftModel,
+    rejection_sample_verify,
+)
 from specforge.modeling.draft.flashmtp_markov_head import FlashMTPMarkovHead
 
 
 class FlashMTPMarkovHeadTest(unittest.TestCase):
+    def test_rejection_sampling_accepts_identical_distributions(self) -> None:
+        draft_logits = torch.tensor(
+            [[[2.0, 0.0, -1.0], [0.0, 2.0, -1.0]]]
+        )
+        target_logits = torch.cat(
+            [draft_logits, torch.tensor([[[0.0, 0.0, 3.0]]])],
+            dim=1,
+        )
+        proposed_tokens = torch.tensor([[0, 1]])
+
+        accepted, bonus = rejection_sample_verify(
+            proposed_tokens=proposed_tokens,
+            draft_logits=draft_logits,
+            target_logits=target_logits,
+            temperature=1.0,
+        )
+
+        self.assertEqual(accepted, 2)
+        self.assertEqual(tuple(bonus.shape), (1,))
+
+    def test_rejection_sampling_uses_residual_on_rejection(self) -> None:
+        draft_logits = torch.tensor([[[100.0, -100.0, -100.0]]])
+        target_logits = torch.tensor(
+            [[[-100.0, 100.0, -100.0], [0.0, 0.0, 100.0]]]
+        )
+
+        accepted, correction = rejection_sample_verify(
+            proposed_tokens=torch.tensor([[0]]),
+            draft_logits=draft_logits,
+            target_logits=target_logits,
+            temperature=1.0,
+        )
+
+        self.assertEqual(accepted, 0)
+        self.assertEqual(correction.item(), 1)
+
     def test_target_prediction_hidden_uses_causal_predecessor_positions(self) -> None:
         last_hidden = torch.arange(2 * 8 * 3, dtype=torch.float32).view(2, 8, 3)
         hidden_states = {
@@ -378,6 +418,53 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         )
         self.assertEqual(tuple(sampled.shape), (2, 3))
         self.assertEqual(tuple(logits.shape), (2, 3, 29))
+
+    def test_compiled_serial_sampler_is_cached(self) -> None:
+        class FailingLMHead(nn.Module):
+            def forward(self, hidden_states):
+                raise AssertionError("direct mode must not call the base LM head")
+
+        config = Qwen3Config(
+            vocab_size=29,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 4
+        config.block_size = 4
+        config.flashmtp_config = {
+            "target_layer_ids": [0, 3],
+            "pivot_fuse_mode": "linear_fuse",
+            "markov_head_type": "rnn",
+            "markov_output_mode": "direct",
+            "markov_rank": 5,
+        }
+        model = FlashMTPDraftModel(config)
+        hidden = torch.randn(1, 3, 16)
+        previous = torch.tensor([1])
+
+        with mock.patch(
+            "torch.compile", side_effect=lambda fn, **kwargs: fn
+        ) as compile_mock:
+            first = model.sample_draft_tokens(
+                draft_hidden=hidden,
+                lm_head=FailingLMHead(),
+                first_prev_token_ids=previous,
+                compile_serial_head=True,
+            )
+            second = model.sample_draft_tokens(
+                draft_hidden=hidden,
+                lm_head=FailingLMHead(),
+                first_prev_token_ids=previous,
+                compile_serial_head=True,
+            )
+
+        compile_mock.assert_called_once()
+        self.assertTrue(torch.equal(first[0], second[0]))
+        self.assertTrue(torch.equal(first[1], second[1]))
 
     def test_chunked_teacher_forcing_loss(self) -> None:
         config = Qwen3Config(

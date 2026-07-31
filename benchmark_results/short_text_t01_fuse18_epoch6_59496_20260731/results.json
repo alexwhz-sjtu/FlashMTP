@@ -1,0 +1,45 @@
+{
+  "checkpoint": "/share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2/cache/models/flashmtp_h100_prefix_condition_fuse18_sample_pb_80k_nlayers5_block_16_mhrnn_easy_direct_r512_ce1.0_tv0.0_wb_0.2_bgemma_21_maxlen4096_epochs6_Qwen3-8B/epoch_6_step_59496",
+  "target_model": "/share/dai-sys/wanghanzhen/models/Qwen/Qwen3-8B",
+  "settings": {
+    "max_samples": 50,
+    "max_new_tokens": 512,
+    "batch_size": 1,
+    "block_size": 16,
+    "verify_block": 16,
+    "compile_serial_head": false,
+    "temperature_0_verification": "match",
+    "temperature_1_verification": "rejection"
+  },
+  "aggregate": {
+    "temperature_0": {
+      "macro_mean_token_weighted_speedup": 2.83,
+      "macro_mean_acceptance_length": 3.7171
+    },
+    "temperature_1": {
+      "macro_mean_token_weighted_speedup": 2.4014,
+      "macro_mean_acceptance_length": 3.3371
+    },
+    "temperature_1_vs_0": {
+      "speedup_absolute_delta": -0.4286,
+      "speedup_relative_delta_percent": -15.14,
+      "acceptance_length_delta": -0.38
+    }
+  },
+  "results": [
+    {"dataset": "gsm8k", "temperature": 0, "turns": 50, "speedup": 3.69, "acceptance_length": 4.83},
+    {"dataset": "gsm8k", "temperature": 1, "turns": 50, "speedup": 3.17, "acceptance_length": 4.40},
+    {"dataset": "alpaca", "temperature": 0, "turns": 50, "speedup": 1.86, "acceptance_length": 2.45},
+    {"dataset": "alpaca", "temperature": 1, "turns": 50, "speedup": 1.63, "acceptance_length": 2.26},
+    {"dataset": "mt-bench", "temperature": 0, "turns": 100, "speedup": 1.99, "acceptance_length": 2.61},
+    {"dataset": "mt-bench", "temperature": 1, "turns": 100, "speedup": 1.73, "acceptance_length": 2.40},
+    {"dataset": "math500", "temperature": 0, "turns": 50, "speedup": 3.73, "acceptance_length": 4.91},
+    {"dataset": "math500", "temperature": 1, "turns": 50, "speedup": 3.04, "acceptance_length": 4.23},
+    {"dataset": "mbpp", "temperature": 0, "turns": 50, "speedup": 2.94, "acceptance_length": 3.86},
+    {"dataset": "mbpp", "temperature": 1, "turns": 50, "speedup": 2.49, "acceptance_length": 3.47},
+    {"dataset": "aime25", "temperature": 0, "turns": 30, "speedup": 2.95, "acceptance_length": 3.88},
+    {"dataset": "aime25", "temperature": 1, "turns": 30, "speedup": 2.41, "acceptance_length": 3.35},
+    {"dataset": "livecodebench", "temperature": 0, "turns": 50, "speedup": 2.65, "acceptance_length": 3.48},
+    {"dataset": "livecodebench", "temperature": 1, "turns": 50, "speedup": 2.34, "acceptance_length": 3.25}
+  ]
+}

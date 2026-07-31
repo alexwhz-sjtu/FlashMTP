@@ -531,6 +531,8 @@ def run_benchmark_warmup(
     max_new_tokens: int,
     temperature: float,
     stop_token_ids: list[int],
+    stochastic_verification_mode: str,
+    compile_serial_head: bool,
 ) -> None:
     """One short baseline + speculative pass to warm CUDA kernels before timing."""
     warmup_prompt = [{"role": "user", "content": "Warmup."}]
@@ -559,6 +561,8 @@ def run_benchmark_warmup(
         stop_token_ids=stop_token_ids,
         temperature=temperature,
         decode_timing_after_first_token=False,
+        stochastic_verification_mode=stochastic_verification_mode,
+        compile_serial_head=compile_serial_head,
     )
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -665,6 +669,8 @@ def flashmtp_generate(
     stop_token_ids: list[int],
     temperature: float = 0.0,
     decode_timing_after_first_token: bool = False,
+    stochastic_verification_mode: str = "match",
+    compile_serial_head: bool = False,
 ) -> SimpleNamespace:
     original_block_size = model.block_size
     model.block_size = block_size
@@ -677,6 +683,8 @@ def flashmtp_generate(
             temperature=temperature,
             decode_timing_after_first_token=decode_timing_after_first_token,
             verify_block_size=verify_block_size,
+            stochastic_verification_mode=stochastic_verification_mode,
+            compile_serial_head=compile_serial_head,
         )
     finally:
         model.block_size = original_block_size
@@ -724,6 +732,20 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=10)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--stochastic-verification-mode",
+        choices=("match", "rejection"),
+        default="match",
+        help="Verification used when temperature > 0. 'match' preserves the "
+        "existing exact-token validation; 'rejection' uses p/q acceptance and "
+        "residual sampling. Temperature 0 always keeps greedy match validation.",
+    )
+    parser.add_argument(
+        "--compile-serial-head",
+        action="store_true",
+        help="Compile the serial Markov-head block sampler with torch.compile. "
+        "Compilation happens during warmup.",
+    )
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -801,15 +823,23 @@ def main() -> None:
     )
     logger.info(
         "FlashMTP decode: draft_block_size={} verify_block_size={} "
+        "verification_mode={} compile_serial_head={} "
         "(discarding {} draft positions before target verification)",
         block_size,
         verify_block_size,
+        args.stochastic_verification_mode,
+        args.compile_serial_head,
         block_size - verify_block_size,
     )
 
     if args.batch_size < 1:
         raise ValueError("--batch-size must be >= 1")
     if args.batch_size > 1 and args.temperature > 1e-5:
+        if args.stochastic_verification_mode == "rejection":
+            raise ValueError(
+                "--stochastic-verification-mode rejection with temperature>0 "
+                "currently requires --batch-size 1."
+            )
         logger.warning(
             "batch_size>1 with temperature>0 can desynchronize FlashMTP across batch rows; "
             "prefer --temperature 0 for batched benchmarking."
@@ -833,6 +863,8 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         stop_token_ids=stop_token_ids,
+        stochastic_verification_mode=args.stochastic_verification_mode,
+        compile_serial_head=args.compile_serial_head,
     )
 
     benchmark_start = cuda_time()
@@ -881,6 +913,8 @@ def main() -> None:
                 stop_token_ids=stop_token_ids,
                 temperature=args.temperature,
                 decode_timing_after_first_token=decode_after_first,
+                stochastic_verification_mode=args.stochastic_verification_mode,
+                compile_serial_head=args.compile_serial_head,
             )
             
             spec_response = response[block_size]

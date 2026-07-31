@@ -40,6 +40,116 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
 
 
+STOCHASTIC_VERIFICATION_MODES = ("match", "rejection")
+
+
+def _validate_stochastic_verification_mode(mode: str) -> str:
+    mode = str(mode).lower()
+    if mode not in STOCHASTIC_VERIFICATION_MODES:
+        raise ValueError(
+            f"Unknown stochastic_verification_mode={mode!r}; expected one of "
+            f"{STOCHASTIC_VERIFICATION_MODES}."
+        )
+    return mode
+
+
+def _logits_to_probs(
+    logits: torch.Tensor, temperature: float
+) -> torch.Tensor:
+    if temperature < 1e-5:
+        return torch.nn.functional.one_hot(
+            torch.argmax(logits, dim=-1),
+            num_classes=logits.shape[-1],
+        ).float()
+    return torch.softmax(logits.float() / float(temperature), dim=-1)
+
+
+def _sample_from_probs(probs: torch.Tensor) -> torch.Tensor:
+    vocab_size = probs.shape[-1]
+    return torch.multinomial(
+        probs.reshape(-1, vocab_size), num_samples=1
+    ).reshape(*probs.shape[:-1])
+
+
+def _sample_residual(
+    target_probs: torch.Tensor, draft_probs: torch.Tensor
+) -> torch.Tensor:
+    residual = torch.clamp(target_probs - draft_probs, min=0.0)
+    residual_mass = residual.sum(dim=-1, keepdim=True)
+    residual = torch.where(
+        residual_mass > 1e-8,
+        residual / residual_mass.clamp_min(1e-8),
+        target_probs,
+    )
+    return _sample_from_probs(residual)
+
+
+def rejection_sample_verify(
+    *,
+    proposed_tokens: torch.Tensor,
+    draft_logits: torch.Tensor,
+    target_logits: torch.Tensor,
+    temperature: float,
+) -> tuple[int, torch.Tensor]:
+    """Verify one stochastic draft block using speculative rejection sampling.
+
+    Returns the number of accepted draft tokens and the correction/bonus token.
+    This first implementation intentionally supports batch size one, matching
+    the sequential acceptance semantics used by DSpARK.
+    """
+    if temperature < 1e-5:
+        raise ValueError("rejection sampling requires temperature > 0.")
+    if proposed_tokens.ndim != 2 or proposed_tokens.shape[0] != 1:
+        raise ValueError(
+            "rejection sampling currently requires proposed_tokens shape [1, K]."
+        )
+    proposal_count = proposed_tokens.shape[1]
+    if draft_logits.shape[:2] != (1, proposal_count):
+        raise ValueError(
+            "draft_logits must have shape [1, K, vocab] matching proposed_tokens."
+        )
+    if target_logits.shape[:2] != (1, proposal_count + 1):
+        raise ValueError(
+            "target_logits must have shape [1, K + 1, vocab]."
+        )
+    if draft_logits.shape[-1] != target_logits.shape[-1]:
+        raise ValueError("draft and target logits must use the same vocabulary.")
+
+    target_probs = _logits_to_probs(target_logits, temperature)
+    if proposal_count == 0:
+        return 0, _sample_from_probs(target_probs[:, 0, :])
+
+    draft_probs = _logits_to_probs(draft_logits, temperature)
+    token_index = proposed_tokens.unsqueeze(-1)
+    selected_target = target_probs[:, :proposal_count, :].gather(
+        dim=-1, index=token_index
+    ).squeeze(-1)
+    selected_draft = draft_probs.gather(
+        dim=-1, index=token_index
+    ).squeeze(-1)
+    accept_probs = torch.minimum(
+        torch.ones_like(selected_target),
+        selected_target / selected_draft.clamp_min(1e-20),
+    )
+    accepted_prefix = (
+        (torch.rand_like(accept_probs) < accept_probs)
+        .to(torch.int64)
+        .cumprod(dim=1)
+    )
+    accepted_count = int(accepted_prefix.sum().item())
+
+    if accepted_count < proposal_count:
+        next_token = _sample_residual(
+            target_probs[:, accepted_count, :],
+            draft_probs[:, accepted_count, :],
+        )
+    else:
+        next_token = _sample_from_probs(
+            target_probs[:, proposal_count, :]
+        )
+    return accepted_count, next_token
+
+
 from .flashmtp_markov_head import (
     FlashMTPMarkovHead,
     MARKOV_HEAD_TYPES,
@@ -425,6 +535,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 markov_output_mode=self.markov_output_mode,
             )
         )
+        self._compiled_serial_sampler_cache: dict[tuple[str, float], Callable] = {}
         config.flashmtp_config = flashmtp_config
 
         self.layers = nn.ModuleList(
@@ -548,6 +659,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         lm_head: nn.Module,
         first_prev_token_ids: torch.Tensor,
         temperature: float = 0.0,
+        compile_serial_head: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample standard FlashMTP draft positions using configured head semantics."""
         base_logits = None
@@ -558,6 +670,49 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         if self.markov_head is None:
             assert base_logits is not None
             return sample(base_logits, temperature), base_logits
+        if compile_serial_head:
+            cache_key = (self.markov_output_mode, float(temperature))
+            compiled_sampler = self._compiled_serial_sampler_cache.get(cache_key)
+            if compiled_sampler is None:
+                markov_head = self.markov_head
+                output_mode = self.markov_output_mode
+                fixed_temperature = float(temperature)
+                if markov_output_uses_base_lm_head(output_mode):
+                    def serial_sampler(
+                        hidden_states: torch.Tensor,
+                        previous_ids: torch.Tensor,
+                        additive_logits: torch.Tensor,
+                    ) -> tuple[torch.Tensor, torch.Tensor]:
+                        return markov_head.sample_block_tokens(
+                            hidden_states=hidden_states,
+                            first_prev_token_ids=previous_ids,
+                            output_mode=output_mode,
+                            base_logits=additive_logits,
+                            temperature=fixed_temperature,
+                        )
+                else:
+                    def serial_sampler(
+                        hidden_states: torch.Tensor,
+                        previous_ids: torch.Tensor,
+                    ) -> tuple[torch.Tensor, torch.Tensor]:
+                        return markov_head.sample_block_tokens(
+                            hidden_states=hidden_states,
+                            first_prev_token_ids=previous_ids,
+                            output_mode=output_mode,
+                            base_logits=None,
+                            temperature=fixed_temperature,
+                        )
+                compiled_sampler = torch.compile(
+                    serial_sampler,
+                    mode="reduce-overhead",
+                    fullgraph=True,
+                )
+                self._compiled_serial_sampler_cache[cache_key] = compiled_sampler
+            if base_logits is None:
+                return compiled_sampler(draft_hidden, first_prev_token_ids)
+            return compiled_sampler(
+                draft_hidden, first_prev_token_ids, base_logits
+            )
         return self.markov_head.sample_block_tokens(
             hidden_states=draft_hidden,
             first_prev_token_ids=first_prev_token_ids,
@@ -915,16 +1070,31 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         temperature: float,
         decode_timing_after_first_token: bool = False,
         verify_block_size: Optional[int] = None,
+        stochastic_verification_mode: str = "match",
+        compile_serial_head: bool = False,
     ):
         self.eval()
+        stochastic_verification_mode = _validate_stochastic_verification_mode(
+            stochastic_verification_mode
+        )
         self._last_decode_stats = {
             "accept_lengths": [],
             "decode_wall_time": 0.0,
             "target_total_time": 0.0,
             "draft_total_time": 0.0,
             "steps": 0,
+            "verification_mode": stochastic_verification_mode,
+            "compile_serial_head": bool(compile_serial_head),
         }
         bsz = input_ids.shape[0]
+        use_rejection_sampling = (
+            temperature >= 1e-5
+            and stochastic_verification_mode == "rejection"
+        )
+        if use_rejection_sampling and bsz != 1:
+            raise ValueError(
+                "stochastic rejection sampling currently requires batch size 1."
+            )
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
 
@@ -1015,11 +1185,13 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 is_causal=False,
             )[:, -block_size + 1 :, :]
             lm_head = target.lm_head
-            sampled_draft_tokens, _ = self.sample_draft_tokens(
+            draft_temperature = temperature if use_rejection_sampling else 0.0
+            sampled_draft_tokens, draft_logits = self.sample_draft_tokens(
                 draft_hidden=draft_hidden,
                 lm_head=lm_head,
                 first_prev_token_ids=block_output_ids[:, 0],
-                temperature=0.0,
+                temperature=draft_temperature,
+                compile_serial_head=compile_serial_head,
             )
             block_output_ids[:, 1:] = sampled_draft_tokens
 
@@ -1036,19 +1208,29 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 output_hidden_states=True,
             )
 
-            posterior = sample(output.logits, temperature)
-            acceptance_lengths_per_row = (
-                (verify_output_ids[:, 1:] == posterior[:, :-1])
-                .cumprod(dim=1)
-                .sum(dim=1)
-            )
-            acceptance_length = int(acceptance_lengths_per_row.min().item())
+            if use_rejection_sampling:
+                proposal_count = verify_block_size - 1
+                acceptance_length, next_token = rejection_sample_verify(
+                    proposed_tokens=verify_output_ids[:, 1:],
+                    draft_logits=draft_logits[:, :proposal_count, :],
+                    target_logits=output.logits,
+                    temperature=temperature,
+                )
+            else:
+                posterior = sample(output.logits, temperature)
+                acceptance_lengths_per_row = (
+                    (verify_output_ids[:, 1:] == posterior[:, :-1])
+                    .cumprod(dim=1)
+                    .sum(dim=1)
+                )
+                acceptance_length = int(
+                    acceptance_lengths_per_row.min().item()
+                )
+                next_token = posterior[:, acceptance_length]
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
                 :, : acceptance_length + 1
             ]
-            output_ids[:, start + acceptance_length + 1] = posterior[
-                :, acceptance_length
-            ]
+            output_ids[:, start + acceptance_length + 1] = next_token
             start += acceptance_length + 1
             past_key_values_target.crop(start)
             pivot_index = min(acceptance_length, output.hidden_states[0].shape[1] - 1)

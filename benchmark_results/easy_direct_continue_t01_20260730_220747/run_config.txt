@@ -1,0 +1,11 @@
+target_model=/share/dai-sys/wanghanzhen/models/Qwen/Qwen3-8B
+draft_model=/share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2/cache/models/flashmtp_v2_mhrnn_easy_direct_r512_wb_0.2_bgemma_21_qwen3_8b_continue/epoch_6_step_59496
+gpu_list=1,2,3
+max_new_tokens=512
+max_samples=50
+batch_size=1
+block_size=16
+verify_block=16
+temperatures=0 1
+started_at=2026-07-30T22:08:38+08:00
+finished_at=2026-07-30T23:22:40+08:00

@@ -202,6 +202,13 @@ def parse_args():
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
     training_group.add_argument(
+        "--resume-optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Restore Adam optimizer moments from checkpoint. Disable to keep "
+        "epoch/step/LR from scheduler only when optimizer state is incompatible.",
+    )
+    training_group.add_argument(
         "--ckpt-dir",
         type=str,
         default=None,
@@ -460,6 +467,22 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     return train_dataloader, eval_dataloader
 
 
+def resolve_training_state_path(checkpoint_dir: str) -> Optional[str]:
+    """Prefer epoch_*_step_* training_state.pt over a flat export."""
+    # get_last_checkpoint returns (path, (epoch, step)) on hit but
+    # (None, None, None) when no epoch_*_step_* subdirs exist (flat export).
+    epoch_ckpt = get_last_checkpoint(checkpoint_dir, prefix=r"epoch_\d+_step")[0]
+    if epoch_ckpt is not None:
+        epoch_state = os.path.join(epoch_ckpt, "training_state.pt")
+        if os.path.isfile(epoch_state):
+            return epoch_state
+
+    direct_state = os.path.join(checkpoint_dir, "training_state.pt")
+    if os.path.isfile(direct_state):
+        return direct_state
+    return None
+
+
 def save_checkpoint(args, epoch, step, flashmtp_model, draft_model, optimizer):
     """Save checkpoint."""
     save_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
@@ -476,12 +499,23 @@ def save_checkpoint(args, epoch, step, flashmtp_model, draft_model, optimizer):
         }
 
         if dist.get_rank() == 0:
+            optimizer_state = optimizer.state_dict()
+            opt_sd = optimizer_state["optimizer_state_dict"]
+            n_state = len(opt_sd["state"])
+            n_params = len(optimizer.fp32_params)
+            if n_state < n_params:
+                print_on_rank0(
+                    "WARNING: saving optimizer state for only "
+                    f"{n_state}/{n_params} parameters. Resume will partially "
+                    "restore Adam moments."
+                )
+
             torch.save(
                 {
                     "epoch": epoch,
                     "global_step": step,
                     "args": args,
-                    **optimizer.state_dict(),
+                    **optimizer_state,
                 },
                 os.path.join(save_dir, "training_state.pt"),
             )
@@ -649,13 +683,14 @@ def main():
         draft_weights_from_checkpoint = True
         print_on_rank0("Loaded draft model weights from checkpoint")
 
-        training_state_path = os.path.join(
-            draft_model_last_checkpoint, "training_state.pt"
+        training_state_path = resolve_training_state_path(
+            draft_model_last_checkpoint
         )
-        if os.path.exists(training_state_path):
+        if training_state_path is not None:
             resume_state = torch.load(
                 training_state_path, map_location="cpu", weights_only=False
             )
+            print_on_rank0(f"Loading training state from {training_state_path}")
             print_on_rank0(
                 f"Will resume from epoch {resume_state['epoch']}, "
                 f"step {resume_state['global_step']}"
@@ -776,11 +811,24 @@ def main():
     start_epoch = 0
     global_step = 0
     if resume_state is not None:
-        optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+        loaded_optimizer = optimizer.load_state_dict(
+            {
+                "optimizer_state_dict": resume_state["optimizer_state_dict"],
+                "scheduler_state_dict": resume_state["scheduler_state_dict"],
+            },
+            load_optimizer=args.resume_optimizer,
+        )
         start_epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
         del resume_state
-        print_on_rank0(f"Restored scheduler, lr={optimizer.get_learning_rate():.6f}")
+        if loaded_optimizer:
+            print_on_rank0(
+                f"Restored optimizer and scheduler, lr={optimizer.get_learning_rate():.6f}"
+            )
+        else:
+            print_on_rank0(
+                f"Restored scheduler only, lr={optimizer.get_learning_rate():.6f}"
+            )
 
         skip_steps = global_step - start_epoch * len(train_dataloader)
 

@@ -1,0 +1,15 @@
+temperature,verification_mode,compile_serial_head,dataset,requested_samples,turns,gpu,status,token_weighted_speedup,unweighted_speedup,baseline_s_per_token,flashmtp_s_per_token,average_acceptance_length,draft_accept_rate,elapsed_seconds,log_path
+0,match,false,gsm8k,50,50,1,completed,3.69,3.72,0.028741,0.007797,4.83,0.2553,563.78,logs/temperature_0/gsm8k.log
+1,rejection,false,gsm8k,50,50,1,completed,3.17,3.22,0.027920,0.008820,4.40,0.2267,556.42,logs/temperature_1/gsm8k.log
+0,match,false,alpaca,50,50,2,completed,1.86,1.74,0.028873,0.015548,2.45,0.0967,569.63,logs/temperature_0/alpaca.log
+1,rejection,false,alpaca,50,50,2,completed,1.63,1.56,0.029169,0.017895,2.26,0.0840,594.32,logs/temperature_1/alpaca.log
+0,match,false,mt-bench,50,100,3,completed,1.99,1.94,0.028142,0.014134,2.61,0.1073,1400.43,logs/temperature_0/mt-bench.log
+1,rejection,false,mt-bench,50,100,3,completed,1.73,1.72,0.028470,0.016412,2.40,0.0933,1581.50,logs/temperature_1/mt-bench.log
+0,match,false,math500,50,50,4,completed,3.73,3.75,0.027368,0.007341,4.91,0.2607,785.65,logs/temperature_0/math500.log
+1,rejection,false,math500,50,50,4,completed,3.04,3.11,0.028532,0.009376,4.23,0.2153,849.32,logs/temperature_1/math500.log
+0,match,false,mbpp,50,50,5,completed,2.94,3.00,0.027400,0.009312,3.86,0.1907,512.56,logs/temperature_0/mbpp.log
+1,rejection,false,mbpp,50,50,5,completed,2.49,2.56,0.027563,0.011071,3.47,0.1647,563.68,logs/temperature_1/mbpp.log
+0,match,false,aime25,50,30,6,completed,2.95,2.95,0.028025,0.009509,3.88,0.1920,579.04,logs/temperature_0/aime25.log
+1,rejection,false,aime25,50,30,6,completed,2.41,2.41,0.027610,0.011464,3.35,0.1567,602.70,logs/temperature_1/aime25.log
+0,match,false,livecodebench,50,50,7,completed,2.65,2.73,0.026990,0.010180,3.48,0.1653,406.64,logs/temperature_0/livecodebench.log
+1,rejection,false,livecodebench,50,50,7,completed,2.34,2.35,0.027978,0.011932,3.25,0.1500,446.76,logs/temperature_1/livecodebench.log

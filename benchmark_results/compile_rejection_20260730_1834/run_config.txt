@@ -1,0 +1,10 @@
+target_model=/share/dai-sys/wanghanzhen/models/Qwen/Qwen3-8B
+gpu_list=0,1,2,3,4,5,6,7
+max_new_tokens=512
+max_samples=50
+batch_size=1
+block_size=16
+verify_block=16
+compile_serial_head=true
+started_at=2026-07-30T18:31:44+08:00
+finished_at=2026-07-30T19:15:35+08:00

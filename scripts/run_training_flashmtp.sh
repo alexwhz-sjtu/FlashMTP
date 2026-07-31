@@ -43,6 +43,7 @@ NUM_ANCHORS="${NUM_ANCHORS:-512}"
 # 恢复训练
 RESUME="${RESUME:-}"
 CKPT_DIR="${CKPT_DIR:-}"
+RESUME_OPTIMIZER="${RESUME_OPTIMIZER:-1}"
 
 # ========================================
 # 主要数据集参数
@@ -268,6 +269,10 @@ fi
 
 if [ -n "${CKPT_DIR}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --ckpt-dir ${CKPT_DIR}"
+fi
+
+if [ "${RESUME_OPTIMIZER}" = "0" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --no-resume-optimizer"
 fi
 
 if [ "${REPORT_TO}" != "none" ]; then

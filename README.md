@@ -1,5 +1,26 @@
 # FlashMTP
 
+> **ICLR submission package:** [`ICLR_SUBMISSION_PACKAGE.md`](ICLR_SUBMISSION_PACKAGE.md)  
+> **Benchmark results:** [`benchmark_results/SUMMARY.md`](benchmark_results/SUMMARY.md)  
+> **Stochastic verification:** [`docs/STOCHASTIC_VERIFICATION.md`](docs/STOCHASTIC_VERIFICATION.md)  
+> **Compile profiling:** [`profile/compile_serial_head_profile.md`](profile/compile_serial_head_profile.md)
+
+## Key results (Qwen3-8B, Model B @ temp=0)
+
+| Dataset | Speedup | Accept length |
+|---------|--------:|--------------:|
+| Math500 | **3.77×** | 5.06 |
+| GSM8K | **3.68×** | 4.94 |
+| MBPP | 2.93× | 3.97 |
+| Macro mean (8 datasets) | **2.43×** | 3.25 |
+
+With `compile_serial_head`: up to **4.01×** on Math500. At temp=1, rejection sampling beats token-match by **+12%** on GSM8K (3.58× vs 3.20×). See [`benchmark_results/SUMMARY.md`](benchmark_results/SUMMARY.md) for full tables.
+
+```bash
+# Reproduce summaries from benchmark logs
+python scripts/summarize_benchmarks.py --per-run
+```
+
 ## Ours core idea
 
 由于隐状态是模型在**完整上下文**下计算得到的，因此它们可以看作对上下文的**浓缩表示**。在预测后续 block 的 token 时，我们只需要**最新的隐状态**即可。
@@ -385,3 +406,14 @@ bash scripts/run_training_flashmtp.sh --dt h100
 > uv pip install -v -e . --prerelease=allow
 >
 > uv pip install datasets==4.8.3 pyarrow==23.0.1
+
+## Citation
+
+```bibtex
+@article{flashmtp2026,
+  title={FlashMTP: Parallel Block Drafting with Low-Rank Markov Heads
+         for Fast and Correct Stochastic Speculative Decoding},
+  author={...},
+  year={2026}
+}
+```

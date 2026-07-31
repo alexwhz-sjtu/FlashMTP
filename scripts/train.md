@@ -61,9 +61,9 @@ bash scripts/run_training_flashmtp.sh --dt h100
 # ["linear_fuse", "attention_fuse", "prefix_condition"]
 cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2
 source .venv/bin/activate
-NUM_MIDDLE_LAYERS_N=16 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=6 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=80000 MAX_LENGTH=4096 NUM_ANCHORS=512 BLOCK_SIZE=16 LOCAL_POSITION=true \
-LOSS_DECAY_GAMMA=7 BASE_LM_CE_DECAY_GAMMA=21 BASE_LM_CE_WEIGHT=0.0 FINAL_CE_WEIGHT=0.1 TV_LOSS_WEIGHT=1.0 \
-MARKOV_HEAD_TYPE=rnn MARKOV_OUTPUT_MODE=direct MARKOV_RANK=512 \
+NUM_MIDDLE_LAYERS_N=16 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=6 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=pb_80k MAX_LENGTH=4096 NUM_ANCHORS=512 BLOCK_SIZE=16 LOCAL_POSITION=true \
+LOSS_DECAY_GAMMA=7 BASE_LM_CE_DECAY_GAMMA=21 BASE_LM_CE_WEIGHT=0.2 FINAL_CE_WEIGHT=1.0 TV_LOSS_WEIGHT=0.0 \
+MARKOV_HEAD_TYPE=rnn_easy MARKOV_OUTPUT_MODE=direct MARKOV_RANK=512 \
 NPROC_PER_NODE=8 TP_SIZE=1 SHARD_DRAFT_BY_TP=1 CE_CHUNK_SIZE=8192 \
 TRAIN_DATA_PATH="/share/dai-sys/wanghanzhen/projects/MTP/training_data/open_perfectblend_80k_qwen3_8b.jsonl" \
 TARGET_MODEL_BACKEND=sglang SGLANG_MEM_FRACTION_STATIC=0.25 \
@@ -165,6 +165,70 @@ cat ${NEW_DATA} ${MIX_DIR}/old_replay_50k.jsonl | shuf > ${MIX_DIR}/math_code_1w
 
 ## 继续训练（从 checkpoint 恢复）
 
+训练脚本通过 `CKPT_DIR` 加载 checkpoint 目录中的 `model.safetensors` + `config.json`，
+若存在 `training_state.pt` 则同时恢复 epoch / global_step / optimizer / scheduler。
+
+**checkpoint 目录结构**（两种均支持）：
+
+- 扁平目录：`config.json`、`model.safetensors`、`training_state.pt`（直接作为 `CKPT_DIR`）
+- 子目录：`epoch_{e}_step_{s}/` 下含上述文件（`CKPT_DIR` 指向该子目录，或 `RESUME=1` 从 `OUTPUT_DIR` 自动找最新）
+
+**继续训练关键参数：**
+
+
+| 参数                                        | 说明                                  |
+| ----------------------------------------- | ----------------------------------- |
+| `CKPT_DIR`                                | 待恢复的 checkpoint 目录                  |
+| `TARGET_MODEL`                            | 目标模型路径                              |
+| `OUTPUT_DIR`                              | 新 run 输出目录（勿与 `CKPT_DIR` 相同，除非有意覆盖） |
+| `TRAIN_DATA_PATH`                         | 训练数据 jsonl                          |
+| `CACHE_DIR`                               | 预处理缓存目录                             |
+| `CUDA_VISIBLE_DEVICES` / `NPROC_PER_NODE` | GPU 与进程数                            |
+| `WANDB_RUN_ID` / `WANDB_RUN_NAME`         | WandB 实验标识                          |
+
+
+**注意：**
+
+- `MARKOV_HEAD_TYPE` / `MARKOV_OUTPUT_MODE` / `MARKOV_RANK` 必须与 checkpoint 一致（脚本会校验）。
+- `LOSS_DECAY_GAMMA`、`BASE_LM_CE_*`、`FINAL_CE_WEIGHT`、`TV_LOSS_WEIGHT` 可在 resume 时覆盖，不影响权重加载。
+- `NUM_EPOCHS` 为**总 epoch 数**（非额外 epoch）。从 epoch 5 恢复且 `NUM_EPOCHS=6` 时，仅再跑 1 个 epoch。
+- 若 `NUM_EPOCHS` 大于原 run，scheduler 的 `T_max` 仍来自 checkpoint，LR 衰减不会按新总步数重算；需接受原 schedule 尾部或放弃加载 scheduler（手动改学习率）。
+- 恢复时**不要**同时设 `RESUME=1` 与 `CKPT_DIR`；`RESUME` 仅从 `OUTPUT_DIR` 找最新 checkpoint。
+- 现有 v2 checkpoint 的 `training_state.pt` 在**训练保存时**就只含约 15/65 个参数的 Adam 动量（FSDP + 外部 `BF16Optimizer` 未做跨 rank gather）；扁平目录与 `epoch_*_step_`* 子目录内容一致，并非导出截断。脚本会**尽量部分恢复**兼容的 optimizer state，其余参数动量重新初始化。权重与 scheduler（LR/epoch/step）仍可正确恢复。
+- 若不想混用「部分旧动量 + 新初始化动量」，可加 `RESUME_OPTIMIZER=0`（或 `--no-resume-optimizer`），仅恢复 scheduler，Adam 全部重初始化。
+- 若原训练 `OUTPUT_DIR` 仍保留 `epoch_*_step_*` 子目录，resume 会优先使用该子目录下的 `training_state.pt`（动量完整度与扁平目录相同）。
+
+
+
+### FlashMTP_v2 示例：从 step 50000 继续（rnn_easy / direct / TV=0）
+
+checkpoint：`cache/models/flashmtp_v2_mhrnn_easy_direct_r512_wb_0.2_bgemma_21_qwen3_8b`
+（epoch=5, global_step=50000, 原 `NUM_EPOCHS=6`，约剩 1 epoch / ~10000 step）
+
+```bash
+cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2
+source .venv/bin/activate
+
+CKPT_DIR=/share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2/cache/models/flashmtp_v2_mhrnn_easy_direct_r512_wb_0.2_bgemma_21_qwen3_8b \
+OUTPUT_DIR=./cache/models/flashmtp_v2_mhrnn_easy_direct_r512_wb_0.2_bgemma_21_qwen3_8b_continue \
+NUM_MIDDLE_LAYERS_N=16 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=6 PIVOT_FUSE_MODE=prefix_condition \
+DATA_NUM_SAMPLES=80000 MAX_LENGTH=4096 NUM_ANCHORS=512 BLOCK_SIZE=16 LOCAL_POSITION=true \
+LOSS_DECAY_GAMMA=7 BASE_LM_CE_DECAY_GAMMA=21 BASE_LM_CE_WEIGHT=0.2 FINAL_CE_WEIGHT=1.0 TV_LOSS_WEIGHT=0.0 \
+MARKOV_HEAD_TYPE=rnn_easy MARKOV_OUTPUT_MODE=direct MARKOV_RANK=512 \
+NPROC_PER_NODE=8 TP_SIZE=1 SHARD_DRAFT_BY_TP=1 CE_CHUNK_SIZE=8192 \
+TRAIN_DATA_PATH="/share/dai-sys/wanghanzhen/projects/MTP/training_data/open_perfectblend_80k_qwen3_8b.jsonl" \
+TARGET_MODEL_BACKEND=sglang SGLANG_MEM_FRACTION_STATIC=0.25 \
+TARGET_MODEL=/share/dai-sys/wanghanzhen/models/Qwen/Qwen3-8B \
+MODEL_TAG='Qwen3-8B' \
+WANDB_RUN_ID=flashmtp_v2_mhrnn_easy_continue_ep6 \
+WANDB_RUN_NAME=flashmtp_v2_mhrnn_easy_continue_ep6 \
+bash scripts/run_training_flashmtp.sh --dt h100
+```
+
+
+
+### v1.1 示例（math_code 继续训练）
+
 从已有 checkpoint 继续训练 math_code 数据：
 
 ```bash
@@ -196,20 +260,6 @@ WANDB_RUN_ID=flashmtp_continue_math_code_1w_ep6 \
 WANDB_RUN_NAME=flashmtp_continue_math_code_1w_ep6 \
 bash scripts/run_training_flashmtp.sh --dt h100
 ```
-
-**继续训练关键参数：**
-
-
-| 参数                                        | 说明                 |
-| ----------------------------------------- | ------------------ |
-| `CKPT_DIR`                                | 待恢复的 checkpoint 目录 |
-| `TARGET_MODEL_PATH`                       | 目标模型路径             |
-| `OUTPUT_DIR`                              | 新 run 输出目录         |
-| `TRAIN_DATA_PATH`                         | 训练数据 jsonl         |
-| `CACHE_DIR`                               | 预处理缓存目录            |
-| `CUDA_VISIBLE_DEVICES` / `NPROC_PER_NODE` | GPU 与进程数           |
-| `WANDB_RUN_ID` / `WANDB_RUN_NAME`         | WandB 实验标识         |
-
 
 ---
 

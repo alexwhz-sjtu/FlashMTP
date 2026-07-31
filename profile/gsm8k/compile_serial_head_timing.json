@@ -1,0 +1,118 @@
+{
+  "config": {
+    "target_model": "/share/dai-sys/wanghanzhen/models/Qwen/Qwen3-8B",
+    "draft_ckpt": "/share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2/cache/models/flashmtp_v2_mhrnn_direct_r512_ce0.1_tv1.0_wb_0.0_bgemma_21_qwen3_8b",
+    "dataset": "gsm8k",
+    "max_samples": 3,
+    "max_new_tokens": 256,
+    "verify_block": 16,
+    "block_size": 16,
+    "markov_output_mode": "direct",
+    "markov_rank": 512,
+    "warmup_steps": 30,
+    "timed_steps": 100
+  },
+  "step_breakdown": [
+    {
+      "compile_serial_head": false,
+      "draft_backbone_ms": 3.580809917449951,
+      "target_lm_head_ms": 0.0,
+      "serial_head_ms": 3.2963878321647644,
+      "target_verify_ms": 29.34901315689087,
+      "draft_total_ms": 6.877197749614716,
+      "step_total_ms": 36.226210906505585,
+      "serial_head_fraction": 0.09099455200192609,
+      "verify_fraction": 0.8101596170970314
+    },
+    {
+      "compile_serial_head": true,
+      "draft_backbone_ms": 3.626808304786682,
+      "target_lm_head_ms": 0.0,
+      "serial_head_ms": 1.7819763219356537,
+      "target_verify_ms": 29.33377634048462,
+      "draft_total_ms": 5.408784626722336,
+      "step_total_ms": 34.742560967206956,
+      "serial_head_fraction": 0.05129087414188141,
+      "verify_fraction": 0.8443181942797016
+    }
+  ],
+  "step_analysis": {
+    "serial_head_speedup": 1.849849401244623,
+    "step_speedup_measured": 1.0427041040727834,
+    "step_speedup_theoretical": 1.0436281476779783,
+    "serial_head_fraction_off": 0.09099455200192609,
+    "verify_fraction_off": 0.8101596170970314,
+    "backbone_fraction_off": 0.09884583090104246
+  },
+  "e2e_results": [
+    {
+      "compile_serial_head": false,
+      "sample_index": 0,
+      "input_len": 60,
+      "output_tokens": 256,
+      "decode_steps": 96,
+      "avg_accept_length": 2.6666666666666665,
+      "decode_wall_s": 3.5220854949438944,
+      "s_per_output_token": 0.013758146464624588
+    },
+    {
+      "compile_serial_head": true,
+      "sample_index": 0,
+      "input_len": 60,
+      "output_tokens": 256,
+      "decode_steps": 96,
+      "avg_accept_length": 2.6666666666666665,
+      "decode_wall_s": 3.3479235260165296,
+      "s_per_output_token": 0.013077826273502069
+    },
+    {
+      "compile_serial_head": false,
+      "sample_index": 1,
+      "input_len": 74,
+      "output_tokens": 256,
+      "decode_steps": 101,
+      "avg_accept_length": 2.5643564356435644,
+      "decode_wall_s": 3.7624752139672637,
+      "s_per_output_token": 0.014697168804559624
+    },
+    {
+      "compile_serial_head": true,
+      "sample_index": 1,
+      "input_len": 74,
+      "output_tokens": 256,
+      "decode_steps": 101,
+      "avg_accept_length": 2.5643564356435644,
+      "decode_wall_s": 3.5003966889926232,
+      "s_per_output_token": 0.013673424566377435
+    },
+    {
+      "compile_serial_head": false,
+      "sample_index": 2,
+      "input_len": 92,
+      "output_tokens": 256,
+      "decode_steps": 103,
+      "avg_accept_length": 2.495145631067961,
+      "decode_wall_s": 3.84066718298709,
+      "s_per_output_token": 0.015002606183543321
+    },
+    {
+      "compile_serial_head": true,
+      "sample_index": 2,
+      "input_len": 92,
+      "output_tokens": 256,
+      "decode_steps": 103,
+      "avg_accept_length": 2.495145631067961,
+      "decode_wall_s": 3.556909271981567,
+      "s_per_output_token": 0.013894176843677997
+    }
+  ],
+  "e2e_analysis": {
+    "mean_e2e_speedup": 1.068889507950541,
+    "per_sample_speedup": {
+      "0": 1.0520208922258714,
+      "1": 1.0748710926960863,
+      "2": 1.0797765389296647
+    },
+    "accept_length_match": true
+  }
+}
