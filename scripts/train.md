@@ -27,7 +27,7 @@
 
 | 环境变量                 | 可选值                                                       | 默认值        |
 | -------------------- | --------------------------------------------------------- | ---------- |
-| `MARKOV_HEAD_TYPE`   | `none` / `vanilla` / `gated` / `rnn` / `rnn_easy` / `mlp` | `none`     |
+| `MARKOV_HEAD_TYPE`   | `none` / `vanilla` / `rnn` / `rnn_easy` | `none`     |
 | `MARKOV_OUTPUT_MODE` | `additive` / `direct`                                     | `additive` |
 | `MARKOV_RANK`        | 正整数                                                       | `256`      |
 | `FINAL_CE_WEIGHT`    | 最终 CE loss 权重                                             | `1.0`      |
@@ -62,7 +62,7 @@ bash scripts/run_training_flashmtp.sh --dt h100
 cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2
 source .venv/bin/activate
 NUM_MIDDLE_LAYERS_N=16 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=6 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=pb_80k MAX_LENGTH=4096 NUM_ANCHORS=512 BLOCK_SIZE=16 LOCAL_POSITION=true \
-LOSS_DECAY_GAMMA=7 BASE_LM_CE_DECAY_GAMMA=21 BASE_LM_CE_WEIGHT=0.2 FINAL_CE_WEIGHT=1.0 TV_LOSS_WEIGHT=0.0 \
+LOSS_DECAY_GAMMA=7 BASE_LM_CE_DECAY_GAMMA=28 BASE_LM_CE_WEIGHT=0.06 FINAL_CE_WEIGHT=0.1 TV_LOSS_WEIGHT=1.0 \
 MARKOV_HEAD_TYPE=rnn_easy MARKOV_OUTPUT_MODE=direct MARKOV_RANK=512 \
 NPROC_PER_NODE=8 TP_SIZE=1 SHARD_DRAFT_BY_TP=1 CE_CHUNK_SIZE=8192 \
 TRAIN_DATA_PATH="/share/dai-sys/wanghanzhen/projects/MTP/training_data/open_perfectblend_80k_qwen3_8b.jsonl" \

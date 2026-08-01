@@ -129,7 +129,7 @@ def parse_args():
         "--markov-head-type",
         type=str,
         default="none",
-        choices=["none", "vanilla", "gated", "rnn", "rnn_easy", "mlp"],
+        choices=["none", "vanilla", "rnn", "rnn_easy"],
         help="Optional serial head applied after the parallel FlashMTP backbone.",
     )
     model_group.add_argument(
@@ -280,7 +280,7 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     if args.markov_head_type == "none" and args.markov_output_mode == "direct":
         raise ValueError(
             f"--markov-output-mode {args.markov_output_mode} requires "
-            "--markov-head-type vanilla, gated, rnn, rnn_easy, or mlp."
+            "--markov-head-type vanilla, rnn, or rnn_easy."
         )
 
     print_on_rank0(

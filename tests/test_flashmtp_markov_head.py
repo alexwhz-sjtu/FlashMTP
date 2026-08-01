@@ -128,28 +128,21 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertIsNotNone(head.prev_token_embedding.weight.grad)
         self.assertIsNotNone(head.output_proj.weight.grad)
         if head_type != "vanilla":
-            if head_type in ("gated", "mlp") or (
-                head_type in ("rnn", "rnn_easy") and output_mode == "direct"
-            ):
+            if head_type in ("rnn", "rnn_easy") and output_mode == "direct":
                 self.assertIsNotNone(hidden.grad)
             else:
                 self.assertIsNone(hidden.grad)
-        if head_type in ("gated", "mlp") or (
-            head_type in ("rnn", "rnn_easy") and output_mode == "direct"
-        ):
+        if head_type in ("rnn", "rnn_easy") and output_mode == "direct":
             self.assertIsNotNone(head.hidden_proj)
-            if output_mode == "direct" or head_type == "mlp":
-                self.assertIsNotNone(head.hidden_proj.weight.grad)
-            else:
-                self.assertIsNone(head.hidden_proj.weight.grad)
+            self.assertIsNotNone(head.hidden_proj.weight.grad)
 
-    def test_direct_hidden_latent_changes_gated_and_rnn_outputs(self) -> None:
+    def test_direct_hidden_latent_changes_rnn_outputs(self) -> None:
         torch.manual_seed(11)
         hidden_size, vocab_size, rank = 12, 23, 5
         hidden = torch.randn(1, 3, hidden_size)
         prev_token_ids = torch.tensor([[1, 2, 3]])
 
-        for head_type in ("gated", "rnn"):
+        for head_type in ("rnn",):
             with self.subTest(head_type=head_type):
                 head = FlashMTPMarkovHead(
                     head_type=head_type,
@@ -170,7 +163,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
                 self.assertFalse(torch.allclose(direct_latent, additive_latent))
 
     def test_all_head_and_output_modes(self) -> None:
-        for head_type in ("vanilla", "gated", "rnn", "rnn_easy", "mlp"):
+        for head_type in ("vanilla", "rnn", "rnn_easy"):
             for output_mode in ("additive", "direct"):
                 with self.subTest(head_type=head_type, output_mode=output_mode):
                     self._assert_teacher_forcing_matches_serial(head_type, output_mode)
@@ -241,39 +234,6 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertIsNotNone(latent_grads)
         self.assertFalse(torch.allclose(latent_grads, torch.zeros_like(hidden)))
 
-    def test_mlp_state_tracks_tokens_without_hidden(self) -> None:
-        torch.manual_seed(5)
-        hidden_size, vocab_size, rank = 12, 23, 5
-        head = FlashMTPMarkovHead(
-            head_type="mlp",
-            vocab_size=vocab_size,
-            markov_rank=rank,
-            hidden_size=hidden_size,
-            markov_output_mode="direct",
-        )
-        state = torch.zeros(2, rank, requires_grad=False)
-        prev_token_ids = torch.tensor([4, 5])
-        hidden = torch.randn(2, hidden_size, requires_grad=True)
-
-        latent, new_state = head._compute_step_latent(
-            prev_token_ids=prev_token_ids,
-            hidden_states=hidden,
-            state=state,
-            output_mode="direct",
-        )
-        state_grads = torch.autograd.grad(
-            new_state.sum(),
-            hidden,
-            retain_graph=True,
-            allow_unused=True,
-        )[0]
-        self.assertTrue(
-            state_grads is None
-            or torch.allclose(state_grads, torch.zeros_like(hidden))
-        )
-        latent_grads = torch.autograd.grad(latent.sum(), hidden)[0]
-        self.assertFalse(torch.allclose(latent_grads, torch.zeros_like(hidden)))
-
     def test_rnn_h_output_mode_is_removed(self) -> None:
         with self.assertRaises(ValueError):
             FlashMTPMarkovHead(
@@ -284,7 +244,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
                 markov_output_mode="rnn_h",
             )
 
-    def test_mlp_model_sampling_skips_base_lm_head_in_direct_mode(self) -> None:
+    def test_rnn_easy_model_sampling_skips_base_lm_head_in_direct_mode(self) -> None:
         class FailingLMHead(nn.Module):
             def forward(self, hidden_states):
                 raise AssertionError("direct mode must not call the base LM head")
@@ -303,7 +263,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         config.flashmtp_config = {
             "target_layer_ids": [0, 3],
             "pivot_fuse_mode": "linear_fuse",
-            "markov_head_type": "mlp",
+            "markov_head_type": "rnn_easy",
             "markov_output_mode": "direct",
             "markov_rank": 5,
         }
@@ -370,19 +330,19 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         config.flashmtp_config = {
             "target_layer_ids": [0, 3],
             "pivot_fuse_mode": "linear_fuse",
-            "markov_head_type": "mlp",
+            "markov_head_type": "rnn_easy",
             "markov_output_mode": "direct",
             "markov_rank": 7,
         }
         model = FlashMTPDraftModel(config)
-        self.assertEqual(model.markov_head_type, "mlp")
+        self.assertEqual(model.markov_head_type, "rnn_easy")
         self.assertEqual(model.markov_output_mode, "direct")
         self.assertEqual(model.markov_rank, 7)
 
         with tempfile.TemporaryDirectory() as checkpoint_dir:
             model.save_pretrained(checkpoint_dir)
             loaded = FlashMTPDraftModel.from_pretrained(checkpoint_dir)
-        self.assertEqual(loaded.markov_head_type, "mlp")
+        self.assertEqual(loaded.markov_head_type, "rnn_easy")
         self.assertEqual(loaded.markov_output_mode, "direct")
         self.assertEqual(loaded.markov_rank, 7)
         self.assertIsNotNone(loaded.markov_head)
@@ -406,7 +366,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         config.flashmtp_config = {
             "target_layer_ids": [0, 3],
             "pivot_fuse_mode": "linear_fuse",
-            "markov_head_type": "gated",
+            "markov_head_type": "rnn",
             "markov_output_mode": "direct",
             "markov_rank": 5,
         }
@@ -481,7 +441,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         config.flashmtp_config = {
             "target_layer_ids": [0, 3],
             "pivot_fuse_mode": "linear_fuse",
-            "markov_head_type": "mlp",
+            "markov_head_type": "rnn_easy",
             "markov_output_mode": "direct",
             "markov_rank": 6,
         }
@@ -566,7 +526,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertIsNotNone(target_prediction_hidden.grad)
         self.assertIsNotNone(draft_model.markov_head.output_proj.weight.grad)
         self.assertIsNotNone(draft_model.markov_head.hidden_proj.weight.grad)
-        self.assertIsNotNone(draft_model.markov_head.mlp_state_proj.weight.grad)
+        self.assertIsNotNone(draft_model.markov_head.state_proj.weight.grad)
 
     def test_base_lm_ce_auxiliary_loss(self) -> None:
         config = Qwen3Config(

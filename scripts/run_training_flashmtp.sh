@@ -55,8 +55,12 @@ ENABLE_THINKING="${ENABLE_THINKING:-off}"
 # 草稿层数：默认目录名/ WandB id/ run name 中均带 nlayers${NUM_DRAFT_LAYERS}
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 
-# 低秩串行 head：none | vanilla | gated | rnn | rnn_easy | mlp
+# 低秩串行 head：none | vanilla | rnn | rnn_easy
 MARKOV_HEAD_TYPE="${MARKOV_HEAD_TYPE:-none}"
+if [[ "$MARKOV_HEAD_TYPE" == "mlp" || "$MARKOV_HEAD_TYPE" == "gated" ]]; then
+    echo "错误: MARKOV_HEAD_TYPE=${MARKOV_HEAD_TYPE} 已不再支持，请使用 none | vanilla | rnn | rnn_easy"
+    exit 1
+fi
 # additive: 修正并行 base logits；direct: head 直接产生最终 logits
 MARKOV_OUTPUT_MODE="${MARKOV_OUTPUT_MODE:-additive}"
 MARKOV_RANK="${MARKOV_RANK:-256}"
@@ -89,7 +93,7 @@ if [ "$DT" = "qz" ]; then
     # export NODE_RANK=${RANK:-0}
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 elif [ "$DT" = "h100" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/share/dai-sys/wanghanzhen/projects/MTP/training_data/nemotron_think_off_samples_40000_qwen3_8b_regen.jsonl}"

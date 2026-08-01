@@ -134,74 +134,7 @@ Vanilla 没有额外的 hidden/state 中间层。Teacher forcing 时所有前驱
 需要注意：在 `direct` 模式下，Vanilla 最终分布只依赖前一个 token，
 等价于一个低秩 bigram head，不再使用当前位置的 backbone hidden state。
 
-### 3. Gated head
-
-Gated head 同时读取前一个 token embedding 和当前位置 backbone hidden：
-
-$$
-e_{k-1}=E[x_{k-1}]\in\mathbb{R}^{R},
-\qquad h_k\in\mathbb{R}^{D}.
-$$
-
-首先拼接为：
-
-$$
-z_k=[h_k;e_{k-1}]
-\in\mathbb{R}^{D+R}.
-$$
-
-然后产生 $R$ 维 gate：
-
-$$
-g_k=\sigma(W_g z_k+b_g)
-\in\mathbb{R}^{R},
-$$
-
-$$
-u_k=g_k\odot e_{k-1}
-\in\mathbb{R}^{R}.
-$$
-
-在 `direct` 模式下，hidden 还会通过 $W_h: \mathbb{R}^{D}\to\mathbb{R}^{R}$ 直接进入 latent：
-
-$$
-h'_k=W_h h_k\in\mathbb{R}^{R},
-\qquad
-u_k=g_k\odot e_{k-1}+h'_k\in\mathbb{R}^{R}.
-$$
-
-$$
-\ell^{\mathrm{head}}_k
-=W_{\mathrm{out}}u_k
-\in\mathbb{R}^{V}.
-$$
-
-维度变化为：
-
-```text
-previous token IDs       [B, A, K]
-    ↓ Embedding(V, R)
-token features           [B, A, K, R]
-
-backbone hidden          [B, A, K, D]
-    ├─ concat with token features
-    │     ↓
-    │  gate input          [B, A, K, D + R]
-    │     ↓ Linear(D + R, R) + sigmoid
-    │  gate                [B, A, K, R]
-    │
-    └─ Linear(D, R)        # 仅 direct 模式
-       hidden latent       [B, A, K, R]
-
-gate * token features + hidden latent
-head latent              [B, A, K, R]
-    ↓ Linear(R, V)
-head logits              [B, A, K, V]
-```
-
-Gated head 没有跨位置 recurrent state。Teacher forcing 时所有位置也可以并行。
-
-### 4. RNN head
+### 3. RNN head
 
 RNN head 维护一个仅由**前序 token 链**驱动的跨位置 $R$ 维状态：
 
@@ -281,7 +214,7 @@ $s_k$ 依赖 $s_{k-1}$，必须沿 block 的 $K$ 个位置串行展开。
 不同 batch、不同 anchor/block 之间的 state 相互独立，并在每个 block
 开始时清零。
 
-### 5. 两种 logits 输出模式
+### 4. 两种 logits 输出模式
 
 并行 backbone hidden 经过共享 target LM head 或可训练 draft LM head，
 得到基础 logits：
@@ -313,7 +246,7 @@ final logits [B, A, K, V]
 
 #### `direct`
 
-跳过 base LM head，串行 head 直接产生最终 logits。对 `gated` / `rnn`，hidden 会通过
+跳过 base LM head，串行 head 直接产生最终 logits。对 `rnn` / `rnn_easy`，hidden 会通过
 $W_h: \mathbb{R}^{D}\to\mathbb{R}^{R}$ 残差注入 latent，使 head 能直接利用 backbone 上下文：
 
 $$
@@ -322,7 +255,7 @@ $$
 
 ```text
 serial latent            [B, A, K, R]
-hidden latent            [B, A, K, R]   # gated / rnn only
+hidden latent            [B, A, K, R]   # rnn / rnn_easy in direct mode
     ↓ add
 head latent              [B, A, K, R]
     ↓ Linear(R, V)
@@ -336,7 +269,7 @@ $[B,A,K,V]$ 张量。模型先保存较小的
 $[B,A,K,R]$ head latent，再按 `ce_chunk_size` 分块投影到词表并计算 CE，
 从而控制 full-vocabulary logits 的峰值显存。
 
-### 6. 参数规模
+### 5. 参数规模
 
 所有 head 都包含 token embedding 和输出投影，共约：
 
@@ -349,9 +282,8 @@ $$
 | Head | 额外参数量 |
 | --- | ---: |
 | Vanilla | $0$ |
-| Gated | $R(D+R)+R+DR+2R^2+R$ |
 | RNN | $7R^2+3R+DR+2R^2+R$ |
-| MLP | $2DR+3R^2+7R$ |
+| RNN easy | $7R^2+3R+DR+2R^2$ |
 
 例如 Qwen3-8B 使用 $D=4096$、$V=151936$、$R=256$ 时：
 
@@ -359,16 +291,15 @@ $$
 | --- | ---: |
 | Token embedding $V\times R$ | 38,895,616 |
 | Output projection $R\rightarrow V$ | 38,895,616 |
-| Gated 额外部分 | 2,294,272 |
 | RNN 额外部分 | 1,508,096 |
-| MLP 额外部分 | 2,295,552 |
+| RNN easy 额外部分 | 1,507,840 |
 
-### 7. 训练接口
+### 6. 训练接口
 
 Python 训练入口支持：
 
 ```bash
---markov-head-type none|vanilla|gated|rnn|mlp
+--markov-head-type none|vanilla|rnn|rnn_easy
 --markov-output-mode additive|direct
 --markov-rank 256
 ```
