@@ -91,11 +91,13 @@ def prepare_target_prediction_hidden(
     anchor_positions: torch.Tensor,
     block_size: int,
     num_transformer_layers: int,
+    left_shift: bool = False,
 ) -> torch.Tensor:
-    """Gather target-model states whose LM logits supervise draft slots 1..B-1.
+    """Gather causal target states aligned with the supervised draft logits.
 
-    The draft label at slot ``k`` is token ``anchor + k``.  A causal target
-    model predicts that token from its hidden state at ``anchor + k - 1``.
+    Legacy mode supervises slots 1..B-1; left-shift mode supervises slots
+    0..B-2 for ``block_size`` total span B (anchor plus ``B-1`` drafts). In both
+    cases the causal predecessor states start at ``anchor``.
     """
     if block_size <= 1:
         raise ValueError(f"block_size must be greater than 1, got {block_size}")
@@ -114,9 +116,10 @@ def prepare_target_prediction_hidden(
         )
         last_hidden = hidden_states[last_layer_id + off]
 
-    offsets = torch.arange(
-        block_size - 1, device=anchor_positions.device
-    ).view(1, 1, -1)
+    prediction_length = block_size - 1
+    offsets = torch.arange(prediction_length, device=anchor_positions.device).view(
+        1, 1, -1
+    )
     target_positions = anchor_positions.unsqueeze(-1) + offsets
     safe_positions = target_positions.clamp(max=last_hidden.size(1) - 1)
     expanded_hidden = last_hidden.unsqueeze(1).expand(
@@ -239,6 +242,7 @@ class OnlineFlashMTPModel(nn.Module):
         add_noise: bool = False,
         target_hidden_noise_ratio: float = 0.1,
         ce_chunk_size: int = 2048,
+        left_shift: Optional[bool] = None,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -256,6 +260,20 @@ class OnlineFlashMTPModel(nn.Module):
         self.add_noise = add_noise
         self.target_hidden_noise_ratio = target_hidden_noise_ratio
         self.ce_chunk_size = max(int(ce_chunk_size), 1)
+        configured_left_shift = bool(getattr(draft_model, "left_shift", False))
+        self.left_shift = (
+            configured_left_shift if left_shift is None else bool(left_shift)
+        )
+        if self.left_shift != configured_left_shift:
+            raise ValueError(
+                "OnlineFlashMTPModel left_shift must match the draft checkpoint/config: "
+                f"wrapper={self.left_shift}, draft={configured_left_shift}."
+            )
+        if self.left_shift and self.block_size <= 1:
+            raise ValueError(
+                "left_shift requires block_size >= 2 (anchor plus at least one "
+                "draft prediction)."
+            )
         self.chs_concat_mode = "feature"
         self.draft_model.chs_concat_mode = "feature"
 
@@ -263,15 +281,23 @@ class OnlineFlashMTPModel(nn.Module):
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
 
+    def _draft_block_len(self) -> int:
+        """Parallel draft slots per anchor; left_shift uses block_size-1 slots."""
+        if self.left_shift:
+            return self.block_size - 1
+        return self.block_size
+
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Randomly sample anchor positions per sample; returns (anchors, keep_mask)."""
-        bs = self.block_size
         bsz = loss_mask.shape[0]
-        max_anchor = max(seq_len - bs, 0)
+        max_label_offset = self.block_size - 1
+        max_anchor = max(seq_len - max_label_offset - 1, 0)
 
         valid = loss_mask[:, : max_anchor + 1] > 0.5
+        if self.left_shift:
+            valid = valid & (loss_mask[:, 1 : max_anchor + 2] > 0.5)
         valid_counts = valid.sum(dim=1)
         max_n = min(self.num_anchors, int(valid_counts.max().item()) - 1)
 
@@ -323,32 +349,32 @@ class OnlineFlashMTPModel(nn.Module):
     def _create_draft_position_ids(
         self, anchor_positions: torch.Tensor
     ) -> torch.Tensor:
-        """Draft token position ids: global (anchor + offset) or block-local 1..block_size."""
+        """Draft token position ids: global (anchor + offset) or block-local 1..draft_len."""
         bsz, n_blocks = anchor_positions.shape
         device = anchor_positions.device
-        bs = self.block_size
+        draft_len = self._draft_block_len()
         if getattr(self.draft_model, "local_position", False):
             local = (
-                torch.arange(1, bs + 1, device=device)
+                torch.arange(1, draft_len + 1, device=device)
                 .view(1, 1, -1)
                 .expand(bsz, n_blocks, -1)
             )
             return local.reshape(bsz, -1)
-        offsets = torch.arange(bs, device=device).view(1, 1, -1)
+        offsets = torch.arange(draft_len, device=device).view(1, 1, -1)
         pos_ids = anchor_positions.unsqueeze(-1) + offsets
         return pos_ids.view(bsz, -1)
 
     def _create_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
         bsz, seq_len = input_ids.shape
         n = anchor_positions.shape[1]
-        bs = self.block_size
+        draft_len = self._draft_block_len()
         device = input_ids.device
 
         noise_ids = torch.full(
-            (bsz, n * bs), self.mask_token_id, dtype=torch.long, device=device
+            (bsz, n * draft_len), self.mask_token_id, dtype=torch.long, device=device
         )
 
-        block_starts = torch.arange(n, device=device) * bs
+        block_starts = torch.arange(n, device=device) * draft_len
         block_starts = block_starts.unsqueeze(0).expand(bsz, -1)
 
         valid_anchor_positions = anchor_positions.clamp(0, seq_len - 1)
@@ -396,6 +422,7 @@ class OnlineFlashMTPModel(nn.Module):
                 anchor_positions,
                 self.block_size,
                 self.draft_model.config.num_target_layers,
+                left_shift=self.left_shift,
             )
         return (
             anchor_positions,
@@ -672,6 +699,7 @@ class OnlineFlashMTPModel(nn.Module):
                     anchor_positions,
                     self.block_size,
                     self.draft_model.config.num_target_layers,
+                    left_shift=self.left_shift,
                 )
         elif anchor_positions is None or block_keep_mask is None:
             raise ValueError(
@@ -703,7 +731,7 @@ class OnlineFlashMTPModel(nn.Module):
             anchor_positions=anchor_positions,
             block_keep_mask=block_keep_mask,
             chs_len_per_block=chs,
-            block_size=self.block_size,
+            block_size=self._draft_block_len(),
             device=device,
         )
 
@@ -715,8 +743,16 @@ class OnlineFlashMTPModel(nn.Module):
             rotary_position_ids=full_rotary_position_ids,
         )
 
-        # --- Labels: same-position prediction (position k predicts token anchor+k) ---
-        label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
+        # DeepSpec-style left shift makes slot k predict anchor+k+1.  Legacy mode
+        # keeps the known anchor in slot 0 and predicts same-position tokens.
+        # left_shift: block_size is total span; labels are anchor+1..anchor+(B-1).
+        label_count = self.block_size - 1
+        label_start = 1 if self.left_shift else 0
+        label_offsets = torch.arange(
+            label_start,
+            label_start + (label_count if self.left_shift else self.block_size),
+            device=device,
+        ).view(1, 1, -1)
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
         valid_label_mask = label_indices < seq_len
         safe_label_indices = label_indices.clamp(max=seq_len - 1)
@@ -727,14 +763,16 @@ class OnlineFlashMTPModel(nn.Module):
             safe_label_indices,
         )
 
-        # --- Weight mask: block validity * bounds * exclude anchor (pos 0) * loss_mask ---
+        # --- Weight mask: block validity * bounds * loss_mask ---
+        draft_len = self._draft_block_len()
         weight_mask = (
-            block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
+            block_keep_mask.unsqueeze(-1).expand(-1, -1, draft_len).float()
         )
         weight_mask = weight_mask * valid_label_mask.float()
 
-        pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
-        weight_mask = weight_mask * (pos_in_block > 0).float()
+        if not self.left_shift:
+            pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
+            weight_mask = weight_mask * (pos_in_block > 0).float()
 
         original_loss_mask_gathered = torch.gather(
             loss_mask.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
@@ -743,18 +781,28 @@ class OnlineFlashMTPModel(nn.Module):
         )
         weight_mask = weight_mask * original_loss_mask_gathered
 
-        # Slot 0 is the known anchor.  Predict slots 1..B-1 from the
-        # teacher-forced predecessors in slots 0..B-2.
+        # In left-shift mode every hidden slot is supervised and the predecessor
+        # sequence is [anchor, token(anchor+1), ..., token(anchor+B-1)].
+        # Legacy mode drops hidden slot 0 and retains its old B-1 predictions.
         output_hidden_4d = output_hidden.view(
             bsz,
             anchor_positions.size(1),
-            self.block_size,
+            draft_len,
             output_hidden.size(-1),
         )
-        prediction_hidden = output_hidden_4d[:, :, 1:, :]
-        prev_token_ids = target_ids[:, :, :-1]
-        labels = target_ids[:, :, 1:]
-        prediction_weight_mask = weight_mask[:, :, 1:]
+        if self.left_shift:
+            prediction_hidden = output_hidden_4d
+            anchor_token_ids = torch.gather(input_ids, 1, anchor_positions)
+            prev_token_ids = torch.cat(
+                [anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]], dim=-1
+            )
+            labels = target_ids
+            prediction_weight_mask = weight_mask
+        else:
+            prediction_hidden = output_hidden_4d[:, :, 1:, :]
+            prev_token_ids = target_ids[:, :, :-1]
+            labels = target_ids[:, :, 1:]
+            prediction_weight_mask = weight_mask[:, :, 1:]
         binary_eval_mask = prediction_weight_mask > 0
 
         base_prediction_weight_mask = None
@@ -764,9 +812,8 @@ class OnlineFlashMTPModel(nn.Module):
                 self.base_lm_ce_decay_gamma is not None
                 and self.base_lm_ce_decay_gamma > 0
             ):
-                k_pred = torch.arange(1, self.block_size, device=device).view(
-                    1, 1, -1
-                )
+                prediction_length = self.block_size - 1
+                k_pred = torch.arange(1, prediction_length + 1, device=device).view(1, 1, -1)
                 base_decay_weights = torch.exp(
                     -(k_pred - 1).clamp(min=0).float() / self.base_lm_ce_decay_gamma
                 )
@@ -776,12 +823,10 @@ class OnlineFlashMTPModel(nn.Module):
 
         # --- Loss decay: exp(-(k-1)/γ) so k=1 (1st prediction) gets weight 1.0 ---
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-            k = torch.arange(self.block_size, device=device).view(1, 1, -1)
-            decay_weights = torch.exp(
-                -(k - 1).clamp(min=0).float() / self.loss_decay_gamma
-            )
-            weight_mask = weight_mask * decay_weights
-            prediction_weight_mask = weight_mask[:, :, 1:]
+            prediction_length = self.block_size - 1
+            k = torch.arange(1, prediction_length + 1, device=device).view(1, 1, -1)
+            decay_weights = torch.exp(-(k - 1).float() / self.loss_decay_gamma)
+            prediction_weight_mask = prediction_weight_mask * decay_weights
 
         loss, accuracy, prefix_acc, final_ce_loss, base_ce_loss, tv_loss = (
             self._chunked_weighted_ce_and_metrics(

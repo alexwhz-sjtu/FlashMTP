@@ -55,6 +55,14 @@ def parse_args():
     )
     model_group.add_argument("--draft-config-path", type=str, default=None)
     model_group.add_argument("--block-size", type=int, default=16)
+    model_group.add_argument(
+        "--left-shift",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use left-shift supervision: block_size is total span (anchor + "
+        "block_size-1 drafts). Draft input is 1 anchor + block_size-2 MASKs. "
+        "Without it, block_size is the draft block width; slot 0 is unsupervised.",
+    )
     model_group.add_argument("--num-draft-layers", type=int, default=1)
     model_group.add_argument(
         "--mask-token-id",
@@ -321,6 +329,7 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     draft_config.flashmtp_config["pivot_fuse_mode"] = args.pivot_fuse_mode
     draft_config.flashmtp_config["num_middle_layers_n"] = args.num_middle_layers_n
     draft_config.flashmtp_config["local_position"] = bool(args.local_position)
+    draft_config.flashmtp_config["left_shift"] = bool(args.left_shift)
     draft_config.flashmtp_config["markov_head_type"] = args.markov_head_type
     draft_config.flashmtp_config["markov_output_mode"] = args.markov_output_mode
     draft_config.flashmtp_config["markov_rank"] = int(args.markov_rank)
@@ -349,6 +358,7 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     )
     print_on_rank0(
         f"local_position={getattr(draft_model, 'local_position', False)}, "
+        f"left_shift={getattr(draft_model, 'left_shift', False)}, "
         f"markov_head_type={draft_model.markov_head_type}, "
         f"markov_output_mode={draft_model.markov_output_mode}, "
         f"markov_rank={draft_model.markov_rank}"
@@ -724,6 +734,9 @@ def main():
     draft_model.config.flashmtp_config["local_position"] = bool(
         getattr(draft_model, "local_position", False)
     )
+    draft_model.config.flashmtp_config["left_shift"] = bool(
+        getattr(draft_model, "left_shift", False)
+    )
     draft_model.config.flashmtp_config["markov_head_type"] = (
         draft_model.markov_head_type
     )
@@ -777,6 +790,7 @@ def main():
         add_noise=args.add_noise,
         target_hidden_noise_ratio=args.target_hidden_noise_ratio,
         ce_chunk_size=args.ce_chunk_size,
+        left_shift=args.left_shift,
     )
     print_on_rank0(
         f"target hidden noise: add_noise={args.add_noise}, "
@@ -786,6 +800,7 @@ def main():
         f"tv_loss_weight={args.tv_loss_weight}, "
         f"base_lm_ce_weight={args.base_lm_ce_weight}, "
         f"base_lm_ce_decay_gamma={args.base_lm_ce_decay_gamma}"
+        f", left_shift={args.left_shift}"
     )
 
     online_flashmtp = flashmtp_model

@@ -724,7 +724,7 @@ def main() -> None:
         type=int,
         default=None,
         help="Verify only this many positions from the front of each drafted block "
-        "(using the same anchor-inclusive counting as --block-size). "
+        "(anchor-inclusive; verify window length equals block_size). "
         "The draft model still receives the full --block-size mask block. "
         "Default: verify the full drafted block.",
     )
@@ -797,10 +797,16 @@ def main() -> None:
 
     fcfg = getattr(draft_model.config, "flashmtp_config", None) or {}
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
-    verify_block_size = args.verify_block if args.verify_block is not None else block_size
-    if not 1 <= verify_block_size <= block_size:
+    max_verify_block_size = block_size
+    verify_block_size = (
+        args.verify_block
+        if args.verify_block is not None
+        else max_verify_block_size
+    )
+    if not 1 <= verify_block_size <= max_verify_block_size:
         raise ValueError(
-            f"--verify-block must be in [1, {block_size}], got {verify_block_size}"
+            f"--verify-block must be in [1, {max_verify_block_size}], "
+            f"got {verify_block_size}"
         )
     if args.sink_num is not None and fcfg.get("sink_num") is not None:
         eff_sink = args.sink_num
@@ -829,7 +835,7 @@ def main() -> None:
         verify_block_size,
         args.stochastic_verification_mode,
         args.compile_serial_head,
-        block_size - verify_block_size,
+        max_verify_block_size - verify_block_size,
     )
 
     if args.batch_size < 1:

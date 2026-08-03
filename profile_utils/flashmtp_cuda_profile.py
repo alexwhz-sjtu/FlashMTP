@@ -81,9 +81,10 @@ def profile_flashmtp_generate(
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
     block_size = model.block_size
+    proposal_length = model.proposal_length
 
     output_ids = torch.full(
-        (bsz, max_length + block_size),
+        (bsz, max_length + proposal_length + 1),
         mask_token_id,
         dtype=torch.long,
         device=device,
@@ -129,8 +130,8 @@ def profile_flashmtp_generate(
     target_verify_times_ms: list[float] = []
 
     while start < max_length:
-        block_output_ids = output_ids[:, start : start + block_size].clone()
-        target_block_pos = position_ids[:, start : start + block_size]
+        draft_input_ids = output_ids[:, start : start + block_size].clone()
+        draft_target_pos = position_ids[:, start : start + block_size]
         if model.local_position:
             draft_block_pos = (
                 torch.arange(1, block_size + 1, device=device, dtype=torch.long)
@@ -138,9 +139,9 @@ def profile_flashmtp_generate(
                 .expand(bsz, -1)
             )
         else:
-            draft_block_pos = target_block_pos
+            draft_block_pos = draft_target_pos
 
-        noise_embedding = target.model.embed_tokens(block_output_ids)
+        noise_embedding = target.model.embed_tokens(draft_input_ids)
         chs = model.chs_len_per_block
         if model.local_position:
             ctx_pos_part = torch.zeros(bsz, chs, dtype=torch.long, device=device)
@@ -152,7 +153,7 @@ def profile_flashmtp_generate(
 
         _sync(device)
         ev_df0.record()
-        draft_hidden = model(
+        block_hidden = model(
             target_hidden=target_hidden,
             noise_embedding=noise_embedding,
             position_ids=draft_block_pos,
@@ -160,25 +161,29 @@ def profile_flashmtp_generate(
             past_key_values=None,
             use_cache=False,
             is_causal=False,
-        )[:, -block_size + 1 :, :]
+        )
+        draft_hidden = model._prediction_hidden(block_hidden)
         lm_head = target.lm_head
         sampled_draft_tokens, _ = model.sample_draft_tokens(
             draft_hidden=draft_hidden,
             lm_head=lm_head,
-            first_prev_token_ids=block_output_ids[:, 0],
+            first_prev_token_ids=draft_input_ids[:, 0],
             temperature=temperature,
         )
         ev_df1.record()
         ev_df1.synchronize()
         draft_forward_times_ms.append(_elapsed_ms(ev_df0, ev_df1))
 
-        block_output_ids[:, 1:] = sampled_draft_tokens
+        verify_output_ids = torch.cat(
+            [draft_input_ids[:, :1], sampled_draft_tokens], dim=1
+        )
+        verify_position_ids = position_ids[:, start : start + proposal_length + 1]
 
         _sync(device)
         ev_tv0.record()
         output = target(
-            block_output_ids,
-            position_ids=target_block_pos,
+            verify_output_ids,
+            position_ids=verify_position_ids,
             past_key_values=past_key_values_target,
             use_cache=True,
             output_hidden_states=True,
@@ -189,7 +194,7 @@ def profile_flashmtp_generate(
 
         posterior = sample(output.logits, temperature)
         acceptance_lengths_per_row = (
-            (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)
+            (verify_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)
         )
         if not bool(
             torch.all(acceptance_lengths_per_row == acceptance_lengths_per_row[0])
@@ -198,7 +203,7 @@ def profile_flashmtp_generate(
                 "Per-row acceptance lengths differ under batched decode."
             )
         acceptance_length = int(acceptance_lengths_per_row[0].item())
-        output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
+        output_ids[:, start : start + acceptance_length + 1] = verify_output_ids[
             :, : acceptance_length + 1
         ]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]

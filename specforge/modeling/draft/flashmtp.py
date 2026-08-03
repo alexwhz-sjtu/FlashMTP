@@ -489,6 +489,13 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         flashmtp_config["target_layer_ids"] = self.target_layer_ids
         self.local_position = bool(flashmtp_config.get("local_position", False))
         flashmtp_config["local_position"] = self.local_position
+        self.left_shift = bool(flashmtp_config.get("left_shift", False))
+        flashmtp_config["left_shift"] = self.left_shift
+        if self.left_shift and int(config.block_size) <= 1:
+            raise ValueError(
+                "left_shift requires block_size >= 2 (anchor plus at least one "
+                "draft prediction)."
+            )
         self.markov_head_type = str(
             flashmtp_config.get("markov_head_type", "none")
         ).lower()
@@ -576,6 +583,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             f"num_middle_layers_n={self.num_middle_layers_n}, "
             f"target_layer_ids={self.target_layer_ids}, "
             f"local_position={self.local_position}, "
+            f"left_shift={self.left_shift}, "
             f"markov_head_type={self.markov_head_type}, "
             f"markov_output_mode={self.markov_output_mode}, "
             f"markov_rank={self.markov_rank}"
@@ -593,6 +601,23 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
 
     def get_last_decode_stats(self) -> dict:
         return dict(self._last_decode_stats)
+
+    @property
+    def draft_block_len(self) -> int:
+        """Parallel draft slots per anchor (1 anchor + remaining MASK tokens)."""
+        if self.left_shift:
+            return self.block_size - 1
+        return self.block_size
+
+    @property
+    def proposal_length(self) -> int:
+        """Draft tokens proposed after the anchor; total span is block_size."""
+        return self.block_size - 1
+
+    def _prediction_hidden(self, block_hidden: torch.Tensor) -> torch.Tensor:
+        """Select hidden slots carrying logits under the checkpoint alignment."""
+        draft_len = self.draft_block_len
+        return block_hidden[:, -draft_len:, :]
 
     def _fuse_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """(B, N, S, H) -> (B, N, H) for linear/attention, or (B, N*S, H) for prefix."""
@@ -774,8 +799,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
     ) -> torch.LongTensor:
         """Same decode path as ``spec_generate``, plus optional JSONL-friendly profiling.
 
-        Draft logits are taken from the same slice ``[:, -block_size + 1:, :]`` as
-        ``spec_generate`` (slots ``1 .. block_size-1``). Slot 0 is the per-step anchor.
+        Legacy checkpoints use hidden slots ``1 .. block_size-1``.  With
+        ``left_shift=true``, ``block_size`` is the total span (anchor plus
+        ``block_size-1`` drafts); the draft block has ``block_size-1`` slots.
         """
         self.eval()
         self._last_decode_stats = {
@@ -791,10 +817,11 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             )
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
-        block_size = self.block_size
+        draft_block_len = self.draft_block_len
+        proposal_length = self.proposal_length
 
         output_ids = torch.full(
-            (1, max_length + block_size),
+            (1, max_length + proposal_length + 1),
             self.mask_token_id,
             dtype=torch.long,
             device=target.device,
@@ -849,18 +876,18 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         while start < max_length:
             spec_step_idx = int(self._last_decode_stats["steps"])
             print_fn(f"\n[Spec step {spec_step_idx}] start={start}")
-            block_output_ids = output_ids[:, start : start + block_size].clone()
-            target_block_pos = position_ids[:, start : start + block_size]
+            draft_input_ids = output_ids[:, start : start + draft_block_len].clone()
+            draft_target_pos = position_ids[:, start : start + draft_block_len]
             if self.local_position:
                 draft_block_pos = torch.arange(
-                    1, block_size + 1, device=target.device, dtype=torch.long
+                    1, draft_block_len + 1, device=target.device, dtype=torch.long
                 ).unsqueeze(0)
             else:
-                draft_block_pos = target_block_pos
+                draft_block_pos = draft_target_pos
             block_start_abs = int(start)
             slot0_tid = int(output_ids[0, start].item())
 
-            noise_embedding = target.model.embed_tokens(block_output_ids)
+            noise_embedding = target.model.embed_tokens(draft_input_ids)
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)
             draft_start = time.perf_counter()
@@ -877,7 +904,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                     device=target.device,
                 )
             full_rotary = torch.cat([ctx_pos_part, draft_block_pos], dim=-1)
-            draft_hidden = self(
+            block_hidden = self(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
                 position_ids=draft_block_pos,
@@ -885,12 +912,13 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 past_key_values=None,
                 use_cache=False,
                 is_causal=False,
-            )[:, -block_size + 1 :, :]
+            )
+            draft_hidden = self._prediction_hidden(block_hidden)
             lm_head = target.lm_head
             sampled_draft_tokens, draft_logits = self.sample_draft_tokens(
                 draft_hidden=draft_hidden,
                 lm_head=lm_head,
-                first_prev_token_ids=block_output_ids[:, 0],
+                first_prev_token_ids=draft_input_ids[:, 0],
                 temperature=temperature,
             )
             if target.device.type == "cuda":
@@ -900,7 +928,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             )
 
             draft_topk_by_slot: dict[int, list[dict]] = {}
-            for slot in range(1, block_size):
+            for slot in range(1, proposal_length + 1):
                 topk_entries = self._format_token_topk(
                     draft_logits[0, slot - 1], tokenizer, top_k
                 )
@@ -913,7 +941,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                     f"top{top_k}={topk_entries}"
                 )
 
-            block_output_ids[:, 1:] = sampled_draft_tokens
+            verify_output_ids = torch.cat(
+                [draft_input_ids[:, :1], sampled_draft_tokens], dim=1
+            )
 
             draft_probs_on_logits: Optional[torch.Tensor] = None
             if profile_records is not None:
@@ -942,7 +972,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                         }
                         for c in draft_topk_by_slot[s]
                     ]
-                    sampled_tid = int(block_output_ids[0, s].item())
+                    sampled_tid = int(verify_output_ids[0, s].item())
                     row = {
                         "abs_pos": block_start_abs + int(s),
                         "slot": int(s),
@@ -960,9 +990,12 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)
             target_start = time.perf_counter()
+            verify_position_ids = position_ids[
+                :, start : start + proposal_length + 1
+            ]
             output = target(
-                block_output_ids,
-                position_ids=target_block_pos,
+                verify_output_ids,
+                position_ids=verify_position_ids,
                 past_key_values=past_key_values_target,
                 use_cache=True,
                 output_hidden_states=True,
@@ -975,12 +1008,12 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
 
             posterior = sample(output.logits, temperature)
             acceptance_length = (
-                (block_output_ids[:, 1:] == posterior[:, :-1])
+                (verify_output_ids[:, 1:] == posterior[:, :-1])
                 .cumprod(dim=1)
                 .sum(dim=1)[0]
                 .item()
             )
-            accepted_tokens = block_output_ids[:, : acceptance_length + 1]
+            accepted_tokens = verify_output_ids[:, : acceptance_length + 1]
             print_fn(
                 f"  [Accept] length={acceptance_length + 1} "
                 f"tokens={self._format_token_list(accepted_tokens[0], tokenizer)}"
@@ -1098,17 +1131,20 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
 
-        block_size = self.block_size
+        draft_block_len = self.draft_block_len
+        proposal_length = self.proposal_length
         verify_block_size = (
-            block_size if verify_block_size is None else int(verify_block_size)
+            proposal_length + 1
+            if verify_block_size is None
+            else int(verify_block_size)
         )
-        if not 1 <= verify_block_size <= block_size:
+        if not 1 <= verify_block_size <= proposal_length + 1:
             raise ValueError(
-                f"verify_block_size must be in [1, {block_size}], got "
+                f"verify_block_size must be in [1, {proposal_length + 1}], got "
                 f"{verify_block_size}"
             )
         output_ids = torch.full(
-            (bsz, max_length + block_size),
+            (bsz, max_length + proposal_length + 1),
             self.mask_token_id,
             dtype=torch.long,
             device=target.device,
@@ -1149,19 +1185,19 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         acceptance_lengths = []
         start = input_ids.shape[1]
         while start < max_length:
-            block_output_ids = output_ids[:, start : start + block_size].clone()
-            target_block_pos = position_ids[:, start : start + block_size]
+            draft_input_ids = output_ids[:, start : start + draft_block_len].clone()
+            draft_target_pos = position_ids[:, start : start + draft_block_len]
             if self.local_position:
                 draft_block_pos = (
                     torch.arange(
-                        1, block_size + 1, device=target.device, dtype=torch.long
+                        1, draft_block_len + 1, device=target.device, dtype=torch.long
                     )
                     .unsqueeze(0)
                     .expand(bsz, -1)
                 )
             else:
-                draft_block_pos = target_block_pos
-            noise_embedding = target.model.embed_tokens(block_output_ids)
+                draft_block_pos = draft_target_pos
+            noise_embedding = target.model.embed_tokens(draft_input_ids)
             chs = self.chs_len_per_block
             if self.local_position:
                 ctx_pos_part = torch.zeros(
@@ -1175,7 +1211,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                     device=target.device,
                 )
             full_rotary = torch.cat([ctx_pos_part, draft_block_pos], dim=-1)
-            draft_hidden = self(
+            block_hidden = self(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
                 position_ids=draft_block_pos,
@@ -1183,23 +1219,26 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 past_key_values=None,
                 use_cache=False,
                 is_causal=False,
-            )[:, -block_size + 1 :, :]
+            )
+            draft_hidden = self._prediction_hidden(block_hidden)
             lm_head = target.lm_head
             draft_temperature = temperature if use_rejection_sampling else 0.0
             sampled_draft_tokens, draft_logits = self.sample_draft_tokens(
                 draft_hidden=draft_hidden,
                 lm_head=lm_head,
-                first_prev_token_ids=block_output_ids[:, 0],
+                first_prev_token_ids=draft_input_ids[:, 0],
                 temperature=draft_temperature,
                 compile_serial_head=compile_serial_head,
             )
-            block_output_ids[:, 1:] = sampled_draft_tokens
+            all_verify_output_ids = torch.cat(
+                [draft_input_ids[:, :1], sampled_draft_tokens], dim=1
+            )
 
             # The draft always consumes and predicts the full configured block.  Only
             # the requested prefix is sent to the target; the remaining draft tokens
             # are deliberately discarded before verification.
-            verify_output_ids = block_output_ids[:, :verify_block_size]
-            verify_position_ids = target_block_pos[:, :verify_block_size]
+            verify_output_ids = all_verify_output_ids[:, :verify_block_size]
+            verify_position_ids = position_ids[:, start : start + verify_block_size]
             output = target(
                 verify_output_ids,
                 position_ids=verify_position_ids,
@@ -1227,7 +1266,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                     acceptance_lengths_per_row.min().item()
                 )
                 next_token = posterior[:, acceptance_length]
-            output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
+            output_ids[:, start : start + acceptance_length + 1] = verify_output_ids[
                 :, : acceptance_length + 1
             ]
             output_ids[:, start + acceptance_length + 1] = next_token

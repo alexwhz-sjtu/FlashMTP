@@ -92,7 +92,7 @@ def profile_steps(
     block_size = draft.block_size
     num_input_tokens = input_ids.shape[1]
     position_ids = (
-        torch.arange(num_input_tokens + block_size, device=device)
+        torch.arange(num_input_tokens + block_size + 1, device=device)
         .unsqueeze(0)
         .expand(bsz, -1)
     )
@@ -151,7 +151,7 @@ def profile_steps(
     for step in range(num_warmup + num_timed):
         _sync(device)
         ev[0].record()
-        draft_hidden = draft(
+        block_hidden = draft(
             target_hidden=target_hidden,
             noise_embedding=noise_embedding,
             position_ids=draft_block_pos,
@@ -159,7 +159,8 @@ def profile_steps(
             past_key_values=None,
             use_cache=False,
             is_causal=False,
-        )[:, -block_size + 1 :, :]
+        )
+        draft_hidden = draft._prediction_hidden(block_hidden)
         ev[1].record()
         ev[1].synchronize()
 
@@ -188,15 +189,14 @@ def profile_steps(
         ev[5].record()
         ev[5].synchronize()
 
-        draft_tokens = block_output_ids.clone()
-        if draft.markov_head is not None:
-            draft_tokens[:, 1:] = sampled
+        draft_tokens = torch.cat([block_output_ids[:, :1], sampled], dim=1)
+        verify_position_ids = position_ids[:, start : start + draft_tokens.size(1)]
 
         _sync(device)
         ev[6].record()
         target(
             draft_tokens,
-            position_ids=target_block_pos,
+            position_ids=verify_position_ids,
             past_key_values=past_key_values_target,
             use_cache=True,
             output_hidden_states=True,

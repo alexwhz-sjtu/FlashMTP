@@ -80,6 +80,34 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         )
         self.assertTrue(torch.equal(gathered, expected))
 
+        left_shifted = prepare_target_prediction_hidden(
+            hidden_states=hidden_states,
+            anchor_positions=anchors,
+            block_size=4,
+            num_transformer_layers=4,
+            left_shift=True,
+        )
+        left_shifted_positions = anchors.unsqueeze(-1) + torch.arange(3)
+        left_shifted_expected = torch.gather(
+            last_hidden.unsqueeze(1).expand(-1, 2, -1, -1),
+            2,
+            left_shifted_positions.unsqueeze(-1).expand(-1, -1, -1, 3),
+        )
+        self.assertTrue(torch.equal(left_shifted, left_shifted_expected))
+
+    def test_left_shift_target_prediction_hidden_uses_total_span(self) -> None:
+        last_hidden = torch.arange(2 * 8 * 3, dtype=torch.float32).view(2, 8, 3)
+        hidden_states = {3: last_hidden}
+        anchors = torch.tensor([[1, 3], [2, 4]])
+        gathered = prepare_target_prediction_hidden(
+            hidden_states=hidden_states,
+            anchor_positions=anchors,
+            block_size=4,
+            num_transformer_layers=4,
+            left_shift=True,
+        )
+        self.assertEqual(tuple(gathered.shape), (2, 2, 3, 3))
+
     def _assert_teacher_forcing_matches_serial(
         self, head_type: str, output_mode: str
     ) -> None:
@@ -333,11 +361,14 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             "markov_head_type": "rnn_easy",
             "markov_output_mode": "direct",
             "markov_rank": 7,
+            "left_shift": True,
         }
         model = FlashMTPDraftModel(config)
         self.assertEqual(model.markov_head_type, "rnn_easy")
         self.assertEqual(model.markov_output_mode, "direct")
         self.assertEqual(model.markov_rank, 7)
+        self.assertTrue(model.left_shift)
+        self.assertEqual(model.proposal_length, 3)
 
         with tempfile.TemporaryDirectory() as checkpoint_dir:
             model.save_pretrained(checkpoint_dir)
@@ -345,7 +376,66 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertEqual(loaded.markov_head_type, "rnn_easy")
         self.assertEqual(loaded.markov_output_mode, "direct")
         self.assertEqual(loaded.markov_rank, 7)
+        self.assertTrue(loaded.left_shift)
+        self.assertEqual(loaded.proposal_length, 3)
         self.assertIsNotNone(loaded.markov_head)
+
+    def test_left_shift_training_alignment(self) -> None:
+        config = Qwen3Config(
+            vocab_size=31,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 4
+        config.block_size = 4
+        config.flashmtp_config = {
+            "target_layer_ids": [0, 3],
+            "pivot_fuse_mode": "linear_fuse",
+            "markov_head_type": "none",
+            "markov_output_mode": "additive",
+            "left_shift": True,
+        }
+        draft_model = FlashMTPDraftModel(config)
+        wrapper = OnlineFlashMTPModel(
+            draft_model=draft_model,
+            target_lm_head=nn.Linear(16, 31, bias=False),
+            target_embed_tokens=nn.Embedding(31, 16),
+            mask_token_id=30,
+            block_size=4,
+            num_anchors=1,
+            tv_loss_weight=0.0,
+        )
+        output_hidden = torch.arange(3 * 16, dtype=torch.float32).view(1, 3, 16)
+        fake_result = tuple(torch.zeros(()) for _ in range(6))
+        with (
+            mock.patch.object(draft_model, "forward", return_value=output_hidden),
+            mock.patch(
+                "specforge.core.flashmtp.create_flashmtp_block_mask",
+                return_value=None,
+            ),
+            mock.patch.object(
+                wrapper,
+                "_chunked_weighted_ce_and_metrics",
+                return_value=fake_result,
+            ) as loss_mock,
+        ):
+            wrapper(
+                input_ids=torch.arange(8).view(1, 8),
+                loss_mask=torch.ones(1, 8),
+                anchor_positions=torch.tensor([[1]]),
+                block_keep_mask=torch.tensor([[True]]),
+                target_hidden=torch.zeros(1, 1, 2, 16),
+            )
+
+        call = loss_mock.call_args.kwargs
+        self.assertTrue(torch.equal(call["prediction_hidden"], output_hidden.view(1, 1, 3, 16)))
+        self.assertTrue(torch.equal(call["prev_token_ids"], torch.tensor([[[1, 2, 3]]])))
+        self.assertTrue(torch.equal(call["labels"], torch.tensor([[[2, 3, 4]]])))
+        self.assertTrue(torch.equal(call["weight_mask"], torch.ones(1, 1, 3)))
 
     def test_direct_model_sampling_skips_base_lm_head(self) -> None:
         class FailingLMHead(nn.Module):

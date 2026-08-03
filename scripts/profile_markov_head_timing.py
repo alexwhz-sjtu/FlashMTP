@@ -160,7 +160,7 @@ def profile_one_mode(
     for step in range(total_iters):
         _sync(device)
         ev0.record()
-        draft_hidden = draft(
+        block_hidden = draft(
             target_hidden=target_hidden,
             noise_embedding=noise_embedding,
             position_ids=draft_block_pos,
@@ -168,7 +168,8 @@ def profile_one_mode(
             past_key_values=None,
             use_cache=False,
             is_causal=False,
-        )[:, -block_size + 1 :, :]
+        )
+        draft_hidden = draft._prediction_hidden(block_hidden)
         ev1.record()
         ev1.synchronize()
         bb_ms = _elapsed_ms(ev0, ev1)

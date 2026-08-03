@@ -92,7 +92,7 @@ def profile_checkpoint(
             f"got {model.markov_output_mode!r}."
         )
 
-    prediction_length = int(model.block_size) - 1
+    prediction_length = model.proposal_length
     hidden = torch.randn(
         batch_size,
         prediction_length,

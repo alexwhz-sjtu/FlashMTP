@@ -85,7 +85,7 @@ def profile_one_step(
     block_size = draft.block_size
     num_input_tokens = input_ids.shape[1]
     position_ids = (
-        torch.arange(num_input_tokens + block_size, device=device)
+        torch.arange(num_input_tokens + block_size + 1, device=device)
         .unsqueeze(0)
         .expand(bsz, -1)
     )
@@ -143,7 +143,7 @@ def profile_one_step(
     for step in range(num_warmup + num_timed):
         _sync(device)
         ev[0].record()
-        draft_hidden = draft(
+        block_hidden = draft(
             target_hidden=target_hidden,
             noise_embedding=noise_embedding,
             position_ids=draft_block_pos,
@@ -151,7 +151,8 @@ def profile_one_step(
             past_key_values=None,
             use_cache=False,
             is_causal=False,
-        )[:, -block_size + 1 :, :]
+        )
+        draft_hidden = draft._prediction_hidden(block_hidden)
         ev[1].record()
         ev[1].synchronize()
 
@@ -177,14 +178,14 @@ def profile_one_step(
         ev[5].record()
         ev[5].synchronize()
 
-        draft_tokens = block_output_ids.clone()
-        draft_tokens[:, 1:] = sampled
+        draft_tokens = torch.cat([block_output_ids[:, :1], sampled], dim=1)
+        verify_position_ids = position_ids[:, start : start + draft_tokens.size(1)]
 
         _sync(device)
         ev[6].record()
         target(
             draft_tokens,
-            position_ids=target_block_pos,
+            position_ids=verify_position_ids,
             past_key_values=past_key_values_target,
             use_cache=True,
             output_hidden_states=True,
@@ -292,7 +293,7 @@ def main() -> None:
     parser.add_argument("--dataset", default="gsm8k")
     parser.add_argument("--max-samples", type=int, default=3)
     parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument("--verify-block", type=int, default=16)
+    parser.add_argument("--verify-block", type=int, default=None)
     parser.add_argument("--warmup-steps", type=int, default=30)
     parser.add_argument("--timed-steps", type=int, default=100)
     parser.add_argument("--e2e-warmup", type=int, default=1)
@@ -327,6 +328,16 @@ def main() -> None:
         dtype=torch.bfloat16,
         trust_remote_code=True,
     ).to(device).eval()
+    verify_block_size = (
+        draft.proposal_length + 1
+        if args.verify_block is None
+        else int(args.verify_block)
+    )
+    if not 1 <= verify_block_size <= draft.proposal_length + 1:
+        raise ValueError(
+            f"--verify-block must be in [1, {draft.proposal_length + 1}], "
+            f"got {verify_block_size}"
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=True
@@ -385,7 +396,7 @@ def main() -> None:
                 input_ids=input_ids,
                 compile_serial_head=compile_flag,
                 max_new_tokens=args.max_new_tokens,
-                verify_block_size=args.verify_block,
+                verify_block_size=verify_block_size,
                 sample_index=si,
                 num_warmup=args.e2e_warmup,
             )
@@ -417,7 +428,7 @@ def main() -> None:
             "dataset": args.dataset,
             "max_samples": args.max_samples,
             "max_new_tokens": args.max_new_tokens,
-            "verify_block": args.verify_block,
+            "verify_block": verify_block_size,
             "block_size": int(draft.block_size),
             "markov_output_mode": draft.markov_output_mode,
             "markov_rank": int(draft.markov_rank),
