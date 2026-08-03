@@ -7,7 +7,6 @@ from torch import nn
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from ...utils import print_on_rank0
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
     FlashAttentionKwargs,
@@ -22,6 +21,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
     rotate_half,
 )
 from typing_extensions import Tuple, Unpack
+
+from ...utils import print_on_rank0
 
 
 def _cuda_sync_time(device: torch.device) -> float:
@@ -41,7 +42,6 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
 
 
 from .flashmtp_draft_tree import (
-    DraftTreeSpec,
     build_draft_tree_from_logits,
     greedy_accept_tree_causal,
     target_forward_tree_verify,
@@ -121,14 +121,64 @@ def gather_pivot_multilayer_inference(
     target_layer_ids: list[int],
     token_index: int,
     num_transformer_layers: int,
+    context_window_size: int = 1,
 ) -> torch.Tensor:
-    """Return (B, 1, S, H) pivot features for inference."""
+    """Return position-major ``(B, 1, W*S, H)`` context ending at token_index."""
     off = _infer_hs_embedding_offset(hidden_states, num_transformer_layers)
+    window_size = int(context_window_size)
+    if window_size <= 0:
+        raise ValueError(
+            f"context_window_size must be positive, got {context_window_size}"
+        )
+    seq_len = hidden_states[off].shape[1]
+    end = token_index if token_index >= 0 else seq_len + token_index
+    indices = torch.arange(
+        max(0, end - window_size + 1),
+        end + 1,
+        device=hidden_states[off].device,
+        dtype=torch.long,
+    )
+    actual_window_size = indices.numel()
     pieces: list[torch.Tensor] = []
     for layer_id in target_layer_ids:
         layer_h = hidden_states[layer_id + off]
-        pieces.append(layer_h[:, token_index, :].unsqueeze(1))
-    return torch.stack(pieces, dim=2)
+        selected = layer_h.index_select(1, indices)
+        pieces.append(selected)
+    stacked = torch.stack(pieces, dim=2)  # (B, W, S, H)
+    return stacked.reshape(
+        stacked.shape[0], 1, actual_window_size * len(target_layer_ids), -1
+    )
+
+
+def append_pivot_multilayer_inference(
+    previous: torch.Tensor,
+    hidden_states: tuple | list,
+    target_layer_ids: list[int],
+    token_indices: list[int],
+    num_transformer_layers: int,
+    context_window_size: int,
+) -> torch.Tensor:
+    """Append newly processed target positions and retain the newest context window."""
+    window_size = int(context_window_size)
+    num_layers = len(target_layer_ids)
+    off = _infer_hs_embedding_offset(hidden_states, num_transformer_layers)
+    if not token_indices:
+        return previous
+    indices = torch.tensor(
+        token_indices, device=hidden_states[off].device, dtype=torch.long
+    )
+    pieces = [
+        hidden_states[layer_id + off].index_select(1, indices)
+        for layer_id in target_layer_ids
+    ]
+    new_context = torch.stack(pieces, dim=2)  # (B, T, S, H)
+    old_context = previous.reshape(
+        previous.shape[0], -1, num_layers, previous.shape[-1]
+    )
+    combined = torch.cat([old_context, new_context], dim=1)[:, -window_size:]
+    return combined.reshape(
+        combined.shape[0], 1, combined.shape[1] * num_layers, combined.shape[-1]
+    )
 
 
 class PivotAttentionFuse(nn.Module):
@@ -146,8 +196,10 @@ class PivotAttentionFuse(nn.Module):
         # x: (B, N, S, H)
         bsz, n_blk, s_len, h = x.shape
         flat = x.view(bsz * n_blk, s_len, h)
-        pos = torch.arange(s_len, device=x.device, dtype=torch.long).unsqueeze(0).expand(
-            bsz * n_blk, -1
+        pos = (
+            torch.arange(s_len, device=x.device, dtype=torch.long)
+            .unsqueeze(0)
+            .expand(bsz * n_blk, -1)
         )
         pos_emb = self.rotary(flat, pos)
         attn_out, _ = self.attention(
@@ -163,7 +215,11 @@ class Qwen3FlashMTPAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(
-        self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str, pivot_fuse_mode: str
+        self,
+        config: Qwen3Config,
+        layer_idx: int,
+        chs_concat_mode: str,
+        pivot_fuse_mode: str,
     ):
         super().__init__()
         self.config = config
@@ -205,7 +261,7 @@ class Qwen3FlashMTPAttention(nn.Module):
             if config.layer_types[layer_idx] == "sliding_attention"
             else None
         )
-        
+
         self.chs_concat_mode = chs_concat_mode
 
     def forward(
@@ -234,7 +290,15 @@ class Qwen3FlashMTPAttention(nn.Module):
         if self.pivot_fuse_mode == "prefix_condition" and ctx_len > 0:
             k_ctx = k_ctx.view(bsz, ctx_len, -1, self.head_dim).transpose(1, 2)
             k_noise = k_noise.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-            q, k_noise = apply_rotary_pos_emb(q, k_noise, cos, sin)
+            # Context occupies the prefix of the supplied global RoPE ids; draft
+            # tokens occupy the suffix. Layer slots for one source position share
+            # an id, but each K vector is rotated independently.
+            ctx_cos = cos[:, :ctx_len].unsqueeze(1)
+            ctx_sin = sin[:, :ctx_len].unsqueeze(1)
+            k_ctx = (k_ctx * ctx_cos) + (rotate_half(k_ctx) * ctx_sin)
+            q, k_noise = apply_rotary_pos_emb(
+                q, k_noise, cos[:, ctx_len:], sin[:, ctx_len:]
+            )
             k = torch.cat([k_ctx, k_noise], dim=2)
             k = self.k_norm(k)
             v_ctx = v_ctx.view(bsz, ctx_len, -1, self.head_dim).transpose(1, 2)
@@ -275,11 +339,20 @@ class Qwen3FlashMTPAttention(nn.Module):
 
 
 class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3Config, layer_idx: int, chs_concat_mode: str, pivot_fuse_mode: str):
+    def __init__(
+        self,
+        config: Qwen3Config,
+        layer_idx: int,
+        chs_concat_mode: str,
+        pivot_fuse_mode: str,
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = Qwen3FlashMTPAttention(
-            config=config, layer_idx=layer_idx, chs_concat_mode=chs_concat_mode, pivot_fuse_mode=pivot_fuse_mode
+            config=config,
+            layer_idx=layer_idx,
+            chs_concat_mode=chs_concat_mode,
+            pivot_fuse_mode=pivot_fuse_mode,
         )
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -346,6 +419,17 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 f"Unknown pivot_fuse_mode={self.pivot_fuse_mode!r}; "
                 "expected linear_fuse | attention_fuse | prefix_condition"
             )
+        self.context_window_size = int(flashmtp_config.get("context_window_size", 1))
+        if self.context_window_size <= 0:
+            raise ValueError(
+                "flashmtp_config['context_window_size'] must be positive, got "
+                f"{self.context_window_size}"
+            )
+        if self.pivot_fuse_mode != "prefix_condition" and self.context_window_size != 1:
+            raise ValueError(
+                "context_window_size > 1 is only supported with "
+                "pivot_fuse_mode='prefix_condition'"
+            )
         self.num_middle_layers_n = int(flashmtp_config.get("num_middle_layers_n", 0))
 
         if flashmtp_config.get("target_layer_ids") is not None:
@@ -361,6 +445,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
 
         flashmtp_config.setdefault("pivot_fuse_mode", self.pivot_fuse_mode)
         flashmtp_config.setdefault("num_middle_layers_n", self.num_middle_layers_n)
+        flashmtp_config["context_window_size"] = self.context_window_size
         flashmtp_config["target_layer_ids"] = self.target_layer_ids
         self.train_lm_head = bool(flashmtp_config.get("train_lm_head", False))
         flashmtp_config["train_lm_head"] = self.train_lm_head
@@ -410,6 +495,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         print_on_rank0(
             f"FlashMTP: pivot_fuse_mode={self.pivot_fuse_mode}, "
             f"num_middle_layers_n={self.num_middle_layers_n}, "
+            f"context_window_size={self.context_window_size}, "
             f"target_layer_ids={self.target_layer_ids}, "
             f"train_lm_head={self.train_lm_head}, "
             f"local_position={self.local_position}"
@@ -419,13 +505,44 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
 
     @property
     def chs_len_per_block(self) -> int:
-        return len(self.target_layer_ids) if self.pivot_fuse_mode == "prefix_condition" else 1
+        if self.pivot_fuse_mode == "prefix_condition":
+            return self.context_window_size * len(self.target_layer_ids)
+        return 1
+
+    def context_position_ids(
+        self,
+        latest_positions: torch.Tensor,
+        num_context_positions: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Global RoPE ids for context slots, position-major then layer-minor."""
+        if self.pivot_fuse_mode != "prefix_condition":
+            return latest_positions.clamp(min=0).reshape(latest_positions.shape[0], -1)
+        num_positions = (
+            self.context_window_size
+            if num_context_positions is None
+            else int(num_context_positions)
+        )
+        offsets = torch.arange(
+            1 - num_positions,
+            1,
+            device=latest_positions.device,
+            dtype=torch.long,
+        )
+        positions = latest_positions.unsqueeze(-1) + offsets
+        positions = positions.clamp(min=0)
+        positions = positions.repeat_interleave(len(self.target_layer_ids), dim=-1)
+        return positions.reshape(latest_positions.shape[0], -1)
 
     def get_last_decode_stats(self) -> dict:
         return dict(self._last_decode_stats)
 
     def _fuse_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        """(B, N, S, H) -> (B, N, H) for linear/attention, or (B, N*S, H) for prefix."""
+        """Fuse pivots or flatten a position-major prefix context bank.
+
+        For shared SWA training, ``N`` is the source sequence length and ``S``
+        is the selected target-layer count.  Legacy training/inference may use
+        ``N`` as the block count and place multiple window positions in ``S``.
+        """
         bsz, n_blk, s_len, h = target_hidden.shape
         if self.pivot_fuse_mode == "linear_fuse":
             flat = target_hidden.reshape(bsz, n_blk, s_len * h)
@@ -434,9 +551,20 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             assert self.pivot_attn_fuse is not None
             return self.pivot_attn_fuse(target_hidden)
         assert self.layer_depth_embedding is not None
+        if s_len % len(self.target_layer_ids) != 0:
+            raise ValueError(
+                f"Context slot count {s_len} is not divisible by selected layer "
+                f"count {len(self.target_layer_ids)}"
+            )
+        num_context_positions = s_len // len(self.target_layer_ids)
+        if num_context_positions > self.context_window_size:
+            raise ValueError(
+                f"Got {num_context_positions} context positions, configured maximum is "
+                f"{self.context_window_size}"
+            )
         depth_ids = torch.tensor(
             self.target_layer_ids, device=target_hidden.device, dtype=torch.long
-        )
+        ).repeat(num_context_positions)
         depth_emb = self.layer_depth_embedding(depth_ids).view(1, 1, s_len, h)
         ctx = target_hidden + depth_emb
         return self.hidden_norm(ctx.reshape(bsz, n_blk * s_len, h))
@@ -461,12 +589,12 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             draft_pos = position_ids
 
         target_hidden = self._fuse_target_hidden(target_hidden)
-        rotary_pos = rotary_position_ids if rotary_position_ids is not None else draft_pos
-        total_len = rotary_pos.shape[1]
-        dummy = hidden_states.new_zeros(
-            hidden_states.shape[0], total_len, hidden_states.shape[-1]
+        rotary_pos = (
+            rotary_position_ids if rotary_position_ids is not None else draft_pos
         )
-        position_embeddings = self.rotary_emb(dummy, rotary_pos)
+        # Qwen3RotaryEmbedding derives sequence length from position_ids and only
+        # needs x for dtype/device.  Avoid a full (B, KV_LEN, H) zero allocation.
+        position_embeddings = self.rotary_emb(hidden_states, rotary_pos)
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
@@ -488,9 +616,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
     ) -> list[dict]:
         probs = torch.softmax(logits.float(), dim=-1)
         top_k = max(int(top_k), 1)
-        top_probs, top_ids = torch.topk(
-            probs, k=min(top_k, probs.shape[-1]), dim=-1
-        )
+        top_probs, top_ids = torch.topk(probs, k=min(top_k, probs.shape[-1]), dim=-1)
         entries = []
         for token_id, prob in zip(top_ids.tolist(), top_probs.tolist()):
             entries.append(
@@ -578,7 +704,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         )
         if target.device.type == "cuda":
             torch.cuda.synchronize(target.device)
-        self._last_decode_stats["target_total_time"] += time.perf_counter() - target_start
+        self._last_decode_stats["target_total_time"] += (
+            time.perf_counter() - target_start
+        )
 
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
@@ -602,6 +730,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             self.target_layer_ids,
             -1,
             self.config.num_target_layers,
+            self.context_window_size,
         )
 
         start = input_ids.shape[1]
@@ -623,18 +752,10 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)
             draft_start = time.perf_counter()
-            chs = self.chs_len_per_block
-            if self.local_position:
-                ctx_pos_part = torch.zeros(
-                    1, chs, dtype=torch.long, device=target.device
-                )
-            else:
-                ctx_pos_part = torch.full(
-                    (1, chs),
-                    start - 1,
-                    dtype=torch.long,
-                    device=target.device,
-                )
+            ctx_pos_part = self.context_position_ids(
+                torch.full((1, 1), start - 1, dtype=torch.long, device=target.device),
+                target_hidden.shape[2] // len(self.target_layer_ids),
+            )
             full_rotary = torch.cat([ctx_pos_part, draft_block_pos], dim=-1)
             draft_hidden = self(
                 target_hidden=target_hidden,
@@ -651,7 +772,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 draft_logits = target.lm_head(draft_hidden)
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)
-            self._last_decode_stats["draft_total_time"] += time.perf_counter() - draft_start
+            self._last_decode_stats["draft_total_time"] += (
+                time.perf_counter() - draft_start
+            )
 
             draft_topk_by_slot: dict[int, list[dict]] = {}
             for slot in range(1, block_size):
@@ -659,7 +782,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                     draft_logits[0, slot - 1], tokenizer, top_k
                 )
                 if profile_records is not None:
-                    draft_topk_by_slot[slot] = self._serialize_topk_entries(topk_entries)
+                    draft_topk_by_slot[slot] = self._serialize_topk_entries(
+                        topk_entries
+                    )
                 print_fn(
                     f"  [Draft slot {slot} | abs_pos={start + slot}] "
                     f"top{top_k}={topk_entries}"
@@ -703,9 +828,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                         "sampled_token_id": sampled_tid,
                         "sampled_token": tokenizer.decode([sampled_tid]),
                         "draft_p_sampled": round(
-                            float(
-                                draft_probs_on_logits[0, s - 1, sampled_tid].item()
-                            ),
+                            float(draft_probs_on_logits[0, s - 1, sampled_tid].item()),
                             4,
                         ),
                     }
@@ -723,7 +846,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             )
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)
-            self._last_decode_stats["target_total_time"] += time.perf_counter() - target_start
+            self._last_decode_stats["target_total_time"] += (
+                time.perf_counter() - target_start
+            )
 
             posterior = sample(output.logits, temperature)
             acceptance_length = (
@@ -772,14 +897,14 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             ]
             start += acceptance_length + 1
             past_key_values_target.crop(start)
-            pivot_index = min(
-                acceptance_length, output.hidden_states[0].shape[1] - 1
-            )
-            target_hidden = gather_pivot_multilayer_inference(
+            pivot_index = min(acceptance_length, output.hidden_states[0].shape[1] - 1)
+            target_hidden = append_pivot_multilayer_inference(
+                target_hidden,
                 output.hidden_states,
                 self.target_layer_ids,
-                pivot_index,
+                list(range(pivot_index + 1)),
                 self.config.num_target_layers,
+                self.context_window_size,
             )
             accept_len_out = int(acceptance_length + 1)
             self._last_decode_stats["accept_lengths"].append(accept_len_out)
@@ -861,7 +986,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         }
         bsz = input_ids.shape[0]
         if bsz != 1:
-            raise ValueError("spec_generate_with_draft_tree currently supports batch_size=1")
+            raise ValueError(
+                "spec_generate_with_draft_tree currently supports batch_size=1"
+            )
 
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
@@ -871,9 +998,11 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             dtype=torch.long,
             device=target.device,
         )
-        position_ids = torch.arange(
-            output_ids.shape[1], device=target.device
-        ).unsqueeze(0).expand(bsz, -1)
+        position_ids = (
+            torch.arange(output_ids.shape[1], device=target.device)
+            .unsqueeze(0)
+            .expand(bsz, -1)
+        )
 
         past_key_values_target = DynamicCache()
         output = target(
@@ -893,6 +1022,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             self.target_layer_ids,
             -1,
             self.config.num_target_layers,
+            self.context_window_size,
         )
 
         decode_start: float | None = (
@@ -906,24 +1036,20 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             block_output_ids = output_ids[:, start : start + block_size].clone()
             target_block_pos = position_ids[:, start : start + block_size]
             if self.local_position:
-                draft_block_pos = torch.arange(
-                    1, block_size + 1, device=target.device, dtype=torch.long
-                ).unsqueeze(0).expand(bsz, -1)
+                draft_block_pos = (
+                    torch.arange(
+                        1, block_size + 1, device=target.device, dtype=torch.long
+                    )
+                    .unsqueeze(0)
+                    .expand(bsz, -1)
+                )
             else:
                 draft_block_pos = target_block_pos
             noise_embedding = target.model.embed_tokens(block_output_ids)
-            chs = self.chs_len_per_block
-            if self.local_position:
-                ctx_pos_part = torch.zeros(
-                    bsz, chs, dtype=torch.long, device=target.device
-                )
-            else:
-                ctx_pos_part = torch.full(
-                    (bsz, chs),
-                    start - 1,
-                    dtype=torch.long,
-                    device=target.device,
-                )
+            ctx_pos_part = self.context_position_ids(
+                torch.full((bsz, 1), start - 1, dtype=torch.long, device=target.device),
+                target_hidden.shape[2] // len(self.target_layer_ids),
+            )
             full_rotary = torch.cat([ctx_pos_part, draft_block_pos], dim=-1)
             draft_hidden = self(
                 target_hidden=target_hidden,
@@ -969,9 +1095,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 noise_embedding.dtype,
             )
             accepted_prefix, correction, acceptance_length, accepted_node = (
-                greedy_accept_tree_causal(
-                    tree_spec, output.logits[0], temperature
-                )
+                greedy_accept_tree_causal(tree_spec, output.logits[0], temperature)
             )
             n_prefix = len(accepted_prefix)
             output_ids[:, start : start + n_prefix] = torch.tensor(
@@ -979,25 +1103,27 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             ).unsqueeze(0)
             if correction is not None:
                 output_ids[:, start + n_prefix] = correction
-                pivot_index = min(
-                    accepted_node, output.hidden_states[0].shape[1] - 1
-                )
             else:
                 output_ids[:, start + n_prefix] = sample(
                     output.logits[:, accepted_node : accepted_node + 1],
                     temperature,
                 ).squeeze(-1)
-                pivot_index = min(
-                    accepted_node, output.hidden_states[0].shape[1] - 1
-                )
 
             start += acceptance_length + 1
             past_key_values_target.crop(start)
-            target_hidden = gather_pivot_multilayer_inference(
+            accepted_path: list[int] = []
+            path_node = int(accepted_node)
+            while path_node >= 0:
+                accepted_path.append(path_node)
+                path_node = int(tree_spec.parent_index[path_node])
+            accepted_path.reverse()
+            target_hidden = append_pivot_multilayer_inference(
+                target_hidden,
                 output.hidden_states,
                 self.target_layer_ids,
-                pivot_index,
+                accepted_path,
                 self.config.num_target_layers,
+                self.context_window_size,
             )
             acceptance_lengths.append(acceptance_length + 1)
             self._last_decode_stats["accept_lengths"].append(acceptance_length + 1)
@@ -1071,9 +1197,11 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             dtype=torch.long,
             device=target.device,
         )
-        position_ids = torch.arange(
-            output_ids.shape[1], device=target.device
-        ).unsqueeze(0).expand(bsz, -1)
+        position_ids = (
+            torch.arange(output_ids.shape[1], device=target.device)
+            .unsqueeze(0)
+            .expand(bsz, -1)
+        )
 
         past_key_values_target = DynamicCache()
 
@@ -1096,6 +1224,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             self.target_layer_ids,
             -1,
             self.config.num_target_layers,
+            self.context_window_size,
         )
 
         # Decode stage: single cuda-synced wall clock (draft + target + bookkeeping)
@@ -1108,24 +1237,20 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             block_output_ids = output_ids[:, start : start + block_size].clone()
             target_block_pos = position_ids[:, start : start + block_size]
             if self.local_position:
-                draft_block_pos = torch.arange(
-                    1, block_size + 1, device=target.device, dtype=torch.long
-                ).unsqueeze(0).expand(bsz, -1)
+                draft_block_pos = (
+                    torch.arange(
+                        1, block_size + 1, device=target.device, dtype=torch.long
+                    )
+                    .unsqueeze(0)
+                    .expand(bsz, -1)
+                )
             else:
                 draft_block_pos = target_block_pos
             noise_embedding = target.model.embed_tokens(block_output_ids)
-            chs = self.chs_len_per_block
-            if self.local_position:
-                ctx_pos_part = torch.zeros(
-                    bsz, chs, dtype=torch.long, device=target.device
-                )
-            else:
-                ctx_pos_part = torch.full(
-                    (bsz, chs),
-                    start - 1,
-                    dtype=torch.long,
-                    device=target.device,
-                )
+            ctx_pos_part = self.context_position_ids(
+                torch.full((bsz, 1), start - 1, dtype=torch.long, device=target.device),
+                target_hidden.shape[2] // len(self.target_layer_ids),
+            )
             full_rotary = torch.cat([ctx_pos_part, draft_block_pos], dim=-1)
             draft_hidden = self(
                 target_hidden=target_hidden,
@@ -1170,14 +1295,14 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             ]
             start += acceptance_length + 1
             past_key_values_target.crop(start)
-            pivot_index = min(
-                acceptance_length, output.hidden_states[0].shape[1] - 1
-            )
-            target_hidden = gather_pivot_multilayer_inference(
+            pivot_index = min(acceptance_length, output.hidden_states[0].shape[1] - 1)
+            target_hidden = append_pivot_multilayer_inference(
+                target_hidden,
                 output.hidden_states,
                 self.target_layer_ids,
-                pivot_index,
+                list(range(pivot_index + 1)),
                 self.config.num_target_layers,
+                self.context_window_size,
             )
             acceptance_lengths.append(acceptance_length + 1)
             self._last_decode_stats["accept_lengths"].append(acceptance_length + 1)

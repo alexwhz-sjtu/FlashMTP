@@ -26,15 +26,15 @@
 
 ```bash
 # ["linear_fuse", "attention_fuse", "prefix_condition"]
-cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v1.1
+cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_swa
 source .venv/bin/activate
-NUM_MIDDLE_LAYERS_N=16 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=8 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=40000 MAX_LENGTH=40960 NUM_ANCHORS=1024 BLOCK_SIZE=8 SHARD_DRAFT_BY_TP=1 \
-NPROC_PER_NODE=8 TP_SIZE=2 CE_CHUNK_SIZE=8192 \
-TRAIN_DATA_PATH="/share/dai-sys/wanghanzhen/projects/MTP/training_data/nemotron_think_off_samples_40000_qwen3_8b_regen.jsonl" \
+NUM_MIDDLE_LAYERS_N=3 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=12 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=80000 MAX_LENGTH=4096 NUM_ANCHORS=512 BLOCK_SIZE=16 SHARD_DRAFT_BY_TP=1 \
+NPROC_PER_NODE=8 TP_SIZE=1 CONTEXT_WINDOW_SIZE=128 CE_CHUNK_SIZE=8192 \
+TRAIN_DATA_PATH="/share/dai-sys/wanghanzhen/projects/MTP/training_data/open_perfectblend_80k_qwen3_8b.jsonl" \
 TARGET_MODEL_BACKEND=sglang SGLANG_MEM_FRACTION_STATIC=0.25 \
-TARGET_MODEL=/share/dai-sys/wanghanzhen/models/Qwen/Qwen3-14B \
-MODEL_TAG='Qwen3-14B' \
-LOSS_DECAY_GAMMA=7 LOCAL_POSITION=true NUM_MIDDLE_LAYERS=5 \
+TARGET_MODEL=/share/dai-sys/wanghanzhen/models/Qwen/Qwen3-8B \
+MODEL_TAG='Qwen3-8B' \
+LOSS_DECAY_GAMMA=7 LOCAL_POSITION=false NUM_MIDDLE_LAYERS=5 \
 bash scripts/run_training_flashmtp.sh --dt h100
 ```
 
@@ -178,6 +178,7 @@ bash scripts/run_training_flashmtp.sh --dt h100
 | `NUM_MIDDLE_LAYERS_N` | 5             | target 中间选取层数               |
 | `BLOCK_SIZE`          | —             | 草稿块大小                       |
 | `PIVOT_FUSE_MODE`     | `linear_fuse` | pivot 融合模式                  |
+| `CONTEXT_WINDOW_SIZE` | 1             | `prefix_condition` 使用的最近位置数 |
 | `CHS_CONCAT_MODE`     | `feature`     | CHS 拼接模式                    |
 | `LOCAL_POSITION`      | false         | 块内局部位置编码                    |
 | `TRAIN_LM_HEAD`       | false         | 是否单独训练草稿 lm_head            |

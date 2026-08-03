@@ -92,6 +92,12 @@ def parse_args():
         help="Middle teacher layers between first and last (total selected = 2 + N).",
     )
     model_group.add_argument(
+        "--context-window-size",
+        type=int,
+        default=1,
+        help="Number of recent target positions used by prefix_condition.",
+    )
+    model_group.add_argument(
         "--loss-decay-gamma",
         type=float,
         default=None,
@@ -203,7 +209,10 @@ def parse_args():
 
 def _sync_config_layer_types_to_draft_depth(draft_config) -> None:
     """Make ``layer_types`` length match ``num_hidden_layers`` for saved config / attention metadata."""
-    if not hasattr(draft_config, "num_hidden_layers") or draft_config.num_hidden_layers is None:
+    if (
+        not hasattr(draft_config, "num_hidden_layers")
+        or draft_config.num_hidden_layers is None
+    ):
         return
     n = int(draft_config.num_hidden_layers)
     lt = getattr(draft_config, "layer_types", None)
@@ -250,11 +259,15 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         draft_config.num_target_layers = target_config.num_hidden_layers
         print_on_rank0("Auto-generated draft config from target model")
 
-    if not hasattr(draft_config, "flashmtp_config") or draft_config.flashmtp_config is None:
+    if (
+        not hasattr(draft_config, "flashmtp_config")
+        or draft_config.flashmtp_config is None
+    ):
         draft_config.flashmtp_config = {}
 
     draft_config.flashmtp_config["chs_concat_mode"] = "feature"
     draft_config.flashmtp_config["pivot_fuse_mode"] = args.pivot_fuse_mode
+    draft_config.flashmtp_config["context_window_size"] = args.context_window_size
     draft_config.flashmtp_config["num_middle_layers_n"] = args.num_middle_layers_n
     draft_config.flashmtp_config["local_position"] = bool(args.local_position)
     if args.train_lm_head:
@@ -312,9 +325,7 @@ def _ensure_embed_vocab_for_mask(
     with torch.no_grad():
         new_emb.weight[:cur].copy_(old_emb.weight)
         init_row = old_emb.weight.mean(dim=0)
-        new_emb.weight[cur:].copy_(
-            init_row.unsqueeze(0).expand(needed - cur, -1)
-        )
+        new_emb.weight[cur:].copy_(init_row.unsqueeze(0).expand(needed - cur, -1))
     target_components.embed_tokens = new_emb
 
     lm = target_components.lm_head
@@ -329,9 +340,7 @@ def _ensure_embed_vocab_for_mask(
         with torch.no_grad():
             new_lm.weight[:cur].copy_(lm.weight)
             init_row = lm.weight.mean(dim=0)
-            new_lm.weight[cur:].copy_(
-                init_row.unsqueeze(0).expand(needed - cur, -1)
-            )
+            new_lm.weight[cur:].copy_(init_row.unsqueeze(0).expand(needed - cur, -1))
             if lm.bias is not None:
                 new_lm.bias[:cur].copy_(lm.bias)
                 new_lm.bias[cur:].zero_()
@@ -575,17 +584,25 @@ def main():
     else:
         tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
         mask_token_id = tokenizer.mask_token_id
-        
-    print_on_rank0(f"****** Important: Make sure using the same mask_token_id with inference.***** \n Using mask_token_id: {mask_token_id} \n")
 
+    print_on_rank0(
+        f"****** Important: Make sure using the same mask_token_id with inference.***** \n Using mask_token_id: {mask_token_id} \n"
+    )
 
     draft_model.mask_token_id = mask_token_id
-    
+
     draft_model.config.flashmtp_config["chs_concat_mode"] = "feature"
     draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
-    draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
+    draft_model.config.flashmtp_config["target_layer_ids"] = (
+        draft_model.target_layer_ids
+    )
     draft_model.config.flashmtp_config["pivot_fuse_mode"] = draft_model.pivot_fuse_mode
-    draft_model.config.flashmtp_config["num_middle_layers_n"] = draft_model.num_middle_layers_n
+    draft_model.config.flashmtp_config["context_window_size"] = (
+        draft_model.context_window_size
+    )
+    draft_model.config.flashmtp_config["num_middle_layers_n"] = (
+        draft_model.num_middle_layers_n
+    )
     draft_model.config.flashmtp_config["train_lm_head"] = bool(
         getattr(draft_model, "train_lm_head", False)
     )
@@ -657,7 +674,8 @@ def main():
     print_on_rank0(
         f"target hidden noise: add_noise={args.add_noise}, "
         f"ratio={args.target_hidden_noise_ratio}, w1_mse={args.w1_mse}, "
-        f"ce_chunk_size={args.ce_chunk_size}"
+        f"ce_chunk_size={args.ce_chunk_size}, "
+        f"shared_training_context={flashmtp_model.uses_shared_training_context}"
     )
 
     online_flashmtp = flashmtp_model
@@ -679,7 +697,7 @@ def main():
         warmup_ratio=args.warmup_ratio,
         total_steps=total_steps,
     )
-    skip_steps=0
+    skip_steps = 0
     start_epoch = 0
     global_step = 0
     if resume_state is not None:

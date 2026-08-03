@@ -37,6 +37,7 @@ NUM_EPOCHS="${NUM_EPOCHS:-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
 PIVOT_FUSE_MODE="${PIVOT_FUSE_MODE:-linear_fuse}"
+CONTEXT_WINDOW_SIZE="${CONTEXT_WINDOW_SIZE:-1}"
 NUM_MIDDLE_LAYERS_N="${NUM_MIDDLE_LAYERS_N:-5}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
 
@@ -79,15 +80,15 @@ if [ "$DT" = "qz" ]; then
     # export NODE_RANK=${RANK:-0}
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_swa${CONTEXT_WINDOW_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 elif [ "$DT" = "h100" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/share/dai-sys/wanghanzhen/projects/MTP/training_data/nemotron_think_off_samples_40000_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_${PIVOT_FUSE_MODE}_fuse$((NUM_MIDDLE_LAYERS_N + 2))_sample_${DATA_NUM_SAMPLES}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_${PIVOT_FUSE_MODE}_fuse$((NUM_MIDDLE_LAYERS_N + 2))_sample_${DATA_NUM_SAMPLES}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_swa${CONTEXT_WINDOW_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_HOME/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${LOCAL_POSITION_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_swa${CONTEXT_WINDOW_SIZE}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${LOCAL_POSITION_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
@@ -126,11 +127,11 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-5000}"
 
 # Tracker 参数
 REPORT_TO="${REPORT_TO:-wandb}"
-WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-exp}"
+WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-v2}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}_${MODEL_TAG}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_swa${CONTEXT_WINDOW_SIZE}_n${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_${DT}_${PIVOT_FUSE_MODE}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_swa${CONTEXT_WINDOW_SIZE}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${CHS_CONCAT_MODE}_${MODEL_TAG}}"
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen}"
@@ -151,7 +152,8 @@ echo "  样本数量: ${DATA_NUM_SAMPLES}"
 echo "  思考模式: ${ENABLE_THINKING}"
 echo "  数据子目录: ${CHS_CONCAT_MODE}"
 echo "  Pivot 融合: ${PIVOT_FUSE_MODE} (中间层数 N=${NUM_MIDDLE_LAYERS_N})"
-echo "  local_position: ${LOCAL_POSITION} (tag ${LOCAL_POSITION_TAG}; draft 1..block, CHS rope 0)"
+echo "  Context window: ${CONTEXT_WINDOW_SIZE} 个最近位置"
+echo "  local_position: ${LOCAL_POSITION} (tag ${LOCAL_POSITION_TAG}; draft 可局部，CHS 始终使用全局 RoPE)"
 echo "------------------------------------------"
 echo "目标模型: ${TARGET_MODEL}"
 echo "目标模型后端: ${TARGET_MODEL_BACKEND}"
@@ -320,6 +322,7 @@ EXIT_CODE=0
     --dist-timeout ${DIST_TIMEOUT} \
     --chs-concat-mode ${CHS_CONCAT_MODE} \
     --pivot-fuse-mode ${PIVOT_FUSE_MODE} \
+    --context-window-size ${CONTEXT_WINDOW_SIZE} \
     --num-middle-layers-n ${NUM_MIDDLE_LAYERS_N} \
     --seed 42 \
     ${OPTIONAL_ARGS} 2>&1 || EXIT_CODE=$?

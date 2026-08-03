@@ -19,6 +19,7 @@ from transformers import AutoModelForCausalLM, DynamicCache
 
 from specforge.modeling.draft.flashmtp import (
     FlashMTPDraftModel,
+    append_pivot_multilayer_inference,
     gather_pivot_multilayer_inference,
     sample,
 )
@@ -117,6 +118,7 @@ def profile_flashmtp_generate(
         model.target_layer_ids,
         -1,
         model.config.num_target_layers,
+        model.context_window_size,
     )
 
     start = num_input_tokens
@@ -135,13 +137,10 @@ def profile_flashmtp_generate(
             draft_block_pos = target_block_pos
 
         noise_embedding = target.model.embed_tokens(block_output_ids)
-        chs = model.chs_len_per_block
-        if model.local_position:
-            ctx_pos_part = torch.zeros(bsz, chs, dtype=torch.long, device=device)
-        else:
-            ctx_pos_part = torch.full(
-                (bsz, chs), start - 1, dtype=torch.long, device=device
-            )
+        ctx_pos_part = model.context_position_ids(
+            torch.full((bsz, 1), start - 1, dtype=torch.long, device=device),
+            target_hidden.shape[2] // len(model.target_layer_ids),
+        )
         full_rotary = torch.cat([ctx_pos_part, draft_block_pos], dim=-1)
 
         _sync(device)
@@ -193,11 +192,13 @@ def profile_flashmtp_generate(
         start += acceptance_length + 1
         past_key_values_target.crop(start)
         pivot_index = min(acceptance_length, output.hidden_states[0].shape[1] - 1)
-        target_hidden = gather_pivot_multilayer_inference(
+        target_hidden = append_pivot_multilayer_inference(
+            target_hidden,
             output.hidden_states,
             model.target_layer_ids,
-            pivot_index,
+            list(range(pivot_index + 1)),
             model.config.num_target_layers,
+            model.context_window_size,
         )
         decode_steps += 1
 

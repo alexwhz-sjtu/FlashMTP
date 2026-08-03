@@ -3,7 +3,6 @@
 
 import argparse
 import gc
-import math
 import os
 import sys
 
@@ -11,19 +10,18 @@ import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoTokenizer
 
 # Reuse training helpers
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from datasets import load_dataset
 
-from scripts.train_flashmtp import (  # noqa: E402
+from scripts.train_flashmtp import (
     _ensure_embed_vocab_for_mask,
     build_dataloader,
     build_models,
-    parse_args as train_parse_args,
 )
+from scripts.train_flashmtp import parse_args as train_parse_args  # noqa: E402
 from specforge.args import SGLangBackendArgs  # noqa: E402
 from specforge.core.flashmtp import OnlineFlashMTPModel  # noqa: E402
 from specforge.distributed import get_dp_group, init_distributed  # noqa: E402
@@ -126,6 +124,7 @@ def main():
         print(
             f"[CFG] mem_fraction_static={args.sglang_mem_fraction_static}, "
             f"num_anchors={args.num_anchors}, ce_chunk_size={args.ce_chunk_size}, "
+            f"shared_training_context={online_flashmtp.uses_shared_training_context}, "
             f"capture_layers={getattr(target_model, 'capture_layer_ids', None)}",
             flush=True,
         )
@@ -151,7 +150,9 @@ def main():
                 k: (v.cuda() if not v.is_cuda else v) for k, v in hidden_states.items()
             }
         else:
-            hidden_states = tuple(h.cuda() if not h.is_cuda else h for h in hidden_states)
+            hidden_states = tuple(
+                h.cuda() if not h.is_cuda else h for h in hidden_states
+            )
 
         hs_bytes = tensor_nbytes(hidden_states)
         if dist.get_rank() == 0:
@@ -177,9 +178,31 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
         if dist.get_rank() == 0:
+            actual_vectors = target_hidden.shape[1] * target_hidden.shape[2]
+            if draft_model.pivot_fuse_mode == "prefix_condition":
+                legacy_vectors = (
+                    anchor_positions.shape[1]
+                    * draft_model.context_window_size
+                    * len(draft_model.target_layer_ids)
+                )
+            else:
+                legacy_vectors = anchor_positions.shape[1] * len(
+                    draft_model.target_layer_ids
+                )
+            layout = (
+                "shared_sequence"
+                if online_flashmtp.uses_shared_training_context
+                else "per_block"
+            )
+            reduction = (
+                1.0 - actual_vectors / legacy_vectors if legacy_vectors > 0 else 0.0
+            )
             print(
                 f"[HS] step{step}: target_hidden ~{_gb(th_bytes):.2f} GiB "
-                f"(shape={tuple(target_hidden.shape)})",
+                f"(shape={tuple(target_hidden.shape)}, layout={layout}, "
+                f"hidden_vectors/sample={actual_vectors}, "
+                f"legacy_vectors/sample={legacy_vectors}, "
+                f"vector_reduction={reduction:.1%})",
                 flush=True,
             )
         log_mem(f"07_step{step}_after_del_full_hidden_states")
