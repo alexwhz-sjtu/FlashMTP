@@ -85,6 +85,23 @@ def validate_decode_config(draft_model: FlashMTPDraftModel) -> None:
     summary = flashmtp_config_summary(draft_model)
     markov_head_type = str(summary["markov_head_type"])
     markov_output_mode = str(summary["markov_output_mode"])
+    left_shift = bool(summary["left_shift"])
+
+    if left_shift:
+        logger.info(
+            "Block alignment: left_shift (config block_size={} is total span; "
+            "draft slots={}; proposals={})",
+            summary["block_size"],
+            draft_model.draft_block_len,
+            draft_model.proposal_length,
+        )
+    else:
+        logger.info(
+            "Block alignment: legacy (config block_size={} is draft block width; "
+            "slot 0 unsupervised; proposals={})",
+            summary["block_size"],
+            draft_model.proposal_length,
+        )
 
     if markov_head_type == "none":
         return
@@ -148,9 +165,13 @@ def load_flashmtp_benchmark_models(
         draft_model.config.flashmtp_config["local_position"] = lp
         logger.info("Overriding local_position={} (from --local-position)", lp)
 
-    block_size = args.block_size if args.block_size is not None else draft_model.block_size
-    draft_model.block_size = block_size
-    draft_model.config.block_size = block_size
+    if args.block_size is not None:
+        draft_model.set_config_block_size(args.block_size)
+        logger.info(
+            "Overriding config block_size={} (left_shift={})",
+            draft_model.block_size,
+            draft_model.left_shift,
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path,

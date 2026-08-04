@@ -428,7 +428,10 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
-    train_eagle3_dataset = build_eagle3_dataset(
+    # The on-disk cache shard names carry no rank/node identifier, so every rank
+    # would write the same files concurrently on a cold cache and corrupt them.
+    # Let global rank 0 build it, then the other ranks just read the finished cache.
+    train_build_kwargs = dict(
         dataset=train_dataset,
         tokenizer=tokenizer,
         chat_template=args.chat_template,
@@ -438,6 +441,11 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         cache_key=cache_key,
         num_proc=args.build_dataset_num_proc,
     )
+    if dist.get_rank() == 0:
+        train_eagle3_dataset = build_eagle3_dataset(**train_build_kwargs)
+    dist.barrier()
+    if dist.get_rank() != 0:
+        train_eagle3_dataset = build_eagle3_dataset(**train_build_kwargs)
 
     min_loss_tokens = 2 * args.block_size
     original_size = len(train_eagle3_dataset)
@@ -459,13 +467,20 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     eval_dataloader = None
     if args.eval_data_path:
         eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
-        eval_eagle3_dataset = build_eagle3_dataset(
+        # Same constraint as the train build: datasets' auto-named map cache files
+        # are identical across ranks, so serialize the build behind rank 0.
+        eval_build_kwargs = dict(
             dataset=eval_dataset,
             tokenizer=tokenizer,
             chat_template=args.chat_template,
             max_length=args.max_length,
             is_preformatted=args.is_preformatted,
         )
+        if dist.get_rank() == 0:
+            eval_eagle3_dataset = build_eagle3_dataset(**eval_build_kwargs)
+        dist.barrier()
+        if dist.get_rank() != 0:
+            eval_eagle3_dataset = build_eagle3_dataset(**eval_build_kwargs)
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
             args.batch_size,
@@ -688,7 +703,19 @@ def main():
                 "current training arguments: "
                 f"requested={requested_markov}, checkpoint={checkpoint_markov}."
             )
+        checkpoint_left_shift = bool(loaded_model.left_shift)
+        if checkpoint_left_shift != bool(args.left_shift):
+            raise ValueError(
+                "Checkpoint left_shift configuration does not match the "
+                "current training arguments: "
+                f"requested={bool(args.left_shift)}, "
+                f"checkpoint={checkpoint_left_shift}."
+            )
         draft_model.load_state_dict(loaded_model.state_dict())
+        draft_model.left_shift = checkpoint_left_shift
+        if draft_model.config.flashmtp_config is None:
+            draft_model.config.flashmtp_config = {}
+        draft_model.config.flashmtp_config["left_shift"] = checkpoint_left_shift
         del loaded_model
         draft_weights_from_checkpoint = True
         print_on_rank0("Loaded draft model weights from checkpoint")

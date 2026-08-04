@@ -380,6 +380,84 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertEqual(loaded.proposal_length, 3)
         self.assertIsNotNone(loaded.markov_head)
 
+    def test_prediction_hidden_legacy_skips_slot_zero(self) -> None:
+        config = Qwen3Config(
+            vocab_size=31,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 4
+        config.block_size = 8
+        config.flashmtp_config = {
+            "target_layer_ids": [0, 3],
+            "pivot_fuse_mode": "linear_fuse",
+            "markov_head_type": "none",
+            "markov_output_mode": "additive",
+            "left_shift": False,
+        }
+        legacy_model = FlashMTPDraftModel(config)
+        block_hidden = torch.randn(2, 8, 16)
+        legacy_hidden = legacy_model._prediction_hidden(block_hidden)
+        self.assertEqual(legacy_hidden.shape, (2, 7, 16))
+
+        config.flashmtp_config["left_shift"] = True
+        left_shift_model = FlashMTPDraftModel(config)
+        left_shift_hidden = left_shift_model._prediction_hidden(block_hidden)
+        self.assertEqual(left_shift_hidden.shape, (2, 7, 16))
+
+    def test_legacy_left_shift_defaults_false_without_config_key(self) -> None:
+        config = Qwen3Config(
+            vocab_size=31,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 4
+        config.block_size = 8
+        config.flashmtp_config = {
+            "target_layer_ids": [0, 3],
+            "pivot_fuse_mode": "linear_fuse",
+            "markov_head_type": "none",
+            "markov_output_mode": "additive",
+        }
+        legacy_model = FlashMTPDraftModel(config)
+        self.assertFalse(legacy_model.left_shift)
+        self.assertEqual(legacy_model.draft_block_len, 8)
+        self.assertEqual(legacy_model.proposal_length, 7)
+        self.assertEqual(legacy_model.max_verify_block_size, 8)
+
+    def test_left_shift_decode_block_sizes(self) -> None:
+        config = Qwen3Config(
+            vocab_size=31,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 4
+        config.block_size = 8
+        config.flashmtp_config = {
+            "target_layer_ids": [0, 3],
+            "pivot_fuse_mode": "linear_fuse",
+            "markov_head_type": "none",
+            "markov_output_mode": "additive",
+            "left_shift": True,
+        }
+        model = FlashMTPDraftModel(config)
+        self.assertTrue(model.left_shift)
+        self.assertEqual(model.draft_block_len, 7)
+        self.assertEqual(model.proposal_length, 7)
+        self.assertEqual(model.max_verify_block_size, 8)
+
     def test_left_shift_training_alignment(self) -> None:
         config = Qwen3Config(
             vocab_size=31,

@@ -31,7 +31,7 @@ fi
 # 主要训练参数
 # ========================================
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-${PET_NPROC_PER_NODE:-8}}"
 
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
@@ -87,17 +87,25 @@ esac
 # ========================================
 
 # GPU 设置
-MASTER_PORT="${MASTER_PORT:-29501}"
+NNODES="${PET_NNODES:-${NNODES:-1}}"
+NODE_RANK="${PET_NODE_RANK:-${NODE_RANK:-0}}"
+MASTER_ADDR="${MASTER_ADDR:-${PET_MASTER_ADDR:-127.0.0.1}}"
+MASTER_PORT="${MASTER_PORT:-${PET_MASTER_PORT:-29501}}"
+
+if [ "${NNODES}" -gt 1 ] 2>/dev/null && { [ "${MASTER_ADDR}" = "127.0.0.1" ] || [ "${MASTER_ADDR}" = "localhost" ]; }; then
+    echo "错误: 多机训练 (NNODES=${NNODES}) 须设置 MASTER_ADDR 或 PET_MASTER_ADDR 为可互通的主节点地址。" >&2
+    exit 1
+fi
+export MASTER_ADDR
+export MASTER_PORT
 TP_SIZE="${TP_SIZE:-1}"
-DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
+DIST_TIMEOUT="${DIST_TIMEOUT:-120}"
 
 # 模型参数（OUTPUT_DIR 依赖 BLOCK_SIZE，须早于 dt 分支）
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 MODEL_TAG="${MODEL_TAG:-'Qwen3_8B'}"
 
 if [ "$DT" = "qz" ]; then
-    # export NNODES=2
-    # export NODE_RANK=${RANK:-0}
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
     OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
@@ -152,8 +160,8 @@ REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-v2}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v2.1_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}2}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_v2.1_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${MODEL_TAG}2}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v2_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}2}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_v2_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${MODEL_TAG}2}"
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen}"
@@ -175,7 +183,11 @@ echo "  思考模式: ${ENABLE_THINKING}"
 echo "  数据子目录: ${CHS_CONCAT_MODE}"
 echo "  Pivot 融合: ${PIVOT_FUSE_MODE} (中间层数 N=${NUM_MIDDLE_LAYERS_N})"
 echo "  local_position: ${LOCAL_POSITION} (tag ${LOCAL_POSITION_TAG}; draft 1..block, CHS rope 0)"
-echo "  left_shift: ${LEFT_SHIFT} (tag ${LEFT_SHIFT_TAG}; block_size=total span anchor+B-1 drafts)"
+if [ "${LEFT_SHIFT_TAG}" = "leftshift1" ]; then
+    echo "  left_shift: true (tag ${LEFT_SHIFT_TAG}; block_size = anchor + B-1 drafts, total span)"
+else
+    echo "  left_shift: false (tag ${LEFT_SHIFT_TAG}; legacy mode, block_size = draft block width)"
+fi
 echo "------------------------------------------"
 echo "目标模型: ${TARGET_MODEL}"
 echo "目标模型后端: ${TARGET_MODEL_BACKEND}"
@@ -212,6 +224,10 @@ echo "------------------------------------------"
 echo "分布式配置:"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 echo "  NPROC_PER_NODE: ${NPROC_PER_NODE}"
+echo "  NNODES: ${NNODES}"
+echo "  NODE_RANK: ${NODE_RANK}"
+echo "  MASTER_ADDR: ${MASTER_ADDR}"
+echo "  MASTER_PORT: ${MASTER_PORT}"
 echo "  TP_SIZE: ${TP_SIZE}"
 echo "------------------------------------------"
 echo "Tracker: ${REPORT_TO}"
@@ -230,7 +246,7 @@ echo ""
 # 如果输出目录已存在，自动添加数字后缀
 original_output_dir="${OUTPUT_DIR}"
 suffix=1
-while [ -d "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null)" ]; do
+while [ "${NNODES}" -le 1 ] 2>/dev/null && [ -d "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null)" ]; do
     OUTPUT_DIR="${original_output_dir}_${suffix}"
     suffix=$((suffix + 1))
 done
@@ -251,7 +267,14 @@ echo "==> 开始训练 FlashMTP"
 echo ""
 
 # train_flashmtp.py 始终 init_distributed()，需 torchrun 提供 RANK/WORLD_SIZE/LOCAL_RANK
-LAUNCHER=(torchrun --nproc_per_node "${NPROC_PER_NODE}" --master_port "${MASTER_PORT}")
+LAUNCHER=(
+    torchrun
+    --nnodes "${NNODES}"
+    --node_rank "${NODE_RANK}"
+    --nproc_per_node "${NPROC_PER_NODE}"
+    --master_addr "${MASTER_ADDR}"
+    --master_port "${MASTER_PORT}"
+)
 
 # 构建可选参数
 OPTIONAL_ARGS=""

@@ -614,10 +614,24 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         """Draft tokens proposed after the anchor; total span is block_size."""
         return self.block_size - 1
 
+    @property
+    def max_verify_block_size(self) -> int:
+        """Anchor-inclusive target verification window (equals config block_size)."""
+        return self.proposal_length + 1
+
+    def set_config_block_size(self, block_size: int) -> None:
+        """Update config block_size while keeping left_shift semantics unchanged."""
+        self.block_size = int(block_size)
+        self.config.block_size = int(block_size)
+
     def _prediction_hidden(self, block_hidden: torch.Tensor) -> torch.Tensor:
         """Select hidden slots carrying logits under the checkpoint alignment."""
         draft_len = self.draft_block_len
-        return block_hidden[:, -draft_len:, :]
+        hidden = block_hidden[:, -draft_len:, :]
+        if not self.left_shift:
+            # Legacy training supervises slots 1..block_size-1; slot 0 is anchor context only.
+            hidden = hidden[:, 1:, :]
+        return hidden
 
     def _fuse_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """(B, N, S, H) -> (B, N, H) for linear/attention, or (B, N*S, H) for prefix."""

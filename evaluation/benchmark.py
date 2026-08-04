@@ -673,7 +673,7 @@ def flashmtp_generate(
     compile_serial_head: bool = False,
 ) -> SimpleNamespace:
     original_block_size = model.block_size
-    model.block_size = block_size
+    model.set_config_block_size(block_size)
     try:
         output_ids = model.spec_generate(
             target=target,
@@ -687,7 +687,7 @@ def flashmtp_generate(
             compile_serial_head=compile_serial_head,
         )
     finally:
-        model.block_size = original_block_size
+        model.set_config_block_size(original_block_size)
 
     stats = model.get_last_decode_stats()
     bsz = int(input_ids.shape[0])
@@ -724,9 +724,9 @@ def main() -> None:
         type=int,
         default=None,
         help="Verify only this many positions from the front of each drafted block "
-        "(anchor-inclusive; verify window length equals block_size). "
-        "The draft model still receives the full --block-size mask block. "
-        "Default: verify the full drafted block.",
+        "(anchor-inclusive). Legacy checkpoints use block_size as draft width; "
+        "left_shift checkpoints use block_size as total span. "
+        "Default: verify the full block (proposal_length + 1).",
     )
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--max-samples", type=int, default=10)
@@ -796,8 +796,11 @@ def main() -> None:
     )
 
     fcfg = getattr(draft_model.config, "flashmtp_config", None) or {}
-    block_size = args.block_size if args.block_size is not None else draft_model.block_size
-    max_verify_block_size = block_size
+    if args.block_size is not None:
+        draft_model.set_config_block_size(args.block_size)
+    config_block_size = draft_model.block_size
+    draft_block_len = draft_model.draft_block_len
+    max_verify_block_size = draft_model.max_verify_block_size
     verify_block_size = (
         args.verify_block
         if args.verify_block is not None
@@ -822,20 +825,23 @@ def main() -> None:
             f"block_size={draft_model.block_size}"
         )
     logger.info(
-        "Decode config: markov_head_type={} markov_output_mode={} markov_rank={}",
+        "Decode config: markov_head_type={} markov_output_mode={} markov_rank={} "
+        "left_shift={}",
         draft_summary["markov_head_type"],
         draft_summary["markov_output_mode"],
         draft_summary["markov_rank"],
+        draft_summary["left_shift"],
     )
     logger.info(
-        "FlashMTP decode: draft_block_size={} verify_block_size={} "
-        "verification_mode={} compile_serial_head={} "
-        "(discarding {} draft positions before target verification)",
-        block_size,
+        "FlashMTP decode: config_block_size={} draft_block_len={} "
+        "verify_block_size={} verification_mode={} compile_serial_head={} "
+        "(discarding {} draft proposals before target verification)",
+        config_block_size,
+        draft_block_len,
         verify_block_size,
         args.stochastic_verification_mode,
         args.compile_serial_head,
-        max_verify_block_size - verify_block_size,
+        draft_model.proposal_length - max(verify_block_size - 1, 0),
     )
 
     if args.batch_size < 1:
@@ -862,7 +868,7 @@ def main() -> None:
         target=target,
         draft_model=draft_model,
         tokenizer=tokenizer,
-        block_size=block_size,
+        block_size=config_block_size,
         verify_block_size=verify_block_size,
         device=device,
         batch_size=args.batch_size,
@@ -909,12 +915,12 @@ def main() -> None:
                 temperature=args.temperature,
                 decode_timing_after_first_token=decode_after_first,
             )
-            response[block_size] = flashmtp_generate(
+            response[config_block_size] = flashmtp_generate(
                 model=draft_model,
                 target=target,
                 input_ids=input_ids,
                 max_new_tokens=args.max_new_tokens,
-                block_size=block_size,
+                block_size=config_block_size,
                 verify_block_size=verify_block_size,
                 stop_token_ids=stop_token_ids,
                 temperature=args.temperature,
@@ -923,7 +929,7 @@ def main() -> None:
                 compile_serial_head=args.compile_serial_head,
             )
             
-            spec_response = response[block_size]
+            spec_response = response[config_block_size]
             generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens:]
             output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
@@ -962,11 +968,11 @@ def main() -> None:
         responses = list(chain(*responses))
 
     overall_stats = compute_benchmark_stats(
-        responses, block_size, verify_block_size
+        responses, config_block_size, verify_block_size
     )
     print_benchmark_stats(
         overall_stats,
-        block_size,
+        config_block_size,
         title=f"Overall (batch_size={args.batch_size})",
     )
 
@@ -977,9 +983,9 @@ def main() -> None:
         print("\n=== Per-category breakdown ===")
         for category in sorted(category_groups):
             cat_stats = compute_benchmark_stats(
-                category_groups[category], block_size, verify_block_size
+                category_groups[category], config_block_size, verify_block_size
             )
-            print_benchmark_stats(cat_stats, block_size, title=f"category={category}")
+            print_benchmark_stats(cat_stats, config_block_size, title=f"category={category}")
 
     total_elapsed_time = cuda_time() - benchmark_start
     print(f"Total elapsed time: {total_elapsed_time:.2f}s")

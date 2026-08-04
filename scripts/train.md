@@ -20,6 +20,19 @@
 
 ---
 
+## `LEFT_SHIFT`（默认关闭）
+
+| 环境变量 | 默认值 | 含义 |
+| --- | --- | --- |
+| `LEFT_SHIFT` | `false` | 关闭 DeepSpec 风格左移监督 |
+
+- **legacy（默认，`LEFT_SHIFT=false`）**：`BLOCK_SIZE` 是 draft block 宽度；slot 0 只做 anchor 上下文，监督 slot `1..B-1`。旧 checkpoint 若 config 里没有 `left_shift` 字段，推理也按 legacy 处理。
+- **left_shift（`LEFT_SHIFT=true`）**：`BLOCK_SIZE` 是总跨度（anchor + `B-1` 个 draft）；draft 实际只有 `B-1` 个并行 slot，监督 anchor+1..anchor+(B-1)。
+
+推理时 `left_shift` 从 checkpoint 的 `flashmtp_config` 读取，不需要手动传参；benchmark 日志会打印 `Block alignment: legacy` 或 `left_shift`。
+
+---
+
 ## 串行 Head
 
 训练脚本支持在并行 FlashMTP backbone 后增加低秩串行 head：
@@ -61,7 +74,7 @@ bash scripts/run_training_flashmtp.sh --dt h100
 # ["linear_fuse", "attention_fuse", "prefix_condition"]
 cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2
 source .venv/bin/activate
-LEFT_SHIFT=true \
+LEFT_SHIFT=false \
 NUM_MIDDLE_LAYERS_N=16 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=6 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=pb_80k MAX_LENGTH=4096 NUM_ANCHORS=512 BLOCK_SIZE=8 LOCAL_POSITION=true \
 LOSS_DECAY_GAMMA=4 BASE_LM_CE_DECAY_GAMMA=16 BASE_LM_CE_WEIGHT=0.06 FINAL_CE_WEIGHT=0.1 TV_LOSS_WEIGHT=1.0 \
 MARKOV_HEAD_TYPE=rnn_easy MARKOV_OUTPUT_MODE=direct MARKOV_RANK=512 \
