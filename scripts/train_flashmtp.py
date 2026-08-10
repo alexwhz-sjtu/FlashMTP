@@ -45,6 +45,8 @@ from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
 from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
 
+logger = logging.getLogger(__name__)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train FlashMTP Draft Model")
@@ -793,7 +795,9 @@ def main():
                 f"Provided ckpt dir {args.ckpt_dir} is not a valid directory."
             )
 
-    if args.resume and os.path.isdir(args.output_dir):
+    # An explicit checkpoint is authoritative. Without --ckpt-dir, --resume
+    # discovers the latest epoch_*_step_* directory under output_dir.
+    if args.resume and args.ckpt_dir is None and os.path.isdir(args.output_dir):
         draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
         print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
 

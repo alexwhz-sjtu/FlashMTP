@@ -658,7 +658,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         target_logits = wrapper.lm_head(target_prediction_hidden)
         manual_tv = (
             F.softmax(draft_logits, dim=-1) - F.softmax(target_logits, dim=-1)
-        ).abs().sum(dim=-1).mul(weight_mask).sum() / (binary_eval_mask.sum() + 1e-6)
+        ).abs().sum(dim=-1).mul(weight_mask).sum() / (weight_mask.sum() + 1e-6)
         manual_ce = F.cross_entropy(
             draft_logits.reshape(-1, draft_logits.size(-1)),
             labels.reshape(-1),

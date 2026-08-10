@@ -685,7 +685,9 @@ class OnlineFlashMTPModel(nn.Module):
         final_ce_loss = loss_num / valid_token_count
         actual_token_count = binary_eval_mask.sum() + 1e-6
         tv_loss = (
-            tv_loss_num / actual_token_count
+            # Keep TV on the same position-weighted scale as its numerator.
+            # Using the binary token count here would shrink TV under decay.
+            tv_loss_num / valid_token_count
             if use_tv_loss
             else prediction_hidden.new_zeros(())
         )

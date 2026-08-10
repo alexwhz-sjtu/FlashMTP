@@ -1,10 +1,12 @@
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 
 import torch
 
 from scripts.train_flashmtp import (
     nonfinite_tensor_names,
+    record_skipped_update,
     validate_numeric_training_args,
     validate_training_batch,
 )
@@ -62,6 +64,25 @@ class FlashMTPTrainingNumericsTest(unittest.TestCase):
             }
         )
         self.assertEqual(names, ["nan_tensor"])
+
+    def test_skipped_update_warning_does_not_crash(self) -> None:
+        tracker = mock.Mock()
+        with self.assertLogs("scripts.train_flashmtp", level="WARNING") as logs:
+            record_skipped_update(
+                tracker,
+                global_step=1,
+                skipped_update_count=1,
+                reason="nonfinite_gradients: params=[weight]",
+            )
+
+        self.assertIn("skipped unsafe training update", logs.output[0])
+        tracker.log.assert_called_once_with(
+            {
+                "train/skipped_unsafe_update": 1,
+                "train/skipped_unsafe_updates_total": 1,
+            },
+            step=1,
+        )
 
     def test_invalid_numeric_args_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "learning-rate"):

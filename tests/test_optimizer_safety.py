@@ -27,10 +27,22 @@ class BF16OptimizerSafetyTest(unittest.TestCase):
         result = optimizer.step()
 
         self.assertFalse(result.updated)
-        self.assertEqual(result.reason, "nonfinite_or_missing_gradients")
+        self.assertIn("nonfinite_gradients", result.reason)
+        self.assertIn("weight", result.reason)
+        self.assertIn("nonfinite_elements=2/2", result.reason)
         self.assertTrue(torch.equal(model.weight, before))
         self.assertEqual(optimizer.scheduler.last_epoch, scheduler_epoch)
         self.assertIsNone(model.weight.grad)
+
+    def test_missing_gradient_reason_is_distinct(self) -> None:
+        model = nn.Linear(2, 1, bias=False)
+        optimizer = self._optimizer(model)
+
+        result = optimizer.step()
+
+        self.assertFalse(result.updated)
+        self.assertIn("missing_gradients", result.reason)
+        self.assertIn("weight", result.reason)
 
     def test_finite_gradient_is_globally_clipped_and_updated(self) -> None:
         model = nn.Linear(2, 1, bias=False)

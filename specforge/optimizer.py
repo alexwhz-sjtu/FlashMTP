@@ -35,7 +35,13 @@ class BF16Optimizer:
         #   These magic numbers: weight_decay=0.0, max_grad_norm=0.5, total_steps=800k, warmup_steps=12k are copied from
         #   https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/ds_config.json
         self.model = model
-        self.model_params = [p for p in model.parameters() if p.requires_grad]
+        named_model_params = [
+            (name, param)
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        ]
+        self.model_param_names = [name for name, _ in named_model_params]
+        self.model_params = [param for _, param in named_model_params]
         self.max_grad_norm = float(max_grad_norm)
         if not math.isfinite(self.max_grad_norm) or self.max_grad_norm <= 0:
             raise ValueError(
@@ -118,6 +124,51 @@ class BF16Optimizer:
             dist.all_reduce(local_bad, op=dist.ReduceOp.MAX)
         return local_bad.item() == 0
 
+    def _nonfinite_gradient_reason(self, grad_norm: torch.Tensor) -> str:
+        """Describe a rejected update before gradients are cleared.
+
+        This path only runs after the scalar global norm is non-finite, so the
+        additional per-gradient scans do not affect normal-step performance.
+        """
+        missing_names: list[str] = []
+        nonfinite_names: list[str] = []
+        nonfinite_elements = 0
+        gradient_elements = 0
+        for name, param in zip(self.model_param_names, self.model_params, strict=True):
+            grad = param.grad
+            if grad is None:
+                missing_names.append(name)
+                continue
+            gradient_elements += grad.numel()
+            finite_mask = torch.isfinite(grad)
+            if not bool(finite_mask.all().item()):
+                nonfinite_names.append(name)
+                nonfinite_elements += int((~finite_mask).sum().item())
+
+        def summarize(names: list[str], limit: int = 8) -> str:
+            shown = names[:limit]
+            suffix = f", ... (+{len(names) - limit})" if len(names) > limit else ""
+            return ", ".join(shown) + suffix
+
+        if nonfinite_names:
+            return (
+                "nonfinite_gradients: "
+                f"params=[{summarize(nonfinite_names)}], "
+                f"nonfinite_elements={nonfinite_elements}/{gradient_elements}, "
+                f"missing_grad_params={len(missing_names)}"
+            )
+        if gradient_elements == 0:
+            return (
+                "missing_gradients: no trainable parameter received a gradient; "
+                f"missing_params=[{summarize(missing_names)}]"
+            )
+        return (
+            "nonfinite_global_grad_norm_with_finite_elements: "
+            f"global_norm={float(grad_norm.item())}, "
+            f"gradient_elements={gradient_elements}, "
+            f"missing_grad_params={len(missing_names)}"
+        )
+
     def step(self) -> OptimizerStepResult:
         with torch.no_grad():
             for p, mp in zip(self.model_params, self.fp32_params):
@@ -127,17 +178,18 @@ class BF16Optimizer:
 
         grad_norm, finite = self._global_grad_norm()
         if not finite:
-            self.zero_grad()
+            reason = self._nonfinite_gradient_reason(grad_norm)
             rank = dist.get_rank() if dist.is_initialized() else 0
             logger.warning(
-                "rank %s: skipped optimizer update because gradients are "
-                "non-finite or missing.",
+                "rank %s: skipped optimizer update: %s",
                 rank,
+                reason,
             )
+            self.zero_grad()
             return OptimizerStepResult(
                 updated=False,
                 grad_norm=float("nan"),
-                reason="nonfinite_or_missing_gradients",
+                reason=reason,
             )
 
         grad_norm_value = float(grad_norm.item())

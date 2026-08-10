@@ -246,7 +246,10 @@ echo ""
 # 如果输出目录已存在，自动添加数字后缀
 original_output_dir="${OUTPUT_DIR}"
 suffix=1
-while [ "${NNODES}" -le 1 ] 2>/dev/null && [ -d "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null)" ]; do
+# A resume must keep the exact original output directory; otherwise the latest
+# epoch_*_step_* checkpoint cannot be discovered. Only fresh single-node runs
+# receive an automatic suffix.
+while [ "${NNODES}" -le 1 ] 2>/dev/null && [ -z "${RESUME}" ] && [ -d "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null)" ]; do
     OUTPUT_DIR="${original_output_dir}_${suffix}"
     suffix=$((suffix + 1))
 done
