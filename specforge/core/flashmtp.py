@@ -1,6 +1,7 @@
 # coding=utf-8
 """FlashMTP Training Wrapper."""
 
+import math
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -9,7 +10,9 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
-from specforge.modeling.draft.flashmtp_markov_head import markov_output_uses_base_lm_head
+from specforge.modeling.draft.flashmtp_markov_head import (
+    markov_output_uses_base_lm_head,
+)
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -128,9 +131,7 @@ def prepare_target_prediction_hidden(
     return torch.gather(
         expanded_hidden,
         dim=2,
-        index=safe_positions.unsqueeze(-1).expand(
-            -1, -1, -1, last_hidden.size(-1)
-        ),
+        index=safe_positions.unsqueeze(-1).expand(-1, -1, -1, last_hidden.size(-1)),
     )
 
 
@@ -175,7 +176,9 @@ def create_flashmtp_block_mask(
       1. Block_i only sees CHS_i (its own feature-concat context token).
       2. Intra-block draft attention is bidirectional.
       3. Different blocks are invisible to each other.
-      4. Invalid blocks (block_keep_mask=False) see nothing.
+      4. Invalid/padded blocks see their own context token only. Their loss is
+         zero, but keeping one finite attention key avoids all-masked softmax
+         rows (which otherwise produce NaN before the zero loss mask is applied).
     """
     block_size = int(block_size)
     chs_len_per_block = int(chs_len_per_block)
@@ -205,7 +208,9 @@ def create_flashmtp_block_mask(
         # flex_attention vmap may probe out-of-range q_idx; clamp before indexing.
         safe_q_block_id = q_block_id.clamp(min=0, max=max_block_id)
         is_valid_block = block_keep_mask[b, safe_q_block_id] & q_block_ok
-        return (mask_context | mask_draft) & is_valid_block
+        valid_attention = (mask_context | mask_draft) & is_valid_block
+        invalid_fallback = mask_context & ~is_valid_block & q_block_ok
+        return valid_attention | invalid_fallback
 
     flashmtp_mask_mod.__name__ = (
         f"flashmtp_mask_N{N}_bs{block_size}_chs{chs_len_per_block}"
@@ -249,6 +254,10 @@ class OnlineFlashMTPModel(nn.Module):
         self.lm_head = target_lm_head
         self.embed_tokens = target_embed_tokens
         self.block_size = block_size
+        if self.block_size <= 1:
+            raise ValueError(
+                f"block_size must be at least 2 for next-token loss, got {block_size}."
+            )
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
@@ -256,9 +265,28 @@ class OnlineFlashMTPModel(nn.Module):
         self.final_ce_weight = float(final_ce_weight)
         self.tv_loss_weight = float(tv_loss_weight)
         self.base_lm_ce_weight = float(base_lm_ce_weight)
+        for name, value in (
+            ("final_ce_weight", self.final_ce_weight),
+            ("tv_loss_weight", self.tv_loss_weight),
+            ("base_lm_ce_weight", self.base_lm_ce_weight),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(
+                    f"{name} must be finite and non-negative, got {value}."
+                )
+        if self.final_ce_weight + self.tv_loss_weight + self.base_lm_ce_weight == 0:
+            raise ValueError("At least one FlashMTP loss weight must be positive.")
         self.base_lm_ce_decay_gamma = base_lm_ce_decay_gamma
         self.add_noise = add_noise
-        self.target_hidden_noise_ratio = target_hidden_noise_ratio
+        self.target_hidden_noise_ratio = float(target_hidden_noise_ratio)
+        if (
+            not math.isfinite(self.target_hidden_noise_ratio)
+            or self.target_hidden_noise_ratio < 0
+        ):
+            raise ValueError(
+                "target_hidden_noise_ratio must be finite and non-negative, got "
+                f"{target_hidden_noise_ratio}."
+            )
         self.ce_chunk_size = max(int(ce_chunk_size), 1)
         configured_left_shift = bool(getattr(draft_model, "left_shift", False))
         self.left_shift = (
@@ -268,11 +296,6 @@ class OnlineFlashMTPModel(nn.Module):
             raise ValueError(
                 "OnlineFlashMTPModel left_shift must match the draft checkpoint/config: "
                 f"wrapper={self.left_shift}, draft={configured_left_shift}."
-            )
-        if self.left_shift and self.block_size <= 1:
-            raise ValueError(
-                "left_shift requires block_size >= 2 (anchor plus at least one "
-                "draft prediction)."
             )
         self.chs_concat_mode = "feature"
         self.draft_model.chs_concat_mode = "feature"
@@ -396,9 +419,7 @@ class OnlineFlashMTPModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: HiddenStatesInput,
         loss_mask: torch.Tensor,
-    ) -> Tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]
-    ]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Sample anchors and gather teacher pivots/distribution states."""
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -458,6 +479,28 @@ class OnlineFlashMTPModel(nn.Module):
         positions, while full-vocabulary logits exist only for one loss chunk.
         """
         device = prediction_hidden.device
+        active_positions = binary_eval_mask.bool()
+        if not active_positions.any():
+            raise ValueError("FlashMTP loss has no supervised label positions.")
+
+        # Padded blocks may contain arbitrary values from backend attention.
+        # Sanitize them before any trainable projection; merely multiplying their
+        # eventual loss by zero is unsafe because NaN * 0 is still NaN.
+        prediction_hidden = torch.where(
+            active_positions.unsqueeze(-1),
+            prediction_hidden,
+            torch.zeros_like(prediction_hidden),
+        )
+        prev_token_ids = torch.where(
+            active_positions, prev_token_ids, torch.zeros_like(prev_token_ids)
+        )
+        if target_prediction_hidden is not None:
+            target_prediction_hidden = torch.where(
+                active_positions.unsqueeze(-1),
+                target_prediction_hidden,
+                torch.zeros_like(target_prediction_hidden),
+            )
+
         flat_hidden = prediction_hidden.reshape(-1, prediction_hidden.size(-1))
         num_tokens = flat_hidden.size(0)
         flat_targets = labels.reshape(-1)
@@ -466,9 +509,7 @@ class OnlineFlashMTPModel(nn.Module):
         valid_token_count = flat_weights.sum() + 1e-6
         markov_head = self.draft_model.markov_head
         output_mode = self.draft_model.markov_output_mode
-        use_base_lm_ce = (
-            self.base_lm_ce_weight > 0.0 and base_weight_mask is not None
-        )
+        use_base_lm_ce = self.base_lm_ce_weight > 0.0 and base_weight_mask is not None
         use_tv_loss = self.tv_loss_weight != 0.0 and markov_head is not None
         if use_tv_loss and target_prediction_hidden is None:
             raise ValueError(
@@ -501,13 +542,13 @@ class OnlineFlashMTPModel(nn.Module):
         ) -> torch.Tensor:
             if markov_head is None:
                 assert lm_head is not None
-                return lm_head(oh)
+                return lm_head(oh).float()
             assert latent is not None
-            head_logits = markov_head.project_logits(latent)
+            head_logits = markov_head.project_logits(latent).float()
             if not markov_output_uses_base_lm_head(output_mode):
                 return head_logits
             assert lm_head is not None
-            return lm_head(oh) + head_logits
+            return lm_head(oh).float() + head_logits
 
         def _chunk_ce_and_tv(
             oh: torch.Tensor,
@@ -516,15 +557,36 @@ class OnlineFlashMTPModel(nn.Module):
             targets_chunk: torch.Tensor,
             weights_chunk: torch.Tensor,
         ):
+            active_chunk = weights_chunk > 0
+            if not active_chunk.any():
+                zero = weights_chunk.new_zeros(())
+                return zero, zero
+
+            oh = oh[active_chunk]
+            latent = latent[active_chunk]
+            target_oh = target_oh[active_chunk]
+            targets_chunk = targets_chunk[active_chunk]
+            weights_chunk = weights_chunk[active_chunk].float()
             logits_chunk = _final_logits(oh, None if markov_head is None else latent)
-            loss_chunk = F.cross_entropy(logits_chunk, targets_chunk, reduction="none")
+            if (targets_chunk < 0).any() or (
+                targets_chunk >= logits_chunk.size(-1)
+            ).any():
+                raise ValueError(
+                    "Supervised labels must be within the output vocabulary: "
+                    f"min={int(targets_chunk.min().item())}, "
+                    f"max={int(targets_chunk.max().item())}, "
+                    f"vocab_size={logits_chunk.size(-1)}."
+                )
+            loss_chunk = F.cross_entropy(
+                logits_chunk.float(), targets_chunk, reduction="none"
+            )
             ce_sum = (loss_chunk * weights_chunk).sum()
             if not use_tv_loss:
                 return ce_sum, ce_sum.new_zeros(())
 
             assert target_lm_head is not None
-            target_logits_chunk = target_lm_head(target_oh)
-            draft_probs = F.softmax(logits_chunk, dim=-1)
+            target_logits_chunk = target_lm_head(target_oh).float()
+            draft_probs = F.softmax(logits_chunk.float(), dim=-1)
             target_probs = F.softmax(target_logits_chunk, dim=-1)
             tv_per_position = (draft_probs - target_probs).abs().sum(dim=-1)
             tv_sum = (tv_per_position * weights_chunk).sum()
@@ -536,7 +598,18 @@ class OnlineFlashMTPModel(nn.Module):
             weights_chunk: torch.Tensor,
         ):
             assert base_lm_head is not None
-            logits_chunk = base_lm_head(oh)
+            active_chunk = weights_chunk > 0
+            if not active_chunk.any():
+                return weights_chunk.new_zeros(())
+            logits_chunk = base_lm_head(oh[active_chunk]).float()
+            targets_chunk = targets_chunk[active_chunk]
+            weights_chunk = weights_chunk[active_chunk].float()
+            if (targets_chunk < 0).any() or (
+                targets_chunk >= logits_chunk.size(-1)
+            ).any():
+                raise ValueError(
+                    "Supervised base-LM labels must be within the output vocabulary."
+                )
             loss_chunk = F.cross_entropy(logits_chunk, targets_chunk, reduction="none")
             return (loss_chunk * weights_chunk).sum()
 
@@ -544,15 +617,11 @@ class OnlineFlashMTPModel(nn.Module):
         tv_loss_num = prediction_hidden.new_zeros(())
         base_loss_num = prediction_hidden.new_zeros(())
         flat_target_prediction_hidden = (
-            target_prediction_hidden.reshape(
-                -1, target_prediction_hidden.size(-1)
-            )
+            target_prediction_hidden.reshape(-1, target_prediction_hidden.size(-1))
             if use_tv_loss and target_prediction_hidden is not None
             else None
         )
-        flat_base_weights = (
-            base_weight_mask.reshape(-1) if use_base_lm_ce else None
-        )
+        flat_base_weights = base_weight_mask.reshape(-1) if use_base_lm_ce else None
         base_valid_token_count = (
             flat_base_weights.sum() + 1e-6 if use_base_lm_ce else None
         )
@@ -765,9 +834,7 @@ class OnlineFlashMTPModel(nn.Module):
 
         # --- Weight mask: block validity * bounds * loss_mask ---
         draft_len = self._draft_block_len()
-        weight_mask = (
-            block_keep_mask.unsqueeze(-1).expand(-1, -1, draft_len).float()
-        )
+        weight_mask = block_keep_mask.unsqueeze(-1).expand(-1, -1, draft_len).float()
         weight_mask = weight_mask * valid_label_mask.float()
 
         if not self.left_shift:
@@ -813,7 +880,9 @@ class OnlineFlashMTPModel(nn.Module):
                 and self.base_lm_ce_decay_gamma > 0
             ):
                 prediction_length = self.block_size - 1
-                k_pred = torch.arange(1, prediction_length + 1, device=device).view(1, 1, -1)
+                k_pred = torch.arange(1, prediction_length + 1, device=device).view(
+                    1, 1, -1
+                )
                 base_decay_weights = torch.exp(
                     -(k_pred - 1).clamp(min=0).float() / self.base_lm_ce_decay_gamma
                 )

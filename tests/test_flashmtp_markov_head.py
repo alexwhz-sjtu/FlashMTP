@@ -20,9 +20,7 @@ from specforge.modeling.draft.flashmtp_markov_head import FlashMTPMarkovHead
 
 class FlashMTPMarkovHeadTest(unittest.TestCase):
     def test_rejection_sampling_accepts_identical_distributions(self) -> None:
-        draft_logits = torch.tensor(
-            [[[2.0, 0.0, -1.0], [0.0, 2.0, -1.0]]]
-        )
+        draft_logits = torch.tensor([[[2.0, 0.0, -1.0], [0.0, 2.0, -1.0]]])
         target_logits = torch.cat(
             [draft_logits, torch.tensor([[[0.0, 0.0, 3.0]]])],
             dim=1,
@@ -41,9 +39,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
 
     def test_rejection_sampling_uses_residual_on_rejection(self) -> None:
         draft_logits = torch.tensor([[[100.0, -100.0, -100.0]]])
-        target_logits = torch.tensor(
-            [[[-100.0, 100.0, -100.0], [0.0, 0.0, 100.0]]]
-        )
+        target_logits = torch.tensor([[[-100.0, 100.0, -100.0], [0.0, 0.0, 100.0]]])
 
         accepted, correction = rejection_sample_verify(
             proposed_tokens=torch.tensor([[0]]),
@@ -510,8 +506,12 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             )
 
         call = loss_mock.call_args.kwargs
-        self.assertTrue(torch.equal(call["prediction_hidden"], output_hidden.view(1, 1, 3, 16)))
-        self.assertTrue(torch.equal(call["prev_token_ids"], torch.tensor([[[1, 2, 3]]])))
+        self.assertTrue(
+            torch.equal(call["prediction_hidden"], output_hidden.view(1, 1, 3, 16))
+        )
+        self.assertTrue(
+            torch.equal(call["prev_token_ids"], torch.tensor([[[1, 2, 3]]]))
+        )
         self.assertTrue(torch.equal(call["labels"], torch.tensor([[[2, 3, 4]]])))
         self.assertTrue(torch.equal(call["weight_mask"], torch.ones(1, 1, 3)))
 
@@ -626,9 +626,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             tv_loss_weight=0.7,
         )
         prediction_hidden = torch.randn(2, 2, 3, 16, requires_grad=True)
-        target_prediction_hidden = torch.randn(
-            2, 2, 3, 16, requires_grad=True
-        )
+        target_prediction_hidden = torch.randn(2, 2, 3, 16, requires_grad=True)
         prev_token_ids = torch.randint(0, 31, (2, 2, 3))
         labels = torch.randint(0, 31, (2, 2, 3))
         weight_mask = torch.tensor(
@@ -659,34 +657,18 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         draft_logits = draft_model.markov_head.project_logits(markov_latent)
         target_logits = wrapper.lm_head(target_prediction_hidden)
         manual_tv = (
-            (
-                F.softmax(draft_logits, dim=-1)
-                - F.softmax(target_logits, dim=-1)
-            )
-            .abs()
-            .sum(dim=-1)
-            .mul(weight_mask)
-            .sum()
-            / (binary_eval_mask.sum() + 1e-6)
-        )
-        manual_ce = (
-            F.cross_entropy(
-                draft_logits.reshape(-1, draft_logits.size(-1)),
-                labels.reshape(-1),
-                reduction="none",
-            )
-            .view_as(labels)
-            .mul(weight_mask)
-            .sum()
-            / (weight_mask.sum() + 1e-6)
-        )
+            F.softmax(draft_logits, dim=-1) - F.softmax(target_logits, dim=-1)
+        ).abs().sum(dim=-1).mul(weight_mask).sum() / (binary_eval_mask.sum() + 1e-6)
+        manual_ce = F.cross_entropy(
+            draft_logits.reshape(-1, draft_logits.size(-1)),
+            labels.reshape(-1),
+            reduction="none",
+        ).view_as(labels).mul(weight_mask).sum() / (weight_mask.sum() + 1e-6)
         self.assertTrue(torch.isfinite(loss))
         self.assertTrue(torch.allclose(final_ce_loss, manual_ce))
         self.assertEqual(float(base_ce_loss), 0.0)
         self.assertTrue(torch.allclose(tv_loss, manual_tv))
-        self.assertTrue(
-            torch.allclose(loss, 0.3 * manual_ce + 0.7 * manual_tv)
-        )
+        self.assertTrue(torch.allclose(loss, 0.3 * manual_ce + 0.7 * manual_tv))
         self.assertTrue(0.0 <= float(accuracy) <= 1.0)
         self.assertTrue(1.0 <= float(prefix_acc) <= 4.0)
         loss.backward()
@@ -756,6 +738,99 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertEqual(float(tv_loss), 0.0)
         loss.backward()
         self.assertIsNotNone(prediction_hidden.grad)
+
+    def test_masked_nan_block_does_not_contaminate_loss_or_gradients(self) -> None:
+        config = Qwen3Config(
+            vocab_size=31,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 4
+        config.block_size = 4
+        config.flashmtp_config = {
+            "target_layer_ids": [0, 3],
+            "pivot_fuse_mode": "linear_fuse",
+            "markov_head_type": "none",
+            "markov_output_mode": "additive",
+        }
+        draft_model = FlashMTPDraftModel(config)
+        wrapper = OnlineFlashMTPModel(
+            draft_model=draft_model,
+            target_lm_head=nn.Linear(16, 31, bias=False),
+            target_embed_tokens=nn.Embedding(31, 16),
+            mask_token_id=30,
+            block_size=4,
+            num_anchors=2,
+            tv_loss_weight=0.0,
+        )
+        prediction_hidden = torch.randn(1, 2, 3, 16, requires_grad=True)
+        with torch.no_grad():
+            prediction_hidden[:, 1].fill_(float("nan"))
+        labels = torch.randint(0, 31, (1, 2, 3))
+        weight_mask = torch.tensor([[[1.0, 1.0, 1.0], [0.0, 0.0, 0.0]]])
+        binary_eval_mask = weight_mask > 0
+
+        loss, *_ = wrapper._chunked_weighted_ce_and_metrics(
+            prediction_hidden=prediction_hidden,
+            prev_token_ids=torch.zeros_like(labels),
+            labels=labels,
+            weight_mask=weight_mask,
+            binary_eval_mask=binary_eval_mask,
+            block_keep_mask=torch.tensor([[True, False]]),
+        )
+
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertTrue(torch.isfinite(prediction_hidden.grad).all())
+        self.assertTrue(torch.isfinite(wrapper.lm_head.weight.grad).all())
+        self.assertTrue(
+            torch.equal(
+                prediction_hidden.grad[:, 1],
+                torch.zeros_like(prediction_hidden.grad[:, 1]),
+            )
+        )
+
+    def test_illegal_supervised_label_is_rejected(self) -> None:
+        config = Qwen3Config(
+            vocab_size=11,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 2
+        config.block_size = 2
+        config.flashmtp_config = {
+            "target_layer_ids": [0, 1],
+            "pivot_fuse_mode": "linear_fuse",
+            "markov_head_type": "none",
+            "markov_output_mode": "additive",
+        }
+        draft_model = FlashMTPDraftModel(config)
+        wrapper = OnlineFlashMTPModel(
+            draft_model=draft_model,
+            target_lm_head=nn.Linear(8, 11, bias=False),
+            target_embed_tokens=nn.Embedding(11, 8),
+            mask_token_id=10,
+            block_size=2,
+            tv_loss_weight=0.0,
+        )
+
+        with self.assertRaisesRegex(ValueError, "within the output vocabulary"):
+            wrapper._chunked_weighted_ce_and_metrics(
+                prediction_hidden=torch.randn(1, 1, 1, 8),
+                prev_token_ids=torch.zeros(1, 1, 1, dtype=torch.long),
+                labels=torch.tensor([[[11]]]),
+                weight_mask=torch.ones(1, 1, 1),
+                binary_eval_mask=torch.ones(1, 1, 1, dtype=torch.bool),
+                block_keep_mask=torch.ones(1, 1, dtype=torch.bool),
+            )
 
 
 if __name__ == "__main__":
