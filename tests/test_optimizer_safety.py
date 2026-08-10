@@ -17,33 +17,6 @@ class BF16OptimizerSafetyTest(unittest.TestCase):
             warmup_ratio=0.1,
         )
 
-    def test_nonfinite_gradient_skips_update_and_scheduler(self) -> None:
-        model = nn.Linear(2, 1, bias=False)
-        optimizer = self._optimizer(model)
-        before = model.weight.detach().clone()
-        scheduler_epoch = optimizer.scheduler.last_epoch
-        model.weight.grad = torch.full_like(model.weight, float("nan"))
-
-        result = optimizer.step()
-
-        self.assertFalse(result.updated)
-        self.assertIn("nonfinite_gradients", result.reason)
-        self.assertIn("weight", result.reason)
-        self.assertIn("nonfinite_elements=2/2", result.reason)
-        self.assertTrue(torch.equal(model.weight, before))
-        self.assertEqual(optimizer.scheduler.last_epoch, scheduler_epoch)
-        self.assertIsNone(model.weight.grad)
-
-    def test_missing_gradient_reason_is_distinct(self) -> None:
-        model = nn.Linear(2, 1, bias=False)
-        optimizer = self._optimizer(model)
-
-        result = optimizer.step()
-
-        self.assertFalse(result.updated)
-        self.assertIn("missing_gradients", result.reason)
-        self.assertIn("weight", result.reason)
-
     def test_finite_gradient_is_globally_clipped_and_updated(self) -> None:
         model = nn.Linear(2, 1, bias=False)
         optimizer = self._optimizer(model, max_grad_norm=0.25)
@@ -63,12 +36,11 @@ class BF16OptimizerSafetyTest(unittest.TestCase):
         optimizer.optimizer.step = capture_step
         result = optimizer.step()
 
-        self.assertTrue(result.updated)
-        self.assertAlmostEqual(result.grad_norm, 5.0, places=5)
+        self.assertAlmostEqual(result, 5.0, places=5)
         self.assertLessEqual(captured_norms[0], 0.250001)
 
     def test_invalid_clip_norm_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "finite and positive"):
+        with self.assertRaisesRegex(ValueError, "positive"):
             self._optimizer(nn.Linear(2, 1), max_grad_norm=0.0)
 
     def test_partial_accumulation_gradient_can_be_rescaled(self) -> None:
@@ -79,8 +51,7 @@ class BF16OptimizerSafetyTest(unittest.TestCase):
         optimizer.scale_model_gradients(4.0)
         result = optimizer.step()
 
-        self.assertTrue(result.updated)
-        self.assertAlmostEqual(result.grad_norm, 2.0, places=5)
+        self.assertAlmostEqual(result, 2.0, places=5)
 
     def test_global_norm_all_reduces_one_scalar_only(self) -> None:
         model = nn.Linear(2, 1, bias=False)
@@ -97,27 +68,11 @@ class BF16OptimizerSafetyTest(unittest.TestCase):
                 "specforge.optimizer.dist.all_reduce", side_effect=capture_all_reduce
             ),
         ):
-            result = optimizer.step()
+            optimizer.step()
 
-        self.assertTrue(result.updated)
         self.assertEqual(len(reduced_tensors), 1)
         self.assertEqual(reduced_tensors[0].ndim, 0)
         self.assertEqual(reduced_tensors[0].numel(), 1)
-
-    def test_nonfinite_loaded_adam_moments_are_discarded(self) -> None:
-        source_model = nn.Linear(2, 1, bias=False)
-        source = self._optimizer(source_model)
-        source_model.weight.grad = torch.ones_like(source_model.weight)
-        self.assertTrue(source.step().updated)
-        state = source.state_dict()
-        first_state = next(iter(state["optimizer_state_dict"]["state"].values()))
-        first_state["exp_avg"].fill_(float("nan"))
-
-        target = self._optimizer(nn.Linear(2, 1, bias=False))
-        loaded = target.load_state_dict(state)
-
-        self.assertFalse(loaded)
-        self.assertEqual(len(target.optimizer.state), 0)
 
 
 if __name__ == "__main__":

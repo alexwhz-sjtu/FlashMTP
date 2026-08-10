@@ -1,7 +1,6 @@
 # coding=utf-8
 """FlashMTP Training Wrapper."""
 
-import math
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -270,21 +269,18 @@ class OnlineFlashMTPModel(nn.Module):
             ("tv_loss_weight", self.tv_loss_weight),
             ("base_lm_ce_weight", self.base_lm_ce_weight),
         ):
-            if not math.isfinite(value) or value < 0:
+            if value < 0:
                 raise ValueError(
-                    f"{name} must be finite and non-negative, got {value}."
+                    f"{name} must be non-negative, got {value}."
                 )
         if self.final_ce_weight + self.tv_loss_weight + self.base_lm_ce_weight == 0:
             raise ValueError("At least one FlashMTP loss weight must be positive.")
         self.base_lm_ce_decay_gamma = base_lm_ce_decay_gamma
         self.add_noise = add_noise
         self.target_hidden_noise_ratio = float(target_hidden_noise_ratio)
-        if (
-            not math.isfinite(self.target_hidden_noise_ratio)
-            or self.target_hidden_noise_ratio < 0
-        ):
+        if self.target_hidden_noise_ratio < 0:
             raise ValueError(
-                "target_hidden_noise_ratio must be finite and non-negative, got "
+                "target_hidden_noise_ratio must be non-negative, got "
                 f"{target_hidden_noise_ratio}."
             )
         self.ce_chunk_size = max(int(ce_chunk_size), 1)

@@ -1,23 +1,8 @@
-import logging
-import math
-from dataclasses import dataclass
-
 import torch
 import torch.distributed as dist
 
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.utils import print_on_rank0
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class OptimizerStepResult:
-    """Result of one guarded optimizer update."""
-
-    updated: bool
-    grad_norm: float
-    reason: str | None = None
 
 
 class BF16Optimizer:
@@ -35,18 +20,10 @@ class BF16Optimizer:
         #   These magic numbers: weight_decay=0.0, max_grad_norm=0.5, total_steps=800k, warmup_steps=12k are copied from
         #   https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/ds_config.json
         self.model = model
-        named_model_params = [
-            (name, param)
-            for name, param in model.named_parameters()
-            if param.requires_grad
-        ]
-        self.model_param_names = [name for name, _ in named_model_params]
-        self.model_params = [param for _, param in named_model_params]
+        self.model_params = [p for p in model.parameters() if p.requires_grad]
         self.max_grad_norm = float(max_grad_norm)
-        if not math.isfinite(self.max_grad_norm) or self.max_grad_norm <= 0:
-            raise ValueError(
-                f"max_grad_norm must be finite and positive, got {max_grad_norm}."
-            )
+        if self.max_grad_norm <= 0:
+            raise ValueError(f"max_grad_norm must be positive, got {max_grad_norm}.")
         self.fp32_params = [
             p.detach().clone().to(torch.float32) for p in self.model_params
         ]
@@ -71,24 +48,21 @@ class BF16Optimizer:
 
     def scale_model_gradients(self, factor: float) -> None:
         """Scale accumulated FSDP gradients before they are copied to FP32."""
-        if not math.isfinite(factor) or factor <= 0:
-            raise ValueError(
-                f"gradient scale must be finite and positive, got {factor}."
-            )
+        if factor <= 0:
+            raise ValueError(f"gradient scale must be positive, got {factor}.")
         with torch.no_grad():
             for param in self.model_params:
                 if param.grad is not None:
                     param.grad.mul_(factor)
 
-    def _global_grad_norm(self) -> tuple[torch.Tensor, bool]:
+    def _global_grad_norm(self) -> torch.Tensor:
         """Return the global L2 norm using one scalar all-reduce.
 
         Gradients remain sharded and local. Only their local squared L2 norm is
-        summed across ranks; NaN/Inf gradients naturally make that scalar
-        non-finite on every rank after the reduction.
+        summed across ranks.
         """
         if not self.fp32_params:
-            return torch.tensor(0.0), False
+            return torch.tensor(0.0)
 
         device = self.fp32_params[0].device
         gradients = [param.grad for param in self.fp32_params if param.grad is not None]
@@ -98,100 +72,21 @@ class BF16Optimizer:
                 torch.stack([norm.double() for norm in local_norms]).square().sum()
             )
         else:
-            # Propagate the unexpected missing-gradient condition through the
-            # same scalar reduction so every rank makes the same skip decision.
-            local_squared_norm = torch.full(
-                (), float("nan"), device=device, dtype=torch.float64
-            )
+            local_squared_norm = torch.zeros((), device=device, dtype=torch.float64)
 
         if dist.is_available() and dist.is_initialized():
             # Communication payload: exactly one 0-D scalar, never gradients.
             dist.all_reduce(local_squared_norm, op=dist.ReduceOp.SUM)
-        global_norm = local_squared_norm.sqrt()
-        return global_norm, bool(torch.isfinite(global_norm).item())
+        return local_squared_norm.sqrt()
 
-    def _optimizer_state_is_finite(self) -> bool:
-        """Check loaded Adam moments consistently across distributed ranks."""
-        if not self.fp32_params:
-            return False
-        device = self.fp32_params[0].device
-        local_bad = torch.zeros((), device=device, dtype=torch.int32)
-        for param_state in self.optimizer.state.values():
-            for value in param_state.values():
-                if isinstance(value, torch.Tensor) and not torch.isfinite(value).all():
-                    local_bad.fill_(1)
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(local_bad, op=dist.ReduceOp.MAX)
-        return local_bad.item() == 0
-
-    def _nonfinite_gradient_reason(self, grad_norm: torch.Tensor) -> str:
-        """Describe a rejected update before gradients are cleared.
-
-        This path only runs after the scalar global norm is non-finite, so the
-        additional per-gradient scans do not affect normal-step performance.
-        """
-        missing_names: list[str] = []
-        nonfinite_names: list[str] = []
-        nonfinite_elements = 0
-        gradient_elements = 0
-        for name, param in zip(self.model_param_names, self.model_params, strict=True):
-            grad = param.grad
-            if grad is None:
-                missing_names.append(name)
-                continue
-            gradient_elements += grad.numel()
-            finite_mask = torch.isfinite(grad)
-            if not bool(finite_mask.all().item()):
-                nonfinite_names.append(name)
-                nonfinite_elements += int((~finite_mask).sum().item())
-
-        def summarize(names: list[str], limit: int = 8) -> str:
-            shown = names[:limit]
-            suffix = f", ... (+{len(names) - limit})" if len(names) > limit else ""
-            return ", ".join(shown) + suffix
-
-        if nonfinite_names:
-            return (
-                "nonfinite_gradients: "
-                f"params=[{summarize(nonfinite_names)}], "
-                f"nonfinite_elements={nonfinite_elements}/{gradient_elements}, "
-                f"missing_grad_params={len(missing_names)}"
-            )
-        if gradient_elements == 0:
-            return (
-                "missing_gradients: no trainable parameter received a gradient; "
-                f"missing_params=[{summarize(missing_names)}]"
-            )
-        return (
-            "nonfinite_global_grad_norm_with_finite_elements: "
-            f"global_norm={float(grad_norm.item())}, "
-            f"gradient_elements={gradient_elements}, "
-            f"missing_grad_params={len(missing_names)}"
-        )
-
-    def step(self) -> OptimizerStepResult:
+    def step(self) -> float:
         with torch.no_grad():
             for p, mp in zip(self.model_params, self.fp32_params):
                 mp.grad = (
                     p.grad.detach().to(torch.float32) if p.grad is not None else None
                 )
 
-        grad_norm, finite = self._global_grad_norm()
-        if not finite:
-            reason = self._nonfinite_gradient_reason(grad_norm)
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            logger.warning(
-                "rank %s: skipped optimizer update: %s",
-                rank,
-                reason,
-            )
-            self.zero_grad()
-            return OptimizerStepResult(
-                updated=False,
-                grad_norm=float("nan"),
-                reason=reason,
-            )
-
+        grad_norm = self._global_grad_norm()
         grad_norm_value = float(grad_norm.item())
         clip_coefficient = min(
             self.max_grad_norm / (grad_norm_value + 1e-6),
@@ -210,7 +105,7 @@ class BF16Optimizer:
             for p, mp in zip(self.model_params, self.fp32_params):
                 p.data.copy_(mp.data.to(p.dtype))
                 p.grad = None
-        return OptimizerStepResult(updated=True, grad_norm=grad_norm_value)
+        return grad_norm_value
 
     def _param_state_compatible(self, param, param_state) -> bool:
         for key, value in param_state.items():
@@ -339,13 +234,6 @@ class BF16Optimizer:
                         "Could not restore optimizer state; Adam moments will be "
                         "reinitialized while scheduler state is still restored."
                     )
-            if loaded_optimizer and not self._optimizer_state_is_finite():
-                self.optimizer.state.clear()
-                loaded_optimizer = False
-                logger.warning(
-                    "Loaded optimizer state contains NaN or Inf; discarded all "
-                    "Adam moments to protect model weights."
-                )
         self.scheduler.load_state_dict(state_dict["scheduler_state_dict"])
         print_on_rank0("Successfully loaded scheduler state_dict.")
         return loaded_optimizer

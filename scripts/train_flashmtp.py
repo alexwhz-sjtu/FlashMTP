@@ -45,8 +45,6 @@ from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
 from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
 
-logger = logging.getLogger(__name__)
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train FlashMTP Draft Model")
@@ -512,126 +510,6 @@ def resolve_training_state_dir(checkpoint_dir: str) -> Optional[str]:
     return None
 
 
-def distributed_any(local_condition: bool, device: torch.device) -> bool:
-    """Return True on every rank when any rank reports the condition."""
-    flag = torch.tensor(int(local_condition), device=device, dtype=torch.int32)
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
-    return bool(flag.item())
-
-
-def nonfinite_tensor_names(
-    named_tensors: dict[str, Optional[torch.Tensor]]
-) -> list[str]:
-    """Return names of tensors containing NaN or Inf."""
-    return [
-        name
-        for name, tensor in named_tensors.items()
-        if tensor is not None and not torch.isfinite(tensor.detach()).all()
-    ]
-
-
-def validate_training_batch(
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    loss_mask: torch.Tensor,
-    vocab_size: int,
-) -> list[str]:
-    """Return local validation errors that would make labels/attention invalid."""
-    errors: list[str] = []
-    if input_ids.shape != attention_mask.shape or input_ids.shape != loss_mask.shape:
-        errors.append(
-            "shape mismatch: "
-            f"input_ids={tuple(input_ids.shape)}, "
-            f"attention_mask={tuple(attention_mask.shape)}, "
-            f"loss_mask={tuple(loss_mask.shape)}"
-        )
-        return errors
-    if input_ids.numel() == 0:
-        errors.append("empty input_ids")
-        return errors
-
-    min_token = int(input_ids.min().item())
-    max_token = int(input_ids.max().item())
-    if min_token < 0 or max_token >= vocab_size:
-        errors.append(
-            f"token/label IDs out of range: min={min_token}, max={max_token}, "
-            f"vocab_size={vocab_size}"
-        )
-
-    for name, mask in (("attention_mask", attention_mask), ("loss_mask", loss_mask)):
-        if not torch.isfinite(mask).all():
-            errors.append(f"{name} contains NaN or Inf")
-        elif ((mask != 0) & (mask != 1)).any():
-            errors.append(f"{name} contains values other than 0/1")
-    return errors
-
-
-def validate_numeric_training_args(args) -> None:
-    """Reject hyperparameters that would deterministically create invalid math."""
-    for name in (
-        "learning_rate",
-        "max_grad_norm",
-    ):
-        value = float(getattr(args, name))
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError(f"--{name.replace('_', '-')} must be finite and positive.")
-
-    for name in (
-        "final_ce_weight",
-        "tv_loss_weight",
-        "base_lm_ce_weight",
-        "target_hidden_noise_ratio",
-    ):
-        value = float(getattr(args, name))
-        if not math.isfinite(value) or value < 0:
-            raise ValueError(
-                f"--{name.replace('_', '-')} must be finite and non-negative."
-            )
-    if args.final_ce_weight + args.tv_loss_weight + args.base_lm_ce_weight <= 0:
-        raise ValueError("At least one configured loss weight must be positive.")
-
-    if not math.isfinite(float(args.warmup_ratio)) or not 0 <= args.warmup_ratio <= 1:
-        raise ValueError("--warmup-ratio must be finite and within [0, 1].")
-    for name in (
-        "num_epochs",
-        "batch_size",
-        "num_anchors",
-        "accumulation_steps",
-        "ce_chunk_size",
-        "log_interval",
-        "eval_interval",
-        "save_interval",
-    ):
-        if int(getattr(args, name)) <= 0:
-            raise ValueError(f"--{name.replace('_', '-')} must be positive.")
-    if int(args.block_size) < 2:
-        raise ValueError("--block-size must be at least 2 for next-token loss.")
-
-
-def record_skipped_update(
-    tracker,
-    global_step: int,
-    skipped_update_count: int,
-    reason: str,
-) -> None:
-    """Write a visible warning and a numeric tracker event for a skipped update."""
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    logger.warning(
-        "rank %s: skipped unsafe training update at global_step=%s: %s",
-        rank,
-        global_step,
-        reason,
-    )
-    tracker.log(
-        {
-            "train/skipped_unsafe_update": 1,
-            "train/skipped_unsafe_updates_total": skipped_update_count,
-        },
-        step=global_step,
-    )
-
-
 def save_checkpoint(args, epoch, step, flashmtp_model, draft_model, optimizer):
     """Save checkpoint."""
     save_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
@@ -754,7 +632,6 @@ def main():
     )
 
     args = parse_args()
-    validate_numeric_training_args(args)
     set_seed(args.seed)
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
@@ -1001,11 +878,9 @@ def main():
     print_on_rank0("Tracker initialized successfully.")
 
     last_time = time.time()
-    skipped_update_count = 0
     accumulated_micro_steps = 0
     checkpoint_pending = False
     last_grad_norm = None
-    target_input_vocab_size = int(target_components.config.vocab_size)
     print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
 
     for epoch in range(start_epoch, args.num_epochs):
@@ -1030,27 +905,6 @@ def main():
             input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
-
-            batch_errors = validate_training_batch(
-                input_ids,
-                attention_mask,
-                loss_mask,
-                target_input_vocab_size,
-            )
-            if distributed_any(bool(batch_errors), input_ids.device):
-                optimizer.zero_grad()
-                accumulated_micro_steps = 0
-                skipped_update_count += 1
-                local_detail = (
-                    "; ".join(batch_errors) or "invalid batch on another rank"
-                )
-                record_skipped_update(
-                    tracker,
-                    global_step,
-                    skipped_update_count,
-                    local_detail,
-                )
-                continue
 
             # here target output is the full sequence
             target_output = target_model.generate_flashmtp_data(
@@ -1086,29 +940,6 @@ def main():
             )
             del target_output, hidden_states
 
-            nonfinite_targets = nonfinite_tensor_names(
-                {
-                    "target_hidden": target_hidden,
-                    "target_prediction_hidden": target_prediction_hidden,
-                }
-            )
-            if distributed_any(bool(nonfinite_targets), input_ids.device):
-                optimizer.zero_grad()
-                accumulated_micro_steps = 0
-                skipped_update_count += 1
-                local_detail = (
-                    f"non-finite teacher tensors: {', '.join(nonfinite_targets)}"
-                    if nonfinite_targets
-                    else "non-finite teacher tensors on another rank"
-                )
-                record_skipped_update(
-                    tracker,
-                    global_step,
-                    skipped_update_count,
-                    local_detail,
-                )
-                continue
-
             if args.shard_draft_by_tp:
                 input_ids = get_tp_data_shard(input_ids)
                 loss_mask = get_tp_data_shard(loss_mask)
@@ -1142,53 +973,12 @@ def main():
                 block_keep_mask,
             )
 
-            nonfinite_losses = nonfinite_tensor_names(
-                {
-                    "loss": loss,
-                    "final_ce_loss": final_ce_loss,
-                    "base_ce_loss": base_ce_loss,
-                    "tv_loss": tv_loss,
-                }
-            )
-            if distributed_any(bool(nonfinite_losses), loss.device):
-                optimizer.zero_grad()
-                accumulated_micro_steps = 0
-                skipped_update_count += 1
-                local_values = {
-                    "loss": float(loss.detach().float().item()),
-                    "final_ce": float(final_ce_loss.detach().float().item()),
-                    "base_ce": float(base_ce_loss.detach().float().item()),
-                    "tv": float(tv_loss.detach().float().item()),
-                }
-                local_detail = (
-                    f"non-finite losses {nonfinite_losses}: {local_values}"
-                    if nonfinite_losses
-                    else "non-finite loss on another rank"
-                )
-                record_skipped_update(
-                    tracker,
-                    global_step,
-                    skipped_update_count,
-                    local_detail,
-                )
-                continue
-
             (loss / args.accumulation_steps).backward()
             accumulated_micro_steps += 1
 
             if accumulated_micro_steps == args.accumulation_steps:
-                step_result = optimizer.step()
+                last_grad_norm = optimizer.step()
                 accumulated_micro_steps = 0
-                if not step_result.updated:
-                    skipped_update_count += 1
-                    record_skipped_update(
-                        tracker,
-                        global_step,
-                        skipped_update_count,
-                        step_result.reason or "optimizer rejected the update",
-                    )
-                    continue
-                last_grad_norm = step_result.grad_norm
 
             if global_step % args.log_interval == 0:
                 loss_log = loss.clone()
@@ -1251,18 +1041,8 @@ def main():
             optimizer.scale_model_gradients(
                 args.accumulation_steps / accumulated_micro_steps
             )
-            step_result = optimizer.step()
+            last_grad_norm = optimizer.step()
             accumulated_micro_steps = 0
-            if not step_result.updated:
-                skipped_update_count += 1
-                record_skipped_update(
-                    tracker,
-                    global_step,
-                    skipped_update_count,
-                    step_result.reason or "optimizer rejected the epoch-end update",
-                )
-            else:
-                last_grad_norm = step_result.grad_norm
 
         if checkpoint_pending:
             save_checkpoint(
