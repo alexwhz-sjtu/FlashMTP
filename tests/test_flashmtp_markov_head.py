@@ -22,6 +22,60 @@ from specforge.modeling.draft.flashmtp_markov_head import FlashMTPMarkovHead
 
 
 class FlashMTPMarkovHeadTest(unittest.TestCase):
+    def test_training_tensor_prep_does_not_lookup_fsdp_sharded_embedding(self) -> None:
+        class ShardedEmbedding(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = nn.Parameter(torch.zeros(31 * 16), requires_grad=False)
+
+            def forward(self, input_ids):
+                raise AssertionError("embedding lookup must happen inside FSDP forward")
+
+        config = Qwen3Config(
+            vocab_size=31,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 4
+        config.block_size = 4
+        config.flashmtp_config = {
+            "target_layer_ids": [0, 3],
+            "pivot_fuse_mode": "prefix_condition",
+            "include_embedding_chs": True,
+        }
+        draft_model = FlashMTPDraftModel(config)
+        wrapper = OnlineFlashMTPModel(
+            draft_model=draft_model,
+            target_lm_head=nn.Linear(16, 31, bias=False),
+            target_embed_tokens=ShardedEmbedding(),
+            mask_token_id=30,
+            block_size=4,
+            num_anchors=1,
+            tv_loss_weight=0.0,
+        )
+        hidden_states = {
+            0: torch.randn(1, 8, 16),
+            3: torch.randn(1, 8, 16),
+        }
+        with mock.patch.object(
+            wrapper,
+            "_sample_anchor_positions",
+            return_value=(torch.tensor([[2]]), torch.tensor([[True]])),
+        ):
+            _, _, target_hidden, _ = wrapper.prepare_training_tensors(
+                input_ids=torch.arange(8).view(1, 8),
+                hidden_states=hidden_states,
+                loss_mask=torch.ones(1, 8),
+            )
+
+        # Only configured CHS layers are prepared outside FSDP. The fixed
+        # embedding slot is added later, after FSDP unshards the table.
+        self.assertEqual(tuple(target_hidden.shape), (1, 1, 2, 16))
+
     def test_embedding_chs_slot_is_not_perturbed_by_hidden_noise(self) -> None:
         target_hidden = torch.zeros(2, 3, 4, 5)
         noisy = add_noise_to_target_hidden(
@@ -130,6 +184,9 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         )
         output_hidden = torch.zeros(1, 3, 16)
         fake_result = tuple(torch.zeros(()) for _ in range(6))
+        expected_predecessor_embedding = (
+            wrapper.embed_tokens.weight[1].detach().clone()
+        )
         with (
             mock.patch.object(
                 draft_model, "forward", return_value=output_hidden
@@ -149,11 +206,16 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
                 loss_mask=torch.ones(1, 8),
                 anchor_positions=torch.tensor([[2]]),
                 block_keep_mask=torch.tensor([[True]]),
-                target_hidden=torch.zeros(1, 1, 3, 16),
+                target_hidden=torch.zeros(1, 1, 2, 16),
             )
 
         rotary_ids = draft_forward.call_args.kwargs["rotary_position_ids"]
         self.assertTrue(torch.equal(rotary_ids, torch.tensor([[1, 1, 1, 2, 3, 4]])))
+        forwarded_chs = draft_forward.call_args.kwargs["target_hidden"]
+        self.assertEqual(tuple(forwarded_chs.shape), (1, 1, 3, 16))
+        self.assertTrue(
+            torch.equal(forwarded_chs[0, 0, 0], expected_predecessor_embedding)
+        )
         self.assertEqual(mask_mock.call_args.kwargs["chs_len_per_block"], 3)
 
     def test_rejection_sampling_accepts_identical_distributions(self) -> None:

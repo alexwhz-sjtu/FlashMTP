@@ -130,14 +130,14 @@ cd /inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP_v2
 source .venv/bin/activate
 export FLASHINFER_CACHE_DIR=/root/.cache/flashinfer_$(hostname)
 LEFT_SHIFT=false \
-NUM_MIDDLE_LAYERS_N=16 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=8 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=2360k_aug3 MAX_LENGTH=30720 NUM_ANCHORS=768 BLOCK_SIZE=8 LOCAL_POSITION=true \
+NUM_MIDDLE_LAYERS_N=16 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=10 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=2360k_aug3 MAX_LENGTH=30720 NUM_ANCHORS=768 BLOCK_SIZE=8 LOCAL_POSITION=true \
 LOSS_DECAY_GAMMA=4 BASE_LM_CE_DECAY_GAMMA=12 BASE_LM_CE_WEIGHT=0.06 FINAL_CE_WEIGHT=0.1 TV_LOSS_WEIGHT=1.0 \
 MARKOV_HEAD_TYPE=vanilla MARKOV_OUTPUT_MODE=additive MARKOV_RANK=256 \
 LEARNING_RATE=5e-4 \
 NPROC_PER_NODE=8 TP_SIZE=1 SHARD_DRAFT_BY_TP=1 CE_CHUNK_SIZE=6144 \
 TRAIN_DATA_PATH="/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/qwen3_4b/mixed_2.3M_qwen3_4b_aug3.jsonl" \
 TARGET_MODEL_BACKEND=sglang SGLANG_MEM_FRACTION_STATIC=0.3 \
-TARGET_MODEL=/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B \
+TARGET_MODEL=/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-4B \
 MODEL_TAG='Qwen3-4B' \
 bash scripts/run_training_flashmtp.sh --dt qz > "whz_mtp_logs/train_flashmtp_qz_dist_$(date +%Y%m%d_%H%M%S).log" 2>&1 &
 

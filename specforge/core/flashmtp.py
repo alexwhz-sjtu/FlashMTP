@@ -435,6 +435,39 @@ class OnlineFlashMTPModel(nn.Module):
 
         return self.embed_tokens(noise_ids)
 
+    def _prepend_embedding_chs(
+        self,
+        target_hidden: torch.Tensor,
+        input_ids: torch.Tensor,
+        anchor_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prepend raw ``anchor-1`` embeddings while inside the FSDP forward.
+
+        Frozen embedding weights can be one-dimensional while FSDP parameters are
+        sharded outside ``forward``. Keeping the lookup here ensures that FSDP has
+        restored the normal two-dimensional embedding table first.
+        """
+        if not self.draft_model.include_embedding_chs:
+            return target_hidden
+
+        selected_chs = len(self.draft_model.target_layer_ids)
+        if target_hidden.size(2) == selected_chs + 1:
+            # Accept callers that already supplied the new physical layout.
+            return target_hidden
+        if target_hidden.size(2) != selected_chs:
+            raise ValueError(
+                "Precomputed target_hidden must contain either the selected CHS "
+                f"layers ({selected_chs}) or embedding+CHS ({selected_chs + 1}); "
+                f"got {target_hidden.size(2)} slots."
+            )
+
+        predecessor_positions = (anchor_positions - 1).clamp(
+            min=0, max=input_ids.size(1) - 1
+        )
+        predecessor_ids = torch.gather(input_ids, 1, predecessor_positions)
+        predecessor_embeddings = self.embed_tokens(predecessor_ids).unsqueeze(2)
+        return torch.cat([predecessor_embeddings, target_hidden], dim=2)
+
     def prepare_training_tensors(
         self,
         input_ids: torch.Tensor,
@@ -452,14 +485,11 @@ class OnlineFlashMTPModel(nn.Module):
             anchor_positions,
             self.draft_model.target_layer_ids,
             self.draft_model.config.num_target_layers,
-            self.embed_tokens(input_ids),
-            include_embedding_chs=self.draft_model.include_embedding_chs,
         )
         if self.add_noise:
             target_hidden = add_noise_to_target_hidden(
                 target_hidden,
                 noise_ratio=self.target_hidden_noise_ratio,
-                preserve_first_slot=self.draft_model.include_embedding_chs,
             )
         target_prediction_hidden = None
         if self.tv_loss_weight != 0.0 and self.draft_model.markov_head is not None:
@@ -780,14 +810,11 @@ class OnlineFlashMTPModel(nn.Module):
                 anchor_positions,
                 self.draft_model.target_layer_ids,
                 self.draft_model.config.num_target_layers,
-                self.embed_tokens(input_ids),
-                include_embedding_chs=self.draft_model.include_embedding_chs,
             )
             if self.add_noise:
                 target_hidden = add_noise_to_target_hidden(
                     target_hidden,
                     noise_ratio=self.target_hidden_noise_ratio,
-                    preserve_first_slot=self.draft_model.include_embedding_chs,
                 )
             if (
                 target_prediction_hidden is None
@@ -805,6 +832,10 @@ class OnlineFlashMTPModel(nn.Module):
             raise ValueError(
                 "anchor_positions and block_keep_mask are required when target_hidden is precomputed."
             )
+
+        target_hidden = self._prepend_embedding_chs(
+            target_hidden, input_ids, anchor_positions
+        )
 
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
