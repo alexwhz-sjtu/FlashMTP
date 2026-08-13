@@ -9,16 +9,153 @@ from transformers import Qwen3Config
 
 from specforge.core.flashmtp import (
     OnlineFlashMTPModel,
+    add_noise_to_target_hidden,
+    prepare_target_hidden,
     prepare_target_prediction_hidden,
 )
 from specforge.modeling.draft.flashmtp import (
     FlashMTPDraftModel,
+    gather_pivot_multilayer_inference,
     rejection_sample_verify,
 )
 from specforge.modeling.draft.flashmtp_markov_head import FlashMTPMarkovHead
 
 
 class FlashMTPMarkovHeadTest(unittest.TestCase):
+    def test_embedding_chs_slot_is_not_perturbed_by_hidden_noise(self) -> None:
+        target_hidden = torch.zeros(2, 3, 4, 5)
+        noisy = add_noise_to_target_hidden(
+            target_hidden, noise_ratio=0.1, preserve_first_slot=True
+        )
+        self.assertTrue(torch.equal(noisy[:, :, 0], target_hidden[:, :, 0]))
+        self.assertFalse(torch.equal(noisy[:, :, 1:], target_hidden[:, :, 1:]))
+
+    def test_training_chs_prepends_anchor_predecessor_embedding(self) -> None:
+        embeddings = torch.arange(1 * 6 * 3, dtype=torch.float32).view(1, 6, 3)
+        layer0 = embeddings + 100
+        layer2 = embeddings + 300
+        anchors = torch.tensor([[2, 5]])
+
+        gathered = prepare_target_hidden(
+            hidden_states={0: layer0, 2: layer2},
+            anchor_positions=anchors,
+            target_layer_ids=[0, 2],
+            num_transformer_layers=3,
+            input_embeddings=embeddings,
+            include_embedding_chs=True,
+        )
+
+        self.assertEqual(tuple(gathered.shape), (1, 2, 3, 3))
+        self.assertTrue(torch.equal(gathered[:, :, 0], embeddings[:, [1, 4]]))
+        self.assertTrue(torch.equal(gathered[:, :, 1], layer0[:, [1, 4]]))
+        self.assertTrue(torch.equal(gathered[:, :, 2], layer2[:, [1, 4]]))
+
+    def test_inference_chs_prepends_embedding_without_counting_it_as_layer(self) -> None:
+        embedding = torch.full((1, 2, 3), 7.0)
+        layer0 = torch.full((1, 2, 3), 11.0)
+        layer1 = torch.full((1, 2, 3), 13.0)
+
+        gathered = gather_pivot_multilayer_inference(
+            hidden_states=(embedding, layer0, layer1),
+            target_layer_ids=[0, 1],
+            token_index=-1,
+            num_transformer_layers=2,
+            include_embedding_chs=True,
+        )
+
+        self.assertEqual(tuple(gathered.shape), (1, 1, 3, 3))
+        self.assertTrue(torch.equal(gathered[0, 0, 0], embedding[0, -1]))
+        self.assertTrue(torch.equal(gathered[0, 0, 1], layer0[0, -1]))
+        self.assertTrue(torch.equal(gathered[0, 0, 2], layer1[0, -1]))
+
+    def test_prefix_embedding_slot_has_no_depth_encoding(self) -> None:
+        config = Qwen3Config(
+            vocab_size=31,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 4
+        config.block_size = 4
+        config.flashmtp_config = {
+            "target_layer_ids": [0, 3],
+            "pivot_fuse_mode": "prefix_condition",
+            "include_embedding_chs": True,
+        }
+        model = FlashMTPDraftModel(config)
+        target_hidden = torch.randn(1, 1, 3, 16)
+        with torch.no_grad():
+            model.layer_depth_embedding.weight.fill_(2.0)
+            expected_embedding = model.hidden_norm(target_hidden[:, :, 0]).squeeze(1)
+            expected_layer = model.hidden_norm(
+                target_hidden[:, :, 1] + 2.0
+            ).squeeze(1)
+            fused = model._fuse_target_hidden(target_hidden)
+
+        self.assertEqual(model.target_layer_ids, [0, 3])
+        self.assertEqual(model.chs_len_per_block, 3)
+        self.assertTrue(torch.allclose(fused[:, 0], expected_embedding))
+        self.assertTrue(torch.allclose(fused[:, 1], expected_layer))
+
+    def test_embedding_prefix_uses_same_rotary_position_as_chs(self) -> None:
+        config = Qwen3Config(
+            vocab_size=31,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 4
+        config.block_size = 4
+        config.flashmtp_config = {
+            "target_layer_ids": [0, 3],
+            "pivot_fuse_mode": "prefix_condition",
+            "include_embedding_chs": True,
+            "left_shift": True,
+        }
+        draft_model = FlashMTPDraftModel(config)
+        wrapper = OnlineFlashMTPModel(
+            draft_model=draft_model,
+            target_lm_head=nn.Linear(16, 31, bias=False),
+            target_embed_tokens=nn.Embedding(31, 16),
+            mask_token_id=30,
+            block_size=4,
+            num_anchors=1,
+            tv_loss_weight=0.0,
+        )
+        output_hidden = torch.zeros(1, 3, 16)
+        fake_result = tuple(torch.zeros(()) for _ in range(6))
+        with (
+            mock.patch.object(
+                draft_model, "forward", return_value=output_hidden
+            ) as draft_forward,
+            mock.patch(
+                "specforge.core.flashmtp.create_flashmtp_block_mask",
+                return_value=None,
+            ) as mask_mock,
+            mock.patch.object(
+                wrapper,
+                "_chunked_weighted_ce_and_metrics",
+                return_value=fake_result,
+            ),
+        ):
+            wrapper(
+                input_ids=torch.arange(8).view(1, 8),
+                loss_mask=torch.ones(1, 8),
+                anchor_positions=torch.tensor([[2]]),
+                block_keep_mask=torch.tensor([[True]]),
+                target_hidden=torch.zeros(1, 1, 3, 16),
+            )
+
+        rotary_ids = draft_forward.call_args.kwargs["rotary_position_ids"]
+        self.assertTrue(torch.equal(rotary_ids, torch.tensor([[1, 1, 1, 2, 3, 4]])))
+        self.assertEqual(mask_mock.call_args.kwargs["chs_len_per_block"], 3)
+
     def test_rejection_sampling_accepts_identical_distributions(self) -> None:
         draft_logits = torch.tensor([[[2.0, 0.0, -1.0], [0.0, 2.0, -1.0]]])
         target_logits = torch.cat(
@@ -375,6 +512,8 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertTrue(loaded.left_shift)
         self.assertEqual(loaded.proposal_length, 3)
         self.assertIsNotNone(loaded.markov_head)
+        self.assertFalse(loaded.include_embedding_chs)
+        self.assertEqual(loaded.fc.in_features, 2 * config.hidden_size)
 
     def test_prediction_hidden_legacy_skips_slot_zero(self) -> None:
         config = Qwen3Config(

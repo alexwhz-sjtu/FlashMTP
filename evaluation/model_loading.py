@@ -48,6 +48,9 @@ def flashmtp_config_summary(draft_model: FlashMTPDraftModel) -> dict[str, Any]:
         "pivot_fuse_mode": getattr(draft_model, "pivot_fuse_mode", fcfg.get("pivot_fuse_mode")),
         "num_middle_layers_n": fcfg.get("num_middle_layers_n"),
         "target_layer_ids": getattr(draft_model, "target_layer_ids", None),
+        "include_embedding_chs": getattr(
+            draft_model, "include_embedding_chs", fcfg.get("include_embedding_chs", False)
+        ),
         "local_position": getattr(draft_model, "local_position", fcfg.get("local_position", False)),
         "left_shift": getattr(draft_model, "left_shift", fcfg.get("left_shift", False)),
         "block_size": int(getattr(draft_model, "block_size", fcfg.get("block_size", 0))),
@@ -64,11 +67,13 @@ def log_flashmtp_config(draft_model: FlashMTPDraftModel) -> dict[str, Any]:
     summary = flashmtp_config_summary(draft_model)
     logger.info(
         "FlashMTP draft: pivot_fuse_mode={} num_middle_layers_n={} target_layer_ids={} "
-        "local_position={} left_shift={} block_size={} markov_head_type={} markov_output_mode={} "
+        "include_embedding_chs={} local_position={} left_shift={} block_size={} "
+        "markov_head_type={} markov_output_mode={} "
         "markov_rank={} mask_token_id={}",
         summary["pivot_fuse_mode"],
         summary["num_middle_layers_n"],
         summary["target_layer_ids"],
+        summary["include_embedding_chs"],
         summary["local_position"],
         summary["left_shift"],
         summary["block_size"],

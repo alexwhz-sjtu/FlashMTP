@@ -110,6 +110,7 @@ def profile_steps(
         draft.target_layer_ids,
         -1,
         draft.config.num_target_layers,
+        include_embedding_chs=draft.include_embedding_chs,
     )
 
     start = num_input_tokens

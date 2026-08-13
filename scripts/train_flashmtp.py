@@ -333,6 +333,9 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     draft_config.flashmtp_config["chs_concat_mode"] = "feature"
     draft_config.flashmtp_config["pivot_fuse_mode"] = args.pivot_fuse_mode
     draft_config.flashmtp_config["num_middle_layers_n"] = args.num_middle_layers_n
+    # Structural v2 revision: always prepend the anchor-predecessor raw embedding.
+    # Old checkpoints omit this key and retain their legacy layout at evaluation.
+    draft_config.flashmtp_config["include_embedding_chs"] = True
     draft_config.flashmtp_config["local_position"] = bool(args.local_position)
     draft_config.flashmtp_config["left_shift"] = bool(args.left_shift)
     draft_config.flashmtp_config["markov_head_type"] = args.markov_head_type
@@ -752,6 +755,9 @@ def main():
     draft_model.config.flashmtp_config["pivot_fuse_mode"] = draft_model.pivot_fuse_mode
     draft_model.config.flashmtp_config["num_middle_layers_n"] = (
         draft_model.num_middle_layers_n
+    )
+    draft_model.config.flashmtp_config["include_embedding_chs"] = bool(
+        draft_model.include_embedding_chs
     )
     draft_model.config.flashmtp_config["local_position"] = bool(
         getattr(draft_model, "local_position", False)

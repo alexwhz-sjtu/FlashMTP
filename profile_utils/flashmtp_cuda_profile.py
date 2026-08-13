@@ -122,6 +122,7 @@ def profile_flashmtp_generate(
         model.target_layer_ids,
         -1,
         model.config.num_target_layers,
+        include_embedding_chs=model.include_embedding_chs,
     )
 
     start = num_input_tokens
@@ -216,6 +217,7 @@ def profile_flashmtp_generate(
             model.target_layer_ids,
             pivot_index,
             model.config.num_target_layers,
+            include_embedding_chs=model.include_embedding_chs,
         )
         decode_steps += 1
 

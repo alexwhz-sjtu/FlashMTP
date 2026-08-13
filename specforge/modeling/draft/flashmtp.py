@@ -231,10 +231,23 @@ def gather_pivot_multilayer_inference(
     target_layer_ids: list[int],
     token_index: int,
     num_transformer_layers: int,
+    include_embedding_chs: bool = False,
 ) -> torch.Tensor:
-    """Return (B, 1, S, H) pivot features for inference."""
+    """Return the fixed embedding prefix plus selected pivots for inference.
+
+    With ``include_embedding_chs=True``, slot 0 is the target model's raw
+    embedding output at ``token_index`` and the shape is ``(B, 1, 1+S, H)``.
+    Otherwise the legacy ``(B, 1, S, H)`` layout is returned.
+    """
     off = _infer_hs_embedding_offset(hidden_states, num_transformer_layers)
     pieces: list[torch.Tensor] = []
+    if include_embedding_chs:
+        if off != 1:
+            raise ValueError(
+                "Inference hidden_states must include the embedding output at index 0 "
+                "when include_embedding_chs=True."
+            )
+        pieces.append(hidden_states[0][:, token_index, :].unsqueeze(1))
     for layer_id in target_layer_ids:
         layer_h = hidden_states[layer_id + off]
         pieces.append(layer_h[:, token_index, :].unsqueeze(1))
@@ -472,6 +485,12 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 "expected linear_fuse | attention_fuse | prefix_condition"
             )
         self.num_middle_layers_n = int(flashmtp_config.get("num_middle_layers_n", 0))
+        # Missing on old checkpoints: preserve their original CHS layout and
+        # projection shapes. New training writes this field explicitly.
+        self.include_embedding_chs = bool(
+            flashmtp_config.get("include_embedding_chs", False)
+        )
+        flashmtp_config["include_embedding_chs"] = self.include_embedding_chs
 
         if flashmtp_config.get("target_layer_ids") is not None:
             self.target_layer_ids = list(flashmtp_config["target_layer_ids"])
@@ -562,10 +581,13 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
         self._last_decode_stats = {}
 
+        # The raw embedding at anchor-1 is an extra fixed conditioning slot. It
+        # is deliberately not included in target_layer_ids / num_middle_layers_n.
         s_layers = len(self.target_layer_ids)
+        conditioning_slots = s_layers + int(self.include_embedding_chs)
         h = config.hidden_size
         if self.pivot_fuse_mode == "linear_fuse":
-            self.fc = nn.Linear(s_layers * h, h, bias=False)
+            self.fc = nn.Linear(conditioning_slots * h, h, bias=False)
             self.pivot_attn_fuse = None
             self.layer_depth_embedding = None
         elif self.pivot_fuse_mode == "attention_fuse":
@@ -582,6 +604,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             f"FlashMTP: pivot_fuse_mode={self.pivot_fuse_mode}, "
             f"num_middle_layers_n={self.num_middle_layers_n}, "
             f"target_layer_ids={self.target_layer_ids}, "
+            f"include_embedding_chs={self.include_embedding_chs}, "
             f"local_position={self.local_position}, "
             f"left_shift={self.left_shift}, "
             f"markov_head_type={self.markov_head_type}, "
@@ -593,8 +616,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
 
     @property
     def chs_len_per_block(self) -> int:
+        """Physical KV-prefix length; selected CHS layer counts remain unchanged."""
         return (
-            len(self.target_layer_ids)
+            len(self.target_layer_ids) + int(self.include_embedding_chs)
             if self.pivot_fuse_mode == "prefix_condition"
             else 1
         )
@@ -634,8 +658,19 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         return hidden
 
     def _fuse_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        """(B, N, S, H) -> (B, N, H) for linear/attention, or (B, N*S, H) for prefix."""
+        """Fuse ``[raw embedding, selected CHS layers]`` conditioning slots."""
         bsz, n_blk, s_len, h = target_hidden.shape
+        expected_slots = len(self.target_layer_ids) + int(self.include_embedding_chs)
+        if s_len != expected_slots:
+            layout = (
+                "one fixed embedding slot followed by "
+                if self.include_embedding_chs
+                else ""
+            )
+            raise ValueError(
+                f"target_hidden must contain {layout}{len(self.target_layer_ids)} "
+                f"selected CHS layers; got {s_len} slots."
+            )
         if self.pivot_fuse_mode == "linear_fuse":
             flat = target_hidden.reshape(bsz, n_blk, s_len * h)
             return self.hidden_norm(self.fc(flat))
@@ -646,8 +681,15 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         depth_ids = torch.tensor(
             self.target_layer_ids, device=target_hidden.device, dtype=torch.long
         )
-        depth_emb = self.layer_depth_embedding(depth_ids).view(1, 1, s_len, h)
-        ctx = target_hidden + depth_emb
+        depth_emb = self.layer_depth_embedding(depth_ids).view(
+            1, 1, len(self.target_layer_ids), h
+        )
+        if self.include_embedding_chs:
+            raw_embedding = target_hidden[:, :, :1, :]
+            layer_ctx = target_hidden[:, :, 1:, :] + depth_emb
+            ctx = torch.cat([raw_embedding, layer_ctx], dim=2)
+        else:
+            ctx = target_hidden + depth_emb
         return self.hidden_norm(ctx.reshape(bsz, n_blk * s_len, h))
 
     def forward(
@@ -884,6 +926,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             self.target_layer_ids,
             -1,
             self.config.num_target_layers,
+            include_embedding_chs=self.include_embedding_chs,
         )
 
         start = input_ids.shape[1]
@@ -1073,6 +1116,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 self.target_layer_ids,
                 pivot_index,
                 self.config.num_target_layers,
+                include_embedding_chs=self.include_embedding_chs,
             )
             accept_len_out = int(acceptance_length + 1)
             self._last_decode_stats["accept_lengths"].append(accept_len_out)
@@ -1190,6 +1234,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             self.target_layer_ids,
             -1,
             self.config.num_target_layers,
+            include_embedding_chs=self.include_embedding_chs,
         )
 
         # Decode stage: single cuda-synced wall clock (draft + target + bookkeeping)
@@ -1292,6 +1337,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 self.target_layer_ids,
                 pivot_index,
                 self.config.num_target_layers,
+                include_embedding_chs=self.include_embedding_chs,
             )
             acceptance_lengths.append(acceptance_length + 1)
             self._last_decode_stats["accept_lengths"].append(acceptance_length + 1)

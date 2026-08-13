@@ -57,8 +57,10 @@ def prepare_target_hidden(
     anchor_positions: torch.Tensor,  # (B, N)
     target_layer_ids: list[int],
     num_transformer_layers: int,
+    input_embeddings: Optional[torch.Tensor] = None,
+    include_embedding_chs: bool = False,
 ) -> torch.Tensor:
-    """Gather pivot hidden states for all selected transformer layers.
+    """Gather the fixed embedding prefix and selected transformer-layer pivots.
 
     ``target_layer_ids`` are **0-based transformer layer indices** (shallow=0, deep=L-1).
 
@@ -66,11 +68,30 @@ def prepare_target_hidden(
     - a tuple/list indexed by transformer layer id (+ optional embedding offset), or
     - a dict mapping layer id -> (B, seq_len, H) (SGLang partial capture).
 
+    When ``include_embedding_chs`` is enabled, the raw input embedding at
+    ``anchor-1`` is slot 0. It is an extra, fixed conditioning slot and is not
+    represented in ``target_layer_ids``. The disabled mode preserves old
+    checkpoints' input layout.
+
     Returns:
-        (B, N, S, H) with ``S = len(target_layer_ids)``, positions ``anchor-1`` per block.
+        (B, N, S, H), or (B, N, 1+S, H) when ``include_embedding_chs`` is
+        enabled, with positions ``anchor-1`` per block.
     """
     context_positions = (anchor_positions - 1).clamp(min=0)  # (B, N)
     pieces: list[torch.Tensor] = []
+    if include_embedding_chs:
+        if input_embeddings is None:
+            raise ValueError(
+                "input_embeddings is required when include_embedding_chs=True."
+            )
+        embedding_selected = torch.gather(
+            input_embeddings,
+            dim=1,
+            index=context_positions.unsqueeze(-1).expand(
+                -1, -1, input_embeddings.size(-1)
+            ),
+        )
+        pieces.append(embedding_selected)
     for layer_id in target_layer_ids:
         if isinstance(hidden_states, dict):
             layer_hidden = hidden_states[layer_id]
@@ -85,7 +106,7 @@ def prepare_target_hidden(
             index=context_positions.unsqueeze(-1).expand(-1, -1, layer_hidden.size(-1)),
         )
         pieces.append(layer_selected)
-    return torch.stack(pieces, dim=2)  # (B, N, S, H)
+    return torch.stack(pieces, dim=2)
 
 
 def prepare_target_prediction_hidden(
@@ -137,14 +158,18 @@ def prepare_target_prediction_hidden(
 def add_noise_to_target_hidden(
     target_hidden: torch.Tensor,
     noise_ratio: float = 0.1,
+    preserve_first_slot: bool = False,
 ) -> torch.Tensor:
-    """Add uniform noise to each selected-layer pivot hidden (training augmentation).
+    """Add uniform noise to conditioning slots (training augmentation).
 
     Samples i.i.d. from U(-noise_ratio, noise_ratio) per element (default U(-0.1, 0.1)).
+    ``preserve_first_slot`` keeps the fixed raw-embedding prefix unchanged.
     """
     if noise_ratio <= 0:
         return target_hidden
     noise = torch.empty_like(target_hidden).uniform_(-noise_ratio, noise_ratio)
+    if preserve_first_slot:
+        noise[..., 0, :] = 0
     return target_hidden + noise
 
 
@@ -160,8 +185,8 @@ def create_flashmtp_block_mask(
     Args:
         anchor_positions: (B, N) tensor of anchor positions for each block
         block_keep_mask: (B, N) boolean mask indicating valid blocks
-        chs_len_per_block: Number of tokens per CHS segment. FlashMTP uses
-            feature-concat CHS, so this is 1.
+        chs_len_per_block: Physical context-prefix tokens per block. This includes
+            the fixed raw-embedding slot when context is kept as a sequence.
         block_size: Number of tokens per draft block
         device: torch device
 
@@ -427,10 +452,14 @@ class OnlineFlashMTPModel(nn.Module):
             anchor_positions,
             self.draft_model.target_layer_ids,
             self.draft_model.config.num_target_layers,
+            self.embed_tokens(input_ids),
+            include_embedding_chs=self.draft_model.include_embedding_chs,
         )
         if self.add_noise:
             target_hidden = add_noise_to_target_hidden(
-                target_hidden, noise_ratio=self.target_hidden_noise_ratio
+                target_hidden,
+                noise_ratio=self.target_hidden_noise_ratio,
+                preserve_first_slot=self.draft_model.include_embedding_chs,
             )
         target_prediction_hidden = None
         if self.tv_loss_weight != 0.0 and self.draft_model.markov_head is not None:
@@ -751,10 +780,14 @@ class OnlineFlashMTPModel(nn.Module):
                 anchor_positions,
                 self.draft_model.target_layer_ids,
                 self.draft_model.config.num_target_layers,
+                self.embed_tokens(input_ids),
+                include_embedding_chs=self.draft_model.include_embedding_chs,
             )
             if self.add_noise:
                 target_hidden = add_noise_to_target_hidden(
-                    target_hidden, noise_ratio=self.target_hidden_noise_ratio
+                    target_hidden,
+                    noise_ratio=self.target_hidden_noise_ratio,
+                    preserve_first_slot=self.draft_model.include_embedding_chs,
                 )
             if (
                 target_prediction_hidden is None
