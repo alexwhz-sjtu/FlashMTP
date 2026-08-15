@@ -55,14 +55,18 @@ ENABLE_THINKING="${ENABLE_THINKING:-off}"
 # 草稿层数：默认目录名/ WandB id/ run name 中均带 nlayers${NUM_DRAFT_LAYERS}
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 
-# 低秩串行 head：none | vanilla | rnn | rnn_easy
+# 低秩串行 head：none | vanilla | gated | rnn | rnn_easy
 MARKOV_HEAD_TYPE="${MARKOV_HEAD_TYPE:-none}"
-if [[ "$MARKOV_HEAD_TYPE" == "mlp" || "$MARKOV_HEAD_TYPE" == "gated" ]]; then
-    echo "错误: MARKOV_HEAD_TYPE=${MARKOV_HEAD_TYPE} 已不再支持，请使用 none | vanilla | rnn | rnn_easy"
+if [[ "$MARKOV_HEAD_TYPE" == "mlp" ]]; then
+    echo "错误: MARKOV_HEAD_TYPE=mlp 已不再支持，请使用 none | vanilla | gated | rnn | rnn_easy"
     exit 1
 fi
 # additive: 修正并行 base logits；direct: head 直接产生最终 logits
 MARKOV_OUTPUT_MODE="${MARKOV_OUTPUT_MODE:-additive}"
+if [[ "$MARKOV_HEAD_TYPE" == "gated" && "$MARKOV_OUTPUT_MODE" == "direct" ]]; then
+    echo "错误: MARKOV_HEAD_TYPE=gated 仅支持 MARKOV_OUTPUT_MODE=additive"
+    exit 1
+fi
 MARKOV_RANK="${MARKOV_RANK:-256}"
 FINAL_CE_WEIGHT="${FINAL_CE_WEIGHT:-1.0}"
 TV_LOSS_WEIGHT="${TV_LOSS_WEIGHT:-1.0}"
@@ -157,7 +161,7 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-50000}"
 
 # Tracker 参数
 REPORT_TO="${REPORT_TO:-wandb}"
-WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-v2}"
+WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-trainingv2-full}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
 WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v2_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}2}"

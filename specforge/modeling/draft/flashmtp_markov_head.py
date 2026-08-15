@@ -14,7 +14,7 @@ import torch
 from torch import nn
 
 
-MARKOV_HEAD_TYPES = ("vanilla", "rnn", "rnn_easy")
+MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn", "rnn_easy")
 MARKOV_OUTPUT_MODES = ("additive", "direct")
 
 
@@ -61,16 +61,26 @@ class FlashMTPMarkovHead(nn.Module):
             )
         if self.markov_rank <= 0:
             raise ValueError(f"markov_rank must be positive, got {self.markov_rank}.")
+        if self.head_type == "gated" and self.markov_output_mode == "direct":
+            raise ValueError(
+                "gated markov head only supports additive output mode."
+            )
 
         self.prev_token_embedding = nn.Embedding(self.vocab_size, self.markov_rank)
         self.output_proj = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
 
+        self.gate_proj: Optional[nn.Linear] = None
         self.state_proj: Optional[nn.Linear] = None
         self.state_out_proj: Optional[nn.Linear] = None
         self.hidden_proj: Optional[nn.Linear] = None
         self.hidden_fuse_gate_proj: Optional[nn.Linear] = None
         self.state_hidden_mlp: Optional[nn.Linear] = None
-        if self.head_type == "rnn":
+        if self.head_type == "gated":
+            self.gate_proj = nn.Linear(
+                self.hidden_size + self.markov_rank,
+                self.markov_rank,
+            )
+        elif self.head_type == "rnn":
             self.state_proj = nn.Linear(2 * self.markov_rank, 2 * self.markov_rank)
             self.hidden_proj = nn.Linear(
                 self.hidden_size, self.markov_rank, bias=False
@@ -105,6 +115,8 @@ class FlashMTPMarkovHead(nn.Module):
                 f"Unknown markov output mode {output_mode!r}; "
                 f"expected one of {MARKOV_OUTPUT_MODES}."
             )
+        if output_mode == "direct" and self.head_type == "gated":
+            raise ValueError("gated markov head only supports additive output mode.")
         return output_mode
 
     def _hidden_latent_contribution(
@@ -163,6 +175,12 @@ class FlashMTPMarkovHead(nn.Module):
 
         if self.head_type == "vanilla":
             return prev_embeddings, None
+
+        if self.head_type == "gated":
+            assert self.gate_proj is not None
+            gate_inputs = torch.cat([hidden_states, prev_embeddings], dim=-1)
+            gate = torch.sigmoid(self.gate_proj(gate_inputs))
+            return gate * prev_embeddings, None
 
         if self.head_type in ("rnn", "rnn_easy"):
             assert self.state_proj is not None

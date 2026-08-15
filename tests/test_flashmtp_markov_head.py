@@ -350,11 +350,16 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         teacher_logits.float().square().mean().backward()
         self.assertIsNotNone(head.prev_token_embedding.weight.grad)
         self.assertIsNotNone(head.output_proj.weight.grad)
-        if head_type != "vanilla":
-            if head_type in ("rnn", "rnn_easy") and output_mode == "direct":
-                self.assertIsNotNone(hidden.grad)
-            else:
-                self.assertIsNone(hidden.grad)
+        if head_type == "vanilla":
+            self.assertIsNone(hidden.grad)
+        elif head_type == "gated":
+            self.assertIsNotNone(hidden.grad)
+            assert head.gate_proj is not None
+            self.assertIsNotNone(head.gate_proj.weight.grad)
+        elif head_type in ("rnn", "rnn_easy") and output_mode == "direct":
+            self.assertIsNotNone(hidden.grad)
+        else:
+            self.assertIsNone(hidden.grad)
         if head_type in ("rnn", "rnn_easy") and output_mode == "direct":
             self.assertIsNotNone(head.hidden_proj)
             self.assertIsNotNone(head.hidden_proj.weight.grad)
@@ -386,10 +391,35 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
                 self.assertFalse(torch.allclose(direct_latent, additive_latent))
 
     def test_all_head_and_output_modes(self) -> None:
-        for head_type in ("vanilla", "rnn", "rnn_easy"):
-            for output_mode in ("additive", "direct"):
+        for head_type in ("vanilla", "gated", "rnn", "rnn_easy"):
+            output_modes = ("additive",) if head_type == "gated" else ("additive", "direct")
+            for output_mode in output_modes:
                 with self.subTest(head_type=head_type, output_mode=output_mode):
                     self._assert_teacher_forcing_matches_serial(head_type, output_mode)
+
+    def test_gated_rejects_direct_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "additive"):
+            FlashMTPMarkovHead(
+                head_type="gated",
+                vocab_size=23,
+                markov_rank=5,
+                hidden_size=12,
+                markov_output_mode="direct",
+            )
+        head = FlashMTPMarkovHead(
+            head_type="gated",
+            vocab_size=23,
+            markov_rank=5,
+            hidden_size=12,
+            markov_output_mode="additive",
+        )
+        with self.assertRaisesRegex(ValueError, "additive"):
+            head.sample_block_tokens(
+                hidden_states=torch.randn(1, 2, 12),
+                first_prev_token_ids=torch.tensor([1]),
+                output_mode="direct",
+                base_logits=None,
+            )
 
     def test_rnn_easy_uses_state_without_state_out_proj(self) -> None:
         head = FlashMTPMarkovHead(
