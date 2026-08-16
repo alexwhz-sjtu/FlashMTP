@@ -908,9 +908,13 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             self.assertIsNotNone(hidden.grad)
         else:
             self.assertIsNone(hidden.grad)
-        if head_type in ("rnn", "rnn_easy") and output_mode == "direct":
+        if head_type == "rnn" and output_mode == "direct":
             self.assertIsNotNone(head.hidden_proj)
             self.assertIsNotNone(head.hidden_proj.weight.grad)
+        if head_type == "rnn_easy" and output_mode == "direct":
+            self.assertIsNone(head.hidden_proj)
+            assert head.state_hidden_mlp is not None
+            self.assertIsNotNone(head.state_hidden_mlp.weight.grad)
 
     def test_direct_hidden_latent_changes_rnn_outputs(self) -> None:
         torch.manual_seed(11)
@@ -918,7 +922,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         hidden = torch.randn(1, 3, hidden_size)
         prev_token_ids = torch.tensor([[1, 2, 3]])
 
-        for head_type in ("rnn",):
+        for head_type in ("rnn", "rnn_easy"):
             with self.subTest(head_type=head_type):
                 head = FlashMTPMarkovHead(
                     head_type=head_type,
@@ -999,8 +1003,9 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         )
         self.assertIsNone(head.state_out_proj)
         self.assertIsNone(head.hidden_fuse_gate_proj)
+        self.assertIsNone(head.hidden_proj)
         self.assertIsNotNone(head.state_hidden_mlp)
-        self.assertEqual(head.state_hidden_mlp.in_features, 10)
+        self.assertEqual(head.state_hidden_mlp.in_features, 17)
         self.assertEqual(head.state_hidden_mlp.out_features, 5)
 
         torch.manual_seed(9)
@@ -1014,7 +1019,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertEqual(tuple(latent.shape), (2, 3, 5))
         latent.sum().backward()
         self.assertIsNotNone(head.state_hidden_mlp.weight.grad)
-        self.assertIsNotNone(head.hidden_proj.weight.grad)
+        self.assertIsNotNone(hidden.grad)
 
     def test_rnn_easy_state_update_does_not_depend_on_hidden(self) -> None:
         torch.manual_seed(3)
@@ -1701,7 +1706,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertIsNotNone(prediction_hidden.grad)
         self.assertIsNotNone(target_prediction_hidden.grad)
         self.assertIsNotNone(draft_model.markov_head.output_proj.weight.grad)
-        self.assertIsNotNone(draft_model.markov_head.hidden_proj.weight.grad)
+        self.assertIsNotNone(draft_model.markov_head.state_hidden_mlp.weight.grad)
         self.assertIsNotNone(draft_model.markov_head.state_proj.weight.grad)
 
     def test_base_lm_ce_auxiliary_loss(self) -> None:

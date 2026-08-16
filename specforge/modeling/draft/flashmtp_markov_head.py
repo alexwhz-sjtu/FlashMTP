@@ -103,11 +103,8 @@ class FlashMTPMarkovHead(nn.Module):
             )
         elif self.head_type == "rnn_easy":
             self.state_proj = nn.Linear(2 * self.markov_rank, 2 * self.markov_rank)
-            self.hidden_proj = nn.Linear(
-                self.hidden_size, self.markov_rank, bias=False
-            )
             self.state_hidden_mlp = nn.Linear(
-                2 * self.markov_rank,
+                self.markov_rank + self.hidden_size,
                 self.markov_rank,
             )
 
@@ -132,7 +129,7 @@ class FlashMTPMarkovHead(nn.Module):
         *,
         output_mode: str,
     ) -> Optional[torch.Tensor]:
-        if self.hidden_proj is None:
+        if self.head_type != "rnn" or self.hidden_proj is None:
             return None
         if output_mode != "direct":
             return None
@@ -145,7 +142,7 @@ class FlashMTPMarkovHead(nn.Module):
         output_mode: str,
     ) -> Optional[torch.Tensor]:
         """Project all block hidden states before serial decoding."""
-        if self.hidden_proj is None:
+        if self.head_type != "rnn" or self.hidden_proj is None:
             return None
         if output_mode != "direct":
             return None
@@ -200,8 +197,7 @@ class FlashMTPMarkovHead(nn.Module):
             if self.head_type == "rnn_easy":
                 if output_mode == "direct":
                     assert self.state_hidden_mlp is not None
-                    assert hidden_latent is not None
-                    fused_inputs = torch.cat([new_state, hidden_latent], dim=-1)
+                    fused_inputs = torch.cat([new_state, hidden_states], dim=-1)
                     return self.state_hidden_mlp(fused_inputs), new_state
                 return new_state, new_state
 
