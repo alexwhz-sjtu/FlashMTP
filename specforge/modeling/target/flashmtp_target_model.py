@@ -18,6 +18,7 @@ class FlashMTPTargetOutput:
     input_ids: torch.Tensor  # [batch, seq_len]
     attention_mask: torch.Tensor  # [batch, seq_len]
     loss_mask: torch.Tensor  # [batch, seq_len]
+    logits: torch.Tensor  # [batch, seq_len, vocab_size]
 
 
 class FlashMTPTargetModel(ABC):
@@ -106,7 +107,7 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
             is_draft_worker=False,
         )
         wrap_eagle3_logits_processors_in_module(
-            model_runner.model, return_full_logits=False
+            model_runner.model, return_full_logits=True
         )
         instance = cls(model_runner)
         # Default: capture all layers for FlashMTP
@@ -234,7 +235,7 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         for _, module in self.model_runner.model.named_modules():
             if isinstance(module, LogitsProcessorForEAGLE3):
                 module.return_last_hidden_states = True
-                module.return_logits = False
+                module.return_logits = True
 
         cache_params = CacheInitParams(
             disable=False,
@@ -300,10 +301,14 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         else:
             raise ValueError("SGLang output does not contain hidden states.")
 
+        if not hasattr(output, "logits") or output.logits is None:
+            raise ValueError("SGLang output does not contain prefill logits.")
+        logits_list = torch.split(output.logits, input_lens, dim=0)
+
         self.model_runner.req_to_token_pool.clear()
         self.model_runner.token_to_kv_pool_allocator.clear()
 
-        return hidden_states_list, last_hidden_list
+        return hidden_states_list, last_hidden_list, logits_list
 
     @torch.no_grad()
     def generate_flashmtp_data(
@@ -337,7 +342,7 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
             data_cache.append((curr_ids, curr_attn, curr_loss))
             reqs.append(req)
 
-        hidden_states_list, last_hidden_list = self._extend(reqs)
+        hidden_states_list, last_hidden_list, logits_list = self._extend(reqs)
 
         batched_aux = torch.cat([h.unsqueeze(0) for h in hidden_states_list], dim=0)
         batched_last = None
@@ -395,12 +400,14 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         input_ids = torch.cat([d[0] for d in data_cache], dim=0)
         attention_mask = torch.cat([d[1] for d in data_cache], dim=0)
         loss_mask = torch.cat([d[2] for d in data_cache], dim=0)
+        logits = torch.cat([x.unsqueeze(0) for x in logits_list], dim=0)
 
         return FlashMTPTargetOutput(
             hidden_states=hidden_states,
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            logits=logits,
         )
 
 
@@ -457,6 +464,7 @@ class HFFlashMTPTargetModel(FlashMTPTargetModel):
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            logits=outputs.logits,
         )
 
 

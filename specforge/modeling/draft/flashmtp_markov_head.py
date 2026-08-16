@@ -8,6 +8,7 @@ inference samples the block from left to right.
 
 from __future__ import annotations
 
+import warnings
 from typing import Optional
 
 import torch
@@ -21,6 +22,55 @@ MARKOV_OUTPUT_MODES = ("additive", "direct")
 def markov_output_uses_base_lm_head(output_mode: str) -> bool:
     """Return True when draft logits include the target LM head."""
     return str(output_mode).lower() == "additive"
+
+
+def migrate_legacy_rnn_easy_direct_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    prefix: str = "",
+    markov_rank: int,
+    hidden_size: int,
+) -> bool:
+    """Upgrade legacy rnn_easy direct weights to full-hidden fusion.
+
+    Legacy direct mode computed::
+
+        latent = W_mlp @ [state; W_h @ hidden]
+
+    The current layout folds ``W_h`` into the MLP's hidden columns::
+
+        latent = W_new @ [state; hidden]
+        W_new[:, :R] = W_mlp[:, :R]
+        W_new[:, R:] = W_mlp[:, R:] @ W_h
+    """
+    hidden_proj_key = f"{prefix}hidden_proj.weight"
+    mlp_weight_key = f"{prefix}state_hidden_mlp.weight"
+    if hidden_proj_key not in state_dict:
+        return False
+
+    hidden_proj = state_dict[hidden_proj_key]
+    mlp_weight = state_dict.get(mlp_weight_key)
+    if mlp_weight is None:
+        return False
+
+    rank = int(markov_rank)
+    hidden_dim = int(hidden_size)
+    if mlp_weight.shape != (rank, 2 * rank):
+        return False
+    if hidden_proj.shape != (rank, hidden_dim):
+        raise ValueError(
+            "Legacy rnn_easy checkpoint has incompatible hidden_proj shape: "
+            f"expected {(rank, hidden_dim)}, got {tuple(hidden_proj.shape)}."
+        )
+
+    state_weight = mlp_weight[:, :rank]
+    hidden_latent_weight = mlp_weight[:, rank:]
+    state_dict[mlp_weight_key] = torch.cat(
+        [state_weight, hidden_latent_weight @ hidden_proj],
+        dim=1,
+    )
+    del state_dict[hidden_proj_key]
+    return True
 
 
 def _sample_tokens(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -106,6 +156,35 @@ class FlashMTPMarkovHead(nn.Module):
             self.state_hidden_mlp = nn.Linear(
                 self.markov_rank + self.hidden_size,
                 self.markov_rank,
+            )
+            self._register_load_state_dict_pre_hook(
+                self._migrate_legacy_rnn_easy_state_dict_pre_hook
+            )
+
+    def _migrate_legacy_rnn_easy_state_dict_pre_hook(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        local_metadata,
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        if self.head_type != "rnn_easy":
+            return
+        migrated = migrate_legacy_rnn_easy_direct_state_dict(
+            state_dict,
+            prefix=prefix,
+            markov_rank=self.markov_rank,
+            hidden_size=self.hidden_size,
+        )
+        if migrated:
+            warnings.warn(
+                "Migrated legacy rnn_easy direct markov-head weights "
+                "(hidden_proj + 2R fusion MLP) to full-hidden fusion layout.",
+                UserWarning,
+                stacklevel=6,
             )
 
     def project_logits(self, latent_states: torch.Tensor) -> torch.Tensor:
@@ -429,4 +508,5 @@ __all__ = [
     "MARKOV_HEAD_TYPES",
     "MARKOV_OUTPUT_MODES",
     "markov_output_uses_base_lm_head",
+    "migrate_legacy_rnn_easy_direct_state_dict",
 ]

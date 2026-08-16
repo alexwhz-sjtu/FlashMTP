@@ -3,6 +3,13 @@
 
 set -e
 
+# Fail loudly for old launch files instead of silently running them under a
+# fuse/token experiment name with the fixed pivot-Q implementation.
+if [[ -n "${HISTORY_MODE:-}" && "${HISTORY_MODE}" != "pivot_q" ]]; then
+    echo "错误: fuse/token 历史模式已删除；当前布局固定为 pivot_q"
+    exit 1
+fi
+
 # 自动激活虚拟环境
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
@@ -40,11 +47,6 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-${PET_NPROC_PER_NODE:-8}}"
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 SLIDING_WINDOW_SIZE="${SLIDING_WINDOW_SIZE:-64}"
-HISTORY_MODE="${HISTORY_MODE:-fuse}"
-if [[ "${HISTORY_MODE}" != "fuse" && "${HISTORY_MODE}" != "token" && "${HISTORY_MODE}" != "pivot_q" ]]; then
-    echo "错误: HISTORY_MODE 须为 fuse、token 或 pivot_q"
-    exit 1
-fi
 CHS_NUM_LAYERS="${CHS_NUM_LAYERS:-7}"
 CHS_LAYOUT_TAG="chsfirst_tokenwindow"
 if [[ -n "${DRAFT_INPUT_MODE:-}" && "${DRAFT_INPUT_MODE}" != "legacy" ]]; then
@@ -118,15 +120,15 @@ MODEL_TAG="${MODEL_TAG:-Qwen3_8B}"
 if [ "$DT" = "qz" ]; then
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_swa_${HISTORY_MODE}_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_sample_${DATA_NUM_SAMPLES}_wb_${BASE_LM_CE_WEIGHT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_swa_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_sample_${DATA_NUM_SAMPLES}_wb_${BASE_LM_CE_WEIGHT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 elif [ "$DT" = "h100" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/share/dai-sys/wanghanzhen/projects/MTP/training_data/nemotron_think_off_samples_40000_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_swa_${HISTORY_MODE}_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_sample_${DATA_NUM_SAMPLES}_wb_${BASE_LM_CE_WEIGHT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_swa_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_sample_${DATA_NUM_SAMPLES}_wb_${BASE_LM_CE_WEIGHT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_HOME/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_swa_${HISTORY_MODE}_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_swa_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
@@ -183,8 +185,8 @@ clip_wandb_id() {
     local keep=$((max_len - 9))
     printf '%s_%s' "${value:0:${keep}}" "${digest}"
 }
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_swa_${HISTORY_MODE}_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_wb_${BASE_LM_CE_WEIGHT}_block_${BLOCK_SIZE}_${MARKOV_TAG}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_swa_${HISTORY_MODE}_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_wb_${BASE_LM_CE_WEIGHT}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${MODEL_TAG}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_swa_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_wb_${BASE_LM_CE_WEIGHT}_block_${BLOCK_SIZE}_${MARKOV_TAG}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_swa_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_wb_${BASE_LM_CE_WEIGHT}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${MODEL_TAG}}"
 WANDB_RUN_ID="$(clip_wandb_id "${WANDB_RUN_ID}")"
 WANDB_NAME="$(clip_wandb_id "${WANDB_NAME}")"
 if [ -n "${WANDB_RUN_NAME}" ]; then
@@ -209,7 +211,6 @@ echo "数据特征:"
 echo "  样本数量: ${DATA_NUM_SAMPLES}"
 echo "  思考模式: ${ENABLE_THINKING}"
 echo "  滑动窗口: W=${SLIDING_WINDOW_SIZE}"
-echo "  历史模式: ${HISTORY_MODE}"
 echo "  当前 CHS: pivot embedding + S=${CHS_NUM_LAYERS} 个 hidden 层"
 echo "  位置与对齐: draft ${POSITION_TAG}，target 全局位置，anchor query 不监督"
 echo "------------------------------------------"
@@ -224,7 +225,6 @@ echo "模型配置:"
 echo "  草稿模型层数: ${NUM_DRAFT_LAYERS}"
 echo "  块大小: ${BLOCK_SIZE}"
 echo "  滑动窗口大小: ${SLIDING_WINDOW_SIZE}"
-echo "  历史模式: ${HISTORY_MODE}"
 echo "  CHS hidden 层数: ${CHS_NUM_LAYERS}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  锚点执行分块: ${ANCHOR_CHUNK_SIZE} (0=关闭)"
@@ -415,7 +415,6 @@ EXIT_CODE=0
     --tp-size ${TP_SIZE} \
     --dist-timeout ${DIST_TIMEOUT} \
     --sliding-window-size ${SLIDING_WINDOW_SIZE} \
-    --history-mode ${HISTORY_MODE} \
     --chs-num-layers ${CHS_NUM_LAYERS} \
     --markov-head-type ${MARKOV_HEAD_TYPE} \
     --markov-output-mode ${MARKOV_OUTPUT_MODE} \

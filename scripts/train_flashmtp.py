@@ -128,14 +128,6 @@ def parse_args():
         help="Dense Sliding-CHS history window W; uses W-1 preceding positions.",
     )
     model_group.add_argument(
-        "--history-mode",
-        type=str,
-        default="fuse",
-        choices=["fuse", "token", "pivot_q"],
-        help="History representation: fused target hidden states, token embeddings "
-        "as context KV, or token embeddings as window queries (pivot_q).",
-    )
-    model_group.add_argument(
         "--chs-num-layers",
         type=int,
         default=7,
@@ -234,7 +226,7 @@ def parse_args():
         "--ce-chunk-size",
         type=int,
         default=2048,
-        help="Chunk size for lm_head + CE/TV to reduce peak activation memory.",
+        help="Chunk size for draft logits + CE/TV to reduce peak activation memory.",
     )
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
@@ -364,7 +356,7 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     draft_config.flashmtp_config["sliding_window_size"] = int(
         args.sliding_window_size
     )
-    draft_config.flashmtp_config["history_mode"] = args.history_mode
+    draft_config.flashmtp_config.pop("history_mode", None)
     draft_config.flashmtp_config.pop("bwa_stride", None)
     draft_config.flashmtp_config["chs_num_layers"] = int(args.chs_num_layers)
     draft_config.flashmtp_config["include_token_embedding_chs"] = False
@@ -386,16 +378,7 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
 
     draft_model = FlashMTPDraftModel(draft_config).cuda().to(torch.bfloat16)
 
-    capture_layer_ids = set(draft_model.target_layer_ids)
-    if draft_model.history_mode == "fuse":
-        capture_layer_ids.update(draft_model.history_layer_ids)
-    capture_layer_ids = sorted(capture_layer_ids)
-    if args.tv_loss_weight != 0.0 and draft_model.markov_head is not None:
-        final_target_layer_id = draft_model.config.num_target_layers - 1
-        if final_target_layer_id not in capture_layer_ids:
-            capture_layer_ids.append(final_target_layer_id)
-    capture_layer_ids.sort()
-    target_model.set_capture_layers(capture_layer_ids)
+    target_model.set_capture_layers(draft_model.target_layer_ids)
 
     print_on_rank0(
         f"Draft config: block_size={draft_config.block_size}, "
@@ -407,14 +390,12 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     )
     print_on_rank0(
         f"sliding_window_size={draft_model.sliding_window_size}, "
-        f"history_mode={draft_model.history_mode}, "
         f"history_slots={draft_model.history_slot_count}, "
         f"chs_num_layers={draft_model.chs_num_layers}, "
         f"current_chs_layers={draft_model.current_chs_slot_count}, "
         f"condition_slots={draft_model.condition_slot_count}, "
         "pivot_query_embedding=False, "
         f"local_position={draft_model.local_position}, "
-        f"history_layer_ids={draft_model.history_layer_ids}, "
         f"markov_head_type={draft_model.markov_head_type}, "
         f"markov_output_mode={draft_model.markov_output_mode}, "
         f"markov_rank={draft_model.markov_rank}"
@@ -765,24 +746,20 @@ def main():
         requested_sliding = (
             draft_model.architecture_version,
             draft_model.sliding_window_size,
-            draft_model.history_mode,
             draft_model.chs_num_layers,
             draft_model.include_token_embedding_chs,
             draft_model.chs_first_context,
             draft_model.local_position,
             draft_model.target_layer_ids,
-            draft_model.history_layer_ids,
         )
         checkpoint_sliding = (
             loaded_model.architecture_version,
             loaded_model.sliding_window_size,
-            loaded_model.history_mode,
             loaded_model.chs_num_layers,
             loaded_model.include_token_embedding_chs,
             loaded_model.chs_first_context,
             loaded_model.local_position,
             loaded_model.target_layer_ids,
-            loaded_model.history_layer_ids,
         )
         if requested_sliding != checkpoint_sliding:
             raise ValueError(
@@ -829,7 +806,7 @@ def main():
     draft_model.config.flashmtp_config["sliding_window_size"] = (
         draft_model.sliding_window_size
     )
-    draft_model.config.flashmtp_config["history_mode"] = draft_model.history_mode
+    draft_model.config.flashmtp_config.pop("history_mode", None)
     draft_model.config.flashmtp_config["chs_num_layers"] = (
         draft_model.chs_num_layers
     )
@@ -842,9 +819,7 @@ def main():
     draft_model.config.flashmtp_config["target_layer_ids"] = (
         draft_model.target_layer_ids
     )
-    draft_model.config.flashmtp_config["history_layer_ids"] = (
-        draft_model.history_layer_ids
-    )
+    draft_model.config.flashmtp_config.pop("history_layer_ids", None)
     draft_model.config.flashmtp_config["markov_head_type"] = (
         draft_model.markov_head_type
     )
@@ -900,7 +875,6 @@ def main():
         f"base_lm_ce_weight={args.base_lm_ce_weight}, "
         f"base_lm_ce_decay_gamma={args.base_lm_ce_decay_gamma}, "
         f"sliding_window_size={draft_model.sliding_window_size}, "
-        f"history_mode={draft_model.history_mode}, "
         f"history_slots={draft_model.history_slot_count}, "
         f"chs_num_layers={draft_model.chs_num_layers}"
     )
@@ -989,6 +963,7 @@ def main():
             target_output = target_model.generate_flashmtp_data(
                 input_ids, attention_mask, loss_mask
             )
+            target_logits = target_output.logits
 
             hidden_states = target_output.hidden_states
             if isinstance(hidden_states, dict):
@@ -1017,12 +992,11 @@ def main():
                     history_hidden_states,
                     history_start_positions,
                     history_source_lengths,
-                    target_prediction_hidden,
-                    shared_fused_history,
+                    target_prediction_logits,
                 ) = flashmtp_model.prepare_training_tensors(
-                    input_ids, hidden_states, loss_mask
+                    input_ids, hidden_states, loss_mask, target_logits
                 )
-            del target_output, hidden_states
+            del target_output, hidden_states, target_logits
 
             if args.shard_draft_by_tp:
                 input_ids = get_tp_data_shard(input_ids)
@@ -1040,13 +1014,9 @@ def main():
                 history_source_lengths = get_tp_data_shard(
                     history_source_lengths
                 )
-                if shared_fused_history is not None:
-                    shared_fused_history = get_tp_data_shard(
-                        shared_fused_history
-                    )
-                if target_prediction_hidden is not None:
-                    target_prediction_hidden = get_tp_data_shard(
-                        target_prediction_hidden
+                if target_prediction_logits is not None:
+                    target_prediction_logits = get_tp_data_shard(
+                        target_prediction_logits
                     )
 
             (
@@ -1065,16 +1035,14 @@ def main():
                 history_hidden_states=history_hidden_states,
                 history_start_positions=history_start_positions,
                 history_source_lengths=history_source_lengths,
-                target_prediction_hidden=target_prediction_hidden,
-                shared_fused_history=shared_fused_history,
+                target_prediction_logits=target_prediction_logits,
             )
             del (
                 target_hidden,
                 history_hidden_states,
                 history_start_positions,
                 history_source_lengths,
-                target_prediction_hidden,
-                shared_fused_history,
+                target_prediction_logits,
                 anchor_positions,
                 block_keep_mask,
             )

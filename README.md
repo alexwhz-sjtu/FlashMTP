@@ -23,15 +23,15 @@ python scripts/summarize_benchmarks.py --per-run
 
 ## Ours core idea
 
-当前版本按 `[CHS hidden | W-1 个连续历史槽]` 排列 context，并在最新 pivot 位置保留多层 CHS。历史槽可选择融合 target hidden（`history_mode=fuse`）、直接使用 target token embedding 作为 KV（`history_mode=token`），或把这些 embedding 作为 draft Q（`history_mode=pivot_q`）。
+当前版本固定使用 pivot-Q：CHS hidden 作为 context KV，anchor 前 `W-1` 个连续 token embedding 放在 draft Q 前部。
 
 FlashMTP 使用 dense Sliding-CHS 和块内双向注意力，一次 backbone 前向生成整个草稿 block 的 hidden，再由低秩串行 head 恢复块内自回归依赖。
 
 ## Base structure
 
-`fuse` 模式下，历史窗口的每个位置取 target 首层、中层和末层 hidden，经 `Linear(3H,H) + RMSNorm` 融合；`token` 模式下直接使用前 `W-1` 个 token embedding 作为 KV。`pivot_q` 使用同样的 token embedding，但把它们放到 Q 上：`[embed(a-W+1), ..., embed(a-1), embed(a), MASK...]`，CHS 仍只作为 KV。CHS 只保留 `CHS_NUM_LAYERS` 个均匀选取并加入层深 embedding 的 target hidden，不再包含重复的 pivot token embedding；这些 CHS 槽位排在显式 window 前并共享 `anchor-1` 的 RoPE position id。`fuse`/`token` 的 draft query 为 `[embed(anchor), MASK...]`，anchor 不监督。CHS、window（`fuse`/`token`）与 draft query block 组成 KV；草稿 block 作为 Q，块内使用双向注意力。`pivot_q` 中 window 同时出现在 Q 和（由 Q 投影得到的）KV 中。
+draft Q 固定为 `[embed(a-W+1), ..., embed(a-1), embed(a), MASK...]`，CHS 只作为 context KV。CHS 保留 `CHS_NUM_LAYERS` 个均匀选取并加入层深 embedding 的 target hidden，不包含重复的 pivot token embedding；所有 CHS 槽共享 `anchor-1` 的 RoPE position id。window 和 anchor 不监督，window 通过自身的 K/V 投影参与块内双向注意力。
 
-窗口始终是 dense Sliding-CHS；`history_mode` 支持 `fuse`（默认）、`token` 和 `pivot_q`。在 `token`/`pivot_q` 模式中，最后一个 window token 与 CHS hidden 都对应 `anchor-1`，因此二者使用相同 RoPE position id；local 模式下第一个有效 window token 从 0 开始编号。
+窗口始终是 dense Sliding-CHS。最后一个 window token 与 CHS hidden 都对应 `anchor-1`；local 模式下第一个有效 window token 从 0 开始编号。
 
 ## v2: Improved structure
 

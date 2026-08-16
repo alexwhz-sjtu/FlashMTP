@@ -168,6 +168,10 @@ def wrap_eagle3_logits_processors_in_module(
     """
     for name, submodule in module.named_modules():
         if isinstance(submodule, LogitsProcessor):
-            wrapped = LogitsProcessorForEAGLE3(submodule, return_full_logits)
+            wrapped = LogitsProcessorForEAGLE3(
+                submodule,
+                return_last_hidden_states=True,
+                return_logits=return_full_logits,
+            )
             setattr(module, name, wrapped)
             print(f"wrapped {name} with LogitsProcessorForEAGLE3")

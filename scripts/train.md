@@ -8,7 +8,7 @@ source .venv/bin/activate
 SLIDING_WINDOW_SIZE=9 \
 CHS_NUM_LAYERS=12 \
 LOCAL_POSITION=true \
-HISTORY_MODE=pivot_q \
+CE_CHUNK_SIZE=4096 \
 BLOCK_SIZE=8 \
 NUM_DRAFT_LAYERS=5 \
 NUM_EPOCHS=8 \
@@ -37,7 +37,6 @@ bash scripts/run_training_flashmtp.sh --dt h100
 | 环境变量                  | 默认值   | 说明                                                                            |
 | --------------------- | ----- | ----------------------------------------------------------------------------- |
 | `SLIDING_WINDOW_SIZE` | 64    | dense 窗口 W，使用 anchor 前 W-1 个连续位置                                              |
-| `HISTORY_MODE`        | fuse  | `fuse` 融合 hidden 作 KV；`token` embedding 作 KV；`pivot_q` 把 W 内 embedding 全部作为 Q |
 | `CHS_NUM_LAYERS`      | 7     | pivot 保留的 target hidden 层数；CHS 不含 token embedding，排在 window 前                 |
 | `LOCAL_POSITION`      | false | draft 使用局部或全局 RoPE                                                            |
 | `BLOCK_SIZE`          | 16    | draft Q 为已知 anchor + B-1 个 MASK；pivot embedding 位于 CHS 首位，实际 proposal 数为 B-1  |
@@ -45,7 +44,7 @@ bash scripts/run_training_flashmtp.sh --dt h100
 | `NUM_ANCHORS`         | 512   | 每条训练序列最多采样的 anchor 数                                                          |
 
 
-窗口布局固定为 dense；`fuse`/`token` 每个 context 按 `[CHS hidden | window]` 排列，window 作为 KV。`pivot_q` 的 context 只保留 CHS，window embedding 拼到 draft Q 前面：`[embed(a-W+1)..embed(a-1), embed(a), MASK...]`。`token`/`pivot_q` 的最后一个 window token 与 CHS hidden 共用 `anchor-1` 的 RoPE position id；local 模式中第一个有效 window token 的 position id 为 0。
+窗口布局固定为 pivot-Q dense SWA：context 只保留 CHS，window embedding 拼到 draft Q 前面：`[embed(a-W+1)..embed(a-1), embed(a), MASK...]`。最后一个 window token 与 CHS hidden 共用 `anchor-1` 的 RoPE position id；local 模式中第一个有效 window token 的 position id 为 0。
 
 ## 串行 head 与 loss
 
@@ -62,4 +61,4 @@ bash scripts/run_training_flashmtp.sh --dt h100
 
 `SLIDING_WINDOW_SIZE > 1` 且串行 head 为 `rnn` / `rnn_easy` 时，会先用 `embed(anchor-1)` 初始化 recurrent state，再预测第一个 draft token。
 
-训练时 target 冻结，只捕获 dense 历史所需的首层、中层、末层，以及当前 CHS 和 TV loss 所需层。draft 不使用 KV cache。
+训练时 target 冻结，只捕获当前 CHS 所需层；TV loss 直接复用 target prefill logits。draft 不使用 KV cache。

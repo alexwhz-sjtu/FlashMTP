@@ -48,13 +48,11 @@ def flashmtp_config_summary(draft_model: FlashMTPDraftModel) -> dict[str, Any]:
         "architecture_version": fcfg.get("architecture_version"),
         "sliding_window_size": draft_model.sliding_window_size,
         "history_slot_count": draft_model.history_slot_count,
-        "history_mode": getattr(draft_model, "history_mode", fcfg.get("history_mode", "fuse")),
         "chs_num_layers": draft_model.chs_num_layers,
         "current_chs_slots": draft_model.current_chs_slot_count,
         "condition_slots": draft_model.condition_slot_count,
         "local_position": draft_model.local_position,
         "target_layer_ids": getattr(draft_model, "target_layer_ids", None),
-        "history_layer_ids": getattr(draft_model, "history_layer_ids", None),
         "block_size": int(getattr(draft_model, "block_size", fcfg.get("block_size", 0))),
         "markov_head_type": getattr(draft_model, "markov_head_type", fcfg.get("markov_head_type", "none")),
         "markov_output_mode": getattr(
@@ -77,13 +75,12 @@ def log_flashmtp_config(draft_model: FlashMTPDraftModel) -> dict[str, Any]:
     summary = flashmtp_config_summary(draft_model)
     logger.info(
         "FlashMTP draft: architecture_version={} sliding_window_size={} "
-        "history_mode={} history_slots={} chs_num_layers={} current_chs_slots={} condition_slots={} "
+        "history_slots={} chs_num_layers={} current_chs_slots={} condition_slots={} "
         "pivot_query_embedding={} include_token_embedding_chs={} local_position={} "
-        "target_layer_ids={} history_layer_ids={} block_size={} markov_head_type={} markov_output_mode={} "
+        "target_layer_ids={} block_size={} markov_head_type={} markov_output_mode={} "
         "markov_rank={} mask_token_id={}",
         summary["architecture_version"],
         summary["sliding_window_size"],
-        summary["history_mode"],
         summary["history_slot_count"],
         summary["chs_num_layers"],
         summary["current_chs_slots"],
@@ -92,7 +89,6 @@ def log_flashmtp_config(draft_model: FlashMTPDraftModel) -> dict[str, Any]:
         summary["include_token_embedding_chs"],
         summary["local_position"],
         summary["target_layer_ids"],
-        summary["history_layer_ids"],
         summary["block_size"],
         summary["markov_head_type"],
         summary["markov_output_mode"],
@@ -107,48 +103,16 @@ def validate_decode_config(draft_model: FlashMTPDraftModel) -> None:
     summary = flashmtp_config_summary(draft_model)
     markov_head_type = str(summary["markov_head_type"])
     markov_output_mode = str(summary["markov_output_mode"])
-    history_mode = str(getattr(draft_model, "history_mode", summary.get("history_mode", "fuse")))
-    if history_mode == "pivot_q":
-        logger.info(
-            "Pivot-Q layout: window embeddings are draft queries "
-            "[embed(a-W+1)..embed(a-1), embed(a), MASK...]; CHS remains context KV. "
-            "block_size={} proposals={} dense_window={} history_slots={} query_len={}",
-            summary["block_size"],
-            draft_model.proposal_length,
-            summary["sliding_window_size"],
-            summary["history_slot_count"],
-            draft_model.draft_query_length,
-        )
-    elif summary["pivot_query_embedding"]:
-        logger.info(
-            "Pivot-query layout: draft Q=[embed(a-1), embed(a), MASK...]; "
-            "current CHS keeps transformer layers only. block_size={} proposals={} "
-            "dense_window={} history_slots={}",
-            summary["block_size"],
-            draft_model.proposal_length,
-            summary["sliding_window_size"],
-            summary["history_slot_count"],
-        )
-    elif summary["include_token_embedding_chs"]:
-        logger.info(
-            "Block alignment: token-embedding CHS + anchor query (config block_size={} "
-            "is anchor-inclusive; anchor unsupervised; proposals={}); "
-            "dense_window={} history_slots={}",
-            summary["block_size"],
-            draft_model.proposal_length,
-            summary["sliding_window_size"],
-            summary["history_slot_count"],
-        )
-    else:
-        logger.info(
-            "CHS-first layout: transformer CHS hidden slots precede the explicit "
-            "history window; draft Q is [embed(a), MASK...]. block_size={} "
-            "proposals={} dense_window={} history_slots={}",
-            summary["block_size"],
-            draft_model.proposal_length,
-            summary["sliding_window_size"],
-            summary["history_slot_count"],
-        )
+    logger.info(
+        "Pivot-Q layout: window embeddings are draft queries "
+        "[embed(a-W+1)..embed(a-1), embed(a), MASK...]; CHS remains context KV. "
+        "block_size={} proposals={} dense_window={} history_slots={} query_len={}",
+        summary["block_size"],
+        draft_model.proposal_length,
+        summary["sliding_window_size"],
+        summary["history_slot_count"],
+        draft_model.draft_query_length,
+    )
 
     if markov_head_type == "none":
         return

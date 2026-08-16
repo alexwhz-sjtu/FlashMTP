@@ -176,9 +176,6 @@ SUPPORTED_FLASHMTP_ARCHITECTURE_VERSIONS = (
     FLASHMTP_ARCHITECTURE_VERSION_V4,
     FLASHMTP_ARCHITECTURE_VERSION_V3,
 )
-FLASHMTP_HISTORY_MODES = ("fuse", "token", "pivot_q")
-
-
 def _infer_hs_embedding_offset(
     hidden_states: tuple | list, num_transformer_layers: int
 ) -> int:
@@ -426,21 +423,17 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             raise ValueError(
                 f"sliding_window_size must be >= 1, got {self.sliding_window_size}."
             )
-        history_mode = str(flashmtp_config.get("history_mode", "fuse")).lower()
+        configured_history_mode = str(
+            flashmtp_config.pop("history_mode", "pivot_q")
+        ).lower()
         flashmtp_config.pop("bwa_stride", None)
-        # ``dense`` was briefly written by development checkpoints before the
-        # history representation became configurable.  It is equivalent to
-        # the original fused-hidden implementation.
-        if history_mode == "dense":
-            history_mode = "fuse"
-        if history_mode in ("pivotq", "pivot-q"):
-            history_mode = "pivot_q"
-        if history_mode not in FLASHMTP_HISTORY_MODES:
+        if configured_history_mode in ("pivotq", "pivot-q"):
+            configured_history_mode = "pivot_q"
+        if configured_history_mode != "pivot_q":
             raise ValueError(
-                f"Unknown history_mode={history_mode!r}; expected one of "
-                f"{FLASHMTP_HISTORY_MODES}."
+                "This FlashMTP implementation only supports pivot-Q token "
+                f"windows; got legacy history_mode={configured_history_mode!r}."
             )
-        self.history_mode = history_mode
         self.chs_num_layers = int(flashmtp_config.get("chs_num_layers", 7))
         self.local_position = bool(flashmtp_config.get("local_position", False))
         leftover_draft_input_mode = flashmtp_config.pop("draft_input_mode", None)
@@ -466,19 +459,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 "target_layer_ids must match the fixed first/last plus evenly "
                 f"spaced selection {selected_layer_ids}, got {self.target_layer_ids}."
             )
-        default_history_ids = [
-            0,
-            config.num_target_layers // 2,
-            config.num_target_layers - 1,
-        ]
-        self.history_layer_ids = list(
-            flashmtp_config.get("history_layer_ids", default_history_ids)
-        )
-        if self.history_layer_ids != default_history_ids:
-            raise ValueError(
-                "history_layer_ids are fixed to target first/middle/last layers "
-                f"{default_history_ids}, got {self.history_layer_ids}."
-            )
+        flashmtp_config.pop("history_layer_ids", None)
 
         self.chs_first_context = (
             self.architecture_version == FLASHMTP_ARCHITECTURE_VERSION
@@ -504,7 +485,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
 
         flashmtp_config["architecture_version"] = self.architecture_version
         flashmtp_config["sliding_window_size"] = self.sliding_window_size
-        flashmtp_config["history_mode"] = self.history_mode
         flashmtp_config["chs_num_layers"] = self.chs_num_layers
         flashmtp_config["include_token_embedding_chs"] = self.include_token_embedding_chs
         flashmtp_config["pivot_query_embedding"] = self.pivot_query_embedding
@@ -513,7 +493,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         flashmtp_config["local_position"] = self.local_position
         flashmtp_config.pop("draft_input_mode", None)
         flashmtp_config["target_layer_ids"] = self.target_layer_ids
-        flashmtp_config["history_layer_ids"] = self.history_layer_ids
         self.markov_head_type = str(
             flashmtp_config.get("markov_head_type", "none")
         ).lower()
@@ -580,14 +559,11 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self._last_decode_stats = {}
 
         h = config.hidden_size
-        self.history_fuse = nn.Linear(3 * h, h, bias=False)
-        self.history_norm = Qwen3RMSNorm(h, eps=config.rms_norm_eps)
         self.layer_depth_embedding = nn.Embedding(config.num_target_layers, h)
         self.context_norm = Qwen3RMSNorm(h, eps=config.rms_norm_eps)
         print_on_rank0(
             f"FlashMTP: architecture_version={self.architecture_version}, "
             f"sliding_window_size={self.sliding_window_size}, "
-            f"history_mode={self.history_mode}, "
             f"history_slots={self.history_slot_count}, "
             f"chs_num_layers={self.chs_num_layers}, "
             f"current_chs_layers={self.current_chs_slot_count}, "
@@ -596,7 +572,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             f"include_token_embedding_chs={self.include_token_embedding_chs}, "
             f"local_position={self.local_position}, "
             f"target_layer_ids={self.target_layer_ids}, "
-            f"history_layer_ids={self.history_layer_ids}, "
             f"markov_head_type={self.markov_head_type}, "
             f"markov_output_mode={self.markov_output_mode}, "
             f"markov_rank={self.markov_rank}"
@@ -606,9 +581,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
 
     @property
     def chs_len_per_block(self) -> int:
-        if self.window_as_query:
-            return self.condition_slot_count
-        return self.history_slot_count + self.condition_slot_count
+        return self.condition_slot_count
 
     @property
     def condition_slot_count(self) -> int:
@@ -627,19 +600,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         return self.sliding_window_size - 1
 
     @property
-    def uses_token_history(self) -> bool:
-        """History slots are target token embeddings (``token`` or ``pivot_q``)."""
-        return self.history_mode in ("token", "pivot_q")
-
-    @property
-    def window_as_query(self) -> bool:
-        """Window embeddings participate as draft queries rather than context KV."""
-        return self.history_mode == "pivot_q"
-
-    @property
     def window_query_count(self) -> int:
         """Unsupervised window query slots prepended to the draft block."""
-        return self.history_slot_count if self.window_as_query else 0
+        return self.history_slot_count
 
     @property
     def core_draft_query_length(self) -> int:
@@ -649,11 +612,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
     @property
     def history_source_lookback(self) -> int:
         """Tokens needed before an anchor to cover the oldest history slot."""
-        return (
-            self.sliding_window_size
-            if self.history_mode == "fuse"
-            else self.history_slot_count
-        )
+        return self.history_slot_count
 
     @property
     def seed_rnn_from_predecessor(self) -> bool:
@@ -751,18 +710,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 draft_length=draft_length,
             )
 
-        context_positions = (
-            current_positions
-            if self.window_as_query
-            else torch.cat(
-                [current_positions, history_positions]
-                if self.chs_first_context
-                else [history_positions, current_positions],
-                dim=-1,
-            )
-        )
-        if self.window_as_query:
-            draft_positions = torch.cat([history_positions, draft_positions], dim=-1)
+        context_positions = current_positions
+        draft_positions = torch.cat([history_positions, draft_positions], dim=-1)
         return (
             context_positions.reshape(anchor_positions.shape[0], -1),
             draft_positions.reshape(anchor_positions.shape[0], -1),
@@ -830,28 +779,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         """Return one hidden state for each proposed token."""
         return block_hidden[:, -self.proposal_length :, :]
 
-    def fuse_history_hidden(self, history_hidden: torch.Tensor) -> torch.Tensor:
-        """Fuse ``(..., 3, H)`` target states into one vector per token."""
-        if history_hidden.ndim < 3:
-            raise ValueError(
-                "history_hidden must have shape (..., 3, H); got "
-                f"{tuple(history_hidden.shape)}."
-            )
-        if history_hidden.shape[-2] != 3:
-            raise ValueError(
-                "history_hidden must have exactly three selected layers; got shape "
-                f"{tuple(history_hidden.shape)}."
-            )
-        expected_in = self.history_fuse.in_features
-        if history_hidden.shape[-1] * 3 != expected_in:
-            raise ValueError(
-                "history_hidden feature dimension does not match history_fuse; "
-                f"got H={history_hidden.shape[-1]} (flattened {history_hidden.shape[-1] * 3}), "
-                f"expected {expected_in}."
-            )
-        flat = history_hidden.flatten(start_dim=-2)
-        return self.history_norm(self.history_fuse(flat))
-
     def _apply_chs_depth_embedding(
         self, target_hidden: torch.Tensor
     ) -> torch.Tensor:
@@ -895,20 +822,17 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             queries = torch.cat([pivot_embedding, anchor_embedding], dim=1)
         else:
             queries = anchor_embedding
-        if self.window_as_query:
-            if window_embeddings is None or window_embeddings.ndim != 3:
-                raise ValueError(
-                    "window_embeddings with shape (B,T,H) are required in pivot_q mode."
-                )
-            queries = torch.cat([window_embeddings, queries], dim=1)
+        if window_embeddings is None or window_embeddings.ndim != 3:
+            raise ValueError(
+                "window_embeddings with shape (B,T,H) are required."
+            )
+        queries = torch.cat([window_embeddings, queries], dim=1)
         return queries
 
     def inference_window_embeddings(
         self, recent_condition_hidden: torch.Tensor
-    ) -> Optional[torch.Tensor]:
-        """Window token embeddings prepended to Q in ``pivot_q`` mode."""
-        if not self.window_as_query:
-            return None
+    ) -> torch.Tensor:
+        """Window token embeddings prepended to draft queries."""
         if self.history_slot_count:
             return recent_condition_hidden[:, -self.history_slot_count :, :]
         return recent_condition_hidden[:, :0, :]
@@ -941,85 +865,18 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             )
         return torch.cat([pivot_embedding, target_hidden], dim=2)
 
-    def _build_shared_context_kv(
-        self,
-        shared_history: torch.Tensor,
-        target_hidden: torch.Tensor,
-    ) -> torch.Tensor:
-        """Concatenate per-anchor CHS slots and one shared history sequence."""
-        if shared_history.ndim != 3:
-            raise ValueError(
-                "shared_history must have shape (B,T,H), got "
-                f"{tuple(shared_history.shape)}."
-            )
-        current_ctx = self._apply_chs_depth_embedding(target_hidden)
-        chs_flat = current_ctx.reshape(
-            current_ctx.shape[0], -1, current_ctx.shape[-1]
-        )
-        return torch.cat(
-            [chs_flat, shared_history]
-            if self.chs_first_context
-            else [shared_history, chs_flat],
-            dim=1,
-        )
-
-    def _fuse_target_hidden(
-        self,
-        target_hidden: torch.Tensor,
-        history_hidden: torch.Tensor,
-    ) -> torch.Tensor:
-        """Build the configured per-block CHS/history context."""
-        bsz, n_blk, _, _ = target_hidden.shape
-        if history_hidden.shape[:2] != (bsz, n_blk):
-            raise ValueError(
-                "history_hidden batch/block dimensions must match target_hidden: "
-                f"{tuple(history_hidden.shape)} vs {tuple(target_hidden.shape)}."
-            )
-        current_ctx = self._apply_chs_depth_embedding(target_hidden)
-        ctx = torch.cat(
-            [current_ctx, history_hidden]
-            if self.chs_first_context
-            else [history_hidden, current_ctx],
-            dim=2,
-        )
-        return ctx.reshape(bsz, n_blk * ctx.shape[2], current_ctx.shape[-1])
-
-    def fuse_target_output_history(
-        self, hidden_states: tuple | list
-    ) -> torch.Tensor:
-        """Fuse the three configured target layers for every returned token."""
-        selected = gather_hidden_layers_inference(
-            hidden_states,
-            self.history_layer_ids,
-            self.config.num_target_layers,
-        )
-        return self.fuse_history_hidden(selected)
-
     def build_inference_context(
         self,
         recent_condition_hidden: torch.Tensor,
         current_target_hidden: torch.Tensor,
         anchor_position: int,
         draft_length: Optional[int] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Rebuild the complete short-window condition for one draft pass.
-
-        In ``fuse`` mode, ``recent_condition_hidden`` contains fused target
-        states through the current pivot; the pivot itself is excluded here
-        because it is represented by current CHS. In ``token`` and ``pivot_q``
-        modes it contains preceding token embeddings including the pivot
-        position; its final window slot and all current CHS hidden slots share
-        RoPE id ``anchor_position - 1``. ``pivot_q`` moves those window
-        embeddings from context KV onto the query sequence.
-        """
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build pivot-Q window positions for one draft pass."""
         if recent_condition_hidden.ndim != 3:
             raise ValueError(
                 "recent_condition_hidden must have shape (B,T,H), got "
                 f"{tuple(recent_condition_hidden.shape)}."
-            )
-        if self.history_mode == "fuse" and recent_condition_hidden.shape[1] < 1:
-            raise ValueError(
-                "recent_condition_hidden must include the current pivot in fuse mode."
             )
         if current_target_hidden.shape[:3] != (
             recent_condition_hidden.shape[0],
@@ -1031,21 +888,13 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 f"condition tensor; got {tuple(current_target_hidden.shape)}."
             )
         anchor_position = int(anchor_position)
-        if self.history_mode == "fuse":
-            recent_condition_hidden = recent_condition_hidden[
-                :, -self.sliding_window_size :, :
-            ]
-            history_source = recent_condition_hidden[:, :-1, :]
-            history_end = anchor_position - 1
-        else:
-            history_source = (
-                recent_condition_hidden[:, -self.history_slot_count :, :]
-                if self.history_slot_count
-                else recent_condition_hidden[:, :0, :]
-            )
-            history_end = anchor_position
-        history = history_source.unsqueeze(1)
-        history_len = history.shape[2]
+        history_source = (
+            recent_condition_hidden[:, -self.history_slot_count :, :]
+            if self.history_slot_count
+            else recent_condition_hidden[:, :0, :]
+        )
+        history_end = anchor_position
+        history_len = history_source.shape[1]
         history_pos = torch.arange(
             history_end - history_len,
             history_end,
@@ -1072,28 +921,18 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             history_keep_mask=history_keep,
             draft_length=draft_length,
         )
-        if self.window_as_query:
-            history = history[:, :, :0, :]
-        return history, context_positions, draft_positions
+        return context_positions, draft_positions
 
     def initialize_inference_condition(
         self,
-        target_hidden_states: tuple | list,
         pivot_index: int = -1,
         token_embeddings: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Retain the bounded history source ending at the current pivot."""
-        if self.uses_token_history:
-            if token_embeddings is None or token_embeddings.ndim != 3:
-                raise ValueError(
-                    "token_embeddings with shape (B,T,H) are required in "
-                    f"{self.history_mode} mode."
-                )
-            condition_source = token_embeddings
-            keep_length = self.history_slot_count
-        else:
-            condition_source = self.fuse_target_output_history(target_hidden_states)
-            keep_length = self.sliding_window_size
+        if token_embeddings is None or token_embeddings.ndim != 3:
+            raise ValueError("token_embeddings with shape (B,T,H) are required.")
+        condition_source = token_embeddings
+        keep_length = self.history_slot_count
         seq_len = condition_source.shape[1]
         pivot_index = int(pivot_index)
         if pivot_index < 0:
@@ -1112,22 +951,14 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
     def update_inference_condition(
         self,
         recent_condition_hidden: torch.Tensor,
-        target_hidden_states: tuple | list,
         pivot_index: int,
         token_embeddings: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Rebuild the bounded condition tensor through the new pivot."""
-        if self.uses_token_history:
-            if token_embeddings is None or token_embeddings.ndim != 3:
-                raise ValueError(
-                    "token_embeddings with shape (B,T,H) are required in "
-                    f"{self.history_mode} mode."
-                )
-            condition_new = token_embeddings
-            keep_length = self.history_slot_count
-        else:
-            condition_new = self.fuse_target_output_history(target_hidden_states)
-            keep_length = self.sliding_window_size
+        if token_embeddings is None or token_embeddings.ndim != 3:
+            raise ValueError("token_embeddings with shape (B,T,H) are required.")
+        condition_new = token_embeddings
+        keep_length = self.history_slot_count
         pivot_index = int(pivot_index)
         if not 0 <= pivot_index < condition_new.shape[1]:
             raise IndexError(
@@ -1150,26 +981,15 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         noise_embedding: Optional[torch.Tensor] = None,
         target_hidden: Optional[torch.Tensor] = None,
-        history_hidden: Optional[torch.Tensor] = None,
-        shared_history: Optional[torch.Tensor] = None,
         rotary_position_ids: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = noise_embedding
-        if shared_history is not None:
-            if target_hidden is None or target_hidden.ndim != 4:
-                raise ValueError(
-                    "shared_history training requires target_hidden shaped (B,N,S,H)."
-                )
-            target_hidden = self._build_shared_context_kv(
-                shared_history, target_hidden
-            )
-        else:
-            assert target_hidden is not None and target_hidden.ndim == 4
-            assert history_hidden is not None and history_hidden.ndim == 4
-            target_hidden = self._fuse_target_hidden(
-                target_hidden, history_hidden
-            )
+        assert target_hidden is not None and target_hidden.ndim == 4
+        target_hidden = self._apply_chs_depth_embedding(target_hidden)
+        target_hidden = target_hidden.reshape(
+            target_hidden.shape[0], -1, target_hidden.shape[-1]
+        )
         noise_len = hidden_states.shape[1]
         if position_ids.shape[1] != noise_len:
             draft_pos = position_ids[:, -noise_len:]
@@ -1416,12 +1236,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             self.config.num_target_layers,
         )
         recent_condition_hidden = self.initialize_inference_condition(
-            output.hidden_states,
-            token_embeddings=(
-                target.model.embed_tokens(input_ids)
-                if self.uses_token_history
-                else None
-            ),
+            token_embeddings=target.model.embed_tokens(input_ids),
         )
 
         start = input_ids.shape[1]
@@ -1449,17 +1264,14 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)
             draft_start = time.perf_counter()
-            history_hidden, ctx_pos_part, draft_block_pos = (
-                self.build_inference_context(
-                    recent_condition_hidden,
-                    current_target_hidden,
-                    start,
-                )
+            ctx_pos_part, draft_block_pos = self.build_inference_context(
+                recent_condition_hidden,
+                current_target_hidden,
+                start,
             )
             full_rotary = torch.cat([ctx_pos_part, draft_block_pos], dim=-1)
             block_hidden = self(
                 target_hidden=current_target_hidden,
-                history_hidden=history_hidden,
                 noise_embedding=noise_embedding,
                 position_ids=draft_block_pos,
                 rotary_position_ids=full_rotary,
@@ -1613,13 +1425,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             pivot_index = min(acceptance_length, output.hidden_states[0].shape[1] - 1)
             recent_condition_hidden = self.update_inference_condition(
                 recent_condition_hidden,
-                output.hidden_states,
                 pivot_index,
-                token_embeddings=(
-                    target.model.embed_tokens(verify_output_ids)
-                    if self.uses_token_history
-                    else None
-                ),
+                token_embeddings=target.model.embed_tokens(verify_output_ids),
             )
             target_hidden = gather_pivot_multilayer_inference(
                 output.hidden_states,
@@ -1745,12 +1552,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             self.config.num_target_layers,
         )
         recent_condition_hidden = self.initialize_inference_condition(
-            output.hidden_states,
-            token_embeddings=(
-                target.model.embed_tokens(input_ids)
-                if self.uses_token_history
-                else None
-            ),
+            token_embeddings=target.model.embed_tokens(input_ids),
         )
 
         # Decode stage: single cuda-synced wall clock (draft + target + bookkeeping)
@@ -1775,17 +1577,14 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 target_hidden,
                 pivot_token_ids,
             )
-            history_hidden, ctx_pos_part, draft_block_pos = (
-                self.build_inference_context(
-                    recent_condition_hidden,
-                    current_target_hidden,
-                    start,
-                )
+            ctx_pos_part, draft_block_pos = self.build_inference_context(
+                recent_condition_hidden,
+                current_target_hidden,
+                start,
             )
             full_rotary = torch.cat([ctx_pos_part, draft_block_pos], dim=-1)
             block_hidden = self(
                 target_hidden=current_target_hidden,
-                history_hidden=history_hidden,
                 noise_embedding=noise_embedding,
                 position_ids=draft_block_pos,
                 rotary_position_ids=full_rotary,
@@ -1851,13 +1650,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             pivot_index = min(acceptance_length, output.hidden_states[0].shape[1] - 1)
             recent_condition_hidden = self.update_inference_condition(
                 recent_condition_hidden,
-                output.hidden_states,
                 pivot_index,
-                token_embeddings=(
-                    target.model.embed_tokens(verify_output_ids)
-                    if self.uses_token_history
-                    else None
-                ),
+                token_embeddings=target.model.embed_tokens(verify_output_ids),
             )
             target_hidden = gather_pivot_multilayer_inference(
                 output.hidden_states,
