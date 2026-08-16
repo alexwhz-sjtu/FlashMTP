@@ -12,6 +12,10 @@ fi
 
 cd "${PROJECT_DIR}"
 
+# The remote .venv may be shared with another checkout. Ensure torchrun workers
+# import this checkout's specforge package rather than the environment's copy.
+export PYTHONPATH="${PROJECT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 
@@ -35,10 +39,26 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-${PET_NPROC_PER_NODE:-8}}"
 
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
-CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
-PIVOT_FUSE_MODE="${PIVOT_FUSE_MODE:-linear_fuse}"
-NUM_MIDDLE_LAYERS_N="${NUM_MIDDLE_LAYERS_N:-5}"
+SLIDING_WINDOW_SIZE="${SLIDING_WINDOW_SIZE:-64}"
+HISTORY_MODE="${HISTORY_MODE:-fuse}"
+if [[ "${HISTORY_MODE}" != "fuse" && "${HISTORY_MODE}" != "token" && "${HISTORY_MODE}" != "pivot_q" ]]; then
+    echo "错误: HISTORY_MODE 须为 fuse、token 或 pivot_q"
+    exit 1
+fi
+CHS_NUM_LAYERS="${CHS_NUM_LAYERS:-7}"
+CHS_LAYOUT_TAG="chsfirst_tokenwindow"
+if [[ -n "${DRAFT_INPUT_MODE:-}" && "${DRAFT_INPUT_MODE}" != "legacy" ]]; then
+    echo "错误: DRAFT_INPUT_MODE 已移除，backbone 固定为 anchor+MASK query"
+    exit 1
+fi
+LOCAL_POSITION="${LOCAL_POSITION:-false}"
+if [[ "${LOCAL_POSITION}" == "1" || "${LOCAL_POSITION}" == "true" ]]; then
+    POSITION_TAG="localpos"
+else
+    POSITION_TAG="globalpos"
+fi
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
+ANCHOR_CHUNK_SIZE="${ANCHOR_CHUNK_SIZE:-0}"
 
 # 恢复训练
 RESUME="${RESUME:-}"
@@ -55,32 +75,22 @@ ENABLE_THINKING="${ENABLE_THINKING:-off}"
 # 草稿层数：默认目录名/ WandB id/ run name 中均带 nlayers${NUM_DRAFT_LAYERS}
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 
-# 低秩串行 head：none | vanilla | rnn | rnn_easy
+# 低秩串行 head：none | vanilla | gated | rnn | rnn_easy
 MARKOV_HEAD_TYPE="${MARKOV_HEAD_TYPE:-none}"
-if [[ "$MARKOV_HEAD_TYPE" == "mlp" || "$MARKOV_HEAD_TYPE" == "gated" ]]; then
-    echo "错误: MARKOV_HEAD_TYPE=${MARKOV_HEAD_TYPE} 已不再支持，请使用 none | vanilla | rnn | rnn_easy"
+if [[ "$MARKOV_HEAD_TYPE" == "mlp" ]]; then
+    echo "错误: MARKOV_HEAD_TYPE=mlp 已不再支持，请使用 none | vanilla | gated | rnn | rnn_easy"
     exit 1
 fi
 # additive: 修正并行 base logits；direct: head 直接产生最终 logits
 MARKOV_OUTPUT_MODE="${MARKOV_OUTPUT_MODE:-additive}"
+if [[ "$MARKOV_HEAD_TYPE" == "gated" && "$MARKOV_OUTPUT_MODE" == "direct" ]]; then
+    echo "错误: MARKOV_HEAD_TYPE=gated 仅支持 MARKOV_OUTPUT_MODE=additive"
+    exit 1
+fi
 MARKOV_RANK="${MARKOV_RANK:-256}"
 FINAL_CE_WEIGHT="${FINAL_CE_WEIGHT:-1.0}"
 TV_LOSS_WEIGHT="${TV_LOSS_WEIGHT:-1.0}"
 MARKOV_TAG="mh${MARKOV_HEAD_TYPE}_${MARKOV_OUTPUT_MODE}_r${MARKOV_RANK}_ce${FINAL_CE_WEIGHT}_tv${TV_LOSS_WEIGHT}"
-
-# 草稿块内 position_ids：CHS RoPE 前缀全 0，draft 为 1..block_size（默认 false 为全局 anchor 位置）
-LOCAL_POSITION="${LOCAL_POSITION:-false}"
-LOCAL_POSITION_TAG="lp0"
-case "$(echo "${LOCAL_POSITION}" | tr '[:upper:]' '[:lower:]')" in
-    true|1|yes) LOCAL_POSITION_TAG="lp1" ;;
-esac
-
-# DeepSpec-style alignment: slot 0 predicts anchor+1 and all B slots are supervised.
-LEFT_SHIFT="${LEFT_SHIFT:-false}"
-LEFT_SHIFT_TAG="leftshift0"
-case "$(echo "${LEFT_SHIFT}" | tr '[:upper:]' '[:lower:]')" in
-    true|1|yes) LEFT_SHIFT_TAG="leftshift1" ;;
-esac
 
 # ========================================
 # 默认参数（通常不需要修改）
@@ -99,24 +109,24 @@ fi
 export MASTER_ADDR
 export MASTER_PORT
 TP_SIZE="${TP_SIZE:-1}"
-DIST_TIMEOUT="${DIST_TIMEOUT:-120}"
+DIST_TIMEOUT="${DIST_TIMEOUT:-1200}"
 
 # 模型参数（OUTPUT_DIR 依赖 BLOCK_SIZE，须早于 dt 分支）
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
-MODEL_TAG="${MODEL_TAG:-'Qwen3_8B'}"
+MODEL_TAG="${MODEL_TAG:-Qwen3_8B}"
 
 if [ "$DT" = "qz" ]; then
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_swa_${HISTORY_MODE}_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_sample_${DATA_NUM_SAMPLES}_wb_${BASE_LM_CE_WEIGHT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 elif [ "$DT" = "h100" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/share/dai-sys/wanghanzhen/projects/MTP/training_data/nemotron_think_off_samples_40000_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_${PIVOT_FUSE_MODE}_fuse$((NUM_MIDDLE_LAYERS_N + 2))_sample_${DATA_NUM_SAMPLES}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_swa_${HISTORY_MODE}_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_sample_${DATA_NUM_SAMPLES}_wb_${BASE_LM_CE_WEIGHT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_HOME/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_${PIVOT_FUSE_MODE}_fuse${NUM_MIDDLE_LAYERS_N}_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${LOCAL_POSITION_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_swa_${HISTORY_MODE}_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
@@ -152,16 +162,34 @@ BASE_LM_CE_DECAY_GAMMA="${BASE_LM_CE_DECAY_GAMMA:-}"
 
 # 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-5000}"
-EVAL_INTERVAL="${EVAL_INTERVAL:-50000}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-20000}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-1000}"
 
 # Tracker 参数
 REPORT_TO="${REPORT_TO:-wandb}"
-WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-v2}"
+WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-v2new}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v2_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}2}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_v2_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${MODEL_TAG}2}"
+# WandB Name/Id 上限 128 字符；超长时保留前缀并追加 8 位哈希，避免训练在 wandb.init 处失败
+clip_wandb_id() {
+    local value="$1"
+    local max_len=128
+    if [ "${#value}" -le "${max_len}" ]; then
+        printf '%s' "${value}"
+        return
+    fi
+    local digest
+    digest="$(printf '%s' "${value}" | sha1sum | cut -c1-8)"
+    local keep=$((max_len - 9))
+    printf '%s_%s' "${value:0:${keep}}" "${digest}"
+}
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_swa_${HISTORY_MODE}_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_wb_${BASE_LM_CE_WEIGHT}_block_${BLOCK_SIZE}_${MARKOV_TAG}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_swa_${HISTORY_MODE}_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_wb_${BASE_LM_CE_WEIGHT}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${MODEL_TAG}}"
+WANDB_RUN_ID="$(clip_wandb_id "${WANDB_RUN_ID}")"
+WANDB_NAME="$(clip_wandb_id "${WANDB_NAME}")"
+if [ -n "${WANDB_RUN_NAME}" ]; then
+    WANDB_RUN_NAME="$(clip_wandb_id "${WANDB_RUN_NAME}")"
+fi
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen}"
@@ -180,14 +208,10 @@ echo "运行环境: --dt ${DT} (qz | a800 | h100)"
 echo "数据特征:"
 echo "  样本数量: ${DATA_NUM_SAMPLES}"
 echo "  思考模式: ${ENABLE_THINKING}"
-echo "  数据子目录: ${CHS_CONCAT_MODE}"
-echo "  Pivot 融合: ${PIVOT_FUSE_MODE} (中间层数 N=${NUM_MIDDLE_LAYERS_N})"
-echo "  local_position: ${LOCAL_POSITION} (tag ${LOCAL_POSITION_TAG}; draft 1..block, CHS rope 0)"
-if [ "${LEFT_SHIFT_TAG}" = "leftshift1" ]; then
-    echo "  left_shift: true (tag ${LEFT_SHIFT_TAG}; block_size = anchor + B-1 drafts, total span)"
-else
-    echo "  left_shift: false (tag ${LEFT_SHIFT_TAG}; legacy mode, block_size = draft block width)"
-fi
+echo "  滑动窗口: W=${SLIDING_WINDOW_SIZE}"
+echo "  历史模式: ${HISTORY_MODE}"
+echo "  当前 CHS: pivot embedding + S=${CHS_NUM_LAYERS} 个 hidden 层"
+echo "  位置与对齐: draft ${POSITION_TAG}，target 全局位置，anchor query 不监督"
 echo "------------------------------------------"
 echo "目标模型: ${TARGET_MODEL}"
 echo "目标模型后端: ${TARGET_MODEL_BACKEND}"
@@ -199,7 +223,11 @@ echo "------------------------------------------"
 echo "模型配置:"
 echo "  草稿模型层数: ${NUM_DRAFT_LAYERS}"
 echo "  块大小: ${BLOCK_SIZE}"
+echo "  滑动窗口大小: ${SLIDING_WINDOW_SIZE}"
+echo "  历史模式: ${HISTORY_MODE}"
+echo "  CHS hidden 层数: ${CHS_NUM_LAYERS}"
 echo "  锚点数量: ${NUM_ANCHORS}"
+echo "  锚点执行分块: ${ANCHOR_CHUNK_SIZE} (0=关闭)"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
 echo "  最终CE权重: ${FINAL_CE_WEIGHT}"
@@ -246,10 +274,7 @@ echo ""
 # 如果输出目录已存在，自动添加数字后缀
 original_output_dir="${OUTPUT_DIR}"
 suffix=1
-# A resume must keep the exact original output directory; otherwise the latest
-# epoch_*_step_* checkpoint cannot be discovered. Only fresh single-node runs
-# receive an automatic suffix.
-while [ "${NNODES}" -le 1 ] 2>/dev/null && [ -z "${RESUME}" ] && [ -d "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null)" ]; do
+while [ "${NNODES}" -le 1 ] 2>/dev/null && [ -d "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null)" ] && [ -z "${CKPT_DIR}" ] && [ -z "${RESUME}" ]; do
     OUTPUT_DIR="${original_output_dir}_${suffix}"
     suffix=$((suffix + 1))
 done
@@ -271,7 +296,9 @@ echo ""
 
 # train_flashmtp.py 始终 init_distributed()，需 torchrun 提供 RANK/WORLD_SIZE/LOCAL_RANK
 LAUNCHER=(
-    torchrun
+    "${PROJECT_DIR}/.venv/bin/python"
+    -m
+    torch.distributed.run
     --nnodes "${NNODES}"
     --node_rank "${NODE_RANK}"
     --nproc_per_node "${NPROC_PER_NODE}"
@@ -288,6 +315,10 @@ fi
 
 if [ -n "${LOSS_DECAY_GAMMA}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --loss-decay-gamma ${LOSS_DECAY_GAMMA}"
+fi
+
+if [[ "${LOCAL_POSITION}" == "1" || "${LOCAL_POSITION}" == "true" ]]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --local-position"
 fi
 
 if awk "BEGIN {exit !(${BASE_LM_CE_WEIGHT} > 0)}"; then
@@ -328,14 +359,6 @@ if [ "${REPORT_TO}" != "none" ]; then
     fi
 fi
 
-if [ "${LOCAL_POSITION_TAG}" = "lp1" ]; then
-    OPTIONAL_ARGS="${OPTIONAL_ARGS} --local-position"
-fi
-
-case "$(echo "${LEFT_SHIFT}" | tr '[:upper:]' '[:lower:]')" in
-    true|1|yes) OPTIONAL_ARGS="${OPTIONAL_ARGS} --left-shift" ;;
-esac
-
 if [ "${TARGET_MODEL_BACKEND}" = "sglang" ]; then
     # SGLang profiles KV pool as: free_mem_after_weights - pre_load_mem * (1 - mem_fraction).
     # With ~14B weights on 80GB H100, mem_fraction < ~0.21 yields negative KV capacity.
@@ -374,6 +397,7 @@ EXIT_CODE=0
     --num-draft-layers ${NUM_DRAFT_LAYERS} \
     --block-size ${BLOCK_SIZE} \
     --num-anchors ${NUM_ANCHORS} \
+    --anchor-chunk-size ${ANCHOR_CHUNK_SIZE} \
     --attention-backend ${ATTENTION_BACKEND} \
     --learning-rate ${LEARNING_RATE} \
     --warmup-ratio ${WARMUP_RATIO} \
@@ -390,9 +414,9 @@ EXIT_CODE=0
     --build-dataset-num-proc ${BUILD_DATASET_NUM_PROC} \
     --tp-size ${TP_SIZE} \
     --dist-timeout ${DIST_TIMEOUT} \
-    --chs-concat-mode ${CHS_CONCAT_MODE} \
-    --pivot-fuse-mode ${PIVOT_FUSE_MODE} \
-    --num-middle-layers-n ${NUM_MIDDLE_LAYERS_N} \
+    --sliding-window-size ${SLIDING_WINDOW_SIZE} \
+    --history-mode ${HISTORY_MODE} \
+    --chs-num-layers ${CHS_NUM_LAYERS} \
     --markov-head-type ${MARKOV_HEAD_TYPE} \
     --markov-output-mode ${MARKOV_OUTPUT_MODE} \
     --markov-rank ${MARKOV_RANK} \

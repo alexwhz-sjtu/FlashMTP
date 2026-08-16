@@ -35,7 +35,10 @@ from specforge.distributed import (
     get_tp_data_shard,
     init_distributed,
 )
-from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
+from specforge.modeling.draft.flashmtp import (
+    FLASHMTP_ARCHITECTURE_VERSION,
+    FlashMTPDraftModel,
+)
 from specforge.modeling.target.flashmtp_target_model import (
     FlashMTPTargetModel,
     get_flashmtp_target_model,
@@ -44,6 +47,35 @@ from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
 from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
+
+
+def validate_serial_loss_schedule(args) -> None:
+    """Validate an optional full-loss then correct-prefix-only epoch schedule."""
+    full_epochs = getattr(args, "serial_full_loss_epochs", None)
+    prefix_epochs = getattr(args, "serial_prefix_loss_epochs", None)
+    if full_epochs is None and prefix_epochs is None:
+        return
+    if full_epochs is None or prefix_epochs is None:
+        raise ValueError(
+            "--serial-full-loss-epochs and --serial-prefix-loss-epochs must be set together."
+        )
+    if full_epochs < 0 or prefix_epochs < 0:
+        raise ValueError("Serial loss stage lengths must be non-negative.")
+    if full_epochs + prefix_epochs != args.num_epochs:
+        raise ValueError(
+            "--serial-full-loss-epochs and --serial-prefix-loss-epochs must sum "
+            "to --num-epochs."
+        )
+
+
+def serial_prefix_loss_for_epoch(args, epoch: int) -> bool:
+    """Return whether an epoch belongs to the correct-prefix-only loss stage."""
+    full_epochs = getattr(args, "serial_full_loss_epochs", None)
+    prefix_epochs = getattr(args, "serial_prefix_loss_epochs", None)
+    if full_epochs is None and prefix_epochs is None:
+        return bool(getattr(args, "serial_loss_correct_prefix_only", False))
+    validate_serial_loss_schedule(args)
+    return int(epoch) >= int(full_epochs)
 
 
 def parse_args():
@@ -60,14 +92,6 @@ def parse_args():
     )
     model_group.add_argument("--draft-config-path", type=str, default=None)
     model_group.add_argument("--block-size", type=int, default=16)
-    model_group.add_argument(
-        "--left-shift",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use left-shift supervision: block_size is total span (anchor + "
-        "block_size-1 drafts). Draft input is 1 anchor + block_size-2 MASKs. "
-        "Without it, block_size is the draft block width; slot 0 is unsupervised.",
-    )
     model_group.add_argument("--num-draft-layers", type=int, default=1)
     model_group.add_argument(
         "--mask-token-id",
@@ -92,17 +116,37 @@ def parse_args():
         help="Number of anchor positions per sequence",
     )
     model_group.add_argument(
-        "--pivot-fuse-mode",
-        type=str,
-        default="linear_fuse",
-        choices=["linear_fuse", "attention_fuse", "prefix_condition"],
-        help="How to fuse multi-layer teacher pivots (v1.1 ablation).",
-    )
-    model_group.add_argument(
-        "--num-middle-layers-n",
+        "--anchor-chunk-size",
         type=int,
         default=0,
-        help="Middle teacher layers between first and last (total selected = 2 + N).",
+        help="Execute sampled anchors in chunks to bound draft-attention memory; 0 disables chunking.",
+    )
+    model_group.add_argument(
+        "--sliding-window-size",
+        type=int,
+        default=32,
+        help="Dense Sliding-CHS history window W; uses W-1 preceding positions.",
+    )
+    model_group.add_argument(
+        "--history-mode",
+        type=str,
+        default="fuse",
+        choices=["fuse", "token", "pivot_q"],
+        help="History representation: fused target hidden states, token embeddings "
+        "as context KV, or token embeddings as window queries (pivot_q).",
+    )
+    model_group.add_argument(
+        "--chs-num-layers",
+        type=int,
+        default=7,
+        help="Target hidden layers retained at the current CHS position. "
+        "CHS contains hidden states only; the explicit token window follows it.",
+    )
+    model_group.add_argument(
+        "--local-position",
+        action="store_true",
+        help="Number draft-only RoPE positions from the left edge of each valid "
+        "attention window. Target positions and target KV cache remain global.",
     )
     model_group.add_argument(
         "--loss-decay-gamma",
@@ -142,7 +186,7 @@ def parse_args():
         "--markov-head-type",
         type=str,
         default="none",
-        choices=["none", "vanilla", "rnn", "rnn_easy"],
+        choices=["none", "vanilla", "gated", "rnn", "rnn_easy"],
         help="Optional serial head applied after the parallel FlashMTP backbone.",
     )
     model_group.add_argument(
@@ -159,32 +203,12 @@ def parse_args():
         default=256,
         help="Low-rank token embedding/state dimension for the serial head.",
     )
-    model_group.add_argument(
-        "--local-position",
-        action="store_true",
-        help="Draft uses block-local position ids 1..block_size (repeated per parallel "
-        "block in training). CHS rotary prefix uses zeros. Target model still uses global ids.",
-    )
-    model_group.add_argument(
-        "--add-noise",
-        action="store_true",
-        help="Add uniform noise U(-r, r) to each selected-layer target hidden before draft "
-        "forward (default r=0.1 from --target-hidden-noise-ratio).",
-    )
-    model_group.add_argument(
-        "--target-hidden-noise-ratio",
-        type=float,
-        default=0.1,
-        help="Half-width r for uniform noise U(-r, r) when --add-noise is set.",
-    )
-
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
-    dataset_group.add_argument("--chs-concat-mode", type=str, default="feature")
     dataset_group.add_argument(
         "--build-dataset-num-proc",
         type=int,
@@ -293,7 +317,11 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     if args.markov_head_type == "none" and args.markov_output_mode == "direct":
         raise ValueError(
             f"--markov-output-mode {args.markov_output_mode} requires "
-            "--markov-head-type vanilla, rnn, or rnn_easy."
+            "--markov-head-type vanilla, gated, rnn, or rnn_easy."
+        )
+    if args.markov_head_type == "gated" and args.markov_output_mode == "direct":
+        raise ValueError(
+            "--markov-head-type gated only supports --markov-output-mode additive."
         )
 
     print_on_rank0(
@@ -330,11 +358,23 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     ):
         draft_config.flashmtp_config = {}
 
-    draft_config.flashmtp_config["chs_concat_mode"] = "feature"
-    draft_config.flashmtp_config["pivot_fuse_mode"] = args.pivot_fuse_mode
-    draft_config.flashmtp_config["num_middle_layers_n"] = args.num_middle_layers_n
+    draft_config.flashmtp_config["architecture_version"] = (
+        FLASHMTP_ARCHITECTURE_VERSION
+    )
+    draft_config.flashmtp_config["sliding_window_size"] = int(
+        args.sliding_window_size
+    )
+    draft_config.flashmtp_config["history_mode"] = args.history_mode
+    draft_config.flashmtp_config.pop("bwa_stride", None)
+    draft_config.flashmtp_config["chs_num_layers"] = int(args.chs_num_layers)
+    draft_config.flashmtp_config["include_token_embedding_chs"] = False
+    draft_config.flashmtp_config["pivot_query_embedding"] = False
+    draft_config.flashmtp_config.pop("add_noise", None)
+    draft_config.flashmtp_config.pop("target_hidden_noise_ratio", None)
     draft_config.flashmtp_config["local_position"] = bool(args.local_position)
-    draft_config.flashmtp_config["left_shift"] = bool(args.left_shift)
+    draft_config.flashmtp_config.pop("draft_input_mode", None)
+    draft_config.flashmtp_config.pop("target_layer_ids", None)
+    draft_config.flashmtp_config.pop("history_layer_ids", None)
     draft_config.flashmtp_config["markov_head_type"] = args.markov_head_type
     draft_config.flashmtp_config["markov_output_mode"] = args.markov_output_mode
     draft_config.flashmtp_config["markov_rank"] = int(args.markov_rank)
@@ -346,11 +386,15 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
 
     draft_model = FlashMTPDraftModel(draft_config).cuda().to(torch.bfloat16)
 
-    capture_layer_ids = list(draft_model.target_layer_ids)
+    capture_layer_ids = set(draft_model.target_layer_ids)
+    if draft_model.history_mode == "fuse":
+        capture_layer_ids.update(draft_model.history_layer_ids)
+    capture_layer_ids = sorted(capture_layer_ids)
     if args.tv_loss_weight != 0.0 and draft_model.markov_head is not None:
         final_target_layer_id = draft_model.config.num_target_layers - 1
         if final_target_layer_id not in capture_layer_ids:
             capture_layer_ids.append(final_target_layer_id)
+    capture_layer_ids.sort()
     target_model.set_capture_layers(capture_layer_ids)
 
     print_on_rank0(
@@ -362,8 +406,15 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}"
     )
     print_on_rank0(
-        f"local_position={getattr(draft_model, 'local_position', False)}, "
-        f"left_shift={getattr(draft_model, 'left_shift', False)}, "
+        f"sliding_window_size={draft_model.sliding_window_size}, "
+        f"history_mode={draft_model.history_mode}, "
+        f"history_slots={draft_model.history_slot_count}, "
+        f"chs_num_layers={draft_model.chs_num_layers}, "
+        f"current_chs_layers={draft_model.current_chs_slot_count}, "
+        f"condition_slots={draft_model.condition_slot_count}, "
+        "pivot_query_embedding=False, "
+        f"local_position={draft_model.local_position}, "
+        f"history_layer_ids={draft_model.history_layer_ids}, "
         f"markov_head_type={draft_model.markov_head_type}, "
         f"markov_output_mode={draft_model.markov_output_mode}, "
         f"markov_rank={draft_model.markov_rank}"
@@ -418,6 +469,7 @@ def _ensure_embed_vocab_for_mask(
         target_components.lm_head = new_lm
     else:
         target_components.lm_head.weight = target_components.embed_tokens.weight
+    target_components.requires_grad_(False)
 
 
 def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
@@ -504,13 +556,20 @@ def resolve_training_state_dir(checkpoint_dir: str) -> Optional[str]:
     epoch_ckpt = get_last_checkpoint(checkpoint_dir)[0]
     if epoch_ckpt is not None and distributed_training_state_exists(epoch_ckpt):
         return epoch_ckpt
-
     if distributed_training_state_exists(checkpoint_dir):
         return checkpoint_dir
     return None
 
 
-def save_checkpoint(args, epoch, step, flashmtp_model, draft_model, optimizer):
+def save_checkpoint(
+    args,
+    epoch,
+    step,
+    flashmtp_model,
+    draft_model,
+    optimizer,
+    save_optimizer_state: bool = True,
+):
     """Save checkpoint."""
     save_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
     if dist.get_rank() == 0:
@@ -525,16 +584,16 @@ def save_checkpoint(args, epoch, step, flashmtp_model, draft_model, optimizer):
             if "draft_model." in k
         }
 
-        optimizer_state = optimizer.state_dict()
-        save_distributed_training_state(
-            save_dir,
-            {
-                "epoch": epoch,
-                "global_step": step,
-                "args": args,
-                **optimizer_state,
-            },
-        )
+        if save_optimizer_state:
+            save_distributed_training_state(
+                save_dir,
+                {
+                    "epoch": epoch,
+                    "global_step": step,
+                    "args": args,
+                    **optimizer.state_dict(),
+                },
+            )
 
         if dist.get_rank() == 0:
             draft_model.save_pretrained(save_dir, state_dict=draft_state_dict)
@@ -562,7 +621,8 @@ def save_checkpoint(args, epoch, step, flashmtp_model, draft_model, optimizer):
             if os.path.exists(markov_src):
                 shutil.copy(markov_src, markov_dst)
 
-            print_on_rank0(f"Saved checkpoint to {save_dir}")
+            suffix = "" if save_optimizer_state else " (weights only, no optimizer state)"
+            print_on_rank0(f"Saved checkpoint to {save_dir}{suffix}")
 
     dist.barrier()
 
@@ -675,7 +735,9 @@ def main():
     # An explicit checkpoint is authoritative. Without --ckpt-dir, --resume
     # discovers the latest epoch_*_step_* directory under output_dir.
     if args.resume and args.ckpt_dir is None and os.path.isdir(args.output_dir):
-        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
+        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(
+            args.output_dir
+        )
         print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
 
     resume_state = None
@@ -700,19 +762,35 @@ def main():
                 "current training arguments: "
                 f"requested={requested_markov}, checkpoint={checkpoint_markov}."
             )
-        checkpoint_left_shift = bool(loaded_model.left_shift)
-        if checkpoint_left_shift != bool(args.left_shift):
+        requested_sliding = (
+            draft_model.architecture_version,
+            draft_model.sliding_window_size,
+            draft_model.history_mode,
+            draft_model.chs_num_layers,
+            draft_model.include_token_embedding_chs,
+            draft_model.chs_first_context,
+            draft_model.local_position,
+            draft_model.target_layer_ids,
+            draft_model.history_layer_ids,
+        )
+        checkpoint_sliding = (
+            loaded_model.architecture_version,
+            loaded_model.sliding_window_size,
+            loaded_model.history_mode,
+            loaded_model.chs_num_layers,
+            loaded_model.include_token_embedding_chs,
+            loaded_model.chs_first_context,
+            loaded_model.local_position,
+            loaded_model.target_layer_ids,
+            loaded_model.history_layer_ids,
+        )
+        if requested_sliding != checkpoint_sliding:
             raise ValueError(
-                "Checkpoint left_shift configuration does not match the "
+                "Checkpoint sliding-CHS configuration does not match the "
                 "current training arguments: "
-                f"requested={bool(args.left_shift)}, "
-                f"checkpoint={checkpoint_left_shift}."
+                f"requested={requested_sliding}, checkpoint={checkpoint_sliding}."
             )
         draft_model.load_state_dict(loaded_model.state_dict())
-        draft_model.left_shift = checkpoint_left_shift
-        if draft_model.config.flashmtp_config is None:
-            draft_model.config.flashmtp_config = {}
-        draft_model.config.flashmtp_config["left_shift"] = checkpoint_left_shift
         del loaded_model
         draft_weights_from_checkpoint = True
         print_on_rank0("Loaded draft model weights from checkpoint")
@@ -744,20 +822,28 @@ def main():
 
     draft_model.mask_token_id = mask_token_id
 
-    draft_model.config.flashmtp_config["chs_concat_mode"] = "feature"
     draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
+    draft_model.config.flashmtp_config["architecture_version"] = (
+        FLASHMTP_ARCHITECTURE_VERSION
+    )
+    draft_model.config.flashmtp_config["sliding_window_size"] = (
+        draft_model.sliding_window_size
+    )
+    draft_model.config.flashmtp_config["history_mode"] = draft_model.history_mode
+    draft_model.config.flashmtp_config["chs_num_layers"] = (
+        draft_model.chs_num_layers
+    )
+    draft_model.config.flashmtp_config["include_token_embedding_chs"] = False
+    draft_model.config.flashmtp_config["pivot_query_embedding"] = False
+    draft_model.config.flashmtp_config["local_position"] = (
+        draft_model.local_position
+    )
+    draft_model.config.flashmtp_config.pop("draft_input_mode", None)
     draft_model.config.flashmtp_config["target_layer_ids"] = (
         draft_model.target_layer_ids
     )
-    draft_model.config.flashmtp_config["pivot_fuse_mode"] = draft_model.pivot_fuse_mode
-    draft_model.config.flashmtp_config["num_middle_layers_n"] = (
-        draft_model.num_middle_layers_n
-    )
-    draft_model.config.flashmtp_config["local_position"] = bool(
-        getattr(draft_model, "local_position", False)
-    )
-    draft_model.config.flashmtp_config["left_shift"] = bool(
-        getattr(draft_model, "left_shift", False)
+    draft_model.config.flashmtp_config["history_layer_ids"] = (
+        draft_model.history_layer_ids
     )
     draft_model.config.flashmtp_config["markov_head_type"] = (
         draft_model.markov_head_type
@@ -766,10 +852,6 @@ def main():
         draft_model.markov_output_mode
     )
     draft_model.config.flashmtp_config["markov_rank"] = int(draft_model.markov_rank)
-    draft_model.config.flashmtp_config["add_noise"] = bool(args.add_noise)
-    draft_model.config.flashmtp_config["target_hidden_noise_ratio"] = float(
-        args.target_hidden_noise_ratio
-    )
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
@@ -808,24 +890,21 @@ def main():
         tv_loss_weight=args.tv_loss_weight,
         base_lm_ce_weight=args.base_lm_ce_weight,
         base_lm_ce_decay_gamma=args.base_lm_ce_decay_gamma,
-        chs_concat_mode="feature",
-        add_noise=args.add_noise,
-        target_hidden_noise_ratio=args.target_hidden_noise_ratio,
         ce_chunk_size=args.ce_chunk_size,
-        left_shift=args.left_shift,
+        anchor_chunk_size=args.anchor_chunk_size,
     )
     print_on_rank0(
-        f"target hidden noise: add_noise={args.add_noise}, "
-        f"ratio={args.target_hidden_noise_ratio}, "
         f"ce_chunk_size={args.ce_chunk_size}, "
         f"final_ce_weight={args.final_ce_weight}, "
         f"tv_loss_weight={args.tv_loss_weight}, "
         f"base_lm_ce_weight={args.base_lm_ce_weight}, "
-        f"base_lm_ce_decay_gamma={args.base_lm_ce_decay_gamma}"
-        f", left_shift={args.left_shift}"
+        f"base_lm_ce_decay_gamma={args.base_lm_ce_decay_gamma}, "
+        f"sliding_window_size={draft_model.sliding_window_size}, "
+        f"history_mode={draft_model.history_mode}, "
+        f"history_slots={draft_model.history_slot_count}, "
+        f"chs_num_layers={draft_model.chs_num_layers}"
     )
 
-    online_flashmtp = flashmtp_model
     flashmtp_model = FSDP(
         flashmtp_model,
         use_orig_params=True,
@@ -930,14 +1009,19 @@ def main():
                     f"{len(hidden_states) if isinstance(hidden_states, dict) else len(hidden_states)}"
                 )
 
-            (
-                anchor_positions,
-                block_keep_mask,
-                target_hidden,
-                target_prediction_hidden,
-            ) = online_flashmtp.prepare_training_tensors(
-                input_ids, hidden_states, loss_mask
-            )
+            with FSDP.summon_full_params(flashmtp_model, writeback=False):
+                (
+                    anchor_positions,
+                    block_keep_mask,
+                    target_hidden,
+                    history_hidden_states,
+                    history_start_positions,
+                    history_source_lengths,
+                    target_prediction_hidden,
+                    shared_fused_history,
+                ) = flashmtp_model.prepare_training_tensors(
+                    input_ids, hidden_states, loss_mask
+                )
             del target_output, hidden_states
 
             if args.shard_draft_by_tp:
@@ -946,6 +1030,20 @@ def main():
                 anchor_positions = get_tp_data_shard(anchor_positions)
                 block_keep_mask = get_tp_data_shard(block_keep_mask)
                 target_hidden = get_tp_data_shard(target_hidden)
+                if history_hidden_states is not None:
+                    history_hidden_states = get_tp_data_shard(
+                        history_hidden_states
+                    )
+                history_start_positions = get_tp_data_shard(
+                    history_start_positions
+                )
+                history_source_lengths = get_tp_data_shard(
+                    history_source_lengths
+                )
+                if shared_fused_history is not None:
+                    shared_fused_history = get_tp_data_shard(
+                        shared_fused_history
+                    )
                 if target_prediction_hidden is not None:
                     target_prediction_hidden = get_tp_data_shard(
                         target_prediction_hidden
@@ -964,11 +1062,19 @@ def main():
                 anchor_positions=anchor_positions,
                 block_keep_mask=block_keep_mask,
                 target_hidden=target_hidden,
+                history_hidden_states=history_hidden_states,
+                history_start_positions=history_start_positions,
+                history_source_lengths=history_source_lengths,
                 target_prediction_hidden=target_prediction_hidden,
+                shared_fused_history=shared_fused_history,
             )
             del (
                 target_hidden,
+                history_hidden_states,
+                history_start_positions,
+                history_source_lengths,
                 target_prediction_hidden,
+                shared_fused_history,
                 anchor_positions,
                 block_keep_mask,
             )
@@ -1051,7 +1157,13 @@ def main():
             checkpoint_pending = False
 
     save_checkpoint(
-        args, args.num_epochs, global_step, flashmtp_model, draft_model, optimizer
+        args,
+        args.num_epochs,
+        global_step,
+        flashmtp_model,
+        draft_model,
+        optimizer,
+        save_optimizer_state=False,
     )
 
     tracker.close()

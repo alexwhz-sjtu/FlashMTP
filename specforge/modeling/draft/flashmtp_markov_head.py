@@ -14,7 +14,7 @@ import torch
 from torch import nn
 
 
-MARKOV_HEAD_TYPES = ("vanilla", "rnn", "rnn_easy")
+MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn", "rnn_easy")
 MARKOV_OUTPUT_MODES = ("additive", "direct")
 
 
@@ -40,6 +40,7 @@ class FlashMTPMarkovHead(nn.Module):
         vocab_size: int,
         markov_rank: int,
         hidden_size: int,
+        max_prediction_length: int,
         markov_output_mode: str = "additive",
     ) -> None:
         super().__init__()
@@ -47,6 +48,7 @@ class FlashMTPMarkovHead(nn.Module):
         self.vocab_size = int(vocab_size)
         self.markov_rank = int(markov_rank)
         self.hidden_size = int(hidden_size)
+        self.max_prediction_length = int(max_prediction_length)
         self.markov_output_mode = str(markov_output_mode).lower()
 
         if self.head_type not in MARKOV_HEAD_TYPES:
@@ -61,16 +63,31 @@ class FlashMTPMarkovHead(nn.Module):
             )
         if self.markov_rank <= 0:
             raise ValueError(f"markov_rank must be positive, got {self.markov_rank}.")
+        if self.max_prediction_length <= 0:
+            raise ValueError(
+                "max_prediction_length must be positive, got "
+                f"{self.max_prediction_length}."
+            )
+        if self.head_type == "gated" and self.markov_output_mode == "direct":
+            raise ValueError(
+                "gated markov head only supports additive output mode."
+            )
 
         self.prev_token_embedding = nn.Embedding(self.vocab_size, self.markov_rank)
         self.output_proj = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
 
+        self.gate_proj: Optional[nn.Linear] = None
         self.state_proj: Optional[nn.Linear] = None
         self.state_out_proj: Optional[nn.Linear] = None
         self.hidden_proj: Optional[nn.Linear] = None
         self.hidden_fuse_gate_proj: Optional[nn.Linear] = None
         self.state_hidden_mlp: Optional[nn.Linear] = None
-        if self.head_type == "rnn":
+        if self.head_type == "gated":
+            self.gate_proj = nn.Linear(
+                self.hidden_size + self.markov_rank,
+                self.markov_rank,
+            )
+        elif self.head_type == "rnn":
             self.state_proj = nn.Linear(2 * self.markov_rank, 2 * self.markov_rank)
             self.hidden_proj = nn.Linear(
                 self.hidden_size, self.markov_rank, bias=False
@@ -105,6 +122,8 @@ class FlashMTPMarkovHead(nn.Module):
                 f"Unknown markov output mode {output_mode!r}; "
                 f"expected one of {MARKOV_OUTPUT_MODES}."
             )
+        if output_mode == "direct" and self.head_type == "gated":
+            raise ValueError("gated markov head only supports additive output mode.")
         return output_mode
 
     def _hidden_latent_contribution(
@@ -164,6 +183,12 @@ class FlashMTPMarkovHead(nn.Module):
         if self.head_type == "vanilla":
             return prev_embeddings, None
 
+        if self.head_type == "gated":
+            assert self.gate_proj is not None
+            gate_inputs = torch.cat([hidden_states, prev_embeddings], dim=-1)
+            gate = torch.sigmoid(self.gate_proj(gate_inputs))
+            return gate * prev_embeddings, None
+
         if self.head_type in ("rnn", "rnn_easy"):
             assert self.state_proj is not None
             if state is None:
@@ -186,12 +211,44 @@ class FlashMTPMarkovHead(nn.Module):
 
         raise RuntimeError(f"Unhandled head type {self.head_type!r}.")
 
+    def _seed_rnn_state(
+        self,
+        initial_prev_token_ids: torch.Tensor,
+        output_mode: str,
+        *,
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prime recurrent state with the token immediately before the anchor."""
+        output_mode = self._validate_runtime_output_mode(output_mode)
+        if self.head_type not in ("rnn", "rnn_easy"):
+            raise ValueError(
+                "initial_prev_token_ids are only supported for rnn/rnn_easy heads."
+            )
+        initial_prev_token_ids = initial_prev_token_ids.long()
+        if initial_prev_token_ids.ndim != 1:
+            raise ValueError(
+                "initial_prev_token_ids must be 1-D for state seeding, got "
+                f"{tuple(initial_prev_token_ids.shape)}."
+            )
+        dummy_hidden = reference.new_zeros(
+            initial_prev_token_ids.shape[0],
+            self.hidden_size,
+        )
+        _, state = self._compute_step_latent(
+            prev_token_ids=initial_prev_token_ids,
+            hidden_states=dummy_hidden,
+            state=None,
+            output_mode=output_mode,
+        )
+        return state
+
     def forward_teacher_forcing(
         self,
         *,
         hidden_states: torch.Tensor,
         prev_token_ids: torch.Tensor,
         output_mode: str = "additive",
+        initial_prev_token_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Return low-rank states for teacher-forced block predictions.
 
@@ -199,6 +256,10 @@ class FlashMTPMarkovHead(nn.Module):
             hidden_states: ``[..., prediction_length, hidden_size]``.
             prev_token_ids: ``[..., prediction_length]``; entry ``k`` is the
                 ground-truth token immediately preceding prediction ``k``.
+            initial_prev_token_ids: Optional ``[...]`` token ids at position
+                ``anchor-1``. When provided for ``rnn``/``rnn_easy``, the
+                recurrent state is primed with this token before the first
+                supervised prediction step.
         """
         output_mode = self._validate_runtime_output_mode(output_mode)
         if hidden_states.shape[:-1] != prev_token_ids.shape:
@@ -214,6 +275,11 @@ class FlashMTPMarkovHead(nn.Module):
             )
 
         prediction_length = hidden_states.size(-2)
+        if prediction_length > self.max_prediction_length:
+            raise ValueError(
+                f"prediction_length={prediction_length} exceeds configured "
+                f"maximum {self.max_prediction_length}."
+            )
         hidden_latents = self._precompute_hidden_latents(
             hidden_states,
             output_mode=output_mode,
@@ -230,12 +296,27 @@ class FlashMTPMarkovHead(nn.Module):
             )
             return latent
 
-        state = torch.zeros(
-            *hidden_states.shape[:-2],
-            self.markov_rank,
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
+        batch_shape = hidden_states.shape[:-2]
+        if initial_prev_token_ids is not None:
+            if initial_prev_token_ids.shape != batch_shape:
+                raise ValueError(
+                    "initial_prev_token_ids must match hidden_states batch "
+                    f"dimensions {batch_shape}, got "
+                    f"{tuple(initial_prev_token_ids.shape)}."
+                )
+            flat_reference = hidden_states.reshape(-1, hidden_states.size(-1))
+            state = self._seed_rnn_state(
+                initial_prev_token_ids.reshape(-1),
+                output_mode,
+                reference=flat_reference,
+            ).view(*batch_shape, self.markov_rank)
+        else:
+            state = torch.zeros(
+                *batch_shape,
+                self.markov_rank,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
         outputs: list[torch.Tensor] = []
         for position in range(prediction_length):
             latent, state = self._compute_step_latent(
@@ -264,6 +345,7 @@ class FlashMTPMarkovHead(nn.Module):
         output_mode: str,
         base_logits: Optional[torch.Tensor] = None,
         temperature: float = 0.0,
+        initial_prev_token_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Serially sample one FlashMTP prediction block.
 
@@ -285,10 +367,24 @@ class FlashMTPMarkovHead(nn.Module):
                 )
 
         batch_size, prediction_length = hidden_states.shape[:2]
+        if prediction_length > self.max_prediction_length:
+            raise ValueError(
+                f"prediction_length={prediction_length} exceeds configured "
+                f"maximum {self.max_prediction_length}."
+            )
         state = (
-            hidden_states.new_zeros(batch_size, self.markov_rank)
+            self._seed_rnn_state(
+                initial_prev_token_ids.reshape(-1),
+                output_mode,
+                reference=hidden_states,
+            ).view(batch_size, self.markov_rank)
             if self.head_type in ("rnn", "rnn_easy")
-            else None
+            and initial_prev_token_ids is not None
+            else (
+                hidden_states.new_zeros(batch_size, self.markov_rank)
+                if self.head_type in ("rnn", "rnn_easy")
+                else None
+            )
         )
         prev_token_ids = first_prev_token_ids.long()
         sampled_tokens: list[torch.Tensor] = []

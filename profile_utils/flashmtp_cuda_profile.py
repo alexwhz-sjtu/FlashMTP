@@ -131,17 +131,28 @@ def profile_flashmtp_generate(
 
     while start < max_length:
         draft_input_ids = output_ids[:, start : start + block_size].clone()
-        draft_target_pos = position_ids[:, start : start + block_size]
         if model.local_position:
             draft_block_pos = (
-                torch.arange(1, block_size + 1, device=device, dtype=torch.long)
+                torch.arange(
+                    model.draft_query_length, device=device, dtype=torch.long
+                )
                 .unsqueeze(0)
                 .expand(bsz, -1)
             )
         else:
-            draft_block_pos = draft_target_pos
+            draft_block_pos = model.build_draft_query_position_ids(
+                torch.full((bsz, 1), start, dtype=torch.long, device=device)
+            ).reshape(bsz, -1)
 
-        noise_embedding = target.model.embed_tokens(draft_input_ids)
+        noise_embedding = model.build_inference_query_embeddings(
+            target.model.embed_tokens,
+            draft_input_ids,
+        )
+        current_target_hidden = model.build_inference_current_chs(
+            target.model.embed_tokens,
+            target_hidden,
+            output_ids[:, start - 1 : start],
+        )
         chs = model.chs_len_per_block
         if model.local_position:
             ctx_pos_part = torch.zeros(bsz, chs, dtype=torch.long, device=device)
@@ -154,7 +165,7 @@ def profile_flashmtp_generate(
         _sync(device)
         ev_df0.record()
         block_hidden = model(
-            target_hidden=target_hidden,
+            target_hidden=current_target_hidden,
             noise_embedding=noise_embedding,
             position_ids=draft_block_pos,
             rotary_position_ids=full_rotary,

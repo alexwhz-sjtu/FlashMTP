@@ -724,8 +724,7 @@ def main() -> None:
         type=int,
         default=None,
         help="Verify only this many positions from the front of each drafted block "
-        "(anchor-inclusive). Legacy checkpoints use block_size as draft width; "
-        "left_shift checkpoints use block_size as total span. "
+        "(anchor-inclusive). block_size is the legacy-aligned draft width. "
         "Default: verify the full block (proposal_length + 1).",
     )
     parser.add_argument("--dataset", type=str, required=True)
@@ -760,18 +759,17 @@ def main() -> None:
         help="Optional legacy override; ignored if checkpoint has no sink_num.",
     )
     parser.add_argument(
-        "--local-position",
-        type=str,
-        default=None,
-        choices=("true", "false"),
-        help="Override draft local_position: true = CHS rope ids 0, draft block ids 1..block_size; "
-        "false = global positions. Default: use checkpoint flashmtp_config.",
-    )
-    parser.add_argument(
         "--mask-token-id",
         type=int,
         default=None,
         help="Override mask token id (default: checkpoint flashmtp_config, then tokenizer).",
+    )
+    parser.add_argument(
+        "--local-position",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override draft-only window-local RoPE. Target always keeps its original "
+        "global position ids and KV cache.",
     )
     parser.add_argument(
         "--trust-remote-code",
@@ -826,11 +824,22 @@ def main() -> None:
         )
     logger.info(
         "Decode config: markov_head_type={} markov_output_mode={} markov_rank={} "
-        "left_shift={}",
+        "alignment={} sliding_window_size={} history_slots={} "
+        "chs_num_layers={} current_chs_slots={} condition_slots={} "
+        "pivot_query_embedding={} include_token_embedding_chs={} "
+        "local_position={}",
         draft_summary["markov_head_type"],
         draft_summary["markov_output_mode"],
         draft_summary["markov_rank"],
-        draft_summary["left_shift"],
+        "pivot_query" if draft_summary.get("pivot_query_embedding") else "embedding_chs",
+        draft_summary["sliding_window_size"],
+        draft_summary["history_slot_count"],
+        draft_summary["chs_num_layers"],
+        draft_summary["current_chs_slots"],
+        draft_summary["condition_slots"],
+        draft_summary.get("pivot_query_embedding", False),
+        draft_summary.get("include_token_embedding_chs", False),
+        draft_summary["local_position"],
     )
     logger.info(
         "FlashMTP decode: config_block_size={} draft_block_len={} "

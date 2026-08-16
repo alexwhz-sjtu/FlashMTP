@@ -6,8 +6,8 @@ from .dflash import (
     sample,
 )
 from .flashmtp import (
+    FLASHMTP_ARCHITECTURE_VERSION,
     FlashMTPDraftModel,
-    build_ablation_target_layer_ids,
     build_target_layer_ids as build_flashmtp_target_layer_ids,
     gather_pivot_multilayer_inference,
 )
@@ -18,11 +18,11 @@ __all__ = [
     "Eagle3DraftModel",
     "DFlashDraftModel",
     "FlashMTPDraftModel",
+    "FLASHMTP_ARCHITECTURE_VERSION",
     "FlashMTPMarkovHead",
     "LlamaForCausalLMEagle3",
     "build_target_layer_ids",
     "build_flashmtp_target_layer_ids",
-    "build_ablation_target_layer_ids",
     "gather_pivot_multilayer_inference",
     "extract_context_feature",
     "sample",

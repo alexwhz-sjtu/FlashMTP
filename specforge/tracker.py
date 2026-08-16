@@ -1,11 +1,33 @@
 # tracker.py
 
 import abc
+import hashlib
+import logging
 import netrc
 import os
 from typing import Any, Dict, Optional
 
 import torch.distributed as dist
+
+logger = logging.getLogger("specforge.utils")
+
+# WandB API rejects run Name (and typically Id) longer than 128 characters.
+_WANDB_STR_MAX_LEN = 128
+
+
+def _clip_wandb_identifier(value: Optional[str], field: str) -> Optional[str]:
+    if not value or len(value) <= _WANDB_STR_MAX_LEN:
+        return value
+    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:8]
+    clipped = f"{value[: _WANDB_STR_MAX_LEN - 9]}_{digest}"
+    logger.warning(
+        "WandB %s exceeds %d chars (%d); clipping to %r",
+        field,
+        _WANDB_STR_MAX_LEN,
+        len(value),
+        clipped,
+    )
+    return clipped
 
 # --- Lazy Imports ---
 # These libraries are imported only when their respective trackers are used.
@@ -133,11 +155,11 @@ class WandbTracker(Tracker):
             # existing run or creates one (resume="must" would fail on first start).
             init_kwargs = {
                 "project": args.wandb_project,
-                "name": args.wandb_name,
+                "name": _clip_wandb_identifier(args.wandb_name, "name"),
                 "config": vars(args),
             }
             if hasattr(args, "wandb_run_id") and args.wandb_run_id:
-                init_kwargs["id"] = args.wandb_run_id
+                init_kwargs["id"] = _clip_wandb_identifier(args.wandb_run_id, "id")
                 # Resume if the id exists; otherwise create (stable ids from e.g. launch scripts).
                 init_kwargs["resume"] = "allow"
             wandb.init(**init_kwargs)

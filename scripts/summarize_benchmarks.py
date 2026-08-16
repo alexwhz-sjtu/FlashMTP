@@ -46,6 +46,16 @@ def _last_match(pattern: re.Pattern[str], text: str) -> str | None:
     return value
 
 
+def _overall_metrics_section(text: str) -> str:
+    """Prefer the aggregate block when a log also contains category breakdowns."""
+    marker = "=== Overall"
+    start = text.rfind(marker)
+    if start < 0:
+        return text
+    end = text.find("=== Per-category breakdown ===", start)
+    return text[start:] if end < 0 else text[start:end]
+
+
 def _to_float(value: str | None) -> float | None:
     if value is None or value == "":
         return None
@@ -116,8 +126,10 @@ def parse_log(
     if not log_path.exists():
         return {}
     text = log_path.read_text(encoding="utf-8", errors="replace")
-    decode_times = _last_match(PATTERNS["decode_times"], text)
-    avg_accept = _last_match(PATTERNS["acceptance"], text)
+    metrics_text = _overall_metrics_section(text)
+    decode_matches = PATTERNS["decode_times"].findall(metrics_text)
+    decode_times = decode_matches[-1] if decode_matches else None
+    avg_accept = _last_match(PATTERNS["acceptance"], metrics_text)
     accept_rate = _draft_accept_rate(_to_float(avg_accept), verify_block)
     verification_mode = (
         _last_match(PATTERNS["verification_mode"], text)
@@ -125,10 +137,10 @@ def parse_log(
     )
     compile_flag = _last_match(PATTERNS["compile_serial_head"], text) or compile_default
     return {
-        "turns": _last_match(PATTERNS["turns"], text) or "",
-        "token_weighted_speedup": _last_match(PATTERNS["speedup"], text) or "",
-        "throughput_ratio": _last_match(PATTERNS["throughput_ratio"], text) or "",
-        "unweighted_speedup": _last_match(PATTERNS["unweighted_speedup"], text)
+        "turns": _last_match(PATTERNS["turns"], metrics_text) or "",
+        "token_weighted_speedup": _last_match(PATTERNS["speedup"], metrics_text) or "",
+        "throughput_ratio": _last_match(PATTERNS["throughput_ratio"], metrics_text) or "",
+        "unweighted_speedup": _last_match(PATTERNS["unweighted_speedup"], metrics_text)
         or "",
         "baseline_s_per_token": decode_times[0] if decode_times else "",
         "flashmtp_s_per_token": decode_times[1] if decode_times else "",

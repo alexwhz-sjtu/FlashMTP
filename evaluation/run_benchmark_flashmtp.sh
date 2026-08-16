@@ -11,6 +11,10 @@ fi
 
 cd "${PROJECT_DIR}"
 
+# The remote .venv may reuse dependencies from another checkout. Always import
+# this checkout's specforge package.
+export PYTHONPATH="${PROJECT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --dt) DT="$2"; shift 2 ;;
@@ -75,7 +79,7 @@ echo "草稿模型: ${DRAFT_NAME_OR_PATH}"
 echo "数据集: ${DATASET} (max_samples=${MAX_SAMPLES})"
 echo "块大小: ${BLOCK_SIZE}"
 echo "verify_block: ${VERIFY_BLOCK:-与 block_size 相同}"
-echo "local_position: ${LOCAL_POSITION:-使用 checkpoint}"
+echo "draft local_position override: ${LOCAL_POSITION:-checkpoint}; target: original global positions/cache"
 echo "串行 head (checkpoint): type=${MARKOV_HEAD_TYPE:-auto} mode=${MARKOV_OUTPUT_MODE:-auto} rank=${MARKOV_RANK:-auto}"
 echo "max_new_tokens=${MAX_NEW_TOKENS} batch_size=${BATCH_SIZE} temperature=${TEMPERATURE}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} NPROC_PER_NODE=${NPROC_PER_NODE}"
@@ -85,14 +89,19 @@ OPTIONAL_ARGS=""
 if [ -n "${VERIFY_BLOCK}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --verify-block ${VERIFY_BLOCK}"
 fi
-if [ -n "${LOCAL_POSITION}" ]; then
-    case "$(echo "${LOCAL_POSITION}" | tr '[:upper:]' '[:lower:]')" in
-        true|1|yes) OPTIONAL_ARGS="${OPTIONAL_ARGS} --local-position true" ;;
-        false|0|no) OPTIONAL_ARGS="${OPTIONAL_ARGS} --local-position false" ;;
-    esac
+if [[ "${LOCAL_POSITION}" == "1" || "${LOCAL_POSITION}" == "true" ]]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --local-position"
+elif [[ "${LOCAL_POSITION}" == "0" || "${LOCAL_POSITION}" == "false" ]]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --no-local-position"
 fi
 
-LAUNCHER=(torchrun --nproc_per_node "${NPROC_PER_NODE}" --master_port "${MASTER_PORT}")
+LAUNCHER=(
+    "${PROJECT_DIR}/.venv/bin/python"
+    -m
+    torch.distributed.run
+    --nproc_per_node "${NPROC_PER_NODE}"
+    --master_port "${MASTER_PORT}"
+)
 
 "${LAUNCHER[@]}" evaluation/benchmark.py \
     --model-name-or-path "${TARGET_MODEL}" \

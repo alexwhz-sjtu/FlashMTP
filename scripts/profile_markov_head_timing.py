@@ -124,10 +124,18 @@ def profile_one_mode(
         device=device,
     )
     block_output_ids[:, 0] = sample(output.logits, 0.0).squeeze(-1)
-    target_block_pos = position_ids[:, start : start + block_size]
+    noise_embedding = draft.build_inference_query_embeddings(
+        target.model.embed_tokens,
+        block_output_ids,
+    )
+    target_hidden = draft.build_inference_current_chs(
+        target.model.embed_tokens, target_hidden, input_ids[:, -1:]
+    )
     if draft.local_position:
         draft_block_pos = (
-            torch.arange(1, block_size + 1, device=device, dtype=torch.long)
+            torch.arange(
+                draft.draft_query_length, device=device, dtype=torch.long
+            )
             .unsqueeze(0)
             .expand(bsz, -1)
         )
@@ -135,12 +143,13 @@ def profile_one_mode(
             bsz, draft.chs_len_per_block, dtype=torch.long, device=device
         )
     else:
-        draft_block_pos = target_block_pos
+        draft_block_pos = draft.build_draft_query_position_ids(
+            torch.full((bsz, 1), start, dtype=torch.long, device=device)
+        ).reshape(bsz, -1)
         ctx_pos_part = torch.full(
             (bsz, draft.chs_len_per_block), start - 1, dtype=torch.long, device=device
         )
     full_rotary = torch.cat([ctx_pos_part, draft_block_pos], dim=-1)
-    noise_embedding = target.model.embed_tokens(block_output_ids)
     first_prev_token_ids = block_output_ids[:, 0]
     lm_head = target.lm_head
     mode = draft.markov_output_mode

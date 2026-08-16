@@ -8,10 +8,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
-from specforge.modeling.draft.flashmtp_markov_head import (
-    markov_output_uses_base_lm_head,
+from specforge.modeling.draft.flashmtp import (
+    FlashMTPDraftModel,
 )
+from specforge.modeling.draft.flashmtp_markov_head import markov_output_uses_base_lm_head
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -93,14 +93,8 @@ def prepare_target_prediction_hidden(
     anchor_positions: torch.Tensor,
     block_size: int,
     num_transformer_layers: int,
-    left_shift: bool = False,
 ) -> torch.Tensor:
-    """Gather causal target states aligned with the supervised draft logits.
-
-    Legacy mode supervises slots 1..B-1; left-shift mode supervises slots
-    0..B-2 for ``block_size`` total span B (anchor plus ``B-1`` drafts). In both
-    cases the causal predecessor states start at ``anchor``.
-    """
+    """Gather causal target states for legacy slots ``1..block_size-1``."""
     if block_size <= 1:
         raise ValueError(f"block_size must be greater than 1, got {block_size}")
 
@@ -130,54 +124,365 @@ def prepare_target_prediction_hidden(
     return torch.gather(
         expanded_hidden,
         dim=2,
-        index=safe_positions.unsqueeze(-1).expand(-1, -1, -1, last_hidden.size(-1)),
+        index=safe_positions.unsqueeze(-1).expand(
+            -1, -1, -1, last_hidden.size(-1)
+        ),
     )
 
 
-def add_noise_to_target_hidden(
-    target_hidden: torch.Tensor,
-    noise_ratio: float = 0.1,
+def prepare_history_hidden_states(
+    hidden_states: HiddenStatesInput,
+    history_layer_ids: list[int],
+    num_transformer_layers: int,
 ) -> torch.Tensor:
-    """Add uniform noise to each selected-layer pivot hidden (training augmentation).
+    """Stack full-sequence history source layers as ``(B, T, 3, H)``."""
+    pieces: list[torch.Tensor] = []
+    off = (
+        infer_hidden_states_embedding_offset(hidden_states, num_transformer_layers)
+        if not isinstance(hidden_states, dict)
+        else 0
+    )
+    for layer_id in history_layer_ids:
+        layer_hidden = (
+            hidden_states[layer_id]
+            if isinstance(hidden_states, dict)
+            else hidden_states[layer_id + off]
+        )
+        if layer_hidden.ndim != 3:
+            raise ValueError(
+                "Each history source layer must have shape (B, T, H); got "
+                f"layer_id={layer_id} with shape {tuple(layer_hidden.shape)}."
+            )
+        pieces.append(layer_hidden)
+    stacked = torch.stack(pieces, dim=2)
+    if stacked.ndim != 4 or stacked.shape[2] != len(history_layer_ids):
+        raise ValueError(
+            "Expected stacked history hidden states with shape (B, T, 3, H), got "
+            f"{tuple(stacked.shape)}."
+        )
+    return stacked
 
-    Samples i.i.d. from U(-noise_ratio, noise_ratio) per element (default U(-0.1, 0.1)).
+
+def pack_history_hidden_states(
+    hidden_states: HiddenStatesInput,
+    loss_mask: torch.Tensor,
+    history_layer_ids: list[int],
+    num_transformer_layers: int,
+    window_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack each sample from ``first_answer-lookback`` onward."""
+    full = prepare_history_hidden_states(
+        hidden_states, history_layer_ids, num_transformer_layers
+    )
+    has_supervision = (loss_mask > 0.5).any(dim=1)
+    if not bool(has_supervision.all()):
+        raise ValueError("Every sample must contain at least one supervised token.")
+    first_supervised = (loss_mask > 0.5).to(torch.int64).argmax(dim=1)
+    start_positions = (first_supervised - int(window_size)).clamp(min=0)
+    source_lengths = full.shape[1] - start_positions
+    max_source_len = int(source_lengths.max().item())
+    relative = torch.arange(max_source_len, device=full.device).unsqueeze(0)
+    absolute = start_positions.unsqueeze(1) + relative
+    valid = relative < source_lengths.unsqueeze(1)
+    safe_absolute = absolute.clamp(max=full.shape[1] - 1)
+    packed = torch.gather(
+        full,
+        dim=1,
+        index=safe_absolute.unsqueeze(-1).unsqueeze(-1).expand(
+            -1, -1, full.shape[2], full.shape[3]
+        ),
+    )
+    packed = packed * valid.unsqueeze(-1).unsqueeze(-1).to(packed.dtype)
+    return packed, start_positions, source_lengths
+
+
+def pack_history_token_embeddings(
+    input_ids: torch.Tensor,
+    loss_mask: torch.Tensor,
+    embed_tokens: nn.Module,
+    window_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack target token embeddings needed by ``token`` and ``pivot_q`` history."""
+    full = embed_tokens(input_ids)
+    has_supervision = (loss_mask > 0.5).any(dim=1)
+    if not bool(has_supervision.all()):
+        raise ValueError("Every sample must contain at least one supervised token.")
+    first_supervised = (loss_mask > 0.5).to(torch.int64).argmax(dim=1)
+    start_positions = (first_supervised - int(window_size)).clamp(min=0)
+    source_lengths = full.shape[1] - start_positions
+    max_source_len = int(source_lengths.max().item())
+    relative = torch.arange(max_source_len, device=full.device).unsqueeze(0)
+    absolute = start_positions.unsqueeze(1) + relative
+    valid = relative < source_lengths.unsqueeze(1)
+    safe_absolute = absolute.clamp(max=full.shape[1] - 1)
+    packed = torch.gather(
+        full,
+        dim=1,
+        index=safe_absolute.unsqueeze(-1).expand(-1, -1, full.shape[-1]),
+    )
+    packed = packed * valid.unsqueeze(-1).to(packed.dtype)
+    return packed, start_positions, source_lengths
+
+
+def gather_sliding_history(
+    fused_history: torch.Tensor,
+    anchor_positions: torch.Tensor,
+    window_size: int,
+    source_start_positions: Optional[torch.Tensor] = None,
+    source_lengths: Optional[torch.Tensor] = None,
+    include_pivot: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gather the ``W-1`` left-padded history slots for every anchor.
+
+    Fused hidden history uses ``a-W .. a-2``. Token and pivot-Q history set
+    ``include_pivot=True`` and uses ``a-W+1 .. a-1`` so its last token and the
+    separately supplied CHS pivot intentionally have the same RoPE position.
+
+    Returns ``(history, valid_mask, position_ids)`` with shapes
+    ``(B,N,W-1,H)``, ``(B,N,W-1)``, and ``(B,N,W-1)``.
     """
-    if noise_ratio <= 0:
-        return target_hidden
-    noise = torch.empty_like(target_hidden).uniform_(-noise_ratio, noise_ratio)
-    return target_hidden + noise
+    bsz, seq_len, hidden_size = fused_history.shape
+    if source_start_positions is None:
+        source_start_positions = torch.zeros(
+            bsz, dtype=torch.long, device=fused_history.device
+        )
+    if source_lengths is None:
+        source_lengths = torch.full(
+            (bsz,), seq_len, dtype=torch.long, device=fused_history.device
+        )
+    history_len = int(window_size) - 1
+    n_blocks = anchor_positions.shape[1]
+    if history_len == 0:
+        empty_hidden = fused_history.new_empty(bsz, n_blocks, 0, hidden_size)
+        empty_mask = torch.empty(
+            bsz, n_blocks, 0, dtype=torch.bool, device=fused_history.device
+        )
+        empty_pos = torch.empty(
+            bsz, n_blocks, 0, dtype=torch.long, device=fused_history.device
+        )
+        return empty_hidden, empty_mask, empty_pos
+
+    end_offset = 0 if include_pivot else -1
+    start_offset = end_offset - history_len
+    offsets = torch.arange(
+        start_offset, end_offset, device=anchor_positions.device
+    ).view(1, 1, history_len)
+    positions = anchor_positions.unsqueeze(-1) + offsets
+    relative_positions = positions - source_start_positions.view(bsz, 1, 1)
+    valid = (relative_positions >= 0) & (
+        relative_positions < source_lengths.view(bsz, 1, 1)
+    )
+    safe_relative_positions = relative_positions.clamp(min=0, max=seq_len - 1)
+    expanded = fused_history.unsqueeze(1).expand(-1, n_blocks, -1, -1)
+    gathered = torch.gather(
+        expanded,
+        dim=2,
+        index=safe_relative_positions.unsqueeze(-1).expand(
+            -1, -1, -1, hidden_size
+        ),
+    )
+    gathered = gathered * valid.unsqueeze(-1).to(gathered.dtype)
+    safe_absolute_positions = positions.clamp(min=0)
+    return gathered, valid, safe_absolute_positions
+
+
+def prepare_shared_fused_history(
+    hidden_states: HiddenStatesInput,
+    history_layer_ids: list[int],
+    num_transformer_layers: int,
+    draft_model: FlashMTPDraftModel,
+) -> torch.Tensor:
+    """Fuse history source layers once over the full sequence ``(B,T,H)``."""
+    raw = prepare_history_hidden_states(
+        hidden_states, history_layer_ids, num_transformer_layers
+    )
+    return draft_model.fuse_history_hidden(raw)
+
+
+def scatter_packed_fused_history_into_shared(
+    fused_packed_history: torch.Tensor,
+    history_start_positions: torch.Tensor,
+    history_source_lengths: torch.Tensor,
+    seq_len: int,
+) -> torch.Tensor:
+    """Write packed fused history ``(B,T_pack,H)`` into a full-length shared buffer."""
+    if fused_packed_history.ndim != 3:
+        raise ValueError(
+            "fused_packed_history must have shape (B,T_pack,H), got "
+            f"{tuple(fused_packed_history.shape)}."
+        )
+    bsz, pack_len, hidden_size = fused_packed_history.shape
+    shared = fused_packed_history.new_zeros(bsz, int(seq_len), hidden_size)
+    if pack_len == 0:
+        return shared
+    relative = torch.arange(pack_len, device=fused_packed_history.device).view(1, -1)
+    absolute = history_start_positions.view(bsz, 1) + relative
+    valid = relative < history_source_lengths.view(bsz, 1)
+    safe_absolute = absolute.clamp(min=0, max=int(seq_len) - 1)
+    shared.scatter_(
+        1,
+        safe_absolute.unsqueeze(-1).expand(-1, -1, hidden_size),
+        fused_packed_history * valid.unsqueeze(-1).to(fused_packed_history.dtype),
+    )
+    return shared
+
+
+def build_global_shared_fused_history(
+    history_hidden_states: torch.Tensor,
+    history_start_positions: torch.Tensor,
+    history_source_lengths: torch.Tensor,
+    seq_len: int,
+    draft_model: FlashMTPDraftModel,
+) -> torch.Tensor:
+    """Build the shared fused-history sequence used by global-position training."""
+    fused_packed = draft_model.fuse_history_hidden(history_hidden_states)
+    shared = scatter_packed_fused_history_into_shared(
+        fused_packed,
+        history_start_positions,
+        history_source_lengths,
+        seq_len,
+    )
+    return shared
+
+
+def create_flashmtp_shared_block_mask(
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+    seq_len: int,
+    sliding_window_size: int,
+    current_chs_slots: int,
+    block_size: int,
+    source_start_positions: torch.Tensor,
+    source_lengths: torch.Tensor,
+    history_mode: str,
+    device: torch.device,
+    chs_first: bool = False,
+):
+    """Flex Attention mask with one shared history sequence plus per-anchor CHS.
+
+    ``block_size`` here is the draft **query** length: known anchor ``a`` then
+    ``B-1`` MASK queries.
+
+    KV layout:
+        V5: [CHS_0..S-1 | ... | CHS_{N-1} | SharedHistory (T) | Block_0 | ...]
+        Old: [SharedHistory (T) | CHS_0..S-1 | ... | CHS_{N-1} | Block_0 | ...]
+    Q layout:
+        [Block_0 | Block_1 | ... | Block_{N-1}]
+    """
+    block_size = int(block_size)
+    current_chs_slots = int(current_chs_slots)
+    seq_len = int(seq_len)
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    if current_chs_slots <= 0:
+        raise ValueError(
+            f"current_chs_slots must be positive, got {current_chs_slots}"
+        )
+
+    B, N = anchor_positions.shape
+    Q_LEN = N * block_size
+    T = seq_len
+    total_chs_len = N * current_chs_slots
+    chs_start = 0 if chs_first else T
+    shared_start = total_chs_len if chs_first else 0
+    draft_start = T + total_chs_len
+    KV_LEN = draft_start + N * block_size
+    max_block_id = max(N - 1, 0)
+    def flashmtp_shared_mask_mod(b, h, q_idx, kv_idx):
+        q_block_id = q_idx // block_size
+        q_block_ok = q_block_id <= max_block_id
+        safe_q_block_id = q_block_id.clamp(min=0, max=max_block_id)
+
+        anchor_pos = anchor_positions[b, safe_q_block_id]
+        src_start = source_start_positions[b]
+        src_end = src_start + source_lengths[b]
+        history_idx = kv_idx - shared_start
+        in_source = (history_idx >= src_start) & (history_idx < src_end)
+
+        is_shared = (kv_idx >= shared_start) & (kv_idx < shared_start + T)
+        is_chs = (kv_idx >= chs_start) & (kv_idx < draft_start)
+        if chs_first:
+            is_chs = is_chs & (kv_idx < total_chs_len)
+        is_draft = kv_idx >= draft_start
+
+        chs_block_id = (kv_idx - chs_start) // current_chs_slots
+        mask_chs = is_chs & (chs_block_id == q_block_id)
+
+        draft_block_id = (kv_idx - draft_start) // block_size
+        mask_draft = is_draft & (draft_block_id == q_block_id)
+
+        if history_mode == "token":
+            window_start = anchor_pos - int(sliding_window_size) + 1
+            history_end = anchor_pos - 1
+        else:
+            window_start = anchor_pos - int(sliding_window_size)
+            history_end = anchor_pos - 2
+        mask_history = (
+            is_shared
+            & in_source
+            & (history_idx >= window_start)
+            & (history_idx <= history_end)
+        )
+
+        is_valid_block = block_keep_mask[b, safe_q_block_id] & q_block_ok
+        return (mask_history | mask_chs | mask_draft) & is_valid_block
+
+    flashmtp_shared_mask_mod.__name__ = (
+        f"flashmtp_shared_mask_N{N}_T{T}_bs{block_size}_chs{current_chs_slots}"
+        f"_cf{int(chs_first)}"
+    )
+
+    create_fn = (
+        compile_friendly_create_block_mask
+        if compile_friendly_create_block_mask is not None
+        else create_block_mask
+    )
+    return create_fn(
+        flashmtp_shared_mask_mod,
+        B=B,
+        H=None,
+        Q_LEN=Q_LEN,
+        KV_LEN=KV_LEN,
+        device=device,
+    )
 
 
 def create_flashmtp_block_mask(
     anchor_positions: torch.Tensor,
     block_keep_mask: torch.Tensor,
+    context_keep_mask: torch.Tensor,
     chs_len_per_block: int,
     block_size: int,
     device: torch.device,
+    draft_keep_mask: Optional[torch.Tensor] = None,
 ):
     """Construct Flex Attention BlockMask for FlashMTP training with per-block CHS.
 
     Args:
         anchor_positions: (B, N) tensor of anchor positions for each block
         block_keep_mask: (B, N) boolean mask indicating valid blocks
-        chs_len_per_block: Number of tokens per CHS segment. FlashMTP uses
-            feature-concat CHS, so this is 1.
-        block_size: Number of tokens per draft block
+        context_keep_mask: (B, N, C) validity mask for dynamic history slots
+            and current multi-layer CHS slots.
+        chs_len_per_block: Context slots per block (``S+W-1`` in V5).
+        block_size: Draft query length per block (window Q + anchor + MASK
+            tokens in ``pivot_q``; otherwise unsupervised anchor + MASK).
         device: torch device
+        draft_keep_mask: Optional ``(B, N, block_size)`` validity mask for
+            query-side KV slots. Used by ``pivot_q`` to hide left-padded
+            window queries. When omitted, every draft slot in a valid block
+            is visible.
 
     Layout:
         KV: [CHS_0 | CHS_1 | ... | CHS_{N-1} | Block_0 | Block_1 | ... | Block_{N-1}]
             - Each CHS_i has length chs_len_per_block
-            - Each Block_i has length block_size
+            - Each Block_i has length block_size (unsupervised anchor + MASK queries)
         Q:  [Block_0 | Block_1 | ... | Block_{N-1}]
 
     Rules:
-      1. Block_i only sees CHS_i (its own feature-concat context token).
+      1. Block_i only sees valid slots in its own sliding-CHS context.
       2. Intra-block draft attention is bidirectional.
       3. Different blocks are invisible to each other.
-      4. Invalid/padded blocks see their own context token only. Their loss is
-         zero, but keeping one finite attention key avoids all-masked softmax
-         rows (which otherwise produce NaN before the zero loss mask is applied).
+      4. Invalid blocks (block_keep_mask=False) see nothing.
     """
     block_size = int(block_size)
     chs_len_per_block = int(chs_len_per_block)
@@ -198,7 +503,7 @@ def create_flashmtp_block_mask(
 
         is_context = kv_idx < total_chs_len
         chs_block_id = kv_idx // chs_len_per_block
-        mask_context = is_context & (chs_block_id == q_block_id)
+        context_slot = kv_idx % chs_len_per_block
 
         is_draft = kv_idx >= total_chs_len
         kv_block_id = (kv_idx - total_chs_len) // block_size
@@ -206,13 +511,30 @@ def create_flashmtp_block_mask(
 
         # flex_attention vmap may probe out-of-range q_idx; clamp before indexing.
         safe_q_block_id = q_block_id.clamp(min=0, max=max_block_id)
+        safe_context_slot = context_slot.clamp(
+            min=0, max=chs_len_per_block - 1
+        )
+        context_is_valid = context_keep_mask[
+            b, safe_q_block_id, safe_context_slot
+        ]
+        mask_context = (
+            is_context
+            & (chs_block_id == q_block_id)
+            & context_is_valid
+        )
+        if draft_keep_mask is not None:
+            draft_slot = (kv_idx - total_chs_len) % block_size
+            safe_kv_block_id = kv_block_id.clamp(min=0, max=max_block_id)
+            safe_draft_slot = draft_slot.clamp(min=0, max=block_size - 1)
+            mask_draft = mask_draft & draft_keep_mask[
+                b, safe_kv_block_id, safe_draft_slot
+            ]
         is_valid_block = block_keep_mask[b, safe_q_block_id] & q_block_ok
-        valid_attention = (mask_context | mask_draft) & is_valid_block
-        invalid_fallback = mask_context & ~is_valid_block & q_block_ok
-        return valid_attention | invalid_fallback
+        return (mask_context | mask_draft) & is_valid_block
 
     flashmtp_mask_mod.__name__ = (
         f"flashmtp_mask_N{N}_bs{block_size}_chs{chs_len_per_block}"
+        f"_dk{int(draft_keep_mask is not None)}"
     )
 
     create_fn = (
@@ -242,21 +564,14 @@ class OnlineFlashMTPModel(nn.Module):
         tv_loss_weight: float = 1.0,
         base_lm_ce_weight: float = 0.0,
         base_lm_ce_decay_gamma: Optional[float] = None,
-        chs_concat_mode: str = "feature",
-        add_noise: bool = False,
-        target_hidden_noise_ratio: float = 0.1,
         ce_chunk_size: int = 2048,
-        left_shift: Optional[bool] = None,
+        anchor_chunk_size: int = 0,
     ):
         super().__init__()
         self.draft_model = draft_model
         self.lm_head = target_lm_head
         self.embed_tokens = target_embed_tokens
         self.block_size = block_size
-        if self.block_size <= 1:
-            raise ValueError(
-                f"block_size must be at least 2 for next-token loss, got {block_size}."
-            )
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
@@ -264,47 +579,12 @@ class OnlineFlashMTPModel(nn.Module):
         self.final_ce_weight = float(final_ce_weight)
         self.tv_loss_weight = float(tv_loss_weight)
         self.base_lm_ce_weight = float(base_lm_ce_weight)
-        for name, value in (
-            ("final_ce_weight", self.final_ce_weight),
-            ("tv_loss_weight", self.tv_loss_weight),
-            ("base_lm_ce_weight", self.base_lm_ce_weight),
-        ):
-            if value < 0:
-                raise ValueError(
-                    f"{name} must be non-negative, got {value}."
-                )
-        if self.final_ce_weight + self.tv_loss_weight + self.base_lm_ce_weight == 0:
-            raise ValueError("At least one FlashMTP loss weight must be positive.")
         self.base_lm_ce_decay_gamma = base_lm_ce_decay_gamma
-        self.add_noise = add_noise
-        self.target_hidden_noise_ratio = float(target_hidden_noise_ratio)
-        if self.target_hidden_noise_ratio < 0:
-            raise ValueError(
-                "target_hidden_noise_ratio must be non-negative, got "
-                f"{target_hidden_noise_ratio}."
-            )
         self.ce_chunk_size = max(int(ce_chunk_size), 1)
-        configured_left_shift = bool(getattr(draft_model, "left_shift", False))
-        self.left_shift = (
-            configured_left_shift if left_shift is None else bool(left_shift)
-        )
-        if self.left_shift != configured_left_shift:
-            raise ValueError(
-                "OnlineFlashMTPModel left_shift must match the draft checkpoint/config: "
-                f"wrapper={self.left_shift}, draft={configured_left_shift}."
-            )
-        self.chs_concat_mode = "feature"
-        self.draft_model.chs_concat_mode = "feature"
-
+        self.anchor_chunk_size = max(int(anchor_chunk_size), 0)
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
-
-    def _draft_block_len(self) -> int:
-        """Parallel draft slots per anchor; left_shift uses block_size-1 slots."""
-        if self.left_shift:
-            return self.block_size - 1
-        return self.block_size
 
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
@@ -315,8 +595,8 @@ class OnlineFlashMTPModel(nn.Module):
         max_anchor = max(seq_len - max_label_offset - 1, 0)
 
         valid = loss_mask[:, : max_anchor + 1] > 0.5
-        if self.left_shift:
-            valid = valid & (loss_mask[:, 1 : max_anchor + 2] > 0.5)
+        if valid.shape[1] > 0:
+            valid[:, 0] = False
         valid_counts = valid.sum(dim=1)
         max_n = min(self.num_anchors, int(valid_counts.max().item()) - 1)
 
@@ -365,28 +645,10 @@ class OnlineFlashMTPModel(nn.Module):
         noise_input_ids[is_block_start] = input_ids[is_block_start]
         return noise_input_ids
 
-    def _create_draft_position_ids(
-        self, anchor_positions: torch.Tensor
-    ) -> torch.Tensor:
-        """Draft token position ids: global (anchor + offset) or block-local 1..draft_len."""
-        bsz, n_blocks = anchor_positions.shape
-        device = anchor_positions.device
-        draft_len = self._draft_block_len()
-        if getattr(self.draft_model, "local_position", False):
-            local = (
-                torch.arange(1, draft_len + 1, device=device)
-                .view(1, 1, -1)
-                .expand(bsz, n_blocks, -1)
-            )
-            return local.reshape(bsz, -1)
-        offsets = torch.arange(draft_len, device=device).view(1, 1, -1)
-        pos_ids = anchor_positions.unsqueeze(-1) + offsets
-        return pos_ids.view(bsz, -1)
-
     def _create_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
         bsz, seq_len = input_ids.shape
         n = anchor_positions.shape[1]
-        draft_len = self._draft_block_len()
+        draft_len = self.draft_model.core_draft_query_length
         device = input_ids.device
 
         noise_ids = torch.full(
@@ -395,27 +657,105 @@ class OnlineFlashMTPModel(nn.Module):
 
         block_starts = torch.arange(n, device=device) * draft_len
         block_starts = block_starts.unsqueeze(0).expand(bsz, -1)
+        flat_batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(bsz, n)
+        mask_id = torch.tensor(self.mask_token_id, dtype=torch.long, device=device)
 
         valid_anchor_positions = anchor_positions.clamp(0, seq_len - 1)
         anchor_tokens = torch.gather(input_ids, 1, valid_anchor_positions)
-
-        flat_batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(bsz, n)
-
-        # substitute the anchor position with label token (bonus token in inference)
         noise_ids[flat_batch_idx, block_starts] = torch.where(
-            block_keep_mask,
-            anchor_tokens,
-            torch.tensor(self.mask_token_id, dtype=torch.long, device=device),
+            block_keep_mask, anchor_tokens, mask_id
         )
-
         return self.embed_tokens(noise_ids)
+
+    def _prepend_token_embedding_chs(
+        self,
+        target_hidden: torch.Tensor,
+        input_ids: torch.Tensor,
+        anchor_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Validate CHS shape and preserve old checkpoint layouts when needed."""
+        selected_chs = self.draft_model.chs_num_layers
+        if not self.draft_model.include_token_embedding_chs:
+            if target_hidden.size(2) != selected_chs:
+                raise ValueError(
+                    f"target_hidden must contain {selected_chs} transformer CHS slots; "
+                    f"got {target_hidden.size(2)}."
+                )
+            return target_hidden
+        if target_hidden.size(2) == selected_chs + 1:
+            return target_hidden
+        if target_hidden.size(2) != selected_chs:
+            raise ValueError(
+                f"target_hidden must contain {selected_chs} transformer CHS slots "
+                f"before embedding prepend; got {target_hidden.size(2)}."
+            )
+        predecessor_positions = (anchor_positions - 1).clamp(
+            min=0, max=input_ids.size(1) - 1
+        )
+        predecessor_ids = torch.gather(input_ids, 1, predecessor_positions)
+        predecessor_embeddings = self.embed_tokens(predecessor_ids).unsqueeze(2)
+        return torch.cat([predecessor_embeddings, target_hidden], dim=2)
+
+    def _prepare_history_sources(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: HiddenStatesInput,
+        loss_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Prepare packed and optional shared history in the configured format."""
+        if self.draft_model.uses_token_history:
+            history_source, starts, lengths = pack_history_token_embeddings(
+                input_ids,
+                loss_mask,
+                self.embed_tokens,
+                self.draft_model.history_source_lookback,
+            )
+        else:
+            history_source, starts, lengths = pack_history_hidden_states(
+                hidden_states,
+                loss_mask,
+                self.draft_model.history_layer_ids,
+                self.draft_model.config.num_target_layers,
+                self.draft_model.history_source_lookback,
+            )
+
+        shared_history = None
+        if (
+            not self.draft_model.local_position
+            and not self.draft_model.window_as_query
+        ):
+            if self.draft_model.uses_token_history:
+                shared_history = scatter_packed_fused_history_into_shared(
+                    history_source,
+                    starts,
+                    lengths,
+                    input_ids.shape[1],
+                )
+            else:
+                shared_history = build_global_shared_fused_history(
+                    history_source,
+                    starts,
+                    lengths,
+                    input_ids.shape[1],
+                    self.draft_model,
+                )
+        return history_source, starts, lengths, shared_history
 
     def prepare_training_tensors(
         self,
         input_ids: torch.Tensor,
         hidden_states: HiddenStatesInput,
         loss_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         """Sample anchors and gather teacher pivots/distribution states."""
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -428,10 +768,16 @@ class OnlineFlashMTPModel(nn.Module):
             self.draft_model.target_layer_ids,
             self.draft_model.config.num_target_layers,
         )
-        if self.add_noise:
-            target_hidden = add_noise_to_target_hidden(
-                target_hidden, noise_ratio=self.target_hidden_noise_ratio
-            )
+        (
+            history_hidden_states,
+            history_start_positions,
+            history_source_lengths,
+            shared_fused_history,
+        ) = self._prepare_history_sources(
+            input_ids,
+            hidden_states,
+            loss_mask,
+        )
         target_prediction_hidden = None
         if self.tv_loss_weight != 0.0 and self.draft_model.markov_head is not None:
             target_prediction_hidden = prepare_target_prediction_hidden(
@@ -439,13 +785,152 @@ class OnlineFlashMTPModel(nn.Module):
                 anchor_positions,
                 self.block_size,
                 self.draft_model.config.num_target_layers,
-                left_shift=self.left_shift,
             )
         return (
             anchor_positions,
             block_keep_mask,
             target_hidden,
+            history_hidden_states,
+            history_start_positions,
+            history_source_lengths,
             target_prediction_hidden,
+            shared_fused_history,
+        )
+
+    def _forward_packed_context(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+        target_hidden: torch.Tensor,
+        history_hidden_states: torch.Tensor,
+        history_start_positions: torch.Tensor,
+        history_source_lengths: torch.Tensor,
+        noise_embedding: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-anchor packed context layout (required for ``local_position``)."""
+        device = input_ids.device
+        bsz, n_blk = anchor_positions.shape
+        fused_history = (
+            history_hidden_states
+            if self.draft_model.uses_token_history
+            else self.draft_model.fuse_history_hidden(history_hidden_states)
+        )
+        history_hidden, history_keep_mask, history_position_ids = (
+            gather_sliding_history(
+                fused_history,
+                anchor_positions,
+                self.draft_model.sliding_window_size,
+                history_start_positions,
+                history_source_lengths,
+                include_pivot=self.draft_model.uses_token_history,
+            )
+        )
+        history_keep_mask = history_keep_mask & block_keep_mask.unsqueeze(-1)
+        current_keep_mask = block_keep_mask.unsqueeze(-1).expand(
+            -1, -1, self.draft_model.condition_slot_count
+        )
+        draft_keep_mask = None
+        if self.draft_model.window_as_query:
+            hidden_size = noise_embedding.size(-1)
+            core_len = self.draft_model.core_draft_query_length
+            draft_queries = noise_embedding.view(bsz, n_blk, core_len, hidden_size)
+            noise_embedding = torch.cat(
+                [history_hidden, draft_queries], dim=2
+            ).reshape(
+                bsz,
+                n_blk * (history_hidden.size(2) + core_len),
+                hidden_size,
+            )
+            kv_history = history_hidden[:, :, :0, :]
+            context_keep_mask = current_keep_mask
+            core_keep = block_keep_mask.unsqueeze(-1).expand(-1, -1, core_len)
+            draft_keep_mask = torch.cat([history_keep_mask, core_keep], dim=-1)
+        else:
+            kv_history = history_hidden
+            context_keep_mask = torch.cat(
+                [current_keep_mask, history_keep_mask]
+                if self.draft_model.chs_first_context
+                else [history_keep_mask, current_keep_mask],
+                dim=-1,
+            )
+        ctx_pos_flat, draft_position_ids = self.draft_model.build_block_position_ids(
+            anchor_positions=anchor_positions,
+            history_position_ids=history_position_ids,
+            history_keep_mask=history_keep_mask,
+        )
+        full_rotary_position_ids = torch.cat([ctx_pos_flat, draft_position_ids], dim=-1)
+        flashmtp_attn_mask = create_flashmtp_block_mask(
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            context_keep_mask=context_keep_mask,
+            chs_len_per_block=self.draft_model.chs_len_per_block,
+            block_size=self.draft_model.draft_query_length,
+            device=device,
+            draft_keep_mask=draft_keep_mask,
+        )
+        return self.draft_model(
+            position_ids=draft_position_ids,
+            noise_embedding=noise_embedding,
+            target_hidden=target_hidden,
+            history_hidden=kv_history,
+            attention_mask=flashmtp_attn_mask,
+            rotary_position_ids=full_rotary_position_ids,
+        )
+
+    def _forward_shared_context(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+        target_hidden: torch.Tensor,
+        shared_fused_history: torch.Tensor,
+        history_start_positions: torch.Tensor,
+        history_source_lengths: torch.Tensor,
+        noise_embedding: torch.Tensor,
+    ) -> torch.Tensor:
+        """Shared fused-history sequence + per-anchor CHS slots."""
+        device = input_ids.device
+        bsz, seq_len = input_ids.shape
+        shared_pos = torch.arange(seq_len, device=device).unsqueeze(0).expand(
+            bsz, -1
+        )
+        pivot_positions = (anchor_positions - 1).clamp(min=0)
+        chs_pos = pivot_positions.unsqueeze(-1).expand(
+            -1, -1, self.draft_model.condition_slot_count
+        )
+        chs_pos_flat = chs_pos.reshape(bsz, -1)
+        draft_position_ids = self.draft_model.build_draft_query_position_ids(
+            anchor_positions
+        ).reshape(bsz, -1)
+        full_rotary_position_ids = torch.cat(
+            [chs_pos_flat, shared_pos, draft_position_ids]
+            if self.draft_model.chs_first_context
+            else [shared_pos, chs_pos_flat, draft_position_ids],
+            dim=-1,
+        )
+        flashmtp_attn_mask = create_flashmtp_shared_block_mask(
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            seq_len=seq_len,
+            sliding_window_size=self.draft_model.sliding_window_size,
+            current_chs_slots=self.draft_model.condition_slot_count,
+            block_size=self.draft_model.draft_query_length,
+            source_start_positions=history_start_positions,
+            source_lengths=history_source_lengths,
+            history_mode=self.draft_model.history_mode,
+            device=device,
+            chs_first=self.draft_model.chs_first_context,
+        )
+        return self.draft_model(
+            position_ids=draft_position_ids,
+            noise_embedding=noise_embedding,
+            target_hidden=target_hidden,
+            shared_history=shared_fused_history,
+            attention_mask=flashmtp_attn_mask,
+            rotary_position_ids=full_rotary_position_ids,
         )
 
     def _lm_head_module(self, output_hidden: torch.Tensor) -> nn.Module:
@@ -461,6 +946,7 @@ class OnlineFlashMTPModel(nn.Module):
         block_keep_mask: torch.Tensor,
         base_weight_mask: Optional[torch.Tensor] = None,
         target_prediction_hidden: Optional[torch.Tensor] = None,
+        initial_prev_token_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -475,28 +961,6 @@ class OnlineFlashMTPModel(nn.Module):
         positions, while full-vocabulary logits exist only for one loss chunk.
         """
         device = prediction_hidden.device
-        active_positions = binary_eval_mask.bool()
-        if not active_positions.any():
-            raise ValueError("FlashMTP loss has no supervised label positions.")
-
-        # Padded blocks may contain arbitrary values from backend attention.
-        # Sanitize them before any trainable projection; merely multiplying their
-        # eventual loss by zero is unsafe because NaN * 0 is still NaN.
-        prediction_hidden = torch.where(
-            active_positions.unsqueeze(-1),
-            prediction_hidden,
-            torch.zeros_like(prediction_hidden),
-        )
-        prev_token_ids = torch.where(
-            active_positions, prev_token_ids, torch.zeros_like(prev_token_ids)
-        )
-        if target_prediction_hidden is not None:
-            target_prediction_hidden = torch.where(
-                active_positions.unsqueeze(-1),
-                target_prediction_hidden,
-                torch.zeros_like(target_prediction_hidden),
-            )
-
         flat_hidden = prediction_hidden.reshape(-1, prediction_hidden.size(-1))
         num_tokens = flat_hidden.size(0)
         flat_targets = labels.reshape(-1)
@@ -505,7 +969,9 @@ class OnlineFlashMTPModel(nn.Module):
         valid_token_count = flat_weights.sum() + 1e-6
         markov_head = self.draft_model.markov_head
         output_mode = self.draft_model.markov_output_mode
-        use_base_lm_ce = self.base_lm_ce_weight > 0.0 and base_weight_mask is not None
+        use_base_lm_ce = (
+            self.base_lm_ce_weight > 0.0 and base_weight_mask is not None
+        )
         use_tv_loss = self.tv_loss_weight != 0.0 and markov_head is not None
         if use_tv_loss and target_prediction_hidden is None:
             raise ValueError(
@@ -529,6 +995,7 @@ class OnlineFlashMTPModel(nn.Module):
                 hidden_states=prediction_hidden,
                 prev_token_ids=prev_token_ids,
                 output_mode=output_mode,
+                initial_prev_token_ids=initial_prev_token_ids,
             )
             flat_markov_latent = markov_latent.reshape(-1, markov_latent.size(-1))
 
@@ -538,13 +1005,13 @@ class OnlineFlashMTPModel(nn.Module):
         ) -> torch.Tensor:
             if markov_head is None:
                 assert lm_head is not None
-                return lm_head(oh).float()
+                return lm_head(oh)
             assert latent is not None
-            head_logits = markov_head.project_logits(latent).float()
+            head_logits = markov_head.project_logits(latent)
             if not markov_output_uses_base_lm_head(output_mode):
                 return head_logits
             assert lm_head is not None
-            return lm_head(oh).float() + head_logits
+            return lm_head(oh) + head_logits
 
         def _chunk_ce_and_tv(
             oh: torch.Tensor,
@@ -553,36 +1020,15 @@ class OnlineFlashMTPModel(nn.Module):
             targets_chunk: torch.Tensor,
             weights_chunk: torch.Tensor,
         ):
-            active_chunk = weights_chunk > 0
-            if not active_chunk.any():
-                zero = weights_chunk.new_zeros(())
-                return zero, zero
-
-            oh = oh[active_chunk]
-            latent = latent[active_chunk]
-            target_oh = target_oh[active_chunk]
-            targets_chunk = targets_chunk[active_chunk]
-            weights_chunk = weights_chunk[active_chunk].float()
             logits_chunk = _final_logits(oh, None if markov_head is None else latent)
-            if (targets_chunk < 0).any() or (
-                targets_chunk >= logits_chunk.size(-1)
-            ).any():
-                raise ValueError(
-                    "Supervised labels must be within the output vocabulary: "
-                    f"min={int(targets_chunk.min().item())}, "
-                    f"max={int(targets_chunk.max().item())}, "
-                    f"vocab_size={logits_chunk.size(-1)}."
-                )
-            loss_chunk = F.cross_entropy(
-                logits_chunk.float(), targets_chunk, reduction="none"
-            )
+            loss_chunk = F.cross_entropy(logits_chunk, targets_chunk, reduction="none")
             ce_sum = (loss_chunk * weights_chunk).sum()
             if not use_tv_loss:
                 return ce_sum, ce_sum.new_zeros(())
 
             assert target_lm_head is not None
-            target_logits_chunk = target_lm_head(target_oh).float()
-            draft_probs = F.softmax(logits_chunk.float(), dim=-1)
+            target_logits_chunk = target_lm_head(target_oh)
+            draft_probs = F.softmax(logits_chunk, dim=-1)
             target_probs = F.softmax(target_logits_chunk, dim=-1)
             tv_per_position = (draft_probs - target_probs).abs().sum(dim=-1)
             tv_sum = (tv_per_position * weights_chunk).sum()
@@ -594,18 +1040,7 @@ class OnlineFlashMTPModel(nn.Module):
             weights_chunk: torch.Tensor,
         ):
             assert base_lm_head is not None
-            active_chunk = weights_chunk > 0
-            if not active_chunk.any():
-                return weights_chunk.new_zeros(())
-            logits_chunk = base_lm_head(oh[active_chunk]).float()
-            targets_chunk = targets_chunk[active_chunk]
-            weights_chunk = weights_chunk[active_chunk].float()
-            if (targets_chunk < 0).any() or (
-                targets_chunk >= logits_chunk.size(-1)
-            ).any():
-                raise ValueError(
-                    "Supervised base-LM labels must be within the output vocabulary."
-                )
+            logits_chunk = base_lm_head(oh)
             loss_chunk = F.cross_entropy(logits_chunk, targets_chunk, reduction="none")
             return (loss_chunk * weights_chunk).sum()
 
@@ -613,11 +1048,15 @@ class OnlineFlashMTPModel(nn.Module):
         tv_loss_num = prediction_hidden.new_zeros(())
         base_loss_num = prediction_hidden.new_zeros(())
         flat_target_prediction_hidden = (
-            target_prediction_hidden.reshape(-1, target_prediction_hidden.size(-1))
+            target_prediction_hidden.reshape(
+                -1, target_prediction_hidden.size(-1)
+            )
             if use_tv_loss and target_prediction_hidden is not None
             else None
         )
-        flat_base_weights = base_weight_mask.reshape(-1) if use_base_lm_ce else None
+        flat_base_weights = (
+            base_weight_mask.reshape(-1) if use_base_lm_ce else None
+        )
         base_valid_token_count = (
             flat_base_weights.sum() + 1e-6 if use_base_lm_ce else None
         )
@@ -681,8 +1120,8 @@ class OnlineFlashMTPModel(nn.Module):
         final_ce_loss = loss_num / valid_token_count
         actual_token_count = binary_eval_mask.sum() + 1e-6
         tv_loss = (
-            # Keep TV on the same position-weighted scale as its numerator.
-            # Using the binary token count here would shrink TV under decay.
+            # The numerator already includes the per-position decay weights,
+            # so divide by their sum to compute a true weighted mean.
             tv_loss_num / valid_token_count
             if use_tv_loss
             else prediction_hidden.new_zeros(())
@@ -725,7 +1164,11 @@ class OnlineFlashMTPModel(nn.Module):
         anchor_positions: Optional[torch.Tensor] = None,
         block_keep_mask: Optional[torch.Tensor] = None,
         target_hidden: Optional[torch.Tensor] = None,
+        history_hidden_states: Optional[torch.Tensor] = None,
+        history_start_positions: Optional[torch.Tensor] = None,
+        history_source_lengths: Optional[torch.Tensor] = None,
         target_prediction_hidden: Optional[torch.Tensor] = None,
+        shared_fused_history: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -752,10 +1195,16 @@ class OnlineFlashMTPModel(nn.Module):
                 self.draft_model.target_layer_ids,
                 self.draft_model.config.num_target_layers,
             )
-            if self.add_noise:
-                target_hidden = add_noise_to_target_hidden(
-                    target_hidden, noise_ratio=self.target_hidden_noise_ratio
-                )
+            (
+                history_hidden_states,
+                history_start_positions,
+                history_source_lengths,
+                shared_fused_history,
+            ) = self._prepare_history_sources(
+                input_ids,
+                hidden_states,
+                loss_mask,
+            )
             if (
                 target_prediction_hidden is None
                 and self.tv_loss_weight != 0.0
@@ -766,59 +1215,164 @@ class OnlineFlashMTPModel(nn.Module):
                     anchor_positions,
                     self.block_size,
                     self.draft_model.config.num_target_layers,
-                    left_shift=self.left_shift,
                 )
         elif anchor_positions is None or block_keep_mask is None:
             raise ValueError(
                 "anchor_positions and block_keep_mask are required when target_hidden is precomputed."
             )
+        if history_hidden_states is None and (
+            self.draft_model.local_position or self.draft_model.window_as_query
+        ):
+            raise ValueError("history_hidden_states is required for sliding CHS.")
+        if history_start_positions is None or history_source_lengths is None:
+            raise ValueError(
+                "history_start_positions and history_source_lengths are required."
+            )
+        use_shared_context = (
+            not self.draft_model.local_position
+            and not self.draft_model.window_as_query
+        )
+        if use_shared_context:
+            if shared_fused_history is None:
+                raise ValueError(
+                    "shared_fused_history is required when local_position is disabled."
+                )
+        elif history_hidden_states is None:
+            raise ValueError("history_hidden_states is required for sliding CHS.")
+
+        target_hidden = self._prepend_token_embedding_chs(
+            target_hidden, input_ids, anchor_positions
+        )
+
+        # FlexAttention's backward workspace grows sharply with the packed
+        # query/KV lengths.  Keep NUM_ANCHORS as the sampling contract, but
+        # execute large anchor sets in independent pieces.  The weighted
+        # reduction below is algebraically equivalent to one packed forward;
+        # it only changes peak workspace, not the sampled anchors or objective.
+        n_anchors = anchor_positions.shape[1]
+        if self.anchor_chunk_size > 0 and n_anchors > self.anchor_chunk_size:
+            chunk_results = []
+            chunk_weights = []
+            label_offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
+            pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
+            loss_decay = None
+            if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+                k = torch.arange(1, self.block_size, device=device).view(1, 1, -1)
+                loss_decay = torch.exp(-(k - 1).float() / self.loss_decay_gamma)
+            base_decay = None
+            if self.base_lm_ce_weight > 0.0:
+                if self.base_lm_ce_decay_gamma is not None and self.base_lm_ce_decay_gamma > 0:
+                    k = torch.arange(1, self.block_size, device=device).view(1, 1, -1)
+                    base_decay = torch.exp(
+                        -(k - 1).float() / self.base_lm_ce_decay_gamma
+                    )
+
+            for start in range(0, n_anchors, self.anchor_chunk_size):
+                end = min(start + self.anchor_chunk_size, n_anchors)
+                chunk_anchor = anchor_positions[:, start:end]
+                chunk_keep = block_keep_mask[:, start:end]
+                chunk_target = target_hidden[:, start:end]
+                chunk_target_prediction = (
+                    target_prediction_hidden[:, start:end]
+                    if target_prediction_hidden is not None
+                    else None
+                )
+                result = self.forward(
+                    input_ids=input_ids,
+                    loss_mask=loss_mask,
+                    anchor_positions=chunk_anchor,
+                    block_keep_mask=chunk_keep,
+                    target_hidden=chunk_target,
+                    history_hidden_states=history_hidden_states,
+                    history_start_positions=history_start_positions,
+                    history_source_lengths=history_source_lengths,
+                    target_prediction_hidden=chunk_target_prediction,
+                    shared_fused_history=shared_fused_history,
+                )
+
+                label_indices = chunk_anchor.unsqueeze(-1) + label_offsets
+                valid = label_indices < seq_len
+                safe_indices = label_indices.clamp(max=seq_len - 1)
+                raw_weight = chunk_keep.unsqueeze(-1).float() * valid.float()
+                raw_weight = raw_weight * (pos_in_block > 0).float()
+                raw_weight = raw_weight * torch.gather(
+                    loss_mask.unsqueeze(1).expand(-1, end - start, -1),
+                    2,
+                    safe_indices,
+                )
+                pred_weight = raw_weight[:, :, 1:]
+                binary = pred_weight > 0
+                final_weight = pred_weight if loss_decay is None else pred_weight * loss_decay
+                base_weight = pred_weight if base_decay is None else pred_weight * base_decay
+                chunk_results.append(result)
+                chunk_weights.append(
+                    (
+                        final_weight.sum(),
+                        base_weight.sum(),
+                        binary.sum().float(),
+                        (chunk_keep & binary.any(dim=-1)).sum().float(),
+                    )
+                )
+
+            final_den = sum(w[0] for w in chunk_weights) + 1e-6
+            base_den = sum(w[1] for w in chunk_weights) + 1e-6
+            acc_den = sum(w[2] for w in chunk_weights) + 1e-6
+            prefix_den = sum(w[3] for w in chunk_weights).clamp(min=1.0)
+            final_ce_loss = sum(
+                r[3] * (w[0] + 1e-6) for r, w in zip(chunk_results, chunk_weights)
+            ) / final_den
+            tv_loss = sum(
+                r[5] * (w[0] + 1e-6) for r, w in zip(chunk_results, chunk_weights)
+            ) / final_den
+            base_ce_loss = sum(
+                r[4] * (w[1] + 1e-6) for r, w in zip(chunk_results, chunk_weights)
+            ) / base_den
+            accuracy = sum(
+                r[1] * (w[2] + 1e-6) for r, w in zip(chunk_results, chunk_weights)
+            ) / acc_den
+            prefix_acc = sum(
+                r[2] * w[3].clamp(min=1.0)
+                for r, w in zip(chunk_results, chunk_weights)
+            ) / prefix_den
+            loss = (
+                self.final_ce_weight * final_ce_loss
+                + self.tv_loss_weight * tv_loss
+                + self.base_lm_ce_weight * base_ce_loss
+            )
+            return loss, accuracy, prefix_acc, final_ce_loss, base_ce_loss, tv_loss
 
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
         )
 
-        # Non-local: CHS rotary ids follow anchor-1 (gather index for pivot hs).
-        # local_position: CHS rotary ids are 0; draft ids are block-local 1..block_size.
-        draft_position_ids = self._create_draft_position_ids(anchor_positions)
-
-        chs = self.draft_model.chs_len_per_block
-        bsz, n_blk = anchor_positions.shape
-        if getattr(self.draft_model, "local_position", False):
-            ctx_pos_flat = torch.zeros(
-                bsz, n_blk * chs, device=device, dtype=torch.long
+        if use_shared_context:
+            output_hidden = self._forward_shared_context(
+                input_ids=input_ids,
+                anchor_positions=anchor_positions,
+                block_keep_mask=block_keep_mask,
+                target_hidden=target_hidden,
+                shared_fused_history=shared_fused_history,
+                history_start_positions=history_start_positions,
+                history_source_lengths=history_source_lengths,
+                noise_embedding=noise_embedding,
             )
         else:
-            ctx_base = (anchor_positions - 1).clamp(min=0)
-            ctx_pos_flat = (
-                ctx_base.unsqueeze(-1).expand(bsz, n_blk, chs).reshape(bsz, n_blk * chs)
+            output_hidden = self._forward_packed_context(
+                input_ids=input_ids,
+                anchor_positions=anchor_positions,
+                block_keep_mask=block_keep_mask,
+                target_hidden=target_hidden,
+                history_hidden_states=history_hidden_states,
+                history_start_positions=history_start_positions,
+                history_source_lengths=history_source_lengths,
+                noise_embedding=noise_embedding,
             )
-        full_rotary_position_ids = torch.cat([ctx_pos_flat, draft_position_ids], dim=-1)
 
-        flashmtp_attn_mask = create_flashmtp_block_mask(
-            anchor_positions=anchor_positions,
-            block_keep_mask=block_keep_mask,
-            chs_len_per_block=chs,
-            block_size=self._draft_block_len(),
-            device=device,
-        )
+        bsz, n_blk = anchor_positions.shape
+        device = input_ids.device
 
-        output_hidden = self.draft_model(
-            position_ids=draft_position_ids,
-            noise_embedding=noise_embedding,
-            target_hidden=target_hidden,
-            attention_mask=flashmtp_attn_mask,
-            rotary_position_ids=full_rotary_position_ids,
-        )
-
-        # DeepSpec-style left shift makes slot k predict anchor+k+1.  Legacy mode
-        # keeps the known anchor in slot 0 and predicts same-position tokens.
-        # left_shift: block_size is total span; labels are anchor+1..anchor+(B-1).
-        label_count = self.block_size - 1
-        label_start = 1 if self.left_shift else 0
         label_offsets = torch.arange(
-            label_start,
-            label_start + (label_count if self.left_shift else self.block_size),
-            device=device,
+            self.block_size, device=device
         ).view(1, 1, -1)
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
         valid_label_mask = label_indices < seq_len
@@ -831,13 +1385,14 @@ class OnlineFlashMTPModel(nn.Module):
         )
 
         # --- Weight mask: block validity * bounds * loss_mask ---
-        draft_len = self._draft_block_len()
-        weight_mask = block_keep_mask.unsqueeze(-1).expand(-1, -1, draft_len).float()
+        draft_len = self.block_size
+        weight_mask = (
+            block_keep_mask.unsqueeze(-1).expand(-1, -1, draft_len).float()
+        )
         weight_mask = weight_mask * valid_label_mask.float()
 
-        if not self.left_shift:
-            pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
-            weight_mask = weight_mask * (pos_in_block > 0).float()
+        pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        weight_mask = weight_mask * (pos_in_block > 0).float()
 
         original_loss_mask_gathered = torch.gather(
             loss_mask.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
@@ -846,29 +1401,27 @@ class OnlineFlashMTPModel(nn.Module):
         )
         weight_mask = weight_mask * original_loss_mask_gathered
 
-        # In left-shift mode every hidden slot is supervised and the predecessor
-        # sequence is [anchor, token(anchor+1), ..., token(anchor+B-1)].
-        # Legacy mode drops hidden slot 0 and retains its old B-1 predictions.
         output_hidden_4d = output_hidden.view(
             bsz,
             anchor_positions.size(1),
-            draft_len,
+            self.draft_model.draft_query_length,
             output_hidden.size(-1),
         )
-        if self.left_shift:
-            prediction_hidden = output_hidden_4d
-            anchor_token_ids = torch.gather(input_ids, 1, anchor_positions)
-            prev_token_ids = torch.cat(
-                [anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]], dim=-1
-            )
-            labels = target_ids
-            prediction_weight_mask = weight_mask
-        else:
-            prediction_hidden = output_hidden_4d[:, :, 1:, :]
-            prev_token_ids = target_ids[:, :, :-1]
-            labels = target_ids[:, :, 1:]
-            prediction_weight_mask = weight_mask[:, :, 1:]
+        prediction_hidden = output_hidden_4d[
+            :, :, self.draft_model.unsupervised_query_count :, :
+        ]
+        prev_token_ids = target_ids[:, :, :-1]
+        labels = target_ids[:, :, 1:]
+        prediction_weight_mask = weight_mask[:, :, 1:]
         binary_eval_mask = prediction_weight_mask > 0
+        initial_prev_token_ids = None
+        if self.draft_model.seed_rnn_from_predecessor:
+            predecessor_positions = (anchor_positions - 1).clamp(
+                min=0, max=seq_len - 1
+            )
+            initial_prev_token_ids = torch.gather(
+                input_ids, 1, predecessor_positions
+            )
 
         base_prediction_weight_mask = None
         if self.base_lm_ce_weight > 0.0:
@@ -878,9 +1431,7 @@ class OnlineFlashMTPModel(nn.Module):
                 and self.base_lm_ce_decay_gamma > 0
             ):
                 prediction_length = self.block_size - 1
-                k_pred = torch.arange(1, prediction_length + 1, device=device).view(
-                    1, 1, -1
-                )
+                k_pred = torch.arange(1, prediction_length + 1, device=device).view(1, 1, -1)
                 base_decay_weights = torch.exp(
                     -(k_pred - 1).clamp(min=0).float() / self.base_lm_ce_decay_gamma
                 )
@@ -905,6 +1456,7 @@ class OnlineFlashMTPModel(nn.Module):
                 block_keep_mask=block_keep_mask,
                 base_weight_mask=base_prediction_weight_mask,
                 target_prediction_hidden=target_prediction_hidden,
+                initial_prev_token_ids=initial_prev_token_ids,
             )
         )
 

@@ -23,19 +23,15 @@ python scripts/summarize_benchmarks.py --per-run
 
 ## Ours core idea
 
-由于隐状态是模型在**完整上下文**下计算得到的，因此它们可以看作对上下文的**浓缩表示**。在预测后续 block 的 token 时，我们只需要**最新的隐状态**即可。
+当前版本按 `[CHS hidden | W-1 个连续历史槽]` 排列 context，并在最新 pivot 位置保留多层 CHS。历史槽可选择融合 target hidden（`history_mode=fuse`）、直接使用 target token embedding 作为 KV（`history_mode=token`），或把这些 embedding 作为 draft Q（`history_mode=pivot_q`）。
 
-我们提出 FlashMTP：利用**最新的隐状态**并结合**双向注意力的**扩散原理，高效生成草稿 token
+FlashMTP 使用 dense Sliding-CHS 和块内双向注意力，一次 backbone 前向生成整个草稿 block 的 hidden，再由低秩串行 head 恢复块内自回归依赖。
 
 ## Base structure
 
-与 DFlash 类似。但我们使用**所有层**的 bonus 隐状态。原因在于：在生成隐状态时，各层会关注上下文的不同部分，因为不同层、不同注意力头的模式差异很大。我们沿 **特征 / 序列 维度**把它们拼接起来，并作为条件使用。随后把 bonus 的干净 token 与若干 mask（噪声）拼接起来，**只做一次前向**。其中噪声 block 作为 **Q**，拼接后的序列作为 **KV**。
+`fuse` 模式下，历史窗口的每个位置取 target 首层、中层和末层 hidden，经 `Linear(3H,H) + RMSNorm` 融合；`token` 模式下直接使用前 `W-1` 个 token embedding 作为 KV。`pivot_q` 使用同样的 token embedding，但把它们放到 Q 上：`[embed(a-W+1), ..., embed(a-1), embed(a), MASK...]`，CHS 仍只作为 KV。CHS 只保留 `CHS_NUM_LAYERS` 个均匀选取并加入层深 embedding 的 target hidden，不再包含重复的 pivot token embedding；这些 CHS 槽位排在显式 window 前并共享 `anchor-1` 的 RoPE position id。`fuse`/`token` 的 draft query 为 `[embed(anchor), MASK...]`，anchor 不监督。CHS、window（`fuse`/`token`）与 draft query block 组成 KV；草稿 block 作为 Q，块内使用双向注意力。`pivot_q` 中 window 同时出现在 Q 和（由 Q 投影得到的）KV 中。
 
-## v1.1 Improved condition injection
-
-- 为提升模型表达能力与条件信息量，我们把**整条拼接序列**都作为 **Q** 输入模型。这样前缀可以在各层之间被逐步处理，每一层都能得到**不同的前缀表示**。
-- 在构造前缀隐状态时，我们**把初始 embedding 也纳入其中**。
-- **seq 模式**：各层对应的隐状态使用**相同的位置 id（position id）**。进入attention之前用线性层将其转换到embedding空间。
+窗口始终是 dense Sliding-CHS；`history_mode` 支持 `fuse`（默认）、`token` 和 `pivot_q`。在 `token`/`pivot_q` 模式中，最后一个 window token 与 CHS hidden 都对应 `anchor-1`，因此二者使用相同 RoPE position id；local 模式下第一个有效 window token 从 0 开始编号。
 
 ## v2: Improved structure
 
@@ -59,13 +55,13 @@ python scripts/summarize_benchmarks.py --per-run
 训练时 FlashMTP backbone 的完整输出为：
 
 $$
-H_{\mathrm{all}}\in\mathbb{R}^{B\times A\times L\times D}.
+H_{\mathrm{all}}\in\mathbb{R}^{B\times A\times (L+1)\times D}.
 $$
 
-slot 0 是已知 anchor，不参与 token 预测。串行头实际接收：
+slot 0 是 pivot token（`anchor-1`），slot 1 是已知 anchor，两者都不参与 token 预测。串行头实际接收：
 
 $$
-H=H_{\mathrm{all}}[:,:,1:,:]
+H=H_{\mathrm{all}}[:,:,2:,:]
 \in\mathbb{R}^{B\times A\times K\times D}.
 $$
 

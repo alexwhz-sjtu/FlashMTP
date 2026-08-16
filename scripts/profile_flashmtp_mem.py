@@ -108,8 +108,6 @@ def main():
         final_ce_weight=args.final_ce_weight,
         tv_loss_weight=args.tv_loss_weight,
         chs_concat_mode="feature",
-        add_noise=args.add_noise,
-        target_hidden_noise_ratio=args.target_hidden_noise_ratio,
         ce_chunk_size=args.ce_chunk_size,
     )
     flashmtp_model = FSDP(

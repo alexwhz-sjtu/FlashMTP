@@ -140,20 +140,71 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
             return runner_output.logits_output
         return runner_output
 
+    @staticmethod
+    def _split_aux_and_last_capture_ids(
+        captured_ids: List[int],
+        num_aux_layers: int,
+        num_transformer_layers: Optional[int],
+        has_last_hidden: bool,
+    ) -> Tuple[List[int], List[int]]:
+        """Map layer ids to SGLang aux vs last_hidden capture buckets.
+
+        SGLang's EAGLE3 hook records layer ``L`` in ``aux_hidden_states`` only when
+        ``L < num_transformer_layers - 1``. The final transformer layer is returned
+        via ``last_hidden_states`` instead.
+        """
+        if num_transformer_layers is None:
+            if captured_ids:
+                if has_last_hidden and len(captured_ids) == num_aux_layers + 1:
+                    return captured_ids[:-1], captured_ids[-1:]
+                return captured_ids, []
+            return list(range(num_aux_layers)), []
+
+        final_layer_id = num_transformer_layers - 1
+        if captured_ids:
+            aux_capture_ids = [
+                layer_id for layer_id in captured_ids if layer_id < final_layer_id
+            ]
+            last_capture_ids = [
+                layer_id for layer_id in captured_ids if layer_id == final_layer_id
+            ]
+        else:
+            aux_capture_ids = list(range(final_layer_id))
+            last_capture_ids = [final_layer_id] if has_last_hidden else []
+
+        if len(aux_capture_ids) != num_aux_layers:
+            raise ValueError(
+                f"Expected {len(aux_capture_ids)} aux hidden layers from SGLang, "
+                f"got {num_aux_layers} (captured_ids={captured_ids})."
+            )
+        if last_capture_ids and not has_last_hidden:
+            raise ValueError(
+                "Missing last_hidden_states for final captured layer(s) "
+                f"{last_capture_ids}."
+            )
+        return aux_capture_ids, last_capture_ids
+
     def _aux_hidden_to_layer_tuple(
         self,
         aux_hidden: torch.Tensor,
         last_hidden: Optional[torch.Tensor] = None,
+        num_layers: Optional[int] = None,
     ) -> Tuple[torch.Tensor, ...]:
         """Split SGLang concatenated aux hidden states into per-layer tensors."""
         hidden_size = self.model_runner.model_config.hidden_size
         bsz, seq_len, total_h = aux_hidden.shape
-        if total_h % hidden_size != 0:
+        if num_layers is None:
+            if total_h % hidden_size != 0:
+                raise ValueError(
+                    f"Unexpected aux_hidden_states shape {tuple(aux_hidden.shape)}; "
+                    f"last dim must be divisible by hidden_size={hidden_size}"
+                )
+            num_layers = total_h // hidden_size
+        elif total_h != int(num_layers) * hidden_size:
             raise ValueError(
-                f"Unexpected aux_hidden_states shape {tuple(aux_hidden.shape)}; "
-                f"last dim must be divisible by hidden_size={hidden_size}"
+                f"aux_hidden_states shape {tuple(aux_hidden.shape)} does not match "
+                f"{num_layers} captured layers at hidden_size={hidden_size}."
             )
-        num_layers = total_h // hidden_size
         reshaped = aux_hidden.view(bsz, seq_len, num_layers, hidden_size)
         layers = [reshaped[:, :, layer_idx, :] for layer_idx in range(num_layers)]
         if last_hidden is not None:
@@ -304,21 +355,37 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
             and batched_aux.shape[-1] % hidden_size == 0
             and batched_aux.shape[-1] > hidden_size
         ):
-            layer_tensors = self._aux_hidden_to_layer_tuple(
-                batched_aux, batched_last
+            captured_ids = list(self.capture_layer_ids or [])
+            num_aux_layers = batched_aux.shape[-1] // hidden_size
+            aux_layer_tensors = self._aux_hidden_to_layer_tuple(
+                batched_aux,
+                last_hidden=None,
+                num_layers=num_aux_layers,
             )
-            captured_ids = self.capture_layer_ids or []
+            aux_capture_ids, last_capture_ids = (
+                self._split_aux_and_last_capture_ids(
+                    captured_ids,
+                    num_aux_layers,
+                    num_transformer_layers,
+                    batched_last is not None,
+                )
+            )
             if (
                 num_transformer_layers is not None
-                and len(captured_ids) < num_transformer_layers
+                and (not captured_ids or len(captured_ids) < num_transformer_layers)
             ):
                 # Partial capture: map absolute layer id -> hidden tensor.
                 hidden_states = {
-                    layer_id: layer_tensors[idx]
-                    for idx, layer_id in enumerate(captured_ids)
+                    layer_id: aux_layer_tensors[idx]
+                    for idx, layer_id in enumerate(aux_capture_ids)
                 }
+                for layer_id in last_capture_ids:
+                    hidden_states[layer_id] = batched_last
             else:
-                hidden_states = layer_tensors
+                layer_tensors = list(aux_layer_tensors)
+                if batched_last is not None:
+                    layer_tensors.append(batched_last)
+                hidden_states = tuple(layer_tensors)
         else:
             raise ValueError(
                 "SGLang returned single-layer hidden states; expected concatenated "
