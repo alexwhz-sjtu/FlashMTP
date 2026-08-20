@@ -11,6 +11,9 @@
     "multifieldqa_en_20k_40k": "/data/wanghanzhen/datasets/LVEval/multifieldqa_en_mixup/multifieldqa_en_mixup_16k_ctx_20k_40k.json",
     "lic_mixup": "/data/wanghanzhen/datasets/LVEval/lic_mixup/lic_mixup_32k_ctx_20k_40k.json",
     "hotpotwikiqa_mixup": "/data/wanghanzhen/datasets/LVEval/hotpotwikiqa_mixup/hotpotwikiqa_mixup_16k_ctx_20k_40k.json",
+    "multifieldqa_en_mixup_32k_32k64k": "/share/dai-sys/wanghanzhen/datasets/LVEval/filtered_32k_64k/multifieldqa_en_mixup_32k_qwen3_32k_64k.jsonl",
+    "hotpotwikiqa_mixup_32k_32k64k": "/share/dai-sys/wanghanzhen/datasets/LVEval/filtered_32k_64k/hotpotwikiqa_mixup_32k_qwen3_32k_64k.jsonl",
+    "lic_mixup_64k_32k64k": "/share/dai-sys/wanghanzhen/datasets/LVEval/filtered_32k_64k/lic_mixup_64k_qwen3_32k_64k.jsonl",
     "specbench_question_jsonl": "/share/dai-sys/wanghanzhen/datasets/specbench/question.jsonl",
     "specbench": "/share/dai-sys/wanghanzhen/datasets/specbench/question.jsonl",
     "specbench_math": "/share/dai-sys/wanghanzhen/datasets/specbench/question.jsonl"

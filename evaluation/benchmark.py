@@ -282,7 +282,12 @@ def flatten_specbench_turns(turns: list) -> list[str]:
     return out
 
 
-def load_specbench_question_jsonl(dataset_path: Path, original_dataset_name: str) -> list[dict]:
+def load_specbench_question_jsonl(
+    dataset_path: Path,
+    original_dataset_name: str,
+    *,
+    first_turn_only: bool = False,
+) -> list[dict]:
     is_sb, category = specbench_dataset_meta(original_dataset_name)
     if not is_sb:
         raise ValueError("internal: load_specbench_question_jsonl requires a specbench dataset name")
@@ -300,13 +305,19 @@ def load_specbench_question_jsonl(dataset_path: Path, original_dataset_name: str
             turns = obj.get("turns")
             if not isinstance(turns, list) or not turns:
                 raise ValueError(f"{dataset_path}:{line_number}: missing non-empty turns")
-            flat = flatten_specbench_turns(turns)
+            if first_turn_only:
+                first_turn = turns[0]
+                if not isinstance(first_turn, str):
+                    first_turn = str(first_turn)
+                flat = [first_turn.strip()] if first_turn.strip() else []
+            else:
+                flat = flatten_specbench_turns(turns)
             if not flat:
                 continue
             instances.append(
                 {
                     "turns": flat,
-                    "specbench_chain_turns": True,
+                    "specbench_chain_turns": not first_turn_only,
                     "category": str(obj.get("category", "unknown")),
                     "question_id": obj.get("question_id"),
                 }
@@ -317,19 +328,32 @@ def load_specbench_question_jsonl(dataset_path: Path, original_dataset_name: str
     return instances
 
 
-def load_benchmark_dataset(dataset_name: str):
+def load_benchmark_dataset(
+    dataset_name: str, *, specbench_first_turn_only: bool = False
+):
     original_dataset_name = dataset_name
     is_specbench, _ = specbench_dataset_meta(original_dataset_name)
     if is_specbench:
         resolved = resolve_dataset_path(original_dataset_name)
         sb_file = Path(resolved)
         if not sb_file.is_file() or sb_file.suffix != ".jsonl":
-            sb_file = default_specbench_question_jsonl()
+            configured_specbench_file = Path(resolve_dataset_path("specbench"))
+            if (
+                configured_specbench_file.is_file()
+                and configured_specbench_file.suffix == ".jsonl"
+            ):
+                sb_file = configured_specbench_file
+            else:
+                sb_file = default_specbench_question_jsonl()
         if not sb_file.is_file():
             raise FileNotFoundError(
                 f"Spec-Bench question.jsonl not found (tried {resolved} and {sb_file})."
             )
-        return load_specbench_question_jsonl(sb_file, original_dataset_name)
+        return load_specbench_question_jsonl(
+            sb_file,
+            original_dataset_name,
+            first_turn_only=specbench_first_turn_only,
+        )
 
     dataset_name = resolve_dataset_path(original_dataset_name)
     dataset_path = Path(dataset_name)
@@ -728,6 +752,11 @@ def main() -> None:
         "Default: verify the full block (proposal_length + 1).",
     )
     parser.add_argument("--dataset", type=str, required=True)
+    parser.add_argument(
+        "--specbench-first-turn-only",
+        action="store_true",
+        help="For SpecBench, evaluate only turns[0] from each question and ignore later turns.",
+    )
     parser.add_argument("--max-samples", type=int, default=10)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -868,7 +897,10 @@ def main() -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     stop_token_ids = [token_id for token_id in [tokenizer.eos_token_id] if token_id is not None]
-    dataset = load_benchmark_dataset(args.dataset)
+    dataset = load_benchmark_dataset(
+        args.dataset,
+        specbench_first_turn_only=args.specbench_first_turn_only,
+    )
     dataset = select_max_samples(dataset, args.max_samples)
 
     if dist.is_main():
