@@ -218,6 +218,14 @@ def parse_args():
         "on its own sample (batch dim 0 / tp_size). Default: on when tp_size > 1.",
     )
     training_group.add_argument("--learning-rate", type=float, default=6e-4)
+    training_group.add_argument(
+        "--markov-lr-multiplier",
+        type=float,
+        default=1.0,
+        help="Serial Markov-head LR multiplier relative to backbone LR. For "
+        "example, 0.5 uses half the backbone LR while sharing the same "
+        "warmup/cosine schedule.",
+    )
     training_group.add_argument("--max-length", type=int, default=3072)
     training_group.add_argument("--warmup-ratio", type=float, default=0.04)
     training_group.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -230,6 +238,13 @@ def parse_args():
     )
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
+    training_group.add_argument(
+        "--load-weights-only",
+        action="store_true",
+        help="Load draft weights/config from --ckpt-dir, but ignore its epoch, "
+        "global step, optimizer, and scheduler state. Training restarts from "
+        "epoch 0 with the newly configured optimizer and LR schedule.",
+    )
     training_group.add_argument(
         "--resume-optimizer",
         action=argparse.BooleanOptionalAction,
@@ -626,7 +641,12 @@ def record_metrics(
     logdict = {}
 
     if mode == "train" and optimizer is not None:
+        learning_rates = optimizer.get_learning_rates()
         logdict["train/lr"] = optimizer.get_learning_rate()
+        if "backbone" in learning_rates:
+            logdict["train/backbone_lr"] = learning_rates["backbone"]
+        if "markov_head" in learning_rates:
+            logdict["train/markov_head_lr"] = learning_rates["markov_head"]
 
     logdict[f"{mode}/loss"] = loss
     logdict[f"{mode}/accuracy"] = accuracy
@@ -773,7 +793,12 @@ def main():
         print_on_rank0("Loaded draft model weights from checkpoint")
 
         training_state_dir = resolve_training_state_dir(draft_model_last_checkpoint)
-        if training_state_dir is not None:
+        if args.load_weights_only:
+            print_on_rank0(
+                "Weights-only initialization requested: ignoring checkpoint "
+                "epoch, global step, optimizer, and scheduler state."
+            )
+        elif training_state_dir is not None:
             resume_state = load_distributed_training_state(
                 training_state_dir, map_location="cpu"
             )
@@ -896,20 +921,33 @@ def main():
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.warmup_ratio,
         total_steps=total_steps,
+        markov_lr_multiplier=args.markov_lr_multiplier,
     )
     print_on_rank0(
         "Gradient clipping enabled: global L2 norm, "
         f"max_grad_norm={args.max_grad_norm}."
     )
+    print_on_rank0(
+        "Optimizer learning rates: "
+        + ", ".join(
+            f"{name}={group_lr:.6g}"
+            for name, group_lr in optimizer.get_learning_rates().items()
+        )
+    )
     skip_steps = 0
     start_epoch = 0
     global_step = 0
     if resume_state is not None:
+        optimizer_resume_state = {
+            "optimizer_state_dict": resume_state["optimizer_state_dict"],
+            "scheduler_state_dict": resume_state["scheduler_state_dict"],
+        }
+        if "optimizer_param_names" in resume_state:
+            optimizer_resume_state["optimizer_param_names"] = resume_state[
+                "optimizer_param_names"
+            ]
         loaded_optimizer = optimizer.load_state_dict(
-            {
-                "optimizer_state_dict": resume_state["optimizer_state_dict"],
-                "scheduler_state_dict": resume_state["scheduler_state_dict"],
-            },
+            optimizer_resume_state,
             load_optimizer=args.resume_optimizer,
         )
         start_epoch = resume_state["epoch"]
@@ -917,11 +955,19 @@ def main():
         del resume_state
         if loaded_optimizer:
             print_on_rank0(
-                f"Restored optimizer and scheduler, lr={optimizer.get_learning_rate():.6f}"
+                "Restored optimizer and scheduler, lr="
+                + ", ".join(
+                    f"{name}={group_lr:.6g}"
+                    for name, group_lr in optimizer.get_learning_rates().items()
+                )
             )
         else:
             print_on_rank0(
-                f"Restored scheduler only, lr={optimizer.get_learning_rate():.6f}"
+                "Restored scheduler only, lr="
+                + ", ".join(
+                    f"{name}={group_lr:.6g}"
+                    for name, group_lr in optimizer.get_learning_rates().items()
+                )
             )
 
         skip_steps = global_step - start_epoch * len(train_dataloader)

@@ -4,7 +4,15 @@ from unittest import mock
 import torch
 from torch import nn
 
+from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.optimizer import BF16Optimizer
+
+
+class ModelWithMarkovHead(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.backbone = nn.Linear(2, 2)
+        self.markov_head = nn.Linear(2, 1)
 
 
 class BF16OptimizerSafetyTest(unittest.TestCase):
@@ -73,6 +81,95 @@ class BF16OptimizerSafetyTest(unittest.TestCase):
         self.assertEqual(len(reduced_tensors), 1)
         self.assertEqual(reduced_tensors[0].ndim, 0)
         self.assertEqual(reduced_tensors[0].numel(), 1)
+
+    def test_markov_head_uses_separate_lr_group(self) -> None:
+        optimizer = BF16Optimizer(
+            ModelWithMarkovHead(),
+            lr=1e-3,
+            markov_lr_multiplier=0.5,
+            total_steps=10,
+            warmup_ratio=0.2,
+        )
+
+        learning_rates = optimizer.get_learning_rates()
+        self.assertEqual(set(learning_rates), {"backbone", "markov_head"})
+        self.assertAlmostEqual(
+            learning_rates["markov_head"] / learning_rates["backbone"], 0.5
+        )
+
+        for _ in range(5):
+            optimizer.scheduler.step()
+            learning_rates = optimizer.get_learning_rates()
+            self.assertAlmostEqual(
+                learning_rates["markov_head"] / learning_rates["backbone"], 0.5
+            )
+
+    def test_legacy_single_group_checkpoint_restores_moments_and_splits_lr(
+        self,
+    ) -> None:
+        source_model = ModelWithMarkovHead()
+        legacy_params = [
+            param.detach().clone().float().requires_grad_(True)
+            for param in source_model.parameters()
+        ]
+        legacy_optimizer = torch.optim.AdamW(legacy_params, lr=1e-3)
+        legacy_scheduler = CosineAnnealingWarmupLR(
+            legacy_optimizer, total_steps=10, warmup_steps=2
+        )
+        for _ in range(8):
+            for param in legacy_params:
+                param.grad = torch.ones_like(param)
+            legacy_optimizer.step()
+            legacy_optimizer.zero_grad(set_to_none=True)
+            legacy_scheduler.step()
+        legacy_lr = legacy_optimizer.param_groups[0]["lr"]
+
+        optimizer = BF16Optimizer(
+            ModelWithMarkovHead(),
+            lr=2e-3,
+            markov_lr_multiplier=0.5,
+            total_steps=10,
+            warmup_ratio=0.2,
+        )
+        loaded = optimizer.load_state_dict(
+            {
+                "optimizer_state_dict": legacy_optimizer.state_dict(),
+                "scheduler_state_dict": legacy_scheduler.state_dict(),
+            }
+        )
+
+        self.assertTrue(loaded)
+        self.assertEqual(len(optimizer.optimizer.state), len(optimizer.fp32_params))
+        learning_rates = optimizer.get_learning_rates()
+        self.assertAlmostEqual(learning_rates["backbone"], legacy_lr)
+        self.assertAlmostEqual(learning_rates["markov_head"], legacy_lr * 0.5)
+        self.assertAlmostEqual(
+            optimizer.scheduler.base_lrs[1] / optimizer.scheduler.base_lrs[0], 0.5
+        )
+        optimizer.optimizer.step()
+        optimizer.scheduler.step()
+        learning_rates = optimizer.get_learning_rates()
+        self.assertAlmostEqual(
+            learning_rates["markov_head"] / learning_rates["backbone"], 0.5
+        )
+
+    def test_optimizer_state_saves_group_parameter_names(self) -> None:
+        optimizer = BF16Optimizer(
+            ModelWithMarkovHead(),
+            lr=1e-3,
+            markov_lr_multiplier=0.5,
+            total_steps=10,
+        )
+
+        state = optimizer.state_dict()
+
+        self.assertEqual(
+            state["optimizer_param_names"],
+            [
+                ["backbone.weight", "backbone.bias"],
+                ["markov_head.weight", "markov_head.bias"],
+            ],
+        )
 
 
 if __name__ == "__main__":

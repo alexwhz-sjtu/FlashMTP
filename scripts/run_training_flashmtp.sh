@@ -66,6 +66,7 @@ ANCHOR_CHUNK_SIZE="${ANCHOR_CHUNK_SIZE:-0}"
 RESUME="${RESUME:-}"
 CKPT_DIR="${CKPT_DIR:-}"
 RESUME_OPTIMIZER="${RESUME_OPTIMIZER:-1}"
+LOAD_WEIGHTS_ONLY="${LOAD_WEIGHTS_ONLY:-0}"
 
 # ========================================
 # 主要数据集参数
@@ -151,6 +152,7 @@ if [ "${TP_SIZE}" -gt 1 ] && [ "${SHARD_DRAFT_BY_TP}" = "1" ]; then
     fi
 fi
 LEARNING_RATE="${LEARNING_RATE:-6e-4}"
+MARKOV_LR_MULTIPLIER="${MARKOV_LR_MULTIPLIER:-1.0}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
@@ -244,7 +246,8 @@ echo "  批大小: ${TRAIN_BATCH_SIZE} x ${ACCUMULATION_STEPS} = $((TRAIN_BATCH_
 if [ "${TP_SIZE}" -gt 1 ] && [ "${SHARD_DRAFT_BY_TP}" = "1" ]; then
     echo "  shard-draft-by-tp: on (${TP_SIZE} target samples / TP group, 1 draft sample / TP rank)"
 fi
-echo "  学习率: ${LEARNING_RATE}"
+echo "  Backbone学习率: ${LEARNING_RATE}"
+echo "  Markov Head学习率倍率: ${MARKOV_LR_MULTIPLIER}"
 echo "  最大长度: ${MAX_LENGTH}"
 echo "  预热比例: ${WARMUP_RATIO}"
 echo "  梯度裁剪: ${MAX_GRAD_NORM}"
@@ -344,6 +347,10 @@ if [ "${RESUME_OPTIMIZER}" = "0" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --no-resume-optimizer"
 fi
 
+if [ "${LOAD_WEIGHTS_ONLY}" = "1" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --load-weights-only"
+fi
+
 if [ "${REPORT_TO}" != "none" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --report-to ${REPORT_TO}"
     if [ "${REPORT_TO}" = "wandb" ] && [ -n "${WANDB_PROJECT}" ]; then
@@ -400,6 +407,7 @@ EXIT_CODE=0
     --anchor-chunk-size ${ANCHOR_CHUNK_SIZE} \
     --attention-backend ${ATTENTION_BACKEND} \
     --learning-rate ${LEARNING_RATE} \
+    --markov-lr-multiplier ${MARKOV_LR_MULTIPLIER} \
     --warmup-ratio ${WARMUP_RATIO} \
     --num-epochs ${NUM_EPOCHS} \
     --batch-size ${TRAIN_BATCH_SIZE} \

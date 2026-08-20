@@ -19,6 +19,7 @@ LOSS_DECAY_GAMMA=4 \
 DATA_NUM_SAMPLES=pb_80k \
 BASE_LM_CE_DECAY_GAMMA=12 \
 LEARNING_RATE=5e-4 \
+MARKOV_LR_MULTIPLIER=0.5 \
 FINAL_CE_WEIGHT=0.1 \
 TV_LOSS_WEIGHT=1.0 \
 BASE_LM_CE_WEIGHT=0.06 \
@@ -54,11 +55,16 @@ bash scripts/run_training_flashmtp.sh --dt h100
 | `MARKOV_HEAD_TYPE`   | `none` / `vanilla` / `gated` / `rnn` / `rnn_easy` |
 | `MARKOV_OUTPUT_MODE` | `additive` / `direct`                             |
 | `MARKOV_RANK`        | 低秩 state/embedding 维度                             |
+| `MARKOV_LR_MULTIPLIER` | Markov head 相对 backbone 的学习率倍率；默认 `1.0`，推荐先试 `0.5` |
 | `FINAL_CE_WEIGHT`    | 最终预测 CE 权重                                        |
 | `TV_LOSS_WEIGHT`     | target/draft 分布 L1 权重                             |
 | `BASE_LM_CE_WEIGHT`  | 可选 base LM-head CE 权重                             |
 
 
 `SLIDING_WINDOW_SIZE > 1` 且串行 head 为 `rnn` / `rnn_easy` 时，会先用 `embed(anchor-1)` 初始化 recurrent state，再预测第一个 draft token。
+
+`LEARNING_RATE` 是 backbone 的峰值学习率；Markov head 的峰值学习率为 `LEARNING_RATE * MARKOV_LR_MULTIPLIER`。两组参数共用同一个 warmup + cosine 进度，因此训练全程保持该倍率。恢复旧版单参数组 checkpoint 时会继承 Adam 动量和当时的 backbone LR，并按当前倍率建立 Markov head LR。
+
+如果只想继承 checkpoint 权重，并使用全新的 Adam、学习率调度、epoch 和 global step，设置 `CKPT_DIR=/path/to/checkpoint` 与 `LOAD_WEIGHTS_ONLY=1`。这时无需设置 `RESUME=1` 或 `RESUME_OPTIMIZER=0`。
 
 训练时 target 冻结，只捕获当前 CHS 所需层；TV loss 直接复用 target prefill logits。draft 不使用 KV cache。
