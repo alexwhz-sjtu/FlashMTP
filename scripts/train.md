@@ -61,7 +61,7 @@ bash scripts/run_training_flashmtp.sh --dt h100
 | `BASE_LM_CE_WEIGHT`  | 可选 base LM-head CE 权重                             |
 
 
-`SLIDING_WINDOW_SIZE > 1` 且串行 head 为 `rnn` / `rnn_easy` 时，会先用 `embed(anchor-1)` 初始化 recurrent state，再预测第一个 draft token。
+`rnn_easy` 的 recurrent state 在每个 block 开始时置零；第一次预测只输入 `embed(anchor)`，不会再用 `embed(anchor-1)` 预热 state。旧版 checkpoint 的参数结构和调用参数保持兼容。完整 `rnn` head 仍保留原有的 predecessor state 初始化行为。
 
 `LEARNING_RATE` 是 backbone 的峰值学习率；Markov head 的峰值学习率为 `LEARNING_RATE * MARKOV_LR_MULTIPLIER`。两组参数共用同一个 warmup + cosine 进度，因此训练全程保持该倍率。恢复旧版单参数组 checkpoint 时会继承 Adam 动量和当时的 backbone LR，并按当前倍率建立 Markov head LR。
 

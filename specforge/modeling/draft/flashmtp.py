@@ -616,11 +616,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
 
     @property
     def seed_rnn_from_predecessor(self) -> bool:
-        """Prime rnn/rnn_easy serial state with ``embed(anchor-1)`` when W>1."""
-        return (
-            self.sliding_window_size > 1
-            and self.markov_head_type in ("rnn", "rnn_easy")
-        )
+        """Prime full rnn state from ``anchor-1``; rnn_easy starts from zero."""
+        return self.sliding_window_size > 1 and self.markov_head_type == "rnn"
 
     def get_last_decode_stats(self) -> dict:
         return dict(self._last_decode_stats)
@@ -1026,7 +1023,11 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         initial_prev_token_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample standard FlashMTP draft positions using configured head semantics."""
-        if initial_prev_token_ids is not None and not self.seed_rnn_from_predecessor:
+        accepts_legacy_predecessor = (
+            self.sliding_window_size > 1
+            and self.markov_head_type in ("rnn", "rnn_easy")
+        )
+        if initial_prev_token_ids is not None and not accepts_legacy_predecessor:
             raise ValueError(
                 "initial_prev_token_ids require sliding_window_size > 1 with "
                 "an rnn/rnn_easy serial head."

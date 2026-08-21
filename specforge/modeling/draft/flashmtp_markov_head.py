@@ -293,11 +293,11 @@ class FlashMTPMarkovHead(nn.Module):
         *,
         reference: torch.Tensor,
     ) -> torch.Tensor:
-        """Prime recurrent state with the token immediately before the anchor."""
+        """Prime the full rnn state with the token before the anchor."""
         output_mode = self._validate_runtime_output_mode(output_mode)
-        if self.head_type not in ("rnn", "rnn_easy"):
+        if self.head_type != "rnn":
             raise ValueError(
-                "initial_prev_token_ids are only supported for rnn/rnn_easy heads."
+                "initial_prev_token_ids state seeding is only supported for rnn heads."
             )
         initial_prev_token_ids = initial_prev_token_ids.long()
         if initial_prev_token_ids.ndim != 1:
@@ -332,9 +332,9 @@ class FlashMTPMarkovHead(nn.Module):
             prev_token_ids: ``[..., prediction_length]``; entry ``k`` is the
                 ground-truth token immediately preceding prediction ``k``.
             initial_prev_token_ids: Optional ``[...]`` token ids at position
-                ``anchor-1``. When provided for ``rnn``/``rnn_easy``, the
-                recurrent state is primed with this token before the first
-                supervised prediction step.
+                ``anchor-1``. Full ``rnn`` heads use it to prime their state.
+                ``rnn_easy`` accepts it for call compatibility but ignores it,
+                so its first recurrent step only consumes the anchor token.
         """
         output_mode = self._validate_runtime_output_mode(output_mode)
         if hidden_states.shape[:-1] != prev_token_ids.shape:
@@ -372,7 +372,7 @@ class FlashMTPMarkovHead(nn.Module):
             return latent
 
         batch_shape = hidden_states.shape[:-2]
-        if initial_prev_token_ids is not None:
+        if self.head_type == "rnn" and initial_prev_token_ids is not None:
             if initial_prev_token_ids.shape != batch_shape:
                 raise ValueError(
                     "initial_prev_token_ids must match hidden_states batch "
@@ -453,8 +453,7 @@ class FlashMTPMarkovHead(nn.Module):
                 output_mode,
                 reference=hidden_states,
             ).view(batch_size, self.markov_rank)
-            if self.head_type in ("rnn", "rnn_easy")
-            and initial_prev_token_ids is not None
+            if self.head_type == "rnn" and initial_prev_token_ids is not None
             else (
                 hidden_states.new_zeros(batch_size, self.markov_rank)
                 if self.head_type in ("rnn", "rnn_easy")

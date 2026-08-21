@@ -105,9 +105,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             fused, torch.tensor([[3]]), 4, include_pivot=True
         )
         self.assertTrue(
-            torch.equal(
-                token_history[0, 0, :, 0], torch.tensor([0.0, 1.0, 2.0])
-            )
+            torch.equal(token_history[0, 0, :, 0], torch.tensor([0.0, 1.0, 2.0]))
         )
         self.assertTrue(token_keep.all())
         self.assertTrue(torch.equal(token_positions, torch.tensor([[[0, 1, 2]]])))
@@ -142,9 +140,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             embed, draft_ids, window_embeddings=torch.empty(1, 0, 16)
         )
         target_hidden = torch.randn(1, 1, 2, 16)
-        current_chs = model.build_inference_current_chs(
-            embed, target_hidden, pivot_ids
-        )
+        current_chs = model.build_inference_current_chs(embed, target_hidden, pivot_ids)
         self.assertEqual(tuple(noise.shape), (1, 4, 16))
         self.assertTrue(torch.equal(noise[0, 0], embed.weight[5]))
         self.assertEqual(tuple(current_chs.shape), (1, 1, 2, 16))
@@ -172,30 +168,20 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         }
         model = FlashMTPDraftModel(config)
         embeddings = (
-            torch.arange(5, dtype=torch.float32)
-            .view(1, 5, 1)
-            .expand(-1, -1, 16)
+            torch.arange(5, dtype=torch.float32).view(1, 5, 1).expand(-1, -1, 16)
         )
-        condition = model.initialize_inference_condition(
-            token_embeddings=embeddings
-        )
-        self.assertTrue(
-            torch.equal(condition[0, :, 0], torch.tensor([2.0, 3.0, 4.0]))
-        )
+        condition = model.initialize_inference_condition(token_embeddings=embeddings)
+        self.assertTrue(torch.equal(condition[0, :, 0], torch.tensor([2.0, 3.0, 4.0])))
 
         new_embeddings = (
-            torch.arange(10, 12, dtype=torch.float32)
-            .view(1, 2, 1)
-            .expand(-1, -1, 16)
+            torch.arange(10, 12, dtype=torch.float32).view(1, 2, 1).expand(-1, -1, 16)
         )
         condition = model.update_inference_condition(
             condition,
             pivot_index=0,
             token_embeddings=new_embeddings,
         )
-        self.assertTrue(
-            torch.equal(condition[0, :, 0], torch.tensor([3.0, 4.0, 10.0]))
-        )
+        self.assertTrue(torch.equal(condition[0, :, 0], torch.tensor([3.0, 4.0, 10.0])))
 
     def test_training_history_uses_embedding_table(self) -> None:
         config = Qwen3Config(
@@ -234,9 +220,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         loss_mask = torch.zeros(1, 8)
         loss_mask[:, 4:] = 1
 
-        packed, starts, lengths = wrapper._prepare_history_sources(
-            input_ids, loss_mask
-        )
+        packed, starts, lengths = wrapper._prepare_history_sources(input_ids, loss_mask)
 
         self.assertTrue(torch.equal(starts, torch.tensor([1])))
         self.assertTrue(torch.equal(lengths, torch.tensor([7])))
@@ -262,9 +246,12 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             "target_layer_ids": [0, 3],
         }
         model = FlashMTPDraftModel(config)
-        token_history = torch.arange(3, dtype=torch.float32).view(1, 3, 1).expand(
-            -1, -1, 16
-        ).clone()
+        token_history = (
+            torch.arange(3, dtype=torch.float32)
+            .view(1, 3, 1)
+            .expand(-1, -1, 16)
+            .clone()
+        )
         current = torch.randn(1, 1, 2, 16)
         context_positions, draft_positions = model.build_inference_context(
             token_history, current, anchor_position=3
@@ -290,12 +277,12 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertTrue(torch.equal(queries[0, 3], embed.weight[5]))
         self.assertTrue(torch.equal(queries[0, 4], embed.weight[28]))
         self.assertEqual(tuple(model._prediction_hidden(queries).shape), (1, 3, 16))
-        self.assertTrue(torch.equal(model._prediction_hidden(queries)[0, 0], queries[0, 4]))
+        self.assertTrue(
+            torch.equal(model._prediction_hidden(queries)[0, 0], queries[0, 4])
+        )
         output = model(
             position_ids=draft_positions,
-            rotary_position_ids=torch.cat(
-                [context_positions, draft_positions], dim=-1
-            ),
+            rotary_position_ids=torch.cat([context_positions, draft_positions], dim=-1),
             noise_embedding=queries,
             target_hidden=current,
             is_causal=False,
@@ -303,10 +290,8 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertEqual(tuple(output.shape), (1, 7, 16))
 
         model.set_local_position(True)
-        local_context_positions, local_draft_positions = (
-            model.build_inference_context(
-                token_history, current, anchor_position=10
-            )
+        local_context_positions, local_draft_positions = model.build_inference_context(
+            token_history, current, anchor_position=10
         )
         self.assertTrue(torch.equal(local_context_positions, torch.tensor([[2, 2]])))
         self.assertTrue(
@@ -412,9 +397,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             "specforge.core.flashmtp.compile_friendly_create_block_mask",
             side_effect=lambda mask_mod, **_: mask_mod,
         ):
-            draft_keep = torch.tensor(
-                [[[False, False, True, True, True, True, True]]]
-            )
+            draft_keep = torch.tensor([[[False, False, True, True, True, True, True]]])
             packed_mod = create_flashmtp_block_mask(
                 anchor_positions=torch.tensor([[3]]),
                 block_keep_mask=torch.tensor([[True]]),
@@ -478,6 +461,79 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
                 self.assertTrue(packed_visible(q_idx, draft_kv))
             self.assertFalse(packed_visible(q_idx, 9))
 
+    def test_invalid_block_keeps_finite_context_fallback(self) -> None:
+        with mock.patch(
+            "specforge.core.flashmtp.compile_friendly_create_block_mask",
+            side_effect=lambda mask_mod, **_: mask_mod,
+        ):
+            packed_mod = create_flashmtp_block_mask(
+                anchor_positions=torch.tensor([[5, 0]]),
+                block_keep_mask=torch.tensor([[True, False]]),
+                context_keep_mask=torch.tensor([[[True, True], [False, False]]]),
+                chs_len_per_block=2,
+                block_size=2,
+                device=torch.device("cpu"),
+                draft_keep_mask=torch.tensor([[[True, True], [False, False]]]),
+            )
+
+        def visible(q_idx: int, kv_idx: int) -> bool:
+            return bool(
+                packed_mod(
+                    torch.tensor(0),
+                    torch.tensor(0),
+                    torch.tensor(q_idx),
+                    torch.tensor(kv_idx),
+                )
+            )
+
+        # KV: [CHS_0 (2) | CHS_1 (2) | Block_0 (2) | Block_1 (2)].
+        # Invalid Block_1 must retain finite keys, but only from its own CHS.
+        self.assertFalse(visible(2, 0))
+        self.assertFalse(visible(2, 1))
+        self.assertTrue(visible(2, 2))
+        self.assertTrue(visible(2, 3))
+        self.assertFalse(visible(2, 6))
+        self.assertFalse(visible(2, 7))
+
+    def test_anchor_sampling_requires_next_supervised_label(self) -> None:
+        config = Qwen3Config(
+            vocab_size=29,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 4
+        config.block_size = 2
+        config.flashmtp_config = {
+            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
+            "sliding_window_size": 1,
+            "chs_num_layers": 2,
+            "target_layer_ids": [0, 3],
+        }
+        draft_model = FlashMTPDraftModel(config)
+        wrapper = OnlineFlashMTPModel(
+            draft_model=draft_model,
+            target_lm_head=nn.Linear(16, 29, bias=False),
+            target_embed_tokens=nn.Embedding(29, 16),
+            mask_token_id=28,
+            block_size=2,
+            num_anchors=8,
+            tv_loss_weight=0.0,
+        )
+        loss_mask = torch.zeros(1, 8)
+        loss_mask[0, [2, 4, 5, 6]] = 1
+
+        anchors, keep = wrapper._sample_anchor_positions(
+            seq_len=8, loss_mask=loss_mask, device=torch.device("cpu")
+        )
+
+        self.assertTrue(keep.all())
+        self.assertTrue(torch.isin(anchors, torch.tensor([4, 5])).all())
+        self.assertFalse((anchors == 2).any())
+
     def test_local_block_positions_skip_left_padding_and_support_w1(self) -> None:
         config = Qwen3Config(
             vocab_size=29,
@@ -500,9 +556,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         model = FlashMTPDraftModel(config)
         anchors = torch.tensor([[1, 3]])
         history_global = torch.tensor([[[0, 0, 0], [0, 1, 2]]])
-        history_keep = torch.tensor(
-            [[[False, False, False], [False, True, True]]]
-        )
+        history_keep = torch.tensor([[[False, False, False], [False, True, True]]])
         context_pos, draft_pos = model.build_block_position_ids(
             anchors, history_global, history_keep, draft_length=4
         )
@@ -530,9 +584,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertTrue(torch.equal(draft_pos, torch.tensor([[1, 2, 3, 4]])))
 
     def test_rejection_sampling_accepts_identical_distributions(self) -> None:
-        draft_logits = torch.tensor(
-            [[[2.0, 0.0, -1.0], [0.0, 2.0, -1.0]]]
-        )
+        draft_logits = torch.tensor([[[2.0, 0.0, -1.0], [0.0, 2.0, -1.0]]])
         target_logits = torch.cat(
             [draft_logits, torch.tensor([[[0.0, 0.0, 3.0]]])],
             dim=1,
@@ -551,9 +603,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
 
     def test_rejection_sampling_uses_residual_on_rejection(self) -> None:
         draft_logits = torch.tensor([[[100.0, -100.0, -100.0]]])
-        target_logits = torch.tensor(
-            [[[-100.0, 100.0, -100.0], [0.0, 0.0, 100.0]]]
-        )
+        target_logits = torch.tensor([[[-100.0, 100.0, -100.0], [0.0, 0.0, 100.0]]])
 
         accepted, correction = rejection_sample_verify(
             proposed_tokens=torch.tensor([[0]]),
@@ -582,7 +632,6 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             expected_positions.unsqueeze(-1).expand(-1, -1, -1, 3),
         )
         self.assertTrue(torch.equal(gathered, expected))
-
 
     def _assert_teacher_forcing_matches_serial(
         self, head_type: str, output_mode: str
@@ -679,7 +728,9 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
 
     def test_all_head_and_output_modes(self) -> None:
         for head_type in ("vanilla", "gated", "rnn", "rnn_easy"):
-            output_modes = ("additive",) if head_type == "gated" else ("additive", "direct")
+            output_modes = (
+                ("additive",) if head_type == "gated" else ("additive", "direct")
+            )
             for output_mode in output_modes:
                 with self.subTest(head_type=head_type, output_mode=output_mode):
                     self._assert_teacher_forcing_matches_serial(head_type, output_mode)
@@ -850,7 +901,9 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             state=state,
             output_mode="direct",
         )
-        self.assertTrue(torch.allclose(legacy_latent, migrated_latent, atol=1e-6, rtol=1e-6))
+        self.assertTrue(
+            torch.allclose(legacy_latent, migrated_latent, atol=1e-6, rtol=1e-6)
+        )
 
     def test_rnn_easy_load_state_dict_migrates_legacy_weights(self) -> None:
         torch.manual_seed(22)
@@ -875,7 +928,9 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             incompatible = head.load_state_dict(legacy_state, strict=False)
-        self.assertTrue(any("Migrated legacy rnn_easy" in str(w.message) for w in caught))
+        self.assertTrue(
+            any("Migrated legacy rnn_easy" in str(w.message) for w in caught)
+        )
         self.assertNotIn("hidden_proj.weight", incompatible.unexpected_keys)
         self.assertEqual(
             tuple(head.state_hidden_mlp.weight.shape),
@@ -927,7 +982,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertEqual(tuple(sampled.shape), (2, 3))
         self.assertEqual(tuple(logits.shape), (2, 3, 29))
 
-    def test_rnn_seeds_state_from_anchor_predecessor_when_window_gt_one(self) -> None:
+    def test_rnn_easy_ignores_legacy_predecessor_seed(self) -> None:
         torch.manual_seed(11)
         hidden_size, vocab_size, rank = 12, 23, 5
         head = FlashMTPMarkovHead(
@@ -952,7 +1007,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             output_mode="direct",
             initial_prev_token_ids=initial_prev,
         )
-        self.assertFalse(torch.allclose(zero_latent, seeded_latent))
+        self.assertTrue(torch.equal(zero_latent, seeded_latent))
 
         zero_sampled, zero_logits = head.sample_block_tokens(
             hidden_states=hidden_states,
@@ -965,7 +1020,8 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             output_mode="direct",
             initial_prev_token_ids=initial_prev,
         )
-        self.assertFalse(torch.allclose(zero_logits, seeded_logits))
+        self.assertTrue(torch.equal(zero_sampled, seeded_sampled))
+        self.assertTrue(torch.equal(zero_logits, seeded_logits))
 
         config = Qwen3Config(
             vocab_size=29,
@@ -988,7 +1044,42 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             "markov_rank": 7,
         }
         model = FlashMTPDraftModel(config)
-        self.assertTrue(model.seed_rnn_from_predecessor)
+        self.assertFalse(model.seed_rnn_from_predecessor)
+        model_hidden = torch.randn(2, 3, 16)
+        unused_lm_head = nn.Linear(16, 29, bias=False)
+        model_unseeded = model.sample_draft_tokens(
+            draft_hidden=model_hidden,
+            lm_head=unused_lm_head,
+            first_prev_token_ids=prev_token_ids[:, 0],
+        )
+        model_legacy_seeded = model.sample_draft_tokens(
+            draft_hidden=model_hidden,
+            lm_head=unused_lm_head,
+            first_prev_token_ids=prev_token_ids[:, 0],
+            initial_prev_token_ids=initial_prev,
+        )
+        self.assertTrue(torch.equal(model_unseeded[0], model_legacy_seeded[0]))
+        self.assertTrue(torch.equal(model_unseeded[1], model_legacy_seeded[1]))
+
+        rnn_head = FlashMTPMarkovHead(
+            head_type="rnn",
+            vocab_size=vocab_size,
+            markov_rank=rank,
+            hidden_size=hidden_size,
+            max_prediction_length=3,
+        )
+        unseeded_rnn = rnn_head.forward_teacher_forcing(
+            hidden_states=hidden_states,
+            prev_token_ids=prev_token_ids,
+            output_mode="direct",
+        )
+        seeded_rnn = rnn_head.forward_teacher_forcing(
+            hidden_states=hidden_states,
+            prev_token_ids=prev_token_ids,
+            output_mode="direct",
+            initial_prev_token_ids=initial_prev,
+        )
+        self.assertFalse(torch.allclose(unseeded_rnn, seeded_rnn))
 
     def test_rnn_state_update_does_not_depend_on_hidden(self) -> None:
         torch.manual_seed(3)
@@ -1081,10 +1172,11 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertEqual(loaded.proposal_length, 3)
         self.assertTrue(loaded.local_position)
         self.assertTrue(loaded.config.flashmtp_config["local_position"])
-        self.assertEqual(loaded.config.flashmtp_config["architecture_version"], FLASHMTP_ARCHITECTURE_VERSION)
-        self.assertFalse(
-            loaded.config.flashmtp_config["include_token_embedding_chs"]
+        self.assertEqual(
+            loaded.config.flashmtp_config["architecture_version"],
+            FLASHMTP_ARCHITECTURE_VERSION,
         )
+        self.assertFalse(loaded.config.flashmtp_config["include_token_embedding_chs"])
         self.assertFalse(loaded.config.flashmtp_config["pivot_query_embedding"])
         self.assertIsNotNone(loaded.markov_head)
 
@@ -1318,34 +1410,19 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         )
         draft_logits = draft_model.markov_head.project_logits(markov_latent)
         manual_tv = (
-            (
-                F.softmax(draft_logits, dim=-1)
-                - F.softmax(target_prediction_logits, dim=-1)
-            )
-            .abs()
-            .sum(dim=-1)
-            .mul(weight_mask)
-            .sum()
-            / (weight_mask.sum() + 1e-6)
-        )
-        manual_ce = (
-            F.cross_entropy(
-                draft_logits.reshape(-1, draft_logits.size(-1)),
-                labels.reshape(-1),
-                reduction="none",
-            )
-            .view_as(labels)
-            .mul(weight_mask)
-            .sum()
-            / (weight_mask.sum() + 1e-6)
-        )
+            F.softmax(draft_logits, dim=-1)
+            - F.softmax(target_prediction_logits, dim=-1)
+        ).abs().sum(dim=-1).mul(weight_mask).sum() / (weight_mask.sum() + 1e-6)
+        manual_ce = F.cross_entropy(
+            draft_logits.reshape(-1, draft_logits.size(-1)),
+            labels.reshape(-1),
+            reduction="none",
+        ).view_as(labels).mul(weight_mask).sum() / (weight_mask.sum() + 1e-6)
         self.assertTrue(torch.isfinite(loss))
         self.assertTrue(torch.allclose(final_ce_loss, manual_ce))
         self.assertEqual(float(base_ce_loss), 0.0)
         self.assertTrue(torch.allclose(tv_loss, manual_tv))
-        self.assertTrue(
-            torch.allclose(loss, 0.3 * manual_ce + 0.7 * manual_tv)
-        )
+        self.assertTrue(torch.allclose(loss, 0.3 * manual_ce + 0.7 * manual_tv))
         self.assertTrue(0.0 <= float(accuracy) <= 1.0)
         self.assertTrue(1.0 <= float(prefix_acc) <= 4.0)
         loss.backward()
@@ -1416,6 +1493,142 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertEqual(float(tv_loss), 0.0)
         loss.backward()
         self.assertIsNotNone(prediction_hidden.grad)
+
+    def test_masked_nan_block_does_not_contaminate_loss_or_gradients(self) -> None:
+        config = Qwen3Config(
+            vocab_size=31,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 4
+        config.block_size = 4
+        config.flashmtp_config = {
+            "target_layer_ids": [0, 3],
+            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
+            "sliding_window_size": 4,
+            "chs_num_layers": 2,
+            "markov_head_type": "none",
+            "markov_output_mode": "additive",
+        }
+        draft_model = FlashMTPDraftModel(config)
+        wrapper = OnlineFlashMTPModel(
+            draft_model=draft_model,
+            target_lm_head=nn.Linear(16, 31, bias=False),
+            target_embed_tokens=nn.Embedding(31, 16),
+            mask_token_id=30,
+            block_size=4,
+            num_anchors=2,
+            tv_loss_weight=0.0,
+        )
+        prediction_hidden = torch.randn(1, 2, 3, 16, requires_grad=True)
+        with torch.no_grad():
+            prediction_hidden[:, 1].fill_(float("nan"))
+        labels = torch.randint(0, 31, (1, 2, 3))
+        weight_mask = torch.tensor([[[1.0, 1.0, 1.0], [0.0, 0.0, 0.0]]])
+        binary_eval_mask = weight_mask > 0
+
+        loss, *_ = wrapper._chunked_weighted_ce_and_metrics(
+            prediction_hidden=prediction_hidden,
+            prev_token_ids=torch.zeros_like(labels),
+            labels=labels,
+            weight_mask=weight_mask,
+            binary_eval_mask=binary_eval_mask,
+            block_keep_mask=torch.tensor([[True, False]]),
+        )
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(loss.dtype, torch.float32)
+        loss.backward()
+        self.assertTrue(torch.isfinite(prediction_hidden.grad).all())
+        self.assertTrue(torch.isfinite(wrapper.lm_head.weight.grad).all())
+        self.assertTrue(
+            torch.equal(
+                prediction_hidden.grad[:, 1],
+                torch.zeros_like(prediction_hidden.grad[:, 1]),
+            )
+        )
+
+    def test_illegal_supervised_label_is_rejected(self) -> None:
+        config = Qwen3Config(
+            vocab_size=11,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 2
+        config.block_size = 2
+        config.flashmtp_config = {
+            "target_layer_ids": [0, 1],
+            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
+            "sliding_window_size": 1,
+            "chs_num_layers": 2,
+            "markov_head_type": "none",
+            "markov_output_mode": "additive",
+        }
+        draft_model = FlashMTPDraftModel(config)
+        wrapper = OnlineFlashMTPModel(
+            draft_model=draft_model,
+            target_lm_head=nn.Linear(8, 11, bias=False),
+            target_embed_tokens=nn.Embedding(11, 8),
+            mask_token_id=10,
+            block_size=2,
+            tv_loss_weight=0.0,
+        )
+
+        with self.assertRaisesRegex(ValueError, "within the output vocabulary"):
+            wrapper._chunked_weighted_ce_and_metrics(
+                prediction_hidden=torch.randn(1, 1, 1, 8),
+                prev_token_ids=torch.zeros(1, 1, 1, dtype=torch.long),
+                labels=torch.tensor([[[11]]]),
+                weight_mask=torch.ones(1, 1, 1),
+                binary_eval_mask=torch.ones(1, 1, 1, dtype=torch.bool),
+                block_keep_mask=torch.ones(1, 1, dtype=torch.bool),
+            )
+
+    def test_empty_supervision_is_rejected(self) -> None:
+        config = Qwen3Config(
+            vocab_size=11,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 2
+        config.block_size = 2
+        config.flashmtp_config = {
+            "target_layer_ids": [0, 1],
+            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
+            "sliding_window_size": 1,
+            "chs_num_layers": 2,
+        }
+        draft_model = FlashMTPDraftModel(config)
+        wrapper = OnlineFlashMTPModel(
+            draft_model=draft_model,
+            target_lm_head=nn.Linear(8, 11, bias=False),
+            target_embed_tokens=nn.Embedding(11, 8),
+            mask_token_id=10,
+            block_size=2,
+            tv_loss_weight=0.0,
+        )
+
+        with self.assertRaisesRegex(ValueError, "no supervised label positions"):
+            wrapper._chunked_weighted_ce_and_metrics(
+                prediction_hidden=torch.randn(1, 1, 1, 8),
+                prev_token_ids=torch.zeros(1, 1, 1, dtype=torch.long),
+                labels=torch.zeros(1, 1, 1, dtype=torch.long),
+                weight_mask=torch.zeros(1, 1, 1),
+                binary_eval_mask=torch.zeros(1, 1, 1, dtype=torch.bool),
+                block_keep_mask=torch.zeros(1, 1, dtype=torch.bool),
+            )
 
     def test_tv_prefill_logits_allow_synthetic_mask_vocab_row(self) -> None:
         config = Qwen3Config(
