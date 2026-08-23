@@ -333,6 +333,78 @@ class FlashMTPMarkovHead(nn.Module):
             )
         return torch.cat(outputs, dim=-2)
 
+    def forward_scheduled_sampling(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        prev_token_ids: torch.Tensor,
+        output_mode: str = "direct",
+        initial_prev_token_ids: Optional[torch.Tensor] = None,
+        teacher_forcing_ratio: float = 0.0,
+    ) -> torch.Tensor:
+        """Run the serial head with sampled previous tokens during training.
+
+        Position zero always consumes the real anchor token.  Later positions
+        consume either the preceding ground-truth token or the preceding greedy
+        prediction.  This matches autoregressive draft inference when the ratio
+        is zero and avoids the large teacher-forcing exposure gap.
+        """
+        output_mode = self._validate_runtime_output_mode(output_mode)
+        ratio = float(teacher_forcing_ratio)
+        if not 0.0 <= ratio <= 1.0:
+            raise ValueError("teacher_forcing_ratio must be in [0, 1].")
+        if output_mode != "direct":
+            raise ValueError("Scheduled sampling currently supports direct mode only.")
+        if hidden_states.shape[:-1] != prev_token_ids.shape:
+            raise ValueError("hidden_states and prev_token_ids leading shapes must match")
+
+        batch_shape = hidden_states.shape[:-2]
+        state = (
+            self._seed_rnn_state(
+                initial_prev_token_ids.reshape(-1),
+                output_mode,
+                reference=hidden_states,
+            ).view(*batch_shape, self.markov_rank)
+            if self.head_type in ("rnn", "rnn_easy")
+            and initial_prev_token_ids is not None
+            else (
+                hidden_states.new_zeros(*batch_shape, self.markov_rank)
+                if self.head_type in ("rnn", "rnn_easy")
+                else None
+            )
+        )
+        outputs: list[torch.Tensor] = []
+        current_prev = prev_token_ids[..., 0]
+        for position in range(hidden_states.size(-2)):
+            latent, state = self._compute_step_latent(
+                prev_token_ids=current_prev,
+                hidden_states=hidden_states[..., position, :],
+                state=state,
+                output_mode=output_mode,
+            )
+            outputs.append(latent.unsqueeze(-2))
+            if position + 1 < hidden_states.size(-2):
+                with torch.no_grad():
+                    predicted = self.project_logits(latent).argmax(dim=-1)
+                    if ratio <= 0.0:
+                        current_prev = predicted
+                    elif ratio >= 1.0:
+                        current_prev = prev_token_ids[..., position + 1]
+                    else:
+                        use_teacher = torch.rand_like(
+                            predicted, dtype=torch.float32
+                        ) < ratio
+                        current_prev = torch.where(
+                            use_teacher,
+                            prev_token_ids[..., position + 1],
+                            predicted,
+                        )
+        if not outputs:
+            return hidden_states.new_empty(
+                *hidden_states.shape[:-2], 0, self.markov_rank
+            )
+        return torch.cat(outputs, dim=-2)
+
     def sample_block_tokens(
         self,
         *,

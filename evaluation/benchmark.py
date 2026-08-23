@@ -524,7 +524,6 @@ def run_benchmark_warmup(
     target: AutoModelForCausalLM,
     draft_model: FlashMTPDraftModel,
     tokenizer: AutoTokenizer,
-    block_size: int,
     verify_block_size: int,
     device: torch.device,
     batch_size: int,
@@ -556,7 +555,6 @@ def run_benchmark_warmup(
         target=target,
         input_ids=input_ids,
         max_new_tokens=warmup_new_tokens,
-        block_size=block_size,
         verify_block_size=verify_block_size,
         stop_token_ids=stop_token_ids,
         temperature=temperature,
@@ -664,7 +662,6 @@ def flashmtp_generate(
     target: AutoModelForCausalLM,
     input_ids: torch.Tensor,
     max_new_tokens: int,
-    block_size: int,
     verify_block_size: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
@@ -672,22 +669,17 @@ def flashmtp_generate(
     stochastic_verification_mode: str = "match",
     compile_serial_head: bool = False,
 ) -> SimpleNamespace:
-    original_block_size = model.block_size
-    model.set_config_block_size(block_size)
-    try:
-        output_ids = model.spec_generate(
-            target=target,
-            input_ids=input_ids,
-            max_new_tokens=max_new_tokens,
-            stop_token_ids=stop_token_ids,
-            temperature=temperature,
-            decode_timing_after_first_token=decode_timing_after_first_token,
-            verify_block_size=verify_block_size,
-            stochastic_verification_mode=stochastic_verification_mode,
-            compile_serial_head=compile_serial_head,
-        )
-    finally:
-        model.set_config_block_size(original_block_size)
+    output_ids = model.spec_generate(
+        target=target,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        stop_token_ids=stop_token_ids,
+        temperature=temperature,
+        decode_timing_after_first_token=decode_timing_after_first_token,
+        verify_block_size=verify_block_size,
+        stochastic_verification_mode=stochastic_verification_mode,
+        compile_serial_head=compile_serial_head,
+    )
 
     stats = model.get_last_decode_stats()
     bsz = int(input_ids.shape[0])
@@ -714,9 +706,8 @@ def flashmtp_generate(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-name-or-path", type=str, default='/data/wanghanzhen/models/Qwen/Qwen3-8B')
-    parser.add_argument("--draft-name-or-path", type=str, default='/data/wanghanzhen/Projects/MTP/NIPS26/FlashMTP_v5.1/cache/models/flashmtp_v5.1_fix_h100_sample_40000_think_off_nlayers5_block_16_maxlen4096_epochs6/epoch_6_step_29844')
-    parser.add_argument("--block-size", type=int, default=None)
+    parser.add_argument("--model-name-or-path", type=str, required=True)
+    parser.add_argument("--draft-name-or-path", type=str, required=True)
     parser.add_argument(
         "--verify-block",
         "--verify_block",
@@ -724,7 +715,7 @@ def main() -> None:
         type=int,
         default=None,
         help="Verify only this many positions from the front of each drafted block "
-        "(anchor-inclusive). block_size is the legacy-aligned draft width. "
+        "(anchor-inclusive). block_size is the configured draft width. "
         "Default: verify the full block (proposal_length + 1).",
     )
     parser.add_argument("--dataset", type=str, required=True)
@@ -753,23 +744,10 @@ def main() -> None:
         "Use temperature=0 so FlashMTP speculative steps stay aligned across the batch.",
     )
     parser.add_argument(
-        "--sink-num",
-        type=int,
-        default=None,
-        help="Optional legacy override; ignored if checkpoint has no sink_num.",
-    )
-    parser.add_argument(
         "--mask-token-id",
         type=int,
         default=None,
         help="Override mask token id (default: checkpoint flashmtp_config, then tokenizer).",
-    )
-    parser.add_argument(
-        "--local-position",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Override draft-only window-local RoPE. Target always keeps its original "
-        "global position ids and KV cache.",
     )
     parser.add_argument(
         "--trust-remote-code",
@@ -793,9 +771,6 @@ def main() -> None:
         args, device
     )
 
-    fcfg = getattr(draft_model.config, "flashmtp_config", None) or {}
-    if args.block_size is not None:
-        draft_model.set_config_block_size(args.block_size)
     config_block_size = draft_model.block_size
     draft_block_len = draft_model.draft_block_len
     max_verify_block_size = draft_model.max_verify_block_size
@@ -809,37 +784,19 @@ def main() -> None:
             f"--verify-block must be in [1, {max_verify_block_size}], "
             f"got {verify_block_size}"
         )
-    if args.sink_num is not None and fcfg.get("sink_num") is not None:
-        eff_sink = args.sink_num
-        if draft_model.config.flashmtp_config is None:
-            draft_model.config.flashmtp_config = {}
-        draft_model.config.flashmtp_config["sink_num"] = eff_sink
-        if hasattr(draft_model, "sink_num"):
-            draft_model.sink_num = int(eff_sink)
-        logger.info(f"Overriding sink_num={eff_sink} (legacy)")
-    if fcfg.get("sink_num") is not None and hasattr(draft_model, "sink_num"):
-        logger.info(
-            f"FlashMTP draft (legacy): sink_num={draft_model.sink_num}, "
-            f"block_size={draft_model.block_size}"
-        )
     logger.info(
         "Decode config: markov_head_type={} markov_output_mode={} markov_rank={} "
-        "alignment={} sliding_window_size={} history_slots={} "
-        "chs_num_layers={} current_chs_slots={} condition_slots={} "
-        "pivot_query_embedding={} include_token_embedding_chs={} "
-        "local_position={}",
+        "model_role={} swa_window_size={} anchor_group_size={} fuse_slots={} "
+        "chs_num_layers={} condition_slots={}",
         draft_summary["markov_head_type"],
         draft_summary["markov_output_mode"],
         draft_summary["markov_rank"],
-        "pivot_query" if draft_summary.get("pivot_query_embedding") else "embedding_chs",
-        draft_summary["sliding_window_size"],
-        draft_summary["history_slot_count"],
+        draft_summary["model_role"],
+        draft_summary["swa_window_size"],
+        draft_summary["anchor_group_size"],
+        draft_summary["fuse_slot_count"],
         draft_summary["chs_num_layers"],
-        draft_summary["current_chs_slots"],
         draft_summary["condition_slots"],
-        draft_summary.get("pivot_query_embedding", False),
-        draft_summary.get("include_token_embedding_chs", False),
-        draft_summary["local_position"],
     )
     logger.info(
         "FlashMTP decode: config_block_size={} draft_block_len={} "
@@ -877,7 +834,6 @@ def main() -> None:
         target=target,
         draft_model=draft_model,
         tokenizer=tokenizer,
-        block_size=config_block_size,
         verify_block_size=verify_block_size,
         device=device,
         batch_size=args.batch_size,
@@ -929,7 +885,6 @@ def main() -> None:
                 target=target,
                 input_ids=input_ids,
                 max_new_tokens=args.max_new_tokens,
-                block_size=config_block_size,
                 verify_block_size=verify_block_size,
                 stop_token_ids=stop_token_ids,
                 temperature=args.temperature,

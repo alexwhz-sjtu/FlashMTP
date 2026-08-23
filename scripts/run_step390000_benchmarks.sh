@@ -135,7 +135,6 @@ run_worker() {
                 --max-samples "${MAX_SAMPLES}" \
                 --dataset "${dataset}" \
                 --batch-size "${BATCH_SIZE}" \
-                --block-size "${BLOCK_SIZE}" \
                 --verify-block "${VERIFY_BLOCK}" \
                 --temperature "${TEMPERATURE}"
             printf '\n'
@@ -150,7 +149,6 @@ run_worker() {
             --max-samples "${MAX_SAMPLES}" \
             --dataset "${dataset}" \
             --batch-size "${BATCH_SIZE}" \
-            --block-size "${BLOCK_SIZE}" \
             --verify-block "${VERIFY_BLOCK}" \
             --temperature "${TEMPERATURE}" \
             >> "${log_path}" 2>&1

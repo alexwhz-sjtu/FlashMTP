@@ -34,9 +34,10 @@ class DataCollatorWithPadding:
     Datacollator that will dynamically pad the inputs for batching.
     """
 
-    def __init__(self):
+    def __init__(self, pad_to_length: Optional[int] = None):
         self.sp_degree = torch.distributed.get_world_size(get_draft_sp_group())
         self.ulysses_degree = torch.distributed.get_world_size(get_sp_ulysses_group())
+        self.pad_to_length = pad_to_length
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         """
@@ -91,6 +92,13 @@ class DataCollatorWithPadding:
                 - loss_mask: torch.Tensor of shape (B, N)
         """
         max_length = max(item["input_ids"].shape[1] for item in features)
+        if self.pad_to_length is not None:
+            if max_length > self.pad_to_length:
+                raise ValueError(
+                    f"Batch length {max_length} exceeds fixed padding length "
+                    f"{self.pad_to_length}."
+                )
+            max_length = self.pad_to_length
 
         # pad for sequence parrel
         max_length = (
@@ -258,6 +266,7 @@ def prepare_dp_dataloaders(
     shuffle: Optional[bool] = False,
     is_vlm: Optional[bool] = False,
     prefetch_factor: Optional[int] = 2,
+    pad_to_length: Optional[int] = None,
     **dataloader_kwargs,
 ) -> DataLoader:
     """
@@ -296,7 +305,11 @@ def prepare_dp_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
-        collate_fn=datacollator_cls(),
+        collate_fn=(
+            datacollator_cls(pad_to_length=pad_to_length)
+            if datacollator_cls is DataCollatorWithPadding
+            else datacollator_cls()
+        ),
         drop_last=True,
         **dataloader_kwargs,
     )

@@ -5,10 +5,141 @@ import os
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributed.nn import functional as dist_nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
+
+
+class SGLangTPEmbeddingAdapter(nn.Module):
+    """Reuse SGLang's vocab-parallel embedding for TP-sharded draft batches."""
+
+    def __init__(self, embedding: nn.Module, tp_group, mask_token_id: int):
+        super().__init__()
+        self.embedding = embedding
+        self.tp_group = tp_group
+        self.tp_rank = dist.get_rank(tp_group)
+        self.tp_size = dist.get_world_size(tp_group)
+        self.mask_token_id = int(mask_token_id)
+        self.vocab_size = int(embedding.org_vocab_size)
+        if not 0 <= self.mask_token_id < self.vocab_size:
+            raise ValueError(
+                "FlashMTP vocab_row MASK mode requires an existing SGLang "
+                f"embedding row, but mask_token_id={self.mask_token_id} and "
+                f"target vocab size={self.vocab_size}."
+            )
+        self.embedding_dim = int(embedding.embedding_dim)
+        self.num_embeddings = self.vocab_size
+        self._trace_pending = True
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        trace = self._trace_pending
+        if trace:
+            print(f"[rank {dist.get_rank()}] TP embedding: enter", flush=True)
+        # v2 behavior: MASK is a real in-vocabulary token and uses its target
+        # embedding row exactly.  Replacing it with the vocabulary mean creates
+        # a different teacher/student input distribution.
+        invalid = (input_ids < 0) | (input_ids >= self.vocab_size)
+        if bool(invalid.any()):
+            raise ValueError("Embedding input contains an out-of-range token ID.")
+        gathered = [torch.empty_like(input_ids) for _ in range(self.tp_size)]
+        dist.all_gather(gathered, input_ids, group=self.tp_group)
+        selected = None
+        for owner, owner_ids in enumerate(gathered):
+            owner_embeddings = self.embedding(owner_ids)
+            if owner == self.tp_rank:
+                selected = owner_embeddings
+        assert selected is not None
+        if trace:
+            print(f"[rank {dist.get_rank()}] TP embedding: lookup done", flush=True)
+        if trace:
+            print(f"[rank {dist.get_rank()}] TP embedding: exit", flush=True)
+            self._trace_pending = False
+        return selected
+
+
+class SGLangTPLMHeadAdapter(nn.Module):
+    """Reuse SGLang's LM-head shard for different samples on each TP rank."""
+
+    def __init__(self, lm_head: nn.Module, tp_group):
+        super().__init__()
+        self.sharded_lm_head = lm_head
+        self.tp_group = tp_group
+        self.tp_size = dist.get_world_size(tp_group)
+        self.in_features = int(lm_head.embedding_dim)
+        self.out_features = int(lm_head.org_vocab_size)
+        self._trace_pending = True
+        mapping = lm_head.get_sharded_to_full_mapping()
+        self.register_buffer(
+            "sharded_to_full",
+            None
+            if mapping is None
+            else torch.tensor(
+                mapping, dtype=torch.long, device=lm_head.weight.device
+            ),
+            persistent=False,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        trace = self._trace_pending
+        if trace:
+            print(f"[rank {dist.get_rank()}] TP LM head: enter", flush=True)
+        if hidden_states.size(-1) != self.in_features:
+            raise ValueError(
+                f"Expected hidden size {self.in_features}, got {hidden_states.size(-1)}."
+            )
+        output_shape = (*hidden_states.shape[:-1], self.out_features)
+        flat_hidden = hidden_states.reshape(-1, self.in_features).contiguous()
+        local_rows = flat_hidden.size(0)
+
+        # Different TP ranks own different draft samples, so masking can leave a
+        # different number of active proposal rows on each rank.  Autograd-aware
+        # all_gather/all_to_all require equal tensor shapes; pad only for the
+        # collectives and crop back to the local row count before returning.
+        local_count = torch.tensor(
+            [local_rows], dtype=torch.int64, device=flat_hidden.device
+        )
+        gathered_counts = [torch.empty_like(local_count) for _ in range(self.tp_size)]
+        dist.all_gather(gathered_counts, local_count, group=self.tp_group)
+        max_rows = max(int(count.item()) for count in gathered_counts)
+        if max_rows == 0:
+            return hidden_states.new_empty(output_shape)
+        if local_rows < max_rows:
+            flat_hidden = F.pad(flat_hidden, (0, 0, 0, max_rows - local_rows))
+
+        hidden_by_owner = dist_nn.all_gather(flat_hidden, group=self.tp_group)
+        local_logits = [
+            F.linear(owner_hidden, self.sharded_lm_head.weight).contiguous()
+            for owner_hidden in hidden_by_owner
+        ]
+        received = [torch.empty_like(local_logits[0]) for _ in range(self.tp_size)]
+        vocab_shards = dist_nn.all_to_all(
+            received, local_logits, group=self.tp_group
+        )
+        if trace:
+            print(f"[rank {dist.get_rank()}] TP LM head: shards gathered", flush=True)
+        gathered_logits = torch.cat(vocab_shards, dim=-1)
+        if self.sharded_to_full is not None:
+            gathered_logits = gathered_logits.index_select(
+                -1, self.sharded_to_full.to(gathered_logits.device)
+            )
+        gathered_logits = gathered_logits[:local_rows, : self.out_features]
+        if trace:
+            print(f"[rank {dist.get_rank()}] TP LM head: exit", flush=True)
+            self._trace_pending = False
+        return gathered_logits.reshape(output_shape)
+
+
+class SharedTargetEmbeddingsAndHead(nn.Module):
+    """Non-owning training view over target-resident embedding/head modules."""
+
+    def __init__(self, embed_tokens: nn.Module, lm_head: nn.Module):
+        super().__init__()
+        self.embed_tokens = embed_tokens
+        self.lm_head = lm_head
 
 
 class TargetEmbeddingsAndHead(nn.Module):

@@ -1,5 +1,5 @@
 #!/bin/bash
-# FlashMTP 推理 / benchmark 启动脚本（与 run_training_flashmtp.sh 参数对齐）
+# FlashMTP 当前架构推理 / benchmark 启动脚本
 
 set -e
 
@@ -34,9 +34,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 MASTER_PORT="${MASTER_PORT:-29502}"
 
-BLOCK_SIZE="${BLOCK_SIZE:-16}"
 VERIFY_BLOCK="${VERIFY_BLOCK:-}"
-LOCAL_POSITION="${LOCAL_POSITION:-}"
 MODEL_TAG="${MODEL_TAG:-Qwen3_8B}"
 
 # 串行 head 配置保存在 checkpoint 的 flashmtp_config 中；以下仅用于日志/路径推导
@@ -77,9 +75,9 @@ echo "运行环境: --dt ${DT}"
 echo "目标模型: ${TARGET_MODEL}"
 echo "草稿模型: ${DRAFT_NAME_OR_PATH}"
 echo "数据集: ${DATASET} (max_samples=${MAX_SAMPLES})"
-echo "块大小: ${BLOCK_SIZE}"
+echo "块大小: 由 checkpoint 固定"
 echo "verify_block: ${VERIFY_BLOCK:-与 block_size 相同}"
-echo "draft local_position override: ${LOCAL_POSITION:-checkpoint}; target: original global positions/cache"
+echo "draft position mode: checkpoint role fixed (teacher global / student local)"
 echo "串行 head (checkpoint): type=${MARKOV_HEAD_TYPE:-auto} mode=${MARKOV_OUTPUT_MODE:-auto} rank=${MARKOV_RANK:-auto}"
 echo "max_new_tokens=${MAX_NEW_TOKENS} batch_size=${BATCH_SIZE} temperature=${TEMPERATURE}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} NPROC_PER_NODE=${NPROC_PER_NODE}"
@@ -89,12 +87,6 @@ OPTIONAL_ARGS=""
 if [ -n "${VERIFY_BLOCK}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --verify-block ${VERIFY_BLOCK}"
 fi
-if [[ "${LOCAL_POSITION}" == "1" || "${LOCAL_POSITION}" == "true" ]]; then
-    OPTIONAL_ARGS="${OPTIONAL_ARGS} --local-position"
-elif [[ "${LOCAL_POSITION}" == "0" || "${LOCAL_POSITION}" == "false" ]]; then
-    OPTIONAL_ARGS="${OPTIONAL_ARGS} --no-local-position"
-fi
-
 LAUNCHER=(
     "${PROJECT_DIR}/.venv/bin/python"
     -m
@@ -106,7 +98,6 @@ LAUNCHER=(
 "${LAUNCHER[@]}" evaluation/benchmark.py \
     --model-name-or-path "${TARGET_MODEL}" \
     --draft-name-or-path "${DRAFT_NAME_OR_PATH}" \
-    --block-size "${BLOCK_SIZE}" \
     --dataset "${DATASET}" \
     --max-samples "${MAX_SAMPLES}" \
     --max-new-tokens "${MAX_NEW_TOKENS}" \

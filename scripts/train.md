@@ -1,65 +1,146 @@
-# FlashMTP dense Sliding-CHS 训练
+# FlashMTP 当前训练接口
 
-训练入口：`scripts/run_training_flashmtp.sh` → `scripts/train_flashmtp.py`。
+## Teacher
+
+入口：`run_training_flashmtp_teacher.sh` → `train_flashmtp_teacher.py`。
+
+```text
+teacher_loss = FINAL_CE_WEIGHT * final_ce
+             + TV_LOSS_WEIGHT * sum(abs(p_final - p_target))
+             + BASE_LM_CE_WEIGHT * base_ce
+```
+
+位置权重为 `exp(-offset/gamma)`，第一个预测位置 offset 为 0。Target prefill
+logits 在 anchor 采样后一次 gather，完整序列张量随即释放。
 
 ```bash
-cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2swa
+cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2.3
 source .venv/bin/activate
-SLIDING_WINDOW_SIZE=9 \
+SWA_WINDOW_SIZE=128 \
+ANCHOR_GROUP_SIZE=6 \
 CHS_NUM_LAYERS=12 \
 LOCAL_POSITION=true \
-HISTORY_MODE=pivot_q \
+CE_CHUNK_SIZE=6144 \
 BLOCK_SIZE=8 \
 NUM_DRAFT_LAYERS=5 \
 NUM_EPOCHS=8 \
-NUM_ANCHORS=512 \
-MAX_LENGTH=4096 \
+NUM_ANCHORS=768 \
+MAX_LENGTH=20480 \
 BATCH_SIZE=1 \
 LOSS_DECAY_GAMMA=4 \
-DATA_NUM_SAMPLES=pb_80k \
+DATA_NUM_SAMPLES=2360K_aug1_qwen3_8b \
 BASE_LM_CE_DECAY_GAMMA=12 \
+ACCUMULATION_STEPS=2 \
 LEARNING_RATE=5e-4 \
 FINAL_CE_WEIGHT=0.1 \
 TV_LOSS_WEIGHT=1.0 \
 BASE_LM_CE_WEIGHT=0.06 \
-MARKOV_HEAD_TYPE=vanilla \
-MARKOV_OUTPUT_MODE=additive \
-MARKOV_RANK=256 \
-TRAIN_DATA_PATH='/share/dai-sys/wanghanzhen/projects/MTP/training_data/open_perfectblend_80k_qwen3_8b.jsonl' \
+MARKOV_HEAD_TYPE=rnn_easy \
+MARKOV_OUTPUT_MODE=direct \
+MARKOV_RANK=512 \
+TRAIN_DATA_PATH='dataset_path' \
 MODEL_TAG='Qwen3_8B' \
 TARGET_MODEL=/share/dai-sys/wanghanzhen/models/Qwen/Qwen3-8B \
-bash scripts/run_training_flashmtp.sh --dt h100
+bash scripts/run_training_flashmtp_teacher.sh --dt h100
+
 ```
 
-## Dense SWA 参数
+
+| 变量                   | 含义                                          |
+| -------------------- | ------------------------------------------- |
+| `SWA_WINDOW_SIZE`    | Teacher 时间窗口 W，包含 W-1 个 fuse 位置和一个 CHS 时间位置 |
+| `ANCHOR_GROUP_SIZE`  | Draft Q 中包含 anchor 的真实 token 数 G            |
+| `BLOCK_SIZE`         | anchor-inclusive block 大小 B，预测 B-1 个 token  |
+| `CHS_NUM_LAYERS`     | `a-1` 处保留的 target hidden 层数                 |
+| `NUM_DRAFT_LAYERS`   | 并行 draft Transformer 深度                     |
+| `MARKOV_HEAD_TYPE`   | `none`、`vanilla`、`gated`、`rnn` 或 `rnn_easy` |
+| `MARKOV_OUTPUT_MODE` | `additive` 或 `direct`                       |
+| `MARKOV_RANK`        | 串行头低秩维度                                     |
 
 
-| 环境变量                  | 默认值   | 说明                                                                            |
-| --------------------- | ----- | ----------------------------------------------------------------------------- |
-| `SLIDING_WINDOW_SIZE` | 64    | dense 窗口 W，使用 anchor 前 W-1 个连续位置                                              |
-| `HISTORY_MODE`        | fuse  | `fuse` 融合 hidden 作 KV；`token` embedding 作 KV；`pivot_q` 把 W 内 embedding 全部作为 Q |
-| `CHS_NUM_LAYERS`      | 7     | pivot 保留的 target hidden 层数；CHS 不含 token embedding，排在 window 前                 |
-| `LOCAL_POSITION`      | false | draft 使用局部或全局 RoPE                                                            |
-| `BLOCK_SIZE`          | 16    | draft Q 为已知 anchor + B-1 个 MASK；pivot embedding 位于 CHS 首位，实际 proposal 数为 B-1  |
-| `NUM_DRAFT_LAYERS`    | 5     | 草稿 Transformer 层数                                                             |
-| `NUM_ANCHORS`         | 512   | 每条训练序列最多采样的 anchor 数                                                          |
 
 
-窗口布局固定为 dense；`fuse`/`token` 每个 context 按 `[CHS hidden | window]` 排列，window 作为 KV。`pivot_q` 的 context 只保留 CHS，window embedding 拼到 draft Q 前面：`[embed(a-W+1)..embed(a-1), embed(a), MASK...]`。`token`/`pivot_q` 的最后一个 window token 与 CHS hidden 共用 `anchor-1` 的 RoPE position id；local 模式中第一个有效 window token 的 position id 为 0。
+## Student 两阶段
 
-## 串行 head 与 loss
+入口：`run_training_flashmtp_two_stage.sh` → `train_flashmtp_two_stage.py`。
+Teacher checkpoint 是 G、CHS、block、draft depth 和串行头结构的权威来源。
+
+`STUDENT_INIT_MODE` 支持 `scratch`（默认）和 `shared_init`。`shared_init`
+在 fresh Stage 1 开始前复制 teacher 的 `layers`、`norm`、
+`layer_depth_embedding` 和 `context_norm`；teacher-only 历史融合参数与
+串行 head 不在此时复制。模式会写入 checkpoint，恢复时自动沿用。
+
+Stage 1：
+
+```text
+loss = STAGE1_TV_WEIGHT * weighted_mean(sum(abs(p_student - p_teacher)))
+     + STAGE1_HIDDEN_WEIGHT * weighted_mean(SmoothL1(h_student, h_teacher))
+```
+
+Teacher 在 `eval/no_grad` 下运行。两者共享 anchors、target hidden、真实 Q embedding、
+labels 和有效位置 mask；student 串行头不参与优化。
+
+```bash
+cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2.3
+source .venv/bin/activate
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/stop_keeper.sh
+
+TARGET_MODEL=/data/wanghanzhen/models/Qwen3-8B \
+STUDENT_INIT_MODE=shared_init \
+TARGET_MODEL_BACKEND=sglang \
+SGLANG_MEM_FRACTION_STATIC=0.25 \
+TEACHER_DRAFT_PATH='/data/wanghanzhen/FlashMTP_v2.3/cache/models/flashmtp_v2_3_teacher_maskrow_from1m_2n16g_targettp2_draftdp16_sglang025_swa128_ag6_chs12_a768_block8_d5_rnn_easy_direct_r512_aug1_qwen3_8b_maxlen10240_acc2_lr5e5_4ep/final' \
+TRAIN_DATA_PATH='/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B' \
+TP_SIZE=2 \
+NNODES=3 \
+ACCUMULATION_STEPS=1 \
+STAGE1_EPOCHS=2 \
+STAGE1_LEARNING_RATE=2e-4 \
+STAGE1_WARMUP_RATIO=0.02 \
+STAGE1_TV_WEIGHT=1.0 \
+STAGE1_HIDDEN_WEIGHT=0.0 \
+STAGE1_SMOOTH_L1_BETA=1.0 \
+STAGE1_LOSS_DECAY_GAMMA=12 \
+STAGE2_EPOCHS=4 \
+STAGE2_LEARNING_RATE=1e-4 \
+STAGE2_WARMUP_RATIO=0.02 \
+STAGE2_FINAL_CE_WEIGHT=0.1 \
+STAGE2_TV_WEIGHT=1.0 \
+STAGE2_BASE_CE_WEIGHT=0.06 \
+STAGE2_LOSS_DECAY_GAMMA=4 \
+STAGE2_BASE_CE_DECAY_GAMMA=12 \
+SHARD_DRAFT_BY_TP=1 \
+MAX_LENGTH=10240 \
+NUM_ANCHORS=768 \
+bash scripts/run_training_flashmtp_two_stage.sh --dt qz > "whz_mtp_logs/train_flashmtp_qz_dist_$(date +%Y%m%d_%H%M%S).log" 2>&1 &
+
+/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/stop_keeper.sh
+```
+
+Stage 2 只复制 teacher 串行头，然后释放 teacher 和 Stage 1 optimizer。训练 loss
+与 teacher 的三项监督 loss 相同，并创建新的 optimizer/scheduler。
 
 
-| 环境变量                 | 可选值/含义                                            |
-| -------------------- | ------------------------------------------------- |
-| `MARKOV_HEAD_TYPE`   | `none` / `vanilla` / `gated` / `rnn` / `rnn_easy` |
-| `MARKOV_OUTPUT_MODE` | `additive` / `direct`                             |
-| `MARKOV_RANK`        | 低秩 state/embedding 维度                             |
-| `FINAL_CE_WEIGHT`    | 最终预测 CE 权重                                        |
-| `TV_LOSS_WEIGHT`     | target/draft 分布 L1 权重                             |
-| `BASE_LM_CE_WEIGHT`  | 可选 base LM-head CE 权重                             |
+| 变量                                              | 含义                   |
+| ----------------------------------------------- | -------------------- |
+| `STAGE1_EPOCHS` / `STAGE2_EPOCHS`               | 两阶段独立 epoch 数        |
+| `STAGE1_LEARNING_RATE` / `STAGE2_LEARNING_RATE` | 两阶段独立学习率             |
+| `STAGE1_WARMUP_RATIO` / `STAGE2_WARMUP_RATIO`   | 两阶段独立 warmup 比例      |
+| `STAGE1_TV_WEIGHT` / `STAGE1_HIDDEN_WEIGHT`     | Stage 1 两项 loss 权重   |
+| `STAGE1_SMOOTH_L1_BETA`                         | SmoothL1 beta        |
+| `STAGE1_LOSS_DECAY_GAMMA`                       | Stage 1 共用位置衰减       |
+| `STAGE2_FINAL_CE_WEIGHT`                        | Stage 2 final CE 权重  |
+| `STAGE2_TV_WEIGHT`                              | Stage 2 target TV 权重 |
+| `STAGE2_BASE_CE_WEIGHT`                         | Stage 2 base CE 权重   |
+| `STAGE2_LOSS_DECAY_GAMMA`                       | final CE/TV 位置衰减     |
+| `STAGE2_BASE_CE_DECAY_GAMMA`                    | base CE 独立位置衰减       |
 
 
-`SLIDING_WINDOW_SIZE > 1` 且串行 head 为 `rnn` / `rnn_easy` 时，会先用 `embed(anchor-1)` 初始化 recurrent state，再预测第一个 draft token。
+通用变量包括 `ACCUMULATION_STEPS`、`NUM_ANCHORS`、`MAX_LENGTH`、
+`SAVE_INTERVAL`、`LOG_INTERVAL`、`TARGET_MODEL_BACKEND` 和 `RESUME_FROM`。
 
-训练时 target 冻结，只捕获 dense 历史所需的首层、中层、末层，以及当前 CHS 和 TV loss 所需层。draft 不使用 KV cache。
+当前 teacher/student 训练均使用 `mask_embedding_mode=vocab_row`：MASK ID 必须
+对应 target embedding 中已有的一行，不再用词表均值构造 MASK embedding。
+多机迁移和完整启动示例见 `docs/STUDENT_TWO_STAGE_PORTING.md`。

@@ -1,663 +1,160 @@
-import tempfile
+import copy
 import unittest
 from unittest import mock
 
 import torch
 from torch import nn
-from torch.nn import functional as F
-from transformers import Qwen3Config
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
+from scripts.train_flashmtp_two_stage import (
+    SHARED_BACKBONE_MODULES,
+    _copy_serial_head,
+    _copy_shared_backbone,
+    _resolve_student_init_mode,
+)
+from scripts import flashmtp_training
+from scripts.flashmtp_training import resume_cursor
 from specforge.core.flashmtp import (
     OnlineFlashMTPModel,
-    create_flashmtp_block_mask,
-    create_flashmtp_shared_block_mask,
-    gather_sliding_history,
-    pack_history_hidden_states,
-    prepare_target_prediction_hidden,
+    PreparedFlashMTPBatch,
+    _make_flex_mask,
+    compute_stage1_distillation_loss,
+    gather_target_prefill_logits,
+    gather_token_group,
 )
 from specforge.modeling.draft.flashmtp import (
     FLASHMTP_ARCHITECTURE_VERSION,
     FlashMTPDraftModel,
-    build_target_layer_ids,
-    rejection_sample_verify,
 )
-from specforge.modeling.draft.flashmtp_markov_head import FlashMTPMarkovHead
+from specforge.optimizer import BF16Optimizer
 
 
-class FlashMTPMarkovHeadTest(unittest.TestCase):
-    def test_sliding_layer_selection_and_architecture_validation(self) -> None:
-        self.assertEqual(build_target_layer_ids(8, 5), [0, 1, 3, 6, 7])
-        with self.assertRaises(ValueError):
-            build_target_layer_ids(4, 1)
+def make_model(role="pivot_q_student", *, block_size=4, g=3, w=4):
+    config = Qwen3Config(
+        vocab_size=31,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+    )
+    config.num_target_layers = 4
+    config.block_size = block_size
+    config.layer_types = ["full_attention"]
+    config._attn_implementation = "eager"
+    config.flashmtp_config = {
+        "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
+        "model_role": role,
+        "swa_window_size": w,
+        "anchor_group_size": g,
+        "chs_num_layers": 2,
+        "markov_head_type": "vanilla",
+        "markov_output_mode": "additive",
+        "markov_rank": 4,
+    }
+    return FlashMTPDraftModel(config)
 
-        config = Qwen3Config(
-            vocab_size=29,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
+
+class CountingHead(nn.Linear):
+    def __init__(self):
+        super().__init__(16, 31, bias=False)
+        self.calls = 0
+
+    def forward(self, value):
+        self.calls += 1
+        return super().forward(value)
+
+
+class CurrentFlashMTPArchitectureTest(unittest.TestCase):
+    def test_stage_total_steps_carries_accumulation_across_epochs(self):
+        from scripts.flashmtp_training import stage_total_steps
+
+        dataloader = [None] * 3
+        self.assertEqual(stage_total_steps(dataloader, epochs=2, accumulation_steps=2), 3)
+        self.assertEqual(stage_total_steps(dataloader, epochs=2, accumulation_steps=4), 2)
+
+    def test_tp_rank_batch_selection_recurses_and_owns_storage(self):
+        from scripts.flashmtp_training import select_tp_rank_batch
+
+        source = torch.arange(24).view(3, 2, 4)
+        selected = select_tp_rank_batch(
+            {"dict": source, "tuple": (source + 1,)}, tp_rank=1
         )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {"target_layer_ids": [0, 3]}
-        with self.assertRaisesRegex(ValueError, "architecture_version"):
+        self.assertTrue(torch.equal(selected["dict"], source[1:2]))
+        self.assertTrue(torch.equal(selected["tuple"][0], source[1:2] + 1))
+        self.assertNotEqual(
+            selected["dict"].untyped_storage().data_ptr(),
+            source.untyped_storage().data_ptr(),
+        )
+
+    def test_stage_resume_cursor_preserves_monotonic_global_step(self):
+        state = {
+            "training_stage": "stage2",
+            "stage_epoch": 3,
+            "next_batch_in_epoch": 17,
+            "stage_step": 211,
+            "global_step": 509,
+        }
+        self.assertEqual(resume_cursor(state, "stage2"), (3, 17, 211, 509))
+        with self.assertRaisesRegex(ValueError, "Expected a 'stage1' checkpoint"):
+            resume_cursor(state, "stage1")
+
+    def test_only_current_architecture_loads(self):
+        model = make_model()
+        self.assertTrue(model.is_student)
+        config = copy.deepcopy(model.config)
+        config.flashmtp_config["architecture_version"] = "sliding_chs_first_token_window_v5"
+        with self.assertRaisesRegex(ValueError, "Historical checkpoints"):
             FlashMTPDraftModel(config)
 
-    def test_history_modes_and_dense_alias(self) -> None:
-        config = Qwen3Config(
-            vocab_size=29,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "chs_num_layers": 2,
-            "target_layer_ids": [0, 3],
-            "history_mode": "bwa",
-            "bwa_stride": 2,
-        }
-        with self.assertRaisesRegex(ValueError, "expected one of"):
-            FlashMTPDraftModel(config)
+    def test_teacher_and_student_positions(self):
+        anchor = torch.tensor([[5]])
+        token_pos = torch.tensor([[[3, 4, 5]]])
+        keep = torch.ones_like(token_pos, dtype=torch.bool)
+        teacher = make_model("swa_teacher")
+        teacher_ctx, teacher_q = teacher.build_block_position_ids(anchor, token_pos, keep)
+        self.assertTrue(torch.equal(teacher_ctx, torch.tensor([[1, 2, 3, 4, 4]])))
+        self.assertTrue(torch.equal(teacher_q, torch.tensor([[3, 4, 5, 6, 7, 8]])))
+        student = make_model("pivot_q_student")
+        student_ctx, student_q = student.build_block_position_ids(anchor, token_pos, keep)
+        self.assertTrue(torch.equal(student_ctx, torch.tensor([[1, 1]])))
+        self.assertTrue(torch.equal(student_q, torch.tensor([[0, 1, 2, 3, 4, 5]])))
 
-        config.flashmtp_config["history_mode"] = "dense"
-        model = FlashMTPDraftModel(config)
-        self.assertEqual(model.history_mode, "fuse")
-        self.assertEqual(model.config.flashmtp_config["history_mode"], "fuse")
-        self.assertNotIn("bwa_stride", model.config.flashmtp_config)
+    def test_short_context_is_left_padded_and_masked(self):
+        ids = torch.tensor([[10, 11, 12]])
+        gathered, keep, positions = gather_token_group(
+            ids, torch.tensor([[1]]), 4, fill_token_id=30
+        )
+        self.assertTrue(torch.equal(gathered, torch.tensor([[[30, 30, 10, 11]]])))
+        self.assertTrue(torch.equal(keep, torch.tensor([[[False, False, True, True]]])))
+        student = make_model(g=4)
+        context, query = student.build_block_position_ids(
+            torch.tensor([[1]]), positions, keep
+        )
+        self.assertTrue(torch.equal(context, torch.tensor([[0, 0]])))
+        self.assertTrue(torch.equal(query, torch.tensor([[0, 0, 0, 1, 2, 3, 4]])))
 
-        config.flashmtp_config["history_mode"] = "token"
-        model = FlashMTPDraftModel(config)
-        self.assertEqual(model.history_mode, "token")
-        self.assertEqual(model.history_source_lookback, 3)
-        self.assertFalse(model.window_as_query)
-        self.assertEqual(model.draft_query_length, 4)
-        self.assertEqual(model.chs_len_per_block, 5)
-
-        config.flashmtp_config["history_mode"] = "pivot_q"
-        model = FlashMTPDraftModel(config)
-        self.assertEqual(model.history_mode, "pivot_q")
-        self.assertTrue(model.window_as_query)
-        self.assertTrue(model.uses_token_history)
-        self.assertEqual(model.history_source_lookback, 3)
-        self.assertEqual(model.window_query_count, 3)
-        self.assertEqual(model.unsupervised_query_count, 4)
-        self.assertEqual(model.core_draft_query_length, 4)
-        self.assertEqual(model.draft_query_length, 7)
-        self.assertEqual(model.chs_len_per_block, 2)
-
-    def test_gather_sliding_history_left_pads_short_windows(self) -> None:
-        fused = torch.arange(6, dtype=torch.float32).view(1, 6, 1)
-        anchors = torch.tensor([[1, 3, 5]])
-        history, keep, positions = gather_sliding_history(fused, anchors, 4)
-
-        self.assertEqual(tuple(history.shape), (1, 3, 3, 1))
-        self.assertTrue(
-            torch.equal(
-                keep,
-                torch.tensor(
-                    [[[False, False, False], [False, True, True], [True, True, True]]]
-                ),
-            )
-        )
-        self.assertTrue(torch.equal(history[0, 1, :, 0], torch.tensor([0.0, 0.0, 1.0])))
-        self.assertTrue(torch.equal(positions[0, 2], torch.tensor([1, 2, 3])))
-
-        empty, empty_keep, empty_pos = gather_sliding_history(fused, anchors, 1)
-        self.assertEqual(tuple(empty.shape), (1, 3, 0, 1))
-        self.assertEqual(empty_keep.numel(), 0)
-        self.assertEqual(empty_pos.numel(), 0)
-
-        token_history, token_keep, token_positions = gather_sliding_history(
-            fused, torch.tensor([[3]]), 4, include_pivot=True
-        )
-        self.assertTrue(
-            torch.equal(
-                token_history[0, 0, :, 0], torch.tensor([0.0, 1.0, 2.0])
-            )
-        )
-        self.assertTrue(token_keep.all())
-        self.assertTrue(torch.equal(token_positions, torch.tensor([[[0, 1, 2]]])))
-
-    def test_history_sources_start_one_window_before_answer(self) -> None:
-        hidden_states = {
-            layer_id: (
-                torch.arange(10, dtype=torch.float32).view(1, 10, 1)
-                + 100 * layer_id
-            )
-            for layer_id in range(4)
-        }
-        loss_mask = torch.zeros(1, 10)
-        loss_mask[:, 6:] = 1
-        packed, starts, lengths = pack_history_hidden_states(
-            hidden_states,
-            loss_mask,
-            history_layer_ids=[0, 2, 3],
-            num_transformer_layers=4,
-            window_size=4,
-        )
-        self.assertTrue(torch.equal(starts, torch.tensor([2])))
-        self.assertTrue(torch.equal(lengths, torch.tensor([8])))
-        self.assertEqual(tuple(packed.shape), (1, 8, 3, 1))
-        self.assertTrue(torch.equal(packed[0, 0, :, 0], torch.tensor([2.0, 202.0, 302.0])))
-
-    def test_history_fusion_and_context_layout(self) -> None:
-        config = Qwen3Config(
-            vocab_size=29,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "chs_num_layers": 2,
-            "target_layer_ids": [0, 3],
-        }
-        model = FlashMTPDraftModel(config)
-        raw_history = torch.randn(2, 5, 3, 16, requires_grad=True)
-        fused = model.fuse_history_hidden(raw_history)
-        self.assertEqual(tuple(fused.shape), (2, 5, 16))
-
-        current = torch.randn(2, 1, 2, 16)
-        with torch.no_grad():
-            model.layer_depth_embedding.weight.fill_(2.0)
-        context = model._fuse_target_hidden(current, fused[:, :3].unsqueeze(1))
-        self.assertEqual(tuple(context.shape), (2, 5, 16))
-        current_ctx = model._apply_chs_depth_embedding(current)
-        self.assertEqual(tuple(current_ctx.shape), (2, 1, 2, 16))
-        self.assertTrue(torch.equal(context[:, :2], current_ctx[:, 0]))
-        self.assertTrue(torch.equal(context[:, 2:], fused[:, :3]))
-        self.assertTrue(
-            torch.allclose(
-                current_ctx, model.context_norm(current + 2.0)
-            )
-        )
-        fused.square().mean().backward()
-        self.assertIsNotNone(model.history_fuse.weight.grad)
-
-    def test_inference_chs_does_not_duplicate_token_embedding(self) -> None:
-        config = Qwen3Config(
-            vocab_size=29,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 1,
-            "chs_num_layers": 2,
-            "target_layer_ids": [0, 3],
-        }
-        model = FlashMTPDraftModel(config)
-        embed = nn.Embedding(29, 16)
-        with torch.no_grad():
-            embed.weight.copy_(
-                torch.arange(29, dtype=torch.float32).view(-1, 1).expand(-1, 16)
-            )
-        draft_ids = torch.tensor([[5, 28, 28, 28]])
-        pivot_ids = torch.tensor([[3]])
-        noise = model.build_inference_query_embeddings(embed, draft_ids)
-        target_hidden = torch.randn(1, 1, 2, 16)
-        current_chs = model.build_inference_current_chs(
-            embed, target_hidden, pivot_ids
-        )
-        self.assertEqual(tuple(noise.shape), (1, 4, 16))
-        self.assertTrue(torch.equal(noise[0, 0], embed.weight[5]))
-        self.assertEqual(tuple(current_chs.shape), (1, 1, 2, 16))
-        self.assertTrue(torch.equal(current_chs, target_hidden))
-        self.assertEqual(model.unsupervised_query_count, 1)
-        self.assertEqual(model.draft_query_length, 4)
-
-    def test_inference_context_supports_global_and_local_positions(self) -> None:
-        config = Qwen3Config(
-            vocab_size=29,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "chs_num_layers": 2,
-            "target_layer_ids": [0, 3],
-        }
-        model = FlashMTPDraftModel(config)
-        buffer = torch.randn(1, 4, 16)
-        current = torch.randn(1, 1, 2, 16)
-        history, position_ids, draft_positions = model.build_inference_context(
-            buffer, current, 10
-        )
-        self.assertEqual(tuple(history.shape), (1, 1, 3, 16))
-        self.assertTrue(
-            torch.equal(position_ids, torch.tensor([[9, 9, 6, 7, 8]]))
-        )
-        self.assertTrue(
-            torch.equal(draft_positions, torch.tensor([[10, 11, 12, 13]]))
-        )
-        output = model(
-            position_ids=draft_positions,
-            rotary_position_ids=torch.cat([position_ids, draft_positions], dim=-1),
-            noise_embedding=torch.randn(1, 4, 16),
-            target_hidden=current,
-            history_hidden=history,
-        )
-        self.assertEqual(tuple(output.shape), (1, 4, 16))
-        self.assertEqual(tuple(model._prediction_hidden(output).shape), (1, 3, 16))
-
-        model.set_local_position(True)
-        history, position_ids, draft_positions = model.build_inference_context(
-            buffer, current, 10
-        )
-        self.assertTrue(
-            torch.equal(position_ids, torch.tensor([[3, 3, 0, 1, 2]]))
-        )
-        self.assertTrue(torch.equal(draft_positions, torch.tensor([[4, 5, 6, 7]])))
-
-        short_buffer = buffer[:, :2]
-        short_history, short_context_pos, short_draft_pos = (
-            model.build_inference_context(
-                short_buffer, current, 2
-            )
-        )
-        self.assertEqual(tuple(short_history.shape), (1, 1, 1, 16))
-        self.assertTrue(
-            torch.equal(short_context_pos, torch.tensor([[1, 1, 0]]))
-        )
-        self.assertTrue(torch.equal(short_draft_pos, torch.tensor([[2, 3, 4, 5]])))
-
-    def test_token_history_duplicates_pivot_position(self) -> None:
-        config = Qwen3Config(
-            vocab_size=29,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "history_mode": "token",
-            "chs_num_layers": 2,
-            "target_layer_ids": [0, 3],
-        }
-        model = FlashMTPDraftModel(config)
-        token_history = torch.randn(1, 3, 16)
-        current = torch.randn(1, 1, 2, 16)
-
-        history, context_positions, draft_positions = model.build_inference_context(
-            token_history, current, anchor_position=3
-        )
-
-        self.assertTrue(torch.equal(history[:, 0], token_history))
-        self.assertTrue(
-            torch.equal(context_positions, torch.tensor([[2, 2, 0, 1, 2]]))
-        )
-        self.assertTrue(torch.equal(draft_positions, torch.tensor([[3, 4, 5, 6]])))
-
-        model.set_local_position(True)
-        _, local_context_positions, local_draft_positions = (
-            model.build_inference_context(
-                token_history, current, anchor_position=10
-            )
-        )
-        self.assertTrue(
-            torch.equal(
-                local_context_positions, torch.tensor([[2, 2, 0, 1, 2]])
-            )
-        )
-        self.assertTrue(
-            torch.equal(local_draft_positions, torch.tensor([[3, 4, 5, 6]]))
-        )
-
-    def test_token_inference_condition_uses_embeddings(self) -> None:
-        config = Qwen3Config(
-            vocab_size=29,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "history_mode": "token",
-            "chs_num_layers": 2,
-            "target_layer_ids": [0, 3],
-        }
-        model = FlashMTPDraftModel(config)
-        embeddings = (
-            torch.arange(5, dtype=torch.float32)
-            .view(1, 5, 1)
-            .expand(-1, -1, 16)
-        )
-        condition = model.initialize_inference_condition(
-            [torch.empty(0)], token_embeddings=embeddings
-        )
-        self.assertTrue(
-            torch.equal(condition[0, :, 0], torch.tensor([2.0, 3.0, 4.0]))
-        )
-
-        new_embeddings = (
-            torch.arange(10, 12, dtype=torch.float32)
-            .view(1, 2, 1)
-            .expand(-1, -1, 16)
-        )
-        condition = model.update_inference_condition(
-            condition,
-            [torch.empty(0)],
-            pivot_index=0,
-            token_embeddings=new_embeddings,
-        )
-        self.assertTrue(
-            torch.equal(condition[0, :, 0], torch.tensor([3.0, 4.0, 10.0]))
-        )
-
-    def test_token_training_history_uses_embedding_table(self) -> None:
-        config = Qwen3Config(
-            vocab_size=29,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "history_mode": "token",
-            "chs_num_layers": 2,
-            "target_layer_ids": [0, 3],
-            "local_position": True,
-        }
-        draft_model = FlashMTPDraftModel(config)
-        embed_tokens = nn.Embedding(29, 16)
-        with torch.no_grad():
-            embed_tokens.weight.copy_(
-                torch.arange(29, dtype=torch.float32).view(-1, 1).expand(-1, 16)
-            )
-        wrapper = OnlineFlashMTPModel(
-            draft_model=draft_model,
-            target_lm_head=nn.Linear(16, 29, bias=False),
-            target_embed_tokens=embed_tokens,
-            mask_token_id=28,
-            block_size=4,
-            tv_loss_weight=0.0,
-        )
-        input_ids = torch.arange(8).view(1, 8)
-        loss_mask = torch.zeros(1, 8)
-        loss_mask[:, 4:] = 1
-
-        packed, starts, lengths, shared = wrapper._prepare_history_sources(
-            input_ids, {}, loss_mask
-        )
-
-        self.assertTrue(torch.equal(starts, torch.tensor([1])))
-        self.assertTrue(torch.equal(lengths, torch.tensor([7])))
-        self.assertEqual(tuple(packed.shape), (1, 7, 16))
-        self.assertTrue(torch.equal(packed[0, :, 0], torch.arange(1.0, 8.0)))
-        self.assertIsNone(shared)
-
-    def test_pivot_q_moves_window_embeddings_onto_queries(self) -> None:
-        config = Qwen3Config(
-            vocab_size=29,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "history_mode": "pivot_q",
-            "chs_num_layers": 2,
-            "target_layer_ids": [0, 3],
-        }
-        model = FlashMTPDraftModel(config)
-        token_history = torch.arange(3, dtype=torch.float32).view(1, 3, 1).expand(
-            -1, -1, 16
-        ).clone()
-        current = torch.randn(1, 1, 2, 16)
-        history, context_positions, draft_positions = model.build_inference_context(
-            token_history, current, anchor_position=3
-        )
-
-        self.assertEqual(tuple(history.shape), (1, 1, 0, 16))
-        self.assertTrue(torch.equal(context_positions, torch.tensor([[2, 2]])))
-        self.assertTrue(
-            torch.equal(draft_positions, torch.tensor([[0, 1, 2, 3, 4, 5, 6]]))
-        )
-
-        embed = nn.Embedding(29, 16)
-        with torch.no_grad():
-            embed.weight.copy_(
-                torch.arange(29, dtype=torch.float32).view(-1, 1).expand(-1, 16)
-            )
-        queries = model.build_inference_query_embeddings(
-            embed,
-            torch.tensor([[5, 28, 28, 28]]),
-            window_embeddings=token_history,
-        )
-        self.assertEqual(tuple(queries.shape), (1, 7, 16))
-        self.assertTrue(torch.equal(queries[0, :3], token_history[0]))
-        self.assertTrue(torch.equal(queries[0, 3], embed.weight[5]))
-        self.assertTrue(torch.equal(queries[0, 4], embed.weight[28]))
-        self.assertEqual(tuple(model._prediction_hidden(queries).shape), (1, 3, 16))
-        self.assertTrue(torch.equal(model._prediction_hidden(queries)[0, 0], queries[0, 4]))
-
-        model.set_local_position(True)
-        _, local_context_positions, local_draft_positions = (
-            model.build_inference_context(
-                token_history, current, anchor_position=10
-            )
-        )
-        self.assertTrue(torch.equal(local_context_positions, torch.tensor([[2, 2]])))
-        self.assertTrue(
-            torch.equal(local_draft_positions, torch.tensor([[0, 1, 2, 3, 4, 5, 6]]))
-        )
-
-    def test_pivot_q_training_puts_window_on_query_not_kv(self) -> None:
-        config = Qwen3Config(
-            vocab_size=29,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "history_mode": "pivot_q",
-            "chs_num_layers": 2,
-            "target_layer_ids": [0, 3],
-            "local_position": True,
-        }
-        draft_model = FlashMTPDraftModel(config)
-        embed_tokens = nn.Embedding(29, 16)
-        with torch.no_grad():
-            embed_tokens.weight.copy_(
-                torch.arange(29, dtype=torch.float32).view(-1, 1).expand(-1, 16)
-            )
-        wrapper = OnlineFlashMTPModel(
-            draft_model=draft_model,
-            target_lm_head=nn.Linear(16, 29, bias=False),
-            target_embed_tokens=embed_tokens,
-            mask_token_id=28,
-            block_size=4,
-            num_anchors=1,
-            tv_loss_weight=0.0,
-        )
-        packed, starts, lengths, shared = wrapper._prepare_history_sources(
-            torch.arange(8).view(1, 8), {}, torch.ones(1, 8)
-        )
-        self.assertTrue(torch.equal(starts, torch.tensor([0])))
-        self.assertEqual(tuple(packed.shape), (1, 8, 16))
-        self.assertIsNone(shared)
-
-        output_hidden = torch.arange(7 * 16, dtype=torch.float32).view(1, 7, 16)
-        fake_result = tuple(torch.zeros(()) for _ in range(6))
-        with (
-            mock.patch.object(
-                draft_model, "forward", return_value=output_hidden
-            ) as draft_forward_mock,
-            mock.patch(
-                "specforge.core.flashmtp.create_flashmtp_block_mask",
-                return_value=None,
-            ) as mask_mock,
-            mock.patch.object(
-                wrapper,
-                "_chunked_weighted_ce_and_metrics",
-                return_value=fake_result,
-            ) as loss_mock,
-        ):
-            wrapper(
-                input_ids=torch.arange(8).view(1, 8),
-                loss_mask=torch.ones(1, 8),
-                anchor_positions=torch.tensor([[3]]),
-                block_keep_mask=torch.tensor([[True]]),
-                target_hidden=torch.zeros(1, 1, 2, 16),
-                history_hidden_states=packed,
-                history_start_positions=starts,
-                history_source_lengths=lengths,
-            )
-
-        draft_call = draft_forward_mock.call_args.kwargs
-        mask_kwargs = mask_mock.call_args.kwargs
-        call = loss_mock.call_args.kwargs
-        self.assertEqual(mask_kwargs["block_size"], 7)
-        self.assertEqual(mask_kwargs["chs_len_per_block"], 2)
-        self.assertEqual(tuple(mask_kwargs["context_keep_mask"].shape), (1, 1, 2))
-        self.assertIsNotNone(mask_kwargs["draft_keep_mask"])
-        self.assertTrue(mask_kwargs["draft_keep_mask"].all())
-        noise = draft_call["noise_embedding"]
-        self.assertEqual(tuple(noise.shape), (1, 7, 16))
-        self.assertTrue(torch.equal(noise[0, 0], embed_tokens.weight[0]))
-        self.assertTrue(torch.equal(noise[0, 1], embed_tokens.weight[1]))
-        self.assertTrue(torch.equal(noise[0, 2], embed_tokens.weight[2]))
-        self.assertTrue(torch.equal(noise[0, 3], embed_tokens.weight[3]))
-        self.assertTrue(torch.equal(noise[0, 4], embed_tokens.weight[28]))
-        self.assertEqual(tuple(draft_call["history_hidden"].shape), (1, 1, 0, 16))
-        self.assertTrue(
-            torch.equal(
-                draft_call["rotary_position_ids"],
-                torch.tensor([[2, 2, 0, 1, 2, 3, 4, 5, 6]]),
-            )
-        )
-        self.assertTrue(
-            torch.equal(
-                call["prediction_hidden"], output_hidden[:, 4:].view(1, 1, 3, 16)
-            )
-        )
-
-    def test_pivot_q_masks_padded_window_queries_as_kv(self) -> None:
+    def test_invalid_block_keeps_finite_chs_fallback(self):
         with mock.patch(
             "specforge.core.flashmtp.compile_friendly_create_block_mask",
             side_effect=lambda mask_mod, **_: mask_mod,
         ):
-            draft_keep = torch.tensor(
-                [[[False, False, True, True, True, True, True]]]
-            )
-            packed_mod = create_flashmtp_block_mask(
-                anchor_positions=torch.tensor([[3]]),
-                block_keep_mask=torch.tensor([[True]]),
-                context_keep_mask=torch.ones(1, 1, 2, dtype=torch.bool),
-                chs_len_per_block=2,
-                block_size=7,
-                device=torch.device("cpu"),
-                draft_keep_mask=draft_keep,
-            )
-
-        def visible(q_idx: int, kv_idx: int) -> bool:
-            return bool(
-                packed_mod(
-                    torch.tensor(0),
-                    torch.tensor(0),
-                    torch.tensor(q_idx),
-                    torch.tensor(kv_idx),
-                )
-            )
-
-        # KV: [CHS (2) | window+draft Q (7)]
-        self.assertTrue(visible(6, 0))
-        self.assertTrue(visible(6, 1))
-        self.assertFalse(visible(6, 2))
-        self.assertFalse(visible(6, 3))
-        self.assertTrue(visible(6, 4))
-        for draft_kv in range(5, 9):
-            self.assertTrue(visible(6, draft_kv))
-
-    def test_training_masks_keep_each_draft_block_bidirectional(self) -> None:
-        with mock.patch(
-            "specforge.core.flashmtp.compile_friendly_create_block_mask",
-            side_effect=lambda mask_mod, **_: mask_mod,
-        ):
-            packed_mod = create_flashmtp_block_mask(
-                anchor_positions=torch.tensor([[5, 20]]),
-                block_keep_mask=torch.tensor([[True, True]]),
-                context_keep_mask=torch.ones(1, 2, 2, dtype=torch.bool),
-                chs_len_per_block=2,
-                block_size=5,
-                device=torch.device("cpu"),
-            )
-            shared_mod = create_flashmtp_shared_block_mask(
-                anchor_positions=torch.tensor([[5]]),
-                block_keep_mask=torch.tensor([[True]]),
+            mask_mod = _make_flex_mask(
+                model_role="pivot_q_student",
+                anchor_positions=torch.tensor([[4, 0]]),
+                block_keep_mask=torch.tensor([[True, False]]),
+                token_keep_mask=torch.ones(1, 2, 2, dtype=torch.bool),
                 seq_len=8,
-                sliding_window_size=4,
-                current_chs_slots=2,
-                block_size=5,
-                source_start_positions=torch.tensor([0]),
-                source_lengths=torch.tensor([8]),
-                history_mode="token",
+                swa_window_size=4,
+                chs_slots=2,
+                query_len=3,
                 device=torch.device("cpu"),
-                chs_first=True,
             )
 
-        def packed_visible(q_idx: int, kv_idx: int) -> bool:
+        def visible(q_idx, kv_idx):
             return bool(
-                packed_mod(
+                mask_mod(
                     torch.tensor(0),
                     torch.tensor(0),
                     torch.tensor(q_idx),
@@ -665,1112 +162,412 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
                 )
             )
 
-        def shared_visible(q_idx: int, kv_idx: int) -> bool:
-            return bool(
-                shared_mod(
-                    torch.tensor(0),
-                    torch.tensor(0),
-                    torch.tensor(q_idx),
-                    torch.tensor(kv_idx),
-                )
+        # KV: [CHS_0 (2) | CHS_1 (2) | Q_0 (3) | Q_1 (3)].
+        self.assertFalse(visible(3, 0))
+        self.assertFalse(visible(3, 1))
+        self.assertTrue(visible(3, 2))
+        self.assertTrue(visible(3, 3))
+        self.assertFalse(visible(3, 7))
+
+    def test_anchor_sampling_requires_next_supervised_label(self):
+        model = make_model(block_size=2)
+        wrapper = OnlineFlashMTPModel(
+            draft_model=model,
+            target_lm_head=nn.Linear(16, 31, bias=False),
+            target_embed_tokens=nn.Embedding(31, 16),
+            mask_token_id=30,
+            block_size=2,
+            num_anchors=8,
+        )
+        loss_mask = torch.zeros(1, 8)
+        loss_mask[0, [2, 4, 5, 6]] = 1
+
+        anchors, keep = wrapper.sample_anchor_positions(8, loss_mask)
+
+        self.assertTrue(keep.all())
+        self.assertTrue(torch.isin(anchors, torch.tensor([4, 5])).all())
+        self.assertFalse((anchors == 2).any())
+
+    def test_inference_mask_embedding_does_not_expand_output_vocab(self):
+        model = make_model()
+        model.mask_token_id = 31
+        embedding = nn.Embedding(31, 16)
+        token_group = torch.tensor([[1, 2, 3]])
+        draft_ids = torch.tensor([[3, 31, 31, 31]])
+        query = model.build_inference_query_embeddings(
+            embedding, draft_ids, token_group_ids=token_group
+        )
+        expected_mask = embedding.weight.mean(dim=0)
+        self.assertEqual(query.shape, (1, 6, 16))
+        self.assertTrue(torch.allclose(query[0, -1], expected_mask))
+
+    def test_inference_vocab_row_mask_uses_exact_embedding(self):
+        model = make_model()
+        model.mask_token_id = 30
+        model.mask_embedding_mode = "vocab_row"
+        embedding = nn.Embedding(31, 16)
+        token_group = torch.tensor([[1, 2, 3]])
+        draft_ids = torch.tensor([[3, 30, 30, 30]])
+
+        query = model.build_inference_query_embeddings(
+            embedding, draft_ids, token_group_ids=token_group
+        )
+
+        self.assertTrue(torch.equal(query[0, -1], embedding.weight[30]))
+
+    def test_inference_vocab_row_mask_rejects_oov_embedding(self):
+        model = make_model()
+        model.mask_token_id = 31
+        model.mask_embedding_mode = "vocab_row"
+        with self.assertRaisesRegex(ValueError, "requires vocab_row"):
+            model.build_inference_query_embeddings(
+                nn.Embedding(31, 16),
+                torch.tensor([[3, 31, 31, 31]]),
+                token_group_ids=torch.tensor([[1, 2, 3]]),
             )
 
-        # Packed KV: [CHS_0 (2) | CHS_1 (2) | Block_0 (5) | Block_1 (5)]
-        for q_idx in (0, 1, 4):
-            self.assertTrue(packed_visible(q_idx, 0))
-            self.assertTrue(packed_visible(q_idx, 1))
-            self.assertFalse(packed_visible(q_idx, 2))
-            self.assertFalse(packed_visible(q_idx, 3))
-            for draft_kv in range(4, 9):
-                self.assertTrue(packed_visible(q_idx, draft_kv))
-            self.assertFalse(packed_visible(q_idx, 9))
-
-        # Shared KV: CHS at 0-1, history T=8 at 2-9, draft at 10-14.
-        self.assertTrue(shared_visible(0, 0))
-        self.assertTrue(shared_visible(0, 1))
-        self.assertFalse(shared_visible(0, 3))
-        self.assertTrue(shared_visible(0, 4))
-        self.assertTrue(shared_visible(0, 6))
-        self.assertFalse(shared_visible(0, 7))
-        for draft_kv in range(10, 15):
-            self.assertTrue(shared_visible(0, draft_kv))
-            self.assertTrue(shared_visible(1, draft_kv))
-        self.assertFalse(shared_visible(0, 15))
-
-    def test_inference_condition_is_rebuilt_as_one_bounded_tensor(self) -> None:
-        config = Qwen3Config(
-            vocab_size=29,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "chs_num_layers": 2,
-            "target_layer_ids": [0, 3],
-        }
-        model = FlashMTPDraftModel(config)
-        initial_fused = torch.arange(6, dtype=torch.float32).view(1, 6, 1)
-        initial_fused = initial_fused.expand(-1, -1, 16)
+    def test_target_component_builder_passes_constructed_target(self):
+        args = object()
+        drafts = [object()]
+        target = object()
+        tokenizer = object()
+        components = object()
         with mock.patch.object(
-            model, "fuse_target_output_history", return_value=initial_fused
-        ):
-            condition = model.initialize_inference_condition([torch.empty(0)])
-        self.assertEqual(tuple(condition.shape), (1, 4, 16))
-        self.assertTrue(
-            torch.equal(condition[0, :, 0], torch.tensor([2.0, 3.0, 4.0, 5.0]))
-        )
+            flashmtp_training, "build_target_model", return_value=target
+        ), mock.patch.object(
+            flashmtp_training,
+            "resolve_tokenizer_and_components",
+            return_value=(tokenizer, components, 17),
+        ) as resolve:
+            result = flashmtp_training.build_target_and_components(args, drafts)
 
-        new_fused = torch.arange(10, 13, dtype=torch.float32).view(1, 3, 1)
-        new_fused = new_fused.expand(-1, -1, 16)
-        with mock.patch.object(
-            model, "fuse_target_output_history", return_value=new_fused
-        ):
-            condition = model.update_inference_condition(
-                condition, [torch.empty(0)], pivot_index=1
+        self.assertEqual(result, (target, tokenizer, components, 17))
+        resolve.assert_called_once_with(args, drafts, target=target)
+
+    def test_prediction_hidden_is_last_b_minus_one_slots(self):
+        for role in ("swa_teacher", "pivot_q_student"):
+            model = make_model(role)
+            hidden = torch.arange(model.draft_query_length * 16).view(
+                1, model.draft_query_length, 16
             )
-        self.assertEqual(tuple(condition.shape), (1, 4, 16))
-        self.assertTrue(
-            torch.equal(condition[0, :, 0], torch.tensor([4.0, 5.0, 10.0, 11.0]))
-        )
+            self.assertTrue(torch.equal(model._prediction_hidden(hidden), hidden[:, -3:]))
 
-    def test_local_block_positions_skip_left_padding_and_support_w1(self) -> None:
-        config = Qwen3Config(
-            vocab_size=29,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "chs_num_layers": 2,
-            "target_layer_ids": [0, 3],
-            "local_position": True,
-        }
-        model = FlashMTPDraftModel(config)
-        anchors = torch.tensor([[1, 3]])
-        history_global = torch.tensor([[[0, 0, 0], [0, 1, 2]]])
-        history_keep = torch.tensor(
-            [[[False, False, False], [False, True, True]]]
-        )
-        context_pos, draft_pos = model.build_block_position_ids(
-            anchors, history_global, history_keep, draft_length=4
-        )
-        self.assertTrue(
-            torch.equal(
-                context_pos,
-                torch.tensor([[0, 0, 0, 0, 0, 1, 1, 0, 0, 1]]),
-            )
-        )
-        self.assertTrue(
-            torch.equal(draft_pos, torch.tensor([[1, 2, 3, 4, 2, 3, 4, 5]]))
-        )
-
-        config.flashmtp_config["sliding_window_size"] = 1
-        w1_model = FlashMTPDraftModel(config)
-        empty_pos = torch.empty(1, 1, 0, dtype=torch.long)
-        empty_keep = torch.empty(1, 1, 0, dtype=torch.bool)
-        context_pos, draft_pos = w1_model.build_block_position_ids(
-            torch.tensor([[9]]), empty_pos, empty_keep, draft_length=4
-        )
-        self.assertTrue(torch.equal(context_pos, torch.tensor([[0, 0]])))
-        self.assertTrue(torch.equal(draft_pos, torch.tensor([[1, 2, 3, 4]])))
-
-    def test_rejection_sampling_accepts_identical_distributions(self) -> None:
-        draft_logits = torch.tensor(
-            [[[2.0, 0.0, -1.0], [0.0, 2.0, -1.0]]]
-        )
-        target_logits = torch.cat(
-            [draft_logits, torch.tensor([[[0.0, 0.0, 3.0]]])],
-            dim=1,
-        )
-        proposed_tokens = torch.tensor([[0, 1]])
-
-        accepted, bonus = rejection_sample_verify(
-            proposed_tokens=proposed_tokens,
-            draft_logits=draft_logits,
-            target_logits=target_logits,
-            temperature=1.0,
-        )
-
-        self.assertEqual(accepted, 2)
-        self.assertEqual(tuple(bonus.shape), (1,))
-
-    def test_rejection_sampling_uses_residual_on_rejection(self) -> None:
-        draft_logits = torch.tensor([[[100.0, -100.0, -100.0]]])
-        target_logits = torch.tensor(
-            [[[-100.0, 100.0, -100.0], [0.0, 0.0, 100.0]]]
-        )
-
-        accepted, correction = rejection_sample_verify(
-            proposed_tokens=torch.tensor([[0]]),
-            draft_logits=draft_logits,
-            target_logits=target_logits,
-            temperature=1.0,
-        )
-
-        self.assertEqual(accepted, 0)
-        self.assertEqual(correction.item(), 1)
-
-    def test_target_prediction_hidden_uses_causal_predecessor_positions(self) -> None:
-        last_hidden = torch.arange(2 * 8 * 3, dtype=torch.float32).view(2, 8, 3)
-        hidden_states = {
-            0: torch.zeros_like(last_hidden),
-            1: torch.zeros_like(last_hidden),
-            2: torch.zeros_like(last_hidden),
-            3: last_hidden,
-        }
-        anchors = torch.tensor([[1, 3], [2, 4]])
-
-        gathered = prepare_target_prediction_hidden(
-            hidden_states=hidden_states,
-            anchor_positions=anchors,
+    def test_teacher_shared_history_rope_is_not_duplicated_per_anchor(self):
+        model = make_model("swa_teacher")
+        wrapper = OnlineFlashMTPModel(
+            draft_model=model,
+            target_lm_head=nn.Linear(16, 31, bias=False),
+            target_embed_tokens=nn.Embedding(31, 16),
+            mask_token_id=30,
             block_size=4,
-            num_transformer_layers=4,
         )
+        batch = PreparedFlashMTPBatch(
+            anchor_positions=torch.tensor([[5]]),
+            block_keep_mask=torch.tensor([[True]]),
+            target_hidden=torch.randn(1, 1, 2, 16),
+            shared_fused_history=torch.randn(1, 7, 16),
+            query_embeddings=torch.randn(1, 1, 6, 16),
+            token_keep_mask=torch.ones(1, 1, 3, dtype=torch.bool),
+            token_position_ids=torch.tensor([[[3, 4, 5]]]),
+            labels=torch.zeros(1, 1, 3, dtype=torch.long),
+            prev_token_ids=torch.zeros(1, 1, 3, dtype=torch.long),
+            raw_weight_mask=torch.ones(1, 1, 3),
+            binary_eval_mask=torch.ones(1, 1, 3, dtype=torch.bool),
+            initial_prev_token_ids=None,
+        )
+        captured = {}
 
-        expected_positions = anchors.unsqueeze(-1) + torch.arange(3)
-        expected = torch.gather(
-            last_hidden.unsqueeze(1).expand(-1, 2, -1, -1),
+        def fake_forward(**kwargs):
+            captured["rotary"] = kwargs["rotary_position_ids"]
+            return torch.zeros(1, 6, 16)
+
+        with mock.patch("specforge.core.flashmtp._make_flex_mask", return_value=None):
+            with mock.patch.object(model, "forward", side_effect=fake_forward):
+                wrapper.forward_backbone(batch, seq_len=7)
+        # one shared 7-token history + two CHS slots + six Q slots
+        self.assertEqual(captured["rotary"].shape, (1, 15))
+        self.assertTrue(torch.equal(captured["rotary"][0, :7], torch.arange(7)))
+
+    def test_prefill_logits_use_causal_predecessor_positions(self):
+        logits = torch.arange(1 * 8 * 5).view(1, 8, 5)
+        selected = gather_target_prefill_logits(logits, torch.tensor([[2, 4]]), 4)
+        self.assertTrue(torch.equal(selected[0, 0], logits[0, 2:5]))
+        self.assertTrue(torch.equal(selected[0, 1], logits[0, 4:7]))
+
+    def test_prefill_gather_matches_projecting_selected_hidden(self):
+        head = nn.Linear(16, 31, bias=False)
+        hidden = torch.randn(1, 8, 16)
+        anchors = torch.tensor([[2, 4]])
+        full_logits = head(hidden)
+        gathered_logits = gather_target_prefill_logits(full_logits, anchors, 4)
+        positions = anchors.unsqueeze(-1) + torch.arange(3).view(1, 1, -1)
+        selected_hidden = torch.gather(
+            hidden.unsqueeze(1).expand(-1, 2, -1, -1),
             2,
-            expected_positions.unsqueeze(-1).expand(-1, -1, -1, 3),
+            positions.unsqueeze(-1).expand(-1, -1, -1, 16),
         )
-        self.assertTrue(torch.equal(gathered, expected))
+        self.assertTrue(torch.allclose(gathered_logits, head(selected_hidden)))
 
-
-    def _assert_teacher_forcing_matches_serial(
-        self, head_type: str, output_mode: str
-    ) -> None:
-        torch.manual_seed(7)
-        batch_size, prediction_length = 2, 4
-        hidden_size, vocab_size, rank = 12, 23, 5
-        head = FlashMTPMarkovHead(
-            head_type=head_type,
-            vocab_size=vocab_size,
-            markov_rank=rank,
-            hidden_size=hidden_size,
-            max_prediction_length=prediction_length,
-            markov_output_mode=output_mode,
+    def test_stage_optimizers_and_schedulers_are_independent(self):
+        stage1_model = nn.Linear(2, 2)
+        stage2_model = nn.Linear(2, 2)
+        stage1 = BF16Optimizer(
+            stage1_model, lr=1e-3, total_steps=10, warmup_ratio=0.2
         )
-        hidden = torch.randn(
-            batch_size, prediction_length, hidden_size, requires_grad=True
+        stage2 = BF16Optimizer(
+            stage2_model, lr=2e-4, total_steps=20, warmup_ratio=0.1
         )
-        base_logits = torch.randn(
-            batch_size, prediction_length, vocab_size, requires_grad=True
+        self.assertIsNot(stage1.optimizer, stage2.optimizer)
+        self.assertIsNot(stage1.scheduler, stage2.scheduler)
+        self.assertEqual(stage1.scheduler.warmup_epochs, 2)
+        self.assertEqual(stage2.scheduler.warmup_epochs, 2)
+        self.assertEqual(stage1.scheduler.after_scheduler.T_max, 8)
+        self.assertEqual(stage2.scheduler.after_scheduler.T_max, 18)
+
+    def test_supervised_logits_are_projected_once(self):
+        model = make_model()
+        head = CountingHead()
+        wrapper = OnlineFlashMTPModel(
+            draft_model=model,
+            target_lm_head=head,
+            target_embed_tokens=nn.Embedding(31, 16),
+            mask_token_id=30,
+            block_size=4,
+            attention_backend="flex_attention",
+            final_ce_weight=1.0,
+            tv_loss_weight=1.0,
+            base_lm_ce_weight=1.0,
         )
-        first_prev = torch.tensor([2, 3])
-
-        sampled, serial_logits = head.sample_block_tokens(
-            hidden_states=hidden,
-            first_prev_token_ids=first_prev,
-            output_mode=output_mode,
-            base_logits=base_logits if output_mode == "additive" else None,
-            temperature=0.0,
+        hidden = torch.randn(1, 1, 3, 16, requires_grad=True)
+        batch = PreparedFlashMTPBatch(
+            anchor_positions=torch.tensor([[2]]),
+            block_keep_mask=torch.tensor([[True]]),
+            target_hidden=torch.empty(1, 1, 2, 16),
+            shared_fused_history=None,
+            query_embeddings=torch.empty(1, 1, 6, 16),
+            token_keep_mask=torch.ones(1, 1, 3, dtype=torch.bool),
+            token_position_ids=torch.tensor([[[0, 1, 2]]]),
+            labels=torch.tensor([[[3, 4, 5]]]),
+            prev_token_ids=torch.tensor([[[2, 3, 4]]]),
+            raw_weight_mask=torch.ones(1, 1, 3),
+            binary_eval_mask=torch.ones(1, 1, 3, dtype=torch.bool),
+            initial_prev_token_ids=None,
         )
-        teacher_prev = torch.cat([first_prev.unsqueeze(1), sampled[:, :-1]], dim=1)
-        teacher_latent = head.forward_teacher_forcing(
-            hidden_states=hidden,
-            prev_token_ids=teacher_prev,
-            output_mode=output_mode,
-        )
-        teacher_logits = head.project_logits(teacher_latent)
-        if output_mode == "additive":
-            teacher_logits = base_logits + teacher_logits
-
-        self.assertEqual(tuple(teacher_latent.shape), (2, 4, rank))
-        self.assertEqual(tuple(sampled.shape), (2, 4))
-        self.assertTrue(
-            torch.allclose(serial_logits, teacher_logits, atol=1e-6, rtol=1e-6)
-        )
-
-        teacher_logits.float().square().mean().backward()
-        self.assertIsNotNone(head.prev_token_embedding.weight.grad)
-        self.assertIsNotNone(head.output_proj.weight.grad)
-        if head_type == "vanilla":
-            self.assertIsNone(hidden.grad)
-        elif head_type == "gated":
-            self.assertIsNotNone(hidden.grad)
-            assert head.gate_proj is not None
-            self.assertIsNotNone(head.gate_proj.weight.grad)
-        elif head_type in ("rnn", "rnn_easy") and output_mode == "direct":
-            self.assertIsNotNone(hidden.grad)
-        else:
-            self.assertIsNone(hidden.grad)
-        if head_type == "rnn" and output_mode == "direct":
-            self.assertIsNotNone(head.hidden_proj)
-            self.assertIsNotNone(head.hidden_proj.weight.grad)
-        if head_type == "rnn_easy" and output_mode == "direct":
-            self.assertIsNone(head.hidden_proj)
-            assert head.state_hidden_mlp is not None
-            self.assertIsNotNone(head.state_hidden_mlp.weight.grad)
-
-    def test_direct_hidden_latent_changes_rnn_outputs(self) -> None:
-        torch.manual_seed(11)
-        hidden_size, vocab_size, rank = 12, 23, 5
-        hidden = torch.randn(1, 3, hidden_size)
-        prev_token_ids = torch.tensor([[1, 2, 3]])
-
-        for head_type in ("rnn", "rnn_easy"):
-            with self.subTest(head_type=head_type):
-                head = FlashMTPMarkovHead(
-                    head_type=head_type,
-                    vocab_size=vocab_size,
-                    markov_rank=rank,
-                    hidden_size=hidden_size,
-                    max_prediction_length=3,
-                )
-                direct_latent = head.forward_teacher_forcing(
-                    hidden_states=hidden,
-                    prev_token_ids=prev_token_ids,
-                    output_mode="direct",
-                )
-                additive_latent = head.forward_teacher_forcing(
-                    hidden_states=hidden,
-                    prev_token_ids=prev_token_ids,
-                    output_mode="additive",
-                )
-                self.assertFalse(torch.allclose(direct_latent, additive_latent))
-
-    def test_all_head_and_output_modes(self) -> None:
-        for head_type in ("vanilla", "gated", "rnn", "rnn_easy"):
-            output_modes = ("additive",) if head_type == "gated" else ("additive", "direct")
-            for output_mode in output_modes:
-                with self.subTest(head_type=head_type, output_mode=output_mode):
-                    self._assert_teacher_forcing_matches_serial(head_type, output_mode)
-
-    def test_gated_rejects_direct_mode(self) -> None:
-        with self.assertRaisesRegex(ValueError, "additive"):
-            FlashMTPMarkovHead(
-                head_type="gated",
-                vocab_size=23,
-                markov_rank=5,
-                hidden_size=12,
-                max_prediction_length=4,
-                markov_output_mode="direct",
-            )
-        head = FlashMTPMarkovHead(
-            head_type="gated",
-            vocab_size=23,
-            markov_rank=5,
-            hidden_size=12,
-            max_prediction_length=4,
-            markov_output_mode="additive",
-        )
-        with self.assertRaisesRegex(ValueError, "additive"):
-            head.sample_block_tokens(
-                hidden_states=torch.randn(1, 2, 12),
-                first_prev_token_ids=torch.tensor([1]),
-                output_mode="direct",
-                base_logits=None,
-            )
-
-    def test_vanilla_additive_head_is_position_agnostic(self) -> None:
-        head = FlashMTPMarkovHead(
-            head_type="vanilla",
-            vocab_size=23,
-            markov_rank=5,
-            hidden_size=12,
-            max_prediction_length=3,
-            markov_output_mode="additive",
-        )
-        latent = head.forward_teacher_forcing(
-            hidden_states=torch.randn(2, 3, 12),
-            prev_token_ids=torch.full((2, 3), 4),
-            output_mode="additive",
-        )
-        self.assertTrue(torch.equal(latent[:, :1, :].expand_as(latent), latent))
-
-    def test_rnn_easy_uses_state_without_state_out_proj(self) -> None:
-        head = FlashMTPMarkovHead(
-            head_type="rnn_easy",
-            vocab_size=23,
-            markov_rank=5,
-            hidden_size=12,
-            max_prediction_length=3,
-            markov_output_mode="direct",
-        )
-        self.assertIsNone(head.state_out_proj)
-        self.assertIsNone(head.hidden_fuse_gate_proj)
-        self.assertIsNone(head.hidden_proj)
-        self.assertIsNotNone(head.state_hidden_mlp)
-        self.assertEqual(head.state_hidden_mlp.in_features, 17)
-        self.assertEqual(head.state_hidden_mlp.out_features, 5)
-
-        torch.manual_seed(9)
-        hidden = torch.randn(2, 3, 12, requires_grad=True)
-        prev_token_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
-        latent = head.forward_teacher_forcing(
-            hidden_states=hidden,
-            prev_token_ids=prev_token_ids,
-            output_mode="direct",
-        )
-        self.assertEqual(tuple(latent.shape), (2, 3, 5))
-        latent.sum().backward()
-        self.assertIsNotNone(head.state_hidden_mlp.weight.grad)
+        target_logits = torch.randn(1, 1, 3, 31)
+        output = wrapper.compute_supervised_loss(hidden, batch, target_logits)
+        self.assertEqual(head.calls, 1)
+        output.loss.backward()
         self.assertIsNotNone(hidden.grad)
 
-    def test_rnn_easy_state_update_does_not_depend_on_hidden(self) -> None:
-        torch.manual_seed(3)
-        hidden_size, vocab_size, rank = 12, 23, 5
-        head = FlashMTPMarkovHead(
-            head_type="rnn_easy",
-            vocab_size=vocab_size,
-            markov_rank=rank,
-            hidden_size=hidden_size,
-            max_prediction_length=3,
-        )
-        state = torch.zeros(2, rank, requires_grad=False)
-        prev_token_ids = torch.tensor([4, 5])
-        hidden = torch.randn(2, hidden_size, requires_grad=True)
-
-        _, new_state = head._compute_step_latent(
-            prev_token_ids=prev_token_ids,
-            hidden_states=hidden,
-            state=state,
-            output_mode="direct",
-        )
-        grads = torch.autograd.grad(
-            new_state.sum(),
-            hidden,
-            retain_graph=True,
-            allow_unused=True,
-        )[0]
-        self.assertTrue(
-            grads is None or torch.allclose(grads, torch.zeros_like(hidden))
-        )
-
-        latent, _ = head._compute_step_latent(
-            prev_token_ids=prev_token_ids,
-            hidden_states=hidden,
-            state=state,
-            output_mode="direct",
-        )
-        latent_grads = torch.autograd.grad(latent.sum(), hidden)[0]
-        self.assertIsNotNone(latent_grads)
-        self.assertFalse(torch.allclose(latent_grads, torch.zeros_like(hidden)))
-
-    def test_rnn_h_output_mode_is_removed(self) -> None:
-        with self.assertRaises(ValueError):
-            FlashMTPMarkovHead(
-                head_type="rnn",
-                vocab_size=23,
-                markov_rank=5,
-                hidden_size=12,
-                max_prediction_length=3,
-                markov_output_mode="rnn_h",
-            )
-
-    def test_rnn_easy_model_sampling_skips_base_lm_head_in_direct_mode(self) -> None:
-        class FailingLMHead(nn.Module):
-            def forward(self, hidden_states):
-                raise AssertionError("direct mode must not call the base LM head")
-
-        config = Qwen3Config(
-            vocab_size=29,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "target_layer_ids": [0, 3],
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "chs_num_layers": 2,
-            "markov_head_type": "rnn_easy",
-            "markov_output_mode": "direct",
-            "markov_rank": 5,
-        }
-        model = FlashMTPDraftModel(config)
-        sampled, logits = model.sample_draft_tokens(
-            draft_hidden=torch.randn(2, 3, 16),
-            lm_head=FailingLMHead(),
-            first_prev_token_ids=torch.tensor([1, 2]),
-        )
-        self.assertEqual(tuple(sampled.shape), (2, 3))
-        self.assertEqual(tuple(logits.shape), (2, 3, 29))
-
-    def test_rnn_seeds_state_from_anchor_predecessor_when_window_gt_one(self) -> None:
-        torch.manual_seed(11)
-        hidden_size, vocab_size, rank = 12, 23, 5
-        head = FlashMTPMarkovHead(
-            head_type="rnn_easy",
-            vocab_size=vocab_size,
-            markov_rank=rank,
-            hidden_size=hidden_size,
-            max_prediction_length=3,
-        )
-        hidden_states = torch.randn(2, 3, hidden_size)
-        prev_token_ids = torch.tensor([[4, 5, 6], [7, 8, 9]])
-        initial_prev = torch.tensor([1, 2])
-
-        zero_latent = head.forward_teacher_forcing(
-            hidden_states=hidden_states,
-            prev_token_ids=prev_token_ids,
-            output_mode="direct",
-        )
-        seeded_latent = head.forward_teacher_forcing(
-            hidden_states=hidden_states,
-            prev_token_ids=prev_token_ids,
-            output_mode="direct",
-            initial_prev_token_ids=initial_prev,
-        )
-        self.assertFalse(torch.allclose(zero_latent, seeded_latent))
-
-        zero_sampled, zero_logits = head.sample_block_tokens(
-            hidden_states=hidden_states,
-            first_prev_token_ids=prev_token_ids[:, 0],
-            output_mode="direct",
-        )
-        seeded_sampled, seeded_logits = head.sample_block_tokens(
-            hidden_states=hidden_states,
-            first_prev_token_ids=prev_token_ids[:, 0],
-            output_mode="direct",
-            initial_prev_token_ids=initial_prev,
-        )
-        self.assertFalse(torch.allclose(zero_logits, seeded_logits))
-
-        config = Qwen3Config(
-            vocab_size=29,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "history_mode": "pivot_q",
-            "chs_num_layers": 2,
-            "target_layer_ids": [0, 3],
-            "markov_head_type": "rnn_easy",
-            "markov_output_mode": "direct",
-            "markov_rank": 7,
-        }
-        model = FlashMTPDraftModel(config)
-        self.assertTrue(model.seed_rnn_from_predecessor)
-
-    def test_rnn_state_update_does_not_depend_on_hidden(self) -> None:
-        torch.manual_seed(3)
-        hidden_size, vocab_size, rank = 12, 23, 5
-        head = FlashMTPMarkovHead(
-            head_type="rnn",
-            vocab_size=vocab_size,
-            markov_rank=rank,
-            hidden_size=hidden_size,
-            max_prediction_length=3,
-        )
-        state = torch.zeros(2, rank, requires_grad=False)
-        prev_token_ids = torch.tensor([4, 5])
-        hidden = torch.randn(2, hidden_size, requires_grad=True)
-
-        _, new_state = head._compute_step_latent(
-            prev_token_ids=prev_token_ids,
-            hidden_states=hidden,
-            state=state,
-            output_mode="direct",
-        )
-        grads = torch.autograd.grad(
-            new_state.sum(),
-            hidden,
-            retain_graph=True,
-            allow_unused=True,
-        )[0]
-        self.assertTrue(
-            grads is None or torch.allclose(grads, torch.zeros_like(hidden))
-        )
-
-        latent, _ = head._compute_step_latent(
-            prev_token_ids=prev_token_ids,
-            hidden_states=hidden,
-            state=state,
-            output_mode="direct",
-        )
-        latent_grads = torch.autograd.grad(latent.sum(), hidden)[0]
-        self.assertIsNotNone(latent_grads)
-        self.assertFalse(torch.allclose(latent_grads, torch.zeros_like(hidden)))
-
-    def test_model_config_round_trip(self) -> None:
-        config = Qwen3Config(
-            vocab_size=29,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "target_layer_ids": [0, 3],
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "history_mode": "token",
-            "chs_num_layers": 2,
-            "local_position": True,
-            "markov_head_type": "rnn_easy",
-            "markov_output_mode": "direct",
-            "markov_rank": 7,
-            "add_noise": True,
-            "target_hidden_noise_ratio": 0.1,
-        }
-        model = FlashMTPDraftModel(config)
-        self.assertEqual(model.history_mode, "token")
-        self.assertEqual(model.markov_head_type, "rnn_easy")
-        self.assertEqual(model.markov_output_mode, "direct")
-        self.assertEqual(model.markov_rank, 7)
-        self.assertEqual(model.proposal_length, 3)
-        self.assertEqual(model.sliding_window_size, 4)
-        self.assertEqual(model.chs_num_layers, 2)
-        self.assertEqual(model.current_chs_slot_count, 2)
-        self.assertEqual(model.condition_slot_count, 2)
-        self.assertEqual(model.chs_len_per_block, 5)
-        self.assertEqual(model.draft_query_length, 4)
-        self.assertFalse(model.config.flashmtp_config["include_token_embedding_chs"])
-        self.assertFalse(model.config.flashmtp_config["pivot_query_embedding"])
-        self.assertNotIn("add_noise", model.config.flashmtp_config)
-        self.assertNotIn("target_hidden_noise_ratio", model.config.flashmtp_config)
-        self.assertTrue(model.local_position)
-        self.assertEqual(model.markov_head.max_prediction_length, 3)
-
-        with tempfile.TemporaryDirectory() as checkpoint_dir:
-            model.save_pretrained(checkpoint_dir)
-            loaded = FlashMTPDraftModel.from_pretrained(checkpoint_dir)
-        self.assertEqual(loaded.markov_head_type, "rnn_easy")
-        self.assertEqual(loaded.markov_output_mode, "direct")
-        self.assertEqual(loaded.markov_rank, 7)
-        self.assertEqual(loaded.history_mode, "token")
-        self.assertEqual(loaded.proposal_length, 3)
-        self.assertTrue(loaded.local_position)
-        self.assertTrue(loaded.config.flashmtp_config["local_position"])
-        self.assertEqual(loaded.config.flashmtp_config["architecture_version"], FLASHMTP_ARCHITECTURE_VERSION)
-        self.assertFalse(
-            loaded.config.flashmtp_config["include_token_embedding_chs"]
-        )
-        self.assertFalse(loaded.config.flashmtp_config["pivot_query_embedding"])
-        self.assertIsNotNone(loaded.markov_head)
-
-    def test_prediction_hidden_legacy_skips_slot_zero(self) -> None:
-        config = Qwen3Config(
-            vocab_size=31,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 8
-        config.flashmtp_config = {
-            "target_layer_ids": [0, 3],
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "chs_num_layers": 2,
-            "markov_head_type": "none",
-            "markov_output_mode": "additive",
-        }
-        legacy_model = FlashMTPDraftModel(config)
-        block_hidden = torch.randn(2, 9, 16)
-        legacy_hidden = legacy_model._prediction_hidden(block_hidden)
-        self.assertEqual(legacy_hidden.shape, (2, 7, 16))
-
-    def test_removed_anchor_kv_mode_is_rejected(self) -> None:
-        config = Qwen3Config(
-            vocab_size=31,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "target_layer_ids": [0, 3],
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "chs_num_layers": 2,
-            "draft_input_mode": "anchor_kv",
-        }
-        with self.assertRaisesRegex(ValueError, "draft_input_mode"):
-            FlashMTPDraftModel(config)
-
-        config.flashmtp_config["draft_input_mode"] = "legacy"
-        model = FlashMTPDraftModel(config)
-        self.assertEqual(model.unsupervised_query_count, 1)
-        self.assertEqual(model.draft_query_length, 4)
-        self.assertNotIn("draft_input_mode", model.config.flashmtp_config)
-
-    def test_legacy_decode_block_sizes(self) -> None:
-        config = Qwen3Config(
-            vocab_size=31,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 8
-        config.flashmtp_config = {
-            "target_layer_ids": [0, 3],
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "chs_num_layers": 2,
-            "markov_head_type": "none",
-            "markov_output_mode": "additive",
-        }
-        legacy_model = FlashMTPDraftModel(config)
-        self.assertEqual(legacy_model.draft_block_len, 8)
-        self.assertEqual(legacy_model.proposal_length, 7)
-        self.assertEqual(legacy_model.max_verify_block_size, 8)
-
-    def test_legacy_training_alignment(self) -> None:
-        config = Qwen3Config(
-            vocab_size=31,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "target_layer_ids": [0, 3],
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "chs_num_layers": 2,
-            "local_position": True,
-            "markov_head_type": "none",
-            "markov_output_mode": "additive",
-        }
-        draft_model = FlashMTPDraftModel(config)
+    def test_masked_nan_block_does_not_contaminate_supervised_loss(self):
+        model = make_model()
+        head = nn.Linear(16, 31, bias=False)
         wrapper = OnlineFlashMTPModel(
-            draft_model=draft_model,
+            draft_model=model,
+            target_lm_head=head,
+            target_embed_tokens=nn.Embedding(31, 16),
+            mask_token_id=30,
+            block_size=4,
+            final_ce_weight=1.0,
+            tv_loss_weight=1.0,
+            base_lm_ce_weight=1.0,
+        )
+        hidden = torch.randn(1, 2, 3, 16, requires_grad=True)
+        target_logits = torch.randn(1, 2, 3, 31)
+        with torch.no_grad():
+            hidden[:, 1].fill_(float("nan"))
+            target_logits[:, 1].fill_(float("nan"))
+        weights = torch.tensor([[[1.0, 1.0, 1.0], [0.0, 0.0, 0.0]]])
+        batch = PreparedFlashMTPBatch(
+            anchor_positions=torch.tensor([[2, 0]]),
+            block_keep_mask=torch.tensor([[True, False]]),
+            target_hidden=torch.empty(1, 2, 2, 16),
+            shared_fused_history=None,
+            query_embeddings=torch.empty(1, 2, 6, 16),
+            token_keep_mask=torch.ones(1, 2, 3, dtype=torch.bool),
+            token_position_ids=torch.zeros(1, 2, 3, dtype=torch.long),
+            labels=torch.randint(0, 31, (1, 2, 3)),
+            prev_token_ids=torch.zeros(1, 2, 3, dtype=torch.long),
+            raw_weight_mask=weights,
+            binary_eval_mask=weights.bool(),
+            initial_prev_token_ids=None,
+        )
+
+        output = wrapper.compute_supervised_loss(hidden, batch, target_logits)
+
+        self.assertTrue(torch.isfinite(output.loss))
+        self.assertEqual(output.loss.dtype, torch.float32)
+        output.loss.backward()
+        self.assertTrue(torch.isfinite(hidden.grad).all())
+        self.assertTrue(torch.isfinite(head.weight.grad).all())
+        self.assertTrue(torch.equal(hidden.grad[:, 1], torch.zeros_like(hidden.grad[:, 1])))
+        for parameter in model.markov_head.parameters():
+            if parameter.grad is not None:
+                self.assertTrue(torch.isfinite(parameter.grad).all())
+
+    def test_illegal_supervised_label_is_rejected(self):
+        model = make_model()
+        wrapper = OnlineFlashMTPModel(
+            draft_model=model,
             target_lm_head=nn.Linear(16, 31, bias=False),
             target_embed_tokens=nn.Embedding(31, 16),
             mask_token_id=30,
             block_size=4,
-            num_anchors=1,
-            tv_loss_weight=0.0,
         )
-        output_hidden = torch.arange(4 * 16, dtype=torch.float32).view(1, 4, 16)
-        fake_result = tuple(torch.zeros(()) for _ in range(6))
-        with (
-            mock.patch.object(
-                draft_model, "forward", return_value=output_hidden
-            ) as draft_forward_mock,
-            mock.patch(
-                "specforge.core.flashmtp.create_flashmtp_block_mask",
-                return_value=None,
-            ) as mask_mock,
-            mock.patch.object(
-                wrapper,
-                "_chunked_weighted_ce_and_metrics",
-                return_value=fake_result,
-            ) as loss_mock,
-        ):
-            wrapper(
-                input_ids=torch.arange(8).view(1, 8),
-                loss_mask=torch.ones(1, 8),
-                anchor_positions=torch.tensor([[1]]),
-                block_keep_mask=torch.tensor([[True]]),
-                target_hidden=torch.zeros(1, 1, 2, 16),
-                history_hidden_states=torch.zeros(1, 8, 3, 16),
-                history_start_positions=torch.zeros(1, dtype=torch.long),
-                history_source_lengths=torch.full((1,), 8, dtype=torch.long),
+        weights = torch.ones(1, 1, 3)
+        batch = PreparedFlashMTPBatch(
+            anchor_positions=torch.tensor([[2]]),
+            block_keep_mask=torch.ones(1, 1, dtype=torch.bool),
+            target_hidden=torch.empty(1, 1, 2, 16),
+            shared_fused_history=None,
+            query_embeddings=torch.empty(1, 1, 6, 16),
+            token_keep_mask=torch.ones(1, 1, 3, dtype=torch.bool),
+            token_position_ids=torch.zeros(1, 1, 3, dtype=torch.long),
+            labels=torch.tensor([[[31, 1, 2]]]),
+            prev_token_ids=torch.zeros(1, 1, 3, dtype=torch.long),
+            raw_weight_mask=weights,
+            binary_eval_mask=weights.bool(),
+            initial_prev_token_ids=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "within the output vocabulary"):
+            wrapper.compute_supervised_loss(
+                torch.randn(1, 1, 3, 16), batch, torch.randn(1, 1, 3, 31)
             )
 
-        call = loss_mock.call_args.kwargs
-        draft_call = draft_forward_mock.call_args.kwargs
-        mask_kwargs = mask_mock.call_args.kwargs
-        self.assertEqual(mask_kwargs["block_size"], 4)
-        self.assertEqual(mask_kwargs["chs_len_per_block"], 5)
-        self.assertEqual(tuple(mask_kwargs["context_keep_mask"].shape), (1, 1, 5))
-        noise = draft_call["noise_embedding"]
-        embed = wrapper.embed_tokens
-        self.assertEqual(tuple(noise.shape), (1, 4, 16))
-        self.assertTrue(torch.equal(noise[0, 0], embed(torch.tensor(1))))
-        self.assertTrue(torch.equal(noise[0, 1], embed(torch.tensor(30))))
-        self.assertEqual(tuple(draft_call["target_hidden"].shape), (1, 1, 2, 16))
-        self.assertTrue(
-            torch.equal(
-                draft_call["rotary_position_ids"],
-                torch.tensor([[0, 0, 0, 0, 0, 1, 2, 3, 4]]),
-            )
-        )
-        self.assertTrue(
-            torch.equal(
-                call["prediction_hidden"], output_hidden[:, 1:].view(1, 1, 3, 16)
-            )
-        )
-        self.assertTrue(torch.equal(call["prev_token_ids"], torch.tensor([[[1, 2, 3]]])))
-        self.assertTrue(torch.equal(call["labels"], torch.tensor([[[2, 3, 4]]])))
-        self.assertTrue(torch.equal(call["weight_mask"], torch.ones(1, 1, 3)))
-
-    def test_shared_training_alignment(self) -> None:
-        config = Qwen3Config(
-            vocab_size=31,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "target_layer_ids": [0, 3],
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "chs_num_layers": 2,
-            "local_position": False,
-            "markov_head_type": "none",
-            "markov_output_mode": "additive",
-        }
-        draft_model = FlashMTPDraftModel(config)
+    def test_empty_supervision_is_rejected(self):
+        model = make_model()
         wrapper = OnlineFlashMTPModel(
-            draft_model=draft_model,
+            draft_model=model,
             target_lm_head=nn.Linear(16, 31, bias=False),
             target_embed_tokens=nn.Embedding(31, 16),
             mask_token_id=30,
             block_size=4,
-            num_anchors=1,
-            tv_loss_weight=0.0,
         )
-        output_hidden = torch.arange(4 * 16, dtype=torch.float32).view(1, 4, 16)
-        fake_result = tuple(torch.zeros(()) for _ in range(6))
-        with (
-            mock.patch.object(
-                draft_model, "forward", return_value=output_hidden
-            ) as draft_forward_mock,
-            mock.patch(
-                "specforge.core.flashmtp.create_flashmtp_shared_block_mask",
-                return_value=None,
-            ) as mask_mock,
-            mock.patch.object(
-                wrapper,
-                "_chunked_weighted_ce_and_metrics",
-                return_value=fake_result,
-            ) as loss_mock,
-        ):
-            wrapper(
-                input_ids=torch.arange(8).view(1, 8),
-                loss_mask=torch.ones(1, 8),
-                anchor_positions=torch.tensor([[1]]),
-                block_keep_mask=torch.tensor([[True]]),
-                target_hidden=torch.zeros(1, 1, 2, 16),
-                history_hidden_states=torch.zeros(1, 8, 3, 16),
-                history_start_positions=torch.zeros(1, dtype=torch.long),
-                history_source_lengths=torch.full((1,), 8, dtype=torch.long),
-                shared_fused_history=torch.zeros(1, 8, 16),
+        weights = torch.zeros(1, 1, 3)
+        batch = PreparedFlashMTPBatch(
+            anchor_positions=torch.tensor([[0]]),
+            block_keep_mask=torch.zeros(1, 1, dtype=torch.bool),
+            target_hidden=torch.empty(1, 1, 2, 16),
+            shared_fused_history=None,
+            query_embeddings=torch.empty(1, 1, 6, 16),
+            token_keep_mask=torch.zeros(1, 1, 3, dtype=torch.bool),
+            token_position_ids=torch.zeros(1, 1, 3, dtype=torch.long),
+            labels=torch.zeros(1, 1, 3, dtype=torch.long),
+            prev_token_ids=torch.zeros(1, 1, 3, dtype=torch.long),
+            raw_weight_mask=weights,
+            binary_eval_mask=weights.bool(),
+            initial_prev_token_ids=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "no supervised label positions"):
+            wrapper.compute_supervised_loss(
+                torch.randn(1, 1, 3, 16), batch, torch.randn(1, 1, 3, 31)
             )
 
-        call = loss_mock.call_args.kwargs
-        draft_call = draft_forward_mock.call_args.kwargs
-        mask_kwargs = mask_mock.call_args.kwargs
-        self.assertEqual(mask_kwargs["block_size"], 4)
-        self.assertEqual(mask_kwargs["current_chs_slots"], 2)
-        self.assertTrue(mask_kwargs["chs_first"])
-        self.assertEqual(mask_kwargs["sliding_window_size"], 4)
-        self.assertEqual(mask_kwargs["seq_len"], 8)
-        noise = draft_call["noise_embedding"]
-        embed = wrapper.embed_tokens
-        self.assertEqual(tuple(noise.shape), (1, 4, 16))
-        self.assertTrue(torch.equal(noise[0, 0], embed(torch.tensor(1))))
-        self.assertTrue(torch.equal(noise[0, 1], embed(torch.tensor(30))))
-        self.assertEqual(tuple(draft_call["target_hidden"].shape), (1, 1, 2, 16))
-        self.assertTrue(
-            torch.equal(
-                draft_call["rotary_position_ids"],
-                torch.tensor([[0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 1, 2, 3, 4]]),
-            )
+    def test_stage1_teacher_is_detached(self):
+        head = CountingHead()
+        student = torch.randn(1, 2, 3, 16, requires_grad=True)
+        teacher = torch.randn(1, 2, 3, 16, requires_grad=True)
+        loss, _, _ = compute_stage1_distillation_loss(
+            student_hidden=student,
+            teacher_hidden=teacher,
+            lm_head=head,
+            raw_weight_mask=torch.ones(1, 2, 3),
+            tv_weight=1.0,
+            hidden_weight=1.0,
+            smooth_l1_beta=1.0,
+            loss_decay_gamma=2.0,
         )
-        self.assertTrue(
-            torch.equal(
-                call["prediction_hidden"], output_hidden[:, 1:].view(1, 1, 3, 16)
-            )
-        )
-        self.assertTrue(torch.equal(call["prev_token_ids"], torch.tensor([[[1, 2, 3]]])))
-        self.assertTrue(torch.equal(call["labels"], torch.tensor([[[2, 3, 4]]])))
-        self.assertTrue(torch.equal(call["weight_mask"], torch.ones(1, 1, 3)))
-
-    def test_direct_model_sampling_skips_base_lm_head(self) -> None:
-        class FailingLMHead(nn.Module):
-            def forward(self, hidden_states):
-                raise AssertionError("direct mode must not call the base LM head")
-
-        config = Qwen3Config(
-            vocab_size=29,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "target_layer_ids": [0, 3],
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "chs_num_layers": 2,
-            "markov_head_type": "rnn",
-            "markov_output_mode": "direct",
-            "markov_rank": 5,
-        }
-        model = FlashMTPDraftModel(config)
-        sampled, logits = model.sample_draft_tokens(
-            draft_hidden=torch.randn(2, 3, 16),
-            lm_head=FailingLMHead(),
-            first_prev_token_ids=torch.tensor([1, 2]),
-        )
-        self.assertEqual(tuple(sampled.shape), (2, 3))
-        self.assertEqual(tuple(logits.shape), (2, 3, 29))
-
-    def test_compiled_serial_sampler_is_cached(self) -> None:
-        class FailingLMHead(nn.Module):
-            def forward(self, hidden_states):
-                raise AssertionError("direct mode must not call the base LM head")
-
-        config = Qwen3Config(
-            vocab_size=29,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "target_layer_ids": [0, 3],
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "chs_num_layers": 2,
-            "markov_head_type": "rnn",
-            "markov_output_mode": "direct",
-            "markov_rank": 5,
-        }
-        model = FlashMTPDraftModel(config)
-        hidden = torch.randn(1, 3, 16)
-        previous = torch.tensor([1])
-
-        with mock.patch(
-            "torch.compile", side_effect=lambda fn, **kwargs: fn
-        ) as compile_mock:
-            first = model.sample_draft_tokens(
-                draft_hidden=hidden,
-                lm_head=FailingLMHead(),
-                first_prev_token_ids=previous,
-                compile_serial_head=True,
-            )
-            second = model.sample_draft_tokens(
-                draft_hidden=hidden,
-                lm_head=FailingLMHead(),
-                first_prev_token_ids=previous,
-                compile_serial_head=True,
-            )
-
-        compile_mock.assert_called_once()
-        self.assertTrue(torch.equal(first[0], second[0]))
-        self.assertTrue(torch.equal(first[1], second[1]))
-
-    def test_chunked_teacher_forcing_loss(self) -> None:
-        config = Qwen3Config(
-            vocab_size=31,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "target_layer_ids": [0, 3],
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "chs_num_layers": 2,
-            "markov_head_type": "rnn_easy",
-            "markov_output_mode": "direct",
-            "markov_rank": 6,
-        }
-        draft_model = FlashMTPDraftModel(config)
-        wrapper = OnlineFlashMTPModel(
-            draft_model=draft_model,
-            target_lm_head=nn.Linear(16, 31, bias=False),
-            target_embed_tokens=nn.Embedding(31, 16),
-            mask_token_id=30,
-            block_size=4,
-            num_anchors=2,
-            ce_chunk_size=3,
-            final_ce_weight=0.3,
-            tv_loss_weight=0.7,
-        )
-        prediction_hidden = torch.randn(2, 2, 3, 16, requires_grad=True)
-        target_prediction_hidden = torch.randn(
-            2, 2, 3, 16, requires_grad=True
-        )
-        prev_token_ids = torch.randint(0, 31, (2, 2, 3))
-        labels = torch.randint(0, 31, (2, 2, 3))
-        weight_mask = torch.tensor(
-            [
-                [[1.0, 0.5, 0.25], [1.0, 0.5, 0.0]],
-                [[1.0, 0.5, 0.25], [1.0, 0.0, 0.0]],
-            ]
-        )
-        binary_eval_mask = weight_mask > 0
-        block_keep_mask = torch.ones(2, 2, dtype=torch.bool)
-
-        loss, accuracy, prefix_acc, final_ce_loss, base_ce_loss, tv_loss = (
-            wrapper._chunked_weighted_ce_and_metrics(
-                prediction_hidden=prediction_hidden,
-                prev_token_ids=prev_token_ids,
-                labels=labels,
-                weight_mask=weight_mask,
-                binary_eval_mask=binary_eval_mask,
-                block_keep_mask=block_keep_mask,
-                target_prediction_hidden=target_prediction_hidden,
-            )
-        )
-        markov_latent = draft_model.markov_head.forward_teacher_forcing(
-            hidden_states=prediction_hidden,
-            prev_token_ids=prev_token_ids,
-            output_mode="direct",
-        )
-        draft_logits = draft_model.markov_head.project_logits(markov_latent)
-        target_logits = wrapper.lm_head(target_prediction_hidden)
-        manual_tv = (
-            (
-                F.softmax(draft_logits, dim=-1)
-                - F.softmax(target_logits, dim=-1)
-            )
-            .abs()
-            .sum(dim=-1)
-            .mul(weight_mask)
-            .sum()
-            / (weight_mask.sum() + 1e-6)
-        )
-        manual_ce = (
-            F.cross_entropy(
-                draft_logits.reshape(-1, draft_logits.size(-1)),
-                labels.reshape(-1),
-                reduction="none",
-            )
-            .view_as(labels)
-            .mul(weight_mask)
-            .sum()
-            / (weight_mask.sum() + 1e-6)
-        )
-        self.assertTrue(torch.isfinite(loss))
-        self.assertTrue(torch.allclose(final_ce_loss, manual_ce))
-        self.assertEqual(float(base_ce_loss), 0.0)
-        self.assertTrue(torch.allclose(tv_loss, manual_tv))
-        self.assertTrue(
-            torch.allclose(loss, 0.3 * manual_ce + 0.7 * manual_tv)
-        )
-        self.assertTrue(0.0 <= float(accuracy) <= 1.0)
-        self.assertTrue(1.0 <= float(prefix_acc) <= 4.0)
         loss.backward()
-        self.assertIsNotNone(prediction_hidden.grad)
-        self.assertIsNotNone(target_prediction_hidden.grad)
-        self.assertIsNotNone(draft_model.markov_head.output_proj.weight.grad)
-        self.assertIsNotNone(draft_model.markov_head.state_hidden_mlp.weight.grad)
-        self.assertIsNotNone(draft_model.markov_head.state_proj.weight.grad)
+        self.assertIsNotNone(student.grad)
+        self.assertIsNone(teacher.grad)
+        self.assertEqual(head.calls, 2)
 
-    def test_base_lm_ce_auxiliary_loss(self) -> None:
-        config = Qwen3Config(
-            vocab_size=31,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-        )
-        config.num_target_layers = 4
-        config.block_size = 4
-        config.flashmtp_config = {
-            "target_layer_ids": [0, 3],
-            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
-            "sliding_window_size": 4,
-            "chs_num_layers": 2,
-            "markov_head_type": "rnn",
-            "markov_output_mode": "direct",
-            "markov_rank": 6,
-        }
-        draft_model = FlashMTPDraftModel(config)
-        wrapper = OnlineFlashMTPModel(
-            draft_model=draft_model,
-            target_lm_head=nn.Linear(16, 31, bias=False),
-            target_embed_tokens=nn.Embedding(31, 16),
-            mask_token_id=30,
-            block_size=4,
-            num_anchors=2,
-            ce_chunk_size=3,
-            base_lm_ce_weight=0.5,
-            base_lm_ce_decay_gamma=2.0,
-            tv_loss_weight=0.0,
-        )
-        prediction_hidden = torch.randn(2, 2, 3, 16, requires_grad=True)
-        prev_token_ids = torch.randint(0, 31, (2, 2, 3))
-        labels = torch.randint(0, 31, (2, 2, 3))
-        weight_mask = torch.ones(2, 2, 3)
-        base_weight_mask = torch.tensor(
-            [[[1.0, 0.5, 0.25], [1.0, 0.5, 0.25]], [[1.0, 0.5, 0.25], [1.0, 0.5, 0.25]]]
-        )
-        binary_eval_mask = torch.ones(2, 2, 3, dtype=torch.bool)
-        block_keep_mask = torch.ones(2, 2, dtype=torch.bool)
+    def test_stage1_masked_nan_does_not_contaminate_loss(self):
+        head = CountingHead()
+        student = torch.randn(1, 2, 3, 16, requires_grad=True)
+        teacher = torch.randn(1, 2, 3, 16, requires_grad=True)
+        with torch.no_grad():
+            student[:, 1].fill_(float("nan"))
+            teacher[:, 1].fill_(float("nan"))
+        weights = torch.tensor([[[1.0, 1.0, 1.0], [0.0, 0.0, 0.0]]])
 
-        loss, _, _, final_ce_loss, base_ce_loss, tv_loss = (
-            wrapper._chunked_weighted_ce_and_metrics(
-                prediction_hidden=prediction_hidden,
-                prev_token_ids=prev_token_ids,
-                labels=labels,
-                weight_mask=weight_mask,
-                binary_eval_mask=binary_eval_mask,
-                block_keep_mask=block_keep_mask,
-                base_weight_mask=base_weight_mask,
-            )
+        loss, tv_loss, hidden_loss = compute_stage1_distillation_loss(
+            student_hidden=student,
+            teacher_hidden=teacher,
+            lm_head=head,
+            raw_weight_mask=weights,
+            tv_weight=1.0,
+            hidden_weight=1.0,
+            smooth_l1_beta=1.0,
+            loss_decay_gamma=2.0,
         )
+
         self.assertTrue(torch.isfinite(loss))
-        self.assertTrue(torch.isfinite(final_ce_loss))
-        self.assertTrue(torch.isfinite(base_ce_loss))
-        self.assertGreater(float(base_ce_loss), 0.0)
-        self.assertEqual(float(tv_loss), 0.0)
+        self.assertTrue(torch.isfinite(tv_loss))
+        self.assertTrue(torch.isfinite(hidden_loss))
         loss.backward()
-        self.assertIsNotNone(prediction_hidden.grad)
+        self.assertTrue(torch.isfinite(student.grad).all())
+        self.assertTrue(torch.isfinite(head.weight.grad).all())
+        self.assertTrue(torch.equal(student.grad[:, 1], torch.zeros_like(student.grad[:, 1])))
+        self.assertIsNone(teacher.grad)
+
+    def test_serial_head_copy_does_not_touch_backbone(self):
+        teacher = make_model("swa_teacher")
+        student = make_model("pivot_q_student")
+        before = student.layers[0].self_attn.q_proj.weight.detach().clone()
+        with torch.no_grad():
+            for parameter in teacher.markov_head.parameters():
+                parameter.fill_(0.25)
+        _copy_serial_head(teacher, student)
+        self.assertTrue(torch.equal(before, student.layers[0].self_attn.q_proj.weight))
+        for parameter in student.markov_head.parameters():
+            self.assertTrue(torch.all(parameter == 0.25))
+
+    def test_shared_init_copies_only_parallel_backbone(self):
+        teacher = make_model("swa_teacher")
+        student = make_model("pivot_q_student")
+        with torch.no_grad():
+            for module_name in SHARED_BACKBONE_MODULES:
+                for parameter in getattr(teacher, module_name).parameters():
+                    parameter.fill_(0.25)
+            for parameter in teacher.markov_head.parameters():
+                parameter.fill_(0.5)
+            for parameter in teacher.history_fuse.parameters():
+                parameter.fill_(0.75)
+        serial_before = {
+            name: value.detach().clone()
+            for name, value in student.markov_head.state_dict().items()
+        }
+        history_before = {
+            name: value.detach().clone()
+            for name, value in student.history_fuse.state_dict().items()
+        }
+
+        _copy_shared_backbone(teacher, student)
+
+        for module_name in SHARED_BACKBONE_MODULES:
+            for parameter in getattr(student, module_name).parameters():
+                self.assertTrue(torch.all(parameter == 0.25))
+        for name, value in student.markov_head.state_dict().items():
+            self.assertTrue(torch.equal(value, serial_before[name]))
+        for name, value in student.history_fuse.state_dict().items():
+            self.assertTrue(torch.equal(value, history_before[name]))
+
+    def test_student_init_mode_is_checkpoint_stable(self):
+        self.assertEqual(_resolve_student_init_mode(None, None), "scratch")
+        self.assertEqual(_resolve_student_init_mode("shared_init", None), "shared_init")
+        state = {"student_init_mode": "shared_init"}
+        self.assertEqual(_resolve_student_init_mode(None, state), "shared_init")
+        with self.assertRaisesRegex(ValueError, "must match"):
+            _resolve_student_init_mode("scratch", state)
+        inconsistent = {
+            "student_init_mode": "shared_init",
+            "shared_backbone_inherited": False,
+        }
+        with self.assertRaisesRegex(ValueError, "metadata is inconsistent"):
+            _resolve_student_init_mode(None, inconsistent)
 
 
 if __name__ == "__main__":

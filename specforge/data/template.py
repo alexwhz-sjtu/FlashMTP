@@ -204,9 +204,22 @@ TEMPLATE_REGISTRY.register(
 TEMPLATE_REGISTRY.register(
     name="qwen3-instruct",
     template=ChatTemplate(
-        assistant_header="<|im_start|>assistant\n<think>\n\n</think>\n",
+        # Qwen3's enable_thinking=False generation prompt ends with two
+        # newlines after </think>.  Keep the parser boundary token-exact so
+        # the final prompt newline is not mislabeled as an assistant target.
+        assistant_header="<|im_start|>assistant\n<think>\n\n</think>\n\n",
         user_header="<|im_start|>user\n",
         system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|im_end|>\n",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="qwen3-instruct-nosystem",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        user_header="<|im_start|>user\n",
+        system_prompt=None,
         end_of_turn_token="<|im_end|>\n",
     ),
 )

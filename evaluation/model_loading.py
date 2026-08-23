@@ -46,13 +46,12 @@ def flashmtp_config_summary(draft_model: FlashMTPDraftModel) -> dict[str, Any]:
     fcfg = getattr(draft_model.config, "flashmtp_config", None) or {}
     return {
         "architecture_version": fcfg.get("architecture_version"),
-        "sliding_window_size": draft_model.sliding_window_size,
-        "history_slot_count": draft_model.history_slot_count,
-        "history_mode": getattr(draft_model, "history_mode", fcfg.get("history_mode", "fuse")),
+        "model_role": draft_model.model_role,
+        "swa_window_size": draft_model.swa_window_size,
+        "anchor_group_size": draft_model.anchor_group_size,
+        "fuse_slot_count": draft_model.fuse_slot_count,
         "chs_num_layers": draft_model.chs_num_layers,
-        "current_chs_slots": draft_model.current_chs_slot_count,
         "condition_slots": draft_model.condition_slot_count,
-        "local_position": draft_model.local_position,
         "target_layer_ids": getattr(draft_model, "target_layer_ids", None),
         "history_layer_ids": getattr(draft_model, "history_layer_ids", None),
         "block_size": int(getattr(draft_model, "block_size", fcfg.get("block_size", 0))),
@@ -62,35 +61,23 @@ def flashmtp_config_summary(draft_model: FlashMTPDraftModel) -> dict[str, Any]:
         ),
         "markov_rank": getattr(draft_model, "markov_rank", fcfg.get("markov_rank", 0)),
         "mask_token_id": getattr(draft_model, "mask_token_id", fcfg.get("mask_token_id")),
-        "pivot_query_embedding": getattr(
-            draft_model, "pivot_query_embedding", fcfg.get("pivot_query_embedding", False)
-        ),
-        "include_token_embedding_chs": getattr(
-            draft_model,
-            "include_token_embedding_chs",
-            fcfg.get("include_token_embedding_chs", False),
-        ),
     }
 
 
 def log_flashmtp_config(draft_model: FlashMTPDraftModel) -> dict[str, Any]:
     summary = flashmtp_config_summary(draft_model)
     logger.info(
-        "FlashMTP draft: architecture_version={} sliding_window_size={} "
-        "history_mode={} history_slots={} chs_num_layers={} current_chs_slots={} condition_slots={} "
-        "pivot_query_embedding={} include_token_embedding_chs={} local_position={} "
+        "FlashMTP draft: architecture_version={} model_role={} swa_window_size={} "
+        "anchor_group_size={} fuse_slots={} chs_num_layers={} condition_slots={} "
         "target_layer_ids={} history_layer_ids={} block_size={} markov_head_type={} markov_output_mode={} "
         "markov_rank={} mask_token_id={}",
         summary["architecture_version"],
-        summary["sliding_window_size"],
-        summary["history_mode"],
-        summary["history_slot_count"],
+        summary["model_role"],
+        summary["swa_window_size"],
+        summary["anchor_group_size"],
+        summary["fuse_slot_count"],
         summary["chs_num_layers"],
-        summary["current_chs_slots"],
         summary["condition_slots"],
-        summary["pivot_query_embedding"],
-        summary["include_token_embedding_chs"],
-        summary["local_position"],
         summary["target_layer_ids"],
         summary["history_layer_ids"],
         summary["block_size"],
@@ -107,47 +94,24 @@ def validate_decode_config(draft_model: FlashMTPDraftModel) -> None:
     summary = flashmtp_config_summary(draft_model)
     markov_head_type = str(summary["markov_head_type"])
     markov_output_mode = str(summary["markov_output_mode"])
-    history_mode = str(getattr(draft_model, "history_mode", summary.get("history_mode", "fuse")))
-    if history_mode == "pivot_q":
+    if draft_model.is_student:
         logger.info(
-            "Pivot-Q layout: window embeddings are draft queries "
-            "[embed(a-W+1)..embed(a-1), embed(a), MASK...]; CHS remains context KV. "
-            "block_size={} proposals={} dense_window={} history_slots={} query_len={}",
+            "PivotQ student: Q=[embed(a-G+1)..embed(a), MASK...], local RoPE; "
+            "CHS is context KV. block_size={} proposals={} G={} query_len={}",
             summary["block_size"],
             draft_model.proposal_length,
-            summary["sliding_window_size"],
-            summary["history_slot_count"],
+            summary["anchor_group_size"],
             draft_model.draft_query_length,
-        )
-    elif summary["pivot_query_embedding"]:
-        logger.info(
-            "Pivot-query layout: draft Q=[embed(a-1), embed(a), MASK...]; "
-            "current CHS keeps transformer layers only. block_size={} proposals={} "
-            "dense_window={} history_slots={}",
-            summary["block_size"],
-            draft_model.proposal_length,
-            summary["sliding_window_size"],
-            summary["history_slot_count"],
-        )
-    elif summary["include_token_embedding_chs"]:
-        logger.info(
-            "Block alignment: token-embedding CHS + anchor query (config block_size={} "
-            "is anchor-inclusive; anchor unsupervised; proposals={}); "
-            "dense_window={} history_slots={}",
-            summary["block_size"],
-            draft_model.proposal_length,
-            summary["sliding_window_size"],
-            summary["history_slot_count"],
         )
     else:
         logger.info(
-            "CHS-first layout: transformer CHS hidden slots precede the explicit "
-            "history window; draft Q is [embed(a), MASK...]. block_size={} "
-            "proposals={} dense_window={} history_slots={}",
+            "SWA teacher: KV=[fuse(a-W)..fuse(a-2), CHS(a-1)], "
+            "Q=[embed(a-G+1)..embed(a), MASK...], global RoPE. "
+            "block_size={} proposals={} W={} G={}",
             summary["block_size"],
             draft_model.proposal_length,
-            summary["sliding_window_size"],
-            summary["history_slot_count"],
+            summary["swa_window_size"],
+            summary["anchor_group_size"],
         )
 
     if markov_head_type == "none":
@@ -203,21 +167,6 @@ def load_flashmtp_benchmark_models(
         dtype=torch.bfloat16,
         trust_remote_code=getattr(args, "trust_remote_code", False),
     ).to(device).eval()
-
-    local_position_override = getattr(args, "local_position", None)
-    if local_position_override is not None:
-        draft_model.set_local_position(bool(local_position_override))
-        logger.info(
-            "Overriding draft-only local_position={} (target positions/cache unchanged)",
-            draft_model.local_position,
-        )
-
-    if args.block_size is not None:
-        draft_model.set_config_block_size(args.block_size)
-        logger.info(
-            "Overriding legacy config block_size={}",
-            draft_model.block_size,
-        )
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path,

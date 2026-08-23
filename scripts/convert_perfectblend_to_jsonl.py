@@ -5,7 +5,7 @@ Input (ShareGPT-style, as in mlabonne/open-perfectblend):
   conversations: [{"from": "human"|"gpt"|..., "value": str}, ...]
   source: str
 
-Output (compatible with train_flashmtp.py / regenerate_train_data.py):
+Output (compatible with the current FlashMTP training entrypoints):
   {"id": int, "conversations": [{"role": "user"|"assistant"|"system", "content": str}], "source": str}
 
 Usage:
