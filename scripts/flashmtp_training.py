@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import math
 import os
@@ -45,7 +46,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     model.add_argument("--swa-window-size", type=int, default=32)
     model.add_argument("--anchor-group-size", type=int, default=8)
     model.add_argument("--chs-num-layers", type=int, default=7)
-    model.add_argument("--mask-token-id", type=int)
+    model.add_argument(
+        "--mask-token-id",
+        type=int,
+        default=151669,
+        help="In-vocabulary v2 MASK row (default: Qwen3 token 151669).",
+    )
     model.add_argument("--num-anchors", type=int, default=512)
     model.add_argument("--markov-head-type", default="vanilla", choices=["none", "vanilla", "gated", "rnn", "rnn_easy"])
     model.add_argument("--markov-output-mode", default="additive", choices=["additive", "direct"])
@@ -53,7 +59,10 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     model.add_argument("--trust-remote-code", action="store_true")
 
     data = parser.add_argument_group("dataset")
-    data.add_argument("--train-data-path", required=True)
+    data.add_argument(
+        "--train-data-path",
+        help="Single-dataset path (teacher training or two-stage compatibility fallback).",
+    )
     data.add_argument("--chat-template", default="qwen")
     data.add_argument("--is-preformatted", action="store_true")
     data.add_argument("--max-length", type=int, default=4096)
@@ -248,38 +257,184 @@ def resolve_tokenizer_and_components(args, draft_models, target=None):
     return tokenizer, components, mask_token_id
 
 
-def build_train_dataloader(args, tokenizer):
+def _build_processed_dataset(
+    args,
+    tokenizer,
+    *,
+    train_data_path: str,
+    cache_namespace: str,
+    num_proc: Optional[int] = None,
+):
     cache_key = hashlib.md5(
         (
-            f"{args.train_data_path}-{args.max_length}-{args.chat_template}-"
+            f"{train_data_path}-{args.max_length}-{args.chat_template}-"
             f"{args.target_model_path}-preformatted={args.is_preformatted}"
         ).encode()
     ).hexdigest()
-    raw = load_dataset("json", data_files=args.train_data_path)["train"]
-    kwargs = dict(
+    raw = load_dataset("json", data_files=train_data_path)["train"]
+    return build_eagle3_dataset(
         dataset=raw,
         tokenizer=tokenizer,
         chat_template=args.chat_template,
         max_length=args.max_length,
         is_preformatted=args.is_preformatted,
-        cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+        cache_dir=os.path.join(
+            args.cache_dir, cache_namespace, "processed_dataset"
+        ),
         cache_key=cache_key,
-        num_proc=args.build_dataset_num_proc,
+        num_proc=(
+            args.build_dataset_num_proc if num_proc is None else int(num_proc)
+        ),
     )
-    if dist.get_rank() == 0:
-        dataset = build_eagle3_dataset(**kwargs)
-    dist.barrier()
-    if dist.get_rank() != 0:
-        dataset = build_eagle3_dataset(**kwargs)
+
+
+def _prepare_dataloader(args, dataset, *, train_data_path: str):
     minimum = 2 * int(args.block_size)
     dataset = dataset.filter(lambda value: value["loss_mask"].sum() >= minimum)
-    return prepare_dp_dataloaders(
+    dataloader = prepare_dp_dataloaders(
         dataset,
         args.batch_size,
         num_workers=args.dataloader_num_workers,
         shuffle=True,
         process_group=get_dp_group(),
         pad_to_length=args.max_length,
+    )
+    if len(dataloader) == 0:
+        raise ValueError(
+            f"Training dataset {train_data_path!r} has no full batches after filtering."
+        )
+    return dataloader
+
+
+def build_train_dataloader(
+    args,
+    tokenizer,
+    *,
+    train_data_path: Optional[str] = None,
+    cache_namespace: str = "single",
+    num_proc: Optional[int] = None,
+):
+    train_data_path = train_data_path or args.train_data_path
+    if not train_data_path:
+        raise ValueError("A training data path is required.")
+    dataset = None
+    if dist.get_rank() == 0:
+        dataset = _build_processed_dataset(
+            args,
+            tokenizer,
+            train_data_path=train_data_path,
+            cache_namespace=cache_namespace,
+            num_proc=num_proc,
+        )
+    dist.barrier()
+    if dataset is None:
+        dataset = _build_processed_dataset(
+            args,
+            tokenizer,
+            train_data_path=train_data_path,
+            cache_namespace=cache_namespace,
+            num_proc=num_proc,
+        )
+    return _prepare_dataloader(
+        args, dataset, train_data_path=train_data_path
+    )
+
+
+def build_two_stage_dataloaders(args, tokenizer):
+    """Preprocess Stage 1/2 concurrently, then create independent dataloaders."""
+    stage1_path = args.stage1_train_data_path
+    stage2_path = args.stage2_train_data_path
+    same_dataset = os.path.realpath(stage1_path) == os.path.realpath(stage2_path)
+    stage1_namespace = "shared" if same_dataset else "stage1"
+    stage2_namespace = "shared" if same_dataset else "stage2"
+    stage1_num_proc = (
+        args.stage1_build_dataset_num_proc or args.build_dataset_num_proc
+    )
+    stage2_num_proc = (
+        args.stage2_build_dataset_num_proc or args.build_dataset_num_proc
+    )
+
+    stage1_dataset = stage2_dataset = None
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    if same_dataset:
+        if rank == 0:
+            stage1_dataset = _build_processed_dataset(
+                args,
+                tokenizer,
+                train_data_path=stage1_path,
+                cache_namespace=stage1_namespace,
+                num_proc=stage1_num_proc,
+            )
+            stage2_dataset = stage1_dataset
+    elif world_size >= 2:
+        # Shared storage lets two global ranks build disjoint caches at once.
+        if rank == 0:
+            stage1_dataset = _build_processed_dataset(
+                args,
+                tokenizer,
+                train_data_path=stage1_path,
+                cache_namespace=stage1_namespace,
+                num_proc=stage1_num_proc,
+            )
+        elif rank == 1:
+            stage2_dataset = _build_processed_dataset(
+                args,
+                tokenizer,
+                train_data_path=stage2_path,
+                cache_namespace=stage2_namespace,
+                num_proc=stage2_num_proc,
+            )
+    else:
+        # Keep the requested startup concurrency for single-process debugging.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            stage1_future = executor.submit(
+                _build_processed_dataset,
+                args,
+                tokenizer,
+                train_data_path=stage1_path,
+                cache_namespace=stage1_namespace,
+                num_proc=stage1_num_proc,
+            )
+            stage2_future = executor.submit(
+                _build_processed_dataset,
+                args,
+                tokenizer,
+                train_data_path=stage2_path,
+                cache_namespace=stage2_namespace,
+                num_proc=stage2_num_proc,
+            )
+            stage1_dataset = stage1_future.result()
+            stage2_dataset = stage2_future.result()
+
+    dist.barrier()
+    if stage1_dataset is None:
+        stage1_dataset = _build_processed_dataset(
+            args,
+            tokenizer,
+            train_data_path=stage1_path,
+            cache_namespace=stage1_namespace,
+            num_proc=stage1_num_proc,
+        )
+    if stage2_dataset is None:
+        stage2_dataset = (
+            stage1_dataset
+            if same_dataset
+            else _build_processed_dataset(
+                args,
+                tokenizer,
+                train_data_path=stage2_path,
+                cache_namespace=stage2_namespace,
+                num_proc=stage2_num_proc,
+            )
+        )
+    print_on_rank0(
+        "Stage 1 and Stage 2 dataset preprocessing is complete: "
+        f"stage1={stage1_path!r}, stage2={stage2_path!r}."
+    )
+    return (
+        _prepare_dataloader(args, stage1_dataset, train_data_path=stage1_path),
+        _prepare_dataloader(args, stage2_dataset, train_data_path=stage2_path),
     )
 
 
@@ -439,6 +594,7 @@ __all__ = [
     "build_target_and_components",
     "build_target_model",
     "build_train_dataloader",
+    "build_two_stage_dataloaders",
     "hidden_states_to_cuda",
     "load_training_state",
     "log_cuda_peak",

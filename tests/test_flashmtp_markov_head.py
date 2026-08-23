@@ -1,5 +1,7 @@
 import copy
+import threading
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -67,6 +69,47 @@ class CountingHead(nn.Linear):
 
 
 class CurrentFlashMTPArchitectureTest(unittest.TestCase):
+    def test_two_stage_dataset_preprocessing_starts_concurrently(self):
+        args = SimpleNamespace(
+            stage1_train_data_path="/data/stage1.jsonl",
+            stage2_train_data_path="/data/stage2.jsonl",
+            stage1_build_dataset_num_proc=3,
+            stage2_build_dataset_num_proc=5,
+            build_dataset_num_proc=8,
+        )
+        rendezvous = threading.Barrier(2)
+        calls = []
+
+        def build(_args, _tokenizer, **kwargs):
+            calls.append((kwargs["cache_namespace"], kwargs["num_proc"]))
+            rendezvous.wait(timeout=2)
+            return kwargs["cache_namespace"]
+
+        def prepare(_args, dataset, *, train_data_path):
+            return dataset, train_data_path
+
+        with (
+            mock.patch.object(flashmtp_training.dist, "get_rank", return_value=0),
+            mock.patch.object(
+                flashmtp_training.dist, "get_world_size", return_value=1
+            ),
+            mock.patch.object(flashmtp_training.dist, "barrier"),
+            mock.patch.object(
+                flashmtp_training, "_build_processed_dataset", side_effect=build
+            ),
+            mock.patch.object(
+                flashmtp_training, "_prepare_dataloader", side_effect=prepare
+            ),
+            mock.patch.object(flashmtp_training, "print_on_rank0"),
+        ):
+            stage1, stage2 = flashmtp_training.build_two_stage_dataloaders(
+                args, object()
+            )
+
+        self.assertCountEqual(calls, [("stage1", 3), ("stage2", 5)])
+        self.assertEqual(stage1, ("stage1", "/data/stage1.jsonl"))
+        self.assertEqual(stage2, ("stage2", "/data/stage2.jsonl"))
+
     def test_stage_total_steps_carries_accumulation_across_epochs(self):
         from scripts.flashmtp_training import stage_total_steps
 

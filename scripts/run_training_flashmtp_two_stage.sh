@@ -6,21 +6,55 @@ PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
 cd "${PROJECT_DIR}"
 export PYTHONPATH="${PROJECT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+PASSTHROUGH_ARGS=()
+DT="${DT:-a800}"
+while (( $# > 0 )); do
+  case "$1" in
+    --dt)
+      if (( $# < 2 )); then
+        echo "--dt requires qz, a800, or h100" >&2
+        exit 2
+      fi
+      DT="$2"
+      shift 2
+      ;;
+    *)
+      PASSTHROUGH_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+case "${DT}" in
+  qz|a800|h100) ;;
+  *) echo "--dt must be qz, a800, or h100; got ${DT}" >&2; exit 2 ;;
+esac
+if [[ "${DT}" == "qz" ]]; then
+  export WANDB_MODE="${WANDB_MODE:-offline}"
+fi
+
+if [[ -z "${PYTHON_BIN:-}" && -x "${PROJECT_DIR}/.venv/bin/python" ]]; then
+  PYTHON_BIN="${PROJECT_DIR}/.venv/bin/python"
+else
+  PYTHON_BIN="${PYTHON_BIN:-python3}"
+fi
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   echo "Python executable not found: ${PYTHON_BIN}" >&2
   exit 2
 fi
 
 if [[ -z "${NPROC_PER_NODE:-}" ]]; then
+  NPROC_PER_NODE="${PET_NPROC_PER_NODE:-}"
+fi
+if [[ -z "${NPROC_PER_NODE}" ]]; then
   NPROC_PER_NODE="$("${PYTHON_BIN}" -c 'import torch; print(torch.cuda.device_count())')"
 fi
-NNODES="${NNODES:-1}"
-NODE_RANK="${NODE_RANK:-0}"
-MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-MASTER_PORT="${MASTER_PORT:-29502}"
+NNODES="${PET_NNODES:-${NNODES:-1}}"
+NODE_RANK="${PET_NODE_RANK:-${NODE_RANK:-0}}"
+MASTER_ADDR="${MASTER_ADDR:-${PET_MASTER_ADDR:-127.0.0.1}}"
+MASTER_PORT="${MASTER_PORT:-${PET_MASTER_PORT:-29502}}"
 TP_SIZE="${TP_SIZE:-1}"
 SHARD_DRAFT_BY_TP="${SHARD_DRAFT_BY_TP:-0}"
+export MASTER_ADDR MASTER_PORT
 
 is_nonnegative_integer() {
   [[ "$1" =~ ^[0-9]+$ ]]
@@ -61,8 +95,10 @@ if (( NNODES > 1 )) && [[ "${MASTER_ADDR}" == "127.0.0.1" || "${MASTER_ADDR}" ==
 fi
 
 : "${TARGET_MODEL:?set TARGET_MODEL}"
-: "${TRAIN_DATA_PATH:?set TRAIN_DATA_PATH}"
-: "${OUTPUT_DIR:?set OUTPUT_DIR}"
+STAGE1_TRAIN_DATA_PATH="${STAGE1_TRAIN_DATA_PATH:-${TRAIN_DATA_PATH:-}}"
+STAGE2_TRAIN_DATA_PATH="${STAGE2_TRAIN_DATA_PATH:-${TRAIN_DATA_PATH:-}}"
+: "${STAGE1_TRAIN_DATA_PATH:?set STAGE1_TRAIN_DATA_PATH (or legacy TRAIN_DATA_PATH)}"
+: "${STAGE2_TRAIN_DATA_PATH:?set STAGE2_TRAIN_DATA_PATH (or legacy TRAIN_DATA_PATH)}"
 : "${STAGE1_EPOCHS:?set STAGE1_EPOCHS}"
 : "${STAGE1_LEARNING_RATE:?set STAGE1_LEARNING_RATE}"
 : "${STAGE2_EPOCHS:?set STAGE2_EPOCHS}"
@@ -73,11 +109,111 @@ if [[ -z "${RESUME_FROM:-}" && -z "${TEACHER_DRAFT_PATH:-}" ]]; then
   exit 2
 fi
 
+TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
+MASK_TOKEN_ID="${MASK_TOKEN_ID:-151669}"
+STUDENT_INIT_MODE="${STUDENT_INIT_MODE:-shared_init}"
+STAGE1_WARMUP_RATIO="${STAGE1_WARMUP_RATIO:-0.04}"
+STAGE1_TV_WEIGHT="${STAGE1_TV_WEIGHT:-1.0}"
+STAGE1_HIDDEN_WEIGHT="${STAGE1_HIDDEN_WEIGHT:-1.0}"
+STAGE1_SMOOTH_L1_BETA="${STAGE1_SMOOTH_L1_BETA:-1.0}"
+STAGE1_LOSS_DECAY_GAMMA="${STAGE1_LOSS_DECAY_GAMMA:-}"
+STAGE2_WARMUP_RATIO="${STAGE2_WARMUP_RATIO:-0.04}"
+STAGE2_FINAL_CE_WEIGHT="${STAGE2_FINAL_CE_WEIGHT:-1.0}"
+STAGE2_TV_WEIGHT="${STAGE2_TV_WEIGHT:-1.0}"
+STAGE2_BASE_CE_WEIGHT="${STAGE2_BASE_CE_WEIGHT:-0.0}"
+STAGE2_LOSS_DECAY_GAMMA="${STAGE2_LOSS_DECAY_GAMMA:-}"
+STAGE2_BASE_CE_DECAY_GAMMA="${STAGE2_BASE_CE_DECAY_GAMMA:-}"
+MAX_LENGTH="${MAX_LENGTH:-4096}"
+NUM_ANCHORS="${NUM_ANCHORS:-512}"
+ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
+REQUESTED_BATCH_SIZE="${BATCH_SIZE:-1}"
+NAME_TARGET_BATCH="${REQUESTED_BATCH_SIZE}"
+NAME_DRAFT_BATCH="${REQUESTED_BATCH_SIZE}"
+if [[ "${SHARD_DRAFT_BY_TP}" == "1" ]]; then
+  NAME_TARGET_BATCH="${TP_SIZE}"
+  NAME_DRAFT_BATCH="1"
+fi
+WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
+
+slug() {
+  local value="$1"
+  local limit="$2"
+  value="$(printf '%s' "${value}" | sed -E 's/[^[:alnum:]_.-]+/-/g; s/^-+//; s/-+$//')"
+  [[ -n "${value}" ]] || value="na"
+  printf '%.*s' "${limit}" "${value}"
+}
+
+TARGET_BASENAME="${TARGET_MODEL%/}"
+TARGET_BASENAME="${TARGET_BASENAME##*/}"
+TARGET_TAG="$(slug "${TARGET_BASENAME}" 14)"
+STAGE1_DATA_BASENAME="${STAGE1_TRAIN_DATA_PATH%/}"
+STAGE1_DATA_BASENAME="${STAGE1_DATA_BASENAME##*/}"
+STAGE1_DATA_BASENAME="${STAGE1_DATA_BASENAME%.jsonl}"
+STAGE1_DATA_TAG="$(slug "${STAGE1_DATA_BASENAME}" 18)"
+STAGE2_DATA_BASENAME="${STAGE2_TRAIN_DATA_PATH%/}"
+STAGE2_DATA_BASENAME="${STAGE2_DATA_BASENAME##*/}"
+STAGE2_DATA_BASENAME="${STAGE2_DATA_BASENAME%.jsonl}"
+STAGE2_DATA_TAG="$(slug "${STAGE2_DATA_BASENAME}" 18)"
+DATA_TAG="s1${STAGE1_DATA_TAG}_s2${STAGE2_DATA_TAG}"
+
+TEACHER_SOURCE="${TEACHER_DRAFT_PATH:-${RESUME_FROM:-checkpoint}}"
+TEACHER_SOURCE="${TEACHER_SOURCE%/}"
+TEACHER_BASENAME="${TEACHER_SOURCE##*/}"
+case "${TEACHER_BASENAME}" in
+  final|transition|epoch_*_step_*)
+    TEACHER_PARENT="${TEACHER_SOURCE%/*}"
+    TEACHER_BASENAME="${TEACHER_PARENT##*/}"
+    ;;
+esac
+TEACHER_TAG="$(slug "${TEACHER_BASENAME}" 28)"
+TEACHER_WANDB_TAG="$(slug "${TEACHER_BASENAME}" 24)"
+TEACHER_CONFIG="${TEACHER_DRAFT_PATH:-}/config.json"
+if [[ -n "${TEACHER_DRAFT_PATH:-}" && -f "${TEACHER_CONFIG}" ]]; then
+  TEACHER_ARCH_META="$("${PYTHON_BIN}" -c '
+import json, sys
+c = json.load(open(sys.argv[1], encoding="utf-8"))
+f = c.get("flashmtp_config") or {}
+v = lambda key, default="x": f.get(key, c.get(key, default))
+full = "swa{}_ag{}_chs{}_b{}_d{}_{}_{}_r{}".format(
+    v("swa_window_size"), v("anchor_group_size"), v("chs_num_layers"),
+    c.get("block_size", "x"), c.get("num_hidden_layers", "x"),
+    v("markov_head_type"), v("markov_output_mode"), v("markov_rank"),
+)
+short = "s{}g{}c{}b{}d{}-{}-{}-r{}".format(
+    v("swa_window_size"), v("anchor_group_size"), v("chs_num_layers"),
+    c.get("block_size", "x"), c.get("num_hidden_layers", "x"),
+    v("markov_head_type"), v("markov_output_mode"), v("markov_rank"),
+)
+print(full + "|" + short)
+' "${TEACHER_CONFIG}")"
+  TEACHER_TAG="$(slug "${TEACHER_ARCH_META%%|*}" 64)"
+  TEACHER_WANDB_TAG="$(slug "${TEACHER_ARCH_META#*|}" 40)"
+fi
+
+RUN_TAG="v23s_${DT}_${TARGET_TAG}_${DATA_TAG}_ws${WORLD_SIZE}_tp${TP_SIZE}_sh${SHARD_DRAFT_BY_TP}_tb${NAME_TARGET_BATCH}_db${NAME_DRAFT_BATCH}_${TEACHER_TAG}_i${STUDENT_INIT_MODE}_m${MASK_TOKEN_ID}_1e${STAGE1_EPOCHS}_lr${STAGE1_LEARNING_RATE}_w${STAGE1_WARMUP_RATIO}_tv${STAGE1_TV_WEIGHT}_h${STAGE1_HIDDEN_WEIGHT}_g${STAGE1_LOSS_DECAY_GAMMA:-none}_2e${STAGE2_EPOCHS}_lr${STAGE2_LEARNING_RATE}_w${STAGE2_WARMUP_RATIO}_ce${STAGE2_FINAL_CE_WEIGHT}_tv${STAGE2_TV_WEIGHT}_b${STAGE2_BASE_CE_WEIGHT}_g${STAGE2_LOSS_DECAY_GAMMA:-none}_bg${STAGE2_BASE_CE_DECAY_GAMMA:-none}_L${MAX_LENGTH}_A${NUM_ANCHORS}_ac${ACCUMULATION_STEPS}"
+if [[ -n "${RUN_SUFFIX:-}" ]]; then
+  RUN_TAG="$(slug "${RUN_TAG}" 210)_$(slug "${RUN_SUFFIX}" 24)"
+else
+  RUN_TAG="$(slug "${RUN_TAG}" 240)"
+fi
+
+OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_DIR}/cache/models}"
+OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_TAG}}"
+CACHE_DIR="${CACHE_DIR:-${PROJECT_DIR}/cache/train/${DATA_TAG}_l${MAX_LENGTH}_m${MASK_TOKEN_ID}}"
+REPORT_TO="${REPORT_TO:-wandb}"
+WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-v2.3-student}"
+RUN_HASH="$("${PYTHON_BIN}" -c 'import hashlib, sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:8])' "${RUN_TAG}")"
+WANDB_DEFAULT_BASE="v23s_${DT}_${TARGET_TAG}_${DATA_TAG}_ws${WORLD_SIZE}tp${TP_SIZE}sh${SHARD_DRAFT_BY_TP}_${TEACHER_WANDB_TAG}_1e${STAGE1_EPOCHS}lr${STAGE1_LEARNING_RATE}_2e${STAGE2_EPOCHS}lr${STAGE2_LEARNING_RATE}_L${MAX_LENGTH}A${NUM_ANCHORS}"
+WANDB_DEFAULT_NAME="$(slug "${WANDB_DEFAULT_BASE}" 118)_${RUN_HASH}"
+WANDB_DEFAULT_ID="v23s-${DT}-${TARGET_TAG}-${DATA_TAG}-ws${WORLD_SIZE}-tp${TP_SIZE}-sh${SHARD_DRAFT_BY_TP}-${RUN_HASH}"
+WANDB_NAME="${WANDB_RUN_NAME:-${WANDB_NAME:-${WANDB_DEFAULT_NAME}}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-${WANDB_DEFAULT_ID}}"
+
 if [[ "${SHARD_DRAFT_BY_TP}" != "0" && "${SHARD_DRAFT_BY_TP}" != "1" ]]; then
   echo "SHARD_DRAFT_BY_TP must be 0 or 1" >&2
   exit 2
 fi
-TRAIN_BATCH_SIZE="${BATCH_SIZE:-1}"
+TRAIN_BATCH_SIZE="${REQUESTED_BATCH_SIZE}"
 if ! is_nonnegative_integer "${TRAIN_BATCH_SIZE}" || (( TRAIN_BATCH_SIZE < 1 )); then
   echo "BATCH_SIZE must be a positive integer" >&2
   exit 2
@@ -106,6 +242,8 @@ OPTIONAL_ARGS=()
 [[ -n "${STAGE1_LOSS_DECAY_GAMMA:-}" ]] && OPTIONAL_ARGS+=(--stage1-loss-decay-gamma "${STAGE1_LOSS_DECAY_GAMMA}")
 [[ -n "${STAGE2_LOSS_DECAY_GAMMA:-}" ]] && OPTIONAL_ARGS+=(--stage2-loss-decay-gamma "${STAGE2_LOSS_DECAY_GAMMA}")
 [[ -n "${STAGE2_BASE_CE_DECAY_GAMMA:-}" ]] && OPTIONAL_ARGS+=(--stage2-base-ce-decay-gamma "${STAGE2_BASE_CE_DECAY_GAMMA}")
+[[ -n "${STAGE1_BUILD_DATASET_NUM_PROC:-}" ]] && OPTIONAL_ARGS+=(--stage1-build-dataset-num-proc "${STAGE1_BUILD_DATASET_NUM_PROC}")
+[[ -n "${STAGE2_BUILD_DATASET_NUM_PROC:-}" ]] && OPTIONAL_ARGS+=(--stage2-build-dataset-num-proc "${STAGE2_BUILD_DATASET_NUM_PROC}")
 [[ -n "${RESUME_FROM:-}" ]] && OPTIONAL_ARGS+=(--resume-from "${RESUME_FROM}")
 [[ -n "${MASK_TOKEN_ID:-}" ]] && OPTIONAL_ARGS+=(--mask-token-id "${MASK_TOKEN_ID}")
 [[ -n "${CHAT_TEMPLATE:-}" ]] && OPTIONAL_ARGS+=(--chat-template "${CHAT_TEMPLATE}")
@@ -116,6 +254,14 @@ OPTIONAL_ARGS=()
 [[ "${SHARD_DRAFT_BY_TP}" == "1" ]] && OPTIONAL_ARGS+=(--shard-draft-by-tp)
 [[ "${IS_PREFORMATTED:-0}" == "1" ]] && OPTIONAL_ARGS+=(--is-preformatted)
 [[ "${TRUST_REMOTE_CODE:-0}" == "1" ]] && OPTIONAL_ARGS+=(--trust-remote-code)
+OPTIONAL_ARGS+=(--report-to "${REPORT_TO}")
+if [[ "${REPORT_TO}" == "wandb" ]]; then
+  OPTIONAL_ARGS+=(
+    --wandb-project "${WANDB_PROJECT}"
+    --wandb-name "${WANDB_NAME}"
+    --wandb-run-id "${WANDB_RUN_ID}"
+  )
+fi
 
 CMD=(
   "${PYTHON_BIN}" -m torch.distributed.run
@@ -124,39 +270,51 @@ CMD=(
   --master_addr "${MASTER_ADDR}" --master_port "${MASTER_PORT}"
   -m scripts.train_flashmtp_two_stage
   --target-model-path "${TARGET_MODEL}"
-  --target-model-backend "${TARGET_MODEL_BACKEND:-hf}"
+  --target-model-backend "${TARGET_MODEL_BACKEND}"
   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-0.4}"
-  --train-data-path "${TRAIN_DATA_PATH}"
+  --stage1-train-data-path "${STAGE1_TRAIN_DATA_PATH}"
+  --stage2-train-data-path "${STAGE2_TRAIN_DATA_PATH}"
   --output-dir "${OUTPUT_DIR}"
   --stage1-epochs "${STAGE1_EPOCHS}"
   --stage1-learning-rate "${STAGE1_LEARNING_RATE}"
-  --stage1-warmup-ratio "${STAGE1_WARMUP_RATIO:-0.04}"
-  --stage1-tv-weight "${STAGE1_TV_WEIGHT:-1.0}"
-  --stage1-hidden-weight "${STAGE1_HIDDEN_WEIGHT:-1.0}"
-  --stage1-smooth-l1-beta "${STAGE1_SMOOTH_L1_BETA:-1.0}"
+  --stage1-warmup-ratio "${STAGE1_WARMUP_RATIO}"
+  --stage1-tv-weight "${STAGE1_TV_WEIGHT}"
+  --stage1-hidden-weight "${STAGE1_HIDDEN_WEIGHT}"
+  --stage1-smooth-l1-beta "${STAGE1_SMOOTH_L1_BETA}"
   --stage2-epochs "${STAGE2_EPOCHS}"
   --stage2-learning-rate "${STAGE2_LEARNING_RATE}"
-  --stage2-warmup-ratio "${STAGE2_WARMUP_RATIO:-0.04}"
-  --stage2-final-ce-weight "${STAGE2_FINAL_CE_WEIGHT:-1.0}"
-  --stage2-tv-weight "${STAGE2_TV_WEIGHT:-1.0}"
-  --stage2-base-ce-weight "${STAGE2_BASE_CE_WEIGHT:-0.0}"
+  --stage2-warmup-ratio "${STAGE2_WARMUP_RATIO}"
+  --stage2-final-ce-weight "${STAGE2_FINAL_CE_WEIGHT}"
+  --stage2-tv-weight "${STAGE2_TV_WEIGHT}"
+  --stage2-base-ce-weight "${STAGE2_BASE_CE_WEIGHT}"
   --batch-size "${TRAIN_BATCH_SIZE}"
-  --max-length "${MAX_LENGTH:-4096}"
-  --num-anchors "${NUM_ANCHORS:-512}"
-  --accumulation-steps "${ACCUMULATION_STEPS:-1}"
+  --max-length "${MAX_LENGTH}"
+  --num-anchors "${NUM_ANCHORS}"
+  --accumulation-steps "${ACCUMULATION_STEPS}"
   --max-grad-norm "${MAX_GRAD_NORM:-1.0}"
   --seed "${SEED:-42}"
   --dist-timeout "${DIST_TIMEOUT:-1200}"
-  --cache-dir "${CACHE_DIR:-./cache/train}"
+  --cache-dir "${CACHE_DIR}"
   --build-dataset-num-proc "${BUILD_DATASET_NUM_PROC:-8}"
   --dataloader-num-workers "${DATALOADER_NUM_WORKERS:-8}"
   --log-interval "${LOG_INTERVAL:-50}"
   --save-interval "${SAVE_INTERVAL:-20000}"
   --tp-size "${TP_SIZE}"
   "${OPTIONAL_ARGS[@]}"
-  "$@"
+  "${PASSTHROUGH_ARGS[@]}"
 )
 
+printf 'FlashMTP v2.3 two-stage config: dt=%s nodes=%s rank=%s gpus/node=%s world=%s tp=%s\n' \
+  "${DT}" "${NNODES}" "${NODE_RANK}" "${NPROC_PER_NODE}" "${WORLD_SIZE}" "${TP_SIZE}"
+printf 'Output directory: %s\n' "${OUTPUT_DIR}"
+printf 'Stage 1 dataset: %s\nStage 2 dataset: %s\n' \
+  "${STAGE1_TRAIN_DATA_PATH}" "${STAGE2_TRAIN_DATA_PATH}"
+printf 'Dataset cache: %s\n' "${CACHE_DIR}"
+printf 'MASK token id: %s\n' "${MASK_TOKEN_ID}"
+if [[ "${REPORT_TO}" == "wandb" ]]; then
+  printf 'W&B project: %s\nW&B name: %s\nW&B run id: %s\n' \
+    "${WANDB_PROJECT}" "${WANDB_NAME}" "${WANDB_RUN_ID}"
+fi
 printf 'Launching two-stage FlashMTP student:'
 printf ' %q' "${CMD[@]}"
 printf '\n'

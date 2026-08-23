@@ -42,7 +42,8 @@ Student 两阶段连续训练：
 ```bash
 TARGET_MODEL=/path/to/target \
 TEACHER_DRAFT_PATH=/path/to/teacher-output/final \
-TRAIN_DATA_PATH=/path/to/train.jsonl \
+STAGE1_TRAIN_DATA_PATH=/path/to/distillation.jsonl \
+STAGE2_TRAIN_DATA_PATH=/path/to/supervised.jsonl \
 OUTPUT_DIR=/path/to/student-output \
 STUDENT_INIT_MODE=shared_init \
 STAGE1_EPOCHS=2 STAGE1_LEARNING_RATE=5e-4 \
@@ -50,16 +51,24 @@ STAGE2_EPOCHS=6 STAGE2_LEARNING_RATE=2e-4 \
 bash scripts/run_training_flashmtp_two_stage.sh
 ```
 
-默认 `STUDENT_INIT_MODE=scratch`。设为 `shared_init` 时，Stage 1 开始前从
+Python 入口默认 `STUDENT_INIT_MODE=scratch`，两阶段 shell 启动器默认使用推荐的
+`shared_init`。设为 `shared_init` 时，Stage 1 开始前从
 teacher 复制并行 backbone、CHS 编码和相关 norm，但不复制历史融合模块
 或串行 head。Stage 1 只更新 student 并行 backbone、CHS 编码和相关 norm，以 teacher hidden
 的 LM-head TV 距离及 SmoothL1 蒸馏。Stage 2 在 full-param 上下文中只继承 teacher
 串行 head，随后释放 teacher，用 label 的 final CE、target TV 和 base CE 训练完整
 student。两阶段分别创建 optimizer 和 cosine/warmup scheduler。
 
+Stage 1 和 Stage 2 使用独立数据变量、缓存和 dataloader；fresh/Stage 1 启动时会
+同时预处理两套数据。若二者相同，也可继续只设置兼容变量 `TRAIN_DATA_PATH`，数据
+只会预处理一次。
+
 SGLang target 可设置 `TP_SIZE=N SHARD_DRAFT_BY_TP=1`：每个 TP 组对共享的 `N`
 样本做一次 target prefill，组内每个 rank 的 teacher/student draft 各训练其中一个
 不同样本。该分片模式同时用于 Stage 1 和 Stage 2。
+
+启动器兼容 v2 的 `PET_*` 多节点环境变量，默认 MASK ID 为 `151669`，并自动生成
+包含 teacher 结构、数据、两阶段超参和并行配置的输出目录及 W&B name/id。
 
 详细参数与 loss 定义见 [scripts/train.md](scripts/train.md)。
 第三方机器迁移、两机启动与恢复示例见

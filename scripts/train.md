@@ -58,12 +58,17 @@ bash scripts/run_training_flashmtp_teacher.sh --dt h100
 | `MARKOV_RANK`        | 串行头低秩维度                                     |
 
 
-
-
 ## Student 两阶段
 
 入口：`run_training_flashmtp_two_stage.sh` → `train_flashmtp_two_stage.py`。
 Teacher checkpoint 是 G、CHS、block、draft depth 和串行头结构的权威来源。
+
+shell 启动器沿用 v2 的集群默认值，优先读取 `PET_NNODES`、`PET_NODE_RANK`、
+`PET_NPROC_PER_NODE`、`PET_MASTER_ADDR` 和 `PET_MASTER_PORT`。默认
+`MASK_TOKEN_ID=151669`、`STUDENT_INIT_MODE=shared_init`、`REPORT_TO=wandb`。
+它会根据 teacher 结构、数据、两阶段 loss/LR、长度、anchor 和并行配置确定性生成
+`OUTPUT_DIR` 及 W&B name/id；同一共享存储上的所有节点会得到相同值。设置
+`RUN_SUFFIX` 可区分同参数的新实验，所有自动值也都能用同名环境变量覆盖。
 
 `STUDENT_INIT_MODE` 支持 `scratch`（默认）和 `shared_init`。`shared_init`
 在 fresh Stage 1 开始前复制 teacher 的 `layers`、`norm`、
@@ -87,12 +92,15 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 /inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/stop_keeper.sh
 
-TARGET_MODEL=/data/wanghanzhen/models/Qwen3-8B \
+TARGET_MODEL='/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B' \
 STUDENT_INIT_MODE=shared_init \
 TARGET_MODEL_BACKEND=sglang \
 SGLANG_MEM_FRACTION_STATIC=0.25 \
 TEACHER_DRAFT_PATH='/data/wanghanzhen/FlashMTP_v2.3/cache/models/flashmtp_v2_3_teacher_maskrow_from1m_2n16g_targettp2_draftdp16_sglang025_swa128_ag6_chs12_a768_block8_d5_rnn_easy_direct_r512_aug1_qwen3_8b_maxlen10240_acc2_lr5e5_4ep/final' \
-TRAIN_DATA_PATH='/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B' \
+STAGE1_TRAIN_DATA_PATH=/path/to/distillation.jsonl \
+STAGE2_TRAIN_DATA_PATH=/path/to/supervised.jsonl \
+STAGE1_BUILD_DATASET_NUM_PROC=32 \
+STAGE2_BUILD_DATASET_NUM_PROC=32 \
 TP_SIZE=2 \
 NNODES=3 \
 ACCUMULATION_STEPS=1 \

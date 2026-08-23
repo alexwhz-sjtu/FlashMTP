@@ -42,11 +42,8 @@ TARGET_MODEL=/shared/models/Qwen3-8B \
 TARGET_MODEL_BACKEND=sglang \
 SGLANG_MEM_FRACTION_STATIC=0.25 \
 TEACHER_DRAFT_PATH=/shared/checkpoints/teacher/final \
-TRAIN_DATA_PATH=/shared/data/train.jsonl \
-OUTPUT_DIR=/shared/checkpoints/student_two_stage \
-CACHE_DIR=/shared/cache/student_maxlen10240 \
-MASK_TOKEN_ID=151669 \
-STUDENT_INIT_MODE=shared_init \
+STAGE1_TRAIN_DATA_PATH=/shared/data/distillation.jsonl \
+STAGE2_TRAIN_DATA_PATH=/shared/data/supervised.jsonl \
 STAGE1_EPOCHS=2 \
 STAGE1_LEARNING_RATE=5e-4 \
 STAGE1_WARMUP_RATIO=0.04 \
@@ -66,7 +63,8 @@ MAX_LENGTH=10240 \
 NUM_ANCHORS=768 \
 BATCH_SIZE=1 \
 ACCUMULATION_STEPS=2 \
-BUILD_DATASET_NUM_PROC=32 \
+STAGE1_BUILD_DATASET_NUM_PROC=32 \
+STAGE2_BUILD_DATASET_NUM_PROC=32 \
 DATALOADER_NUM_WORKERS=8 \
 SAVE_INTERVAL=20000 \
 LOG_INTERVAL=50 \
@@ -79,12 +77,44 @@ MASTER_ADDR=10.0.0.10 \
 MASTER_PORT=29550 \
 PYTHON_BIN=/path/to/FlashMTP_v2.3/.venv/bin/python \
 DRY_RUN=1 \
-bash scripts/run_training_flashmtp_two_stage.sh \
-  --report-to wandb \
-  --wandb-project flashmtp-trainingv2-full \
-  --wandb-name flashmtp-v2.3-student-two-stage \
-  --wandb-run-id flashmtp-v2-3-student-two-stage
+bash scripts/run_training_flashmtp_two_stage.sh --dt qz
 ```
+
+启动器默认 `MASK_TOKEN_ID=151669`、`STUDENT_INIT_MODE=shared_init` 和
+`REPORT_TO=wandb`。它使用 target/data/teacher 结构、两阶段 epoch/LR/loss、长度、
+anchor、累积步数、world size、TP 和分片模式生成确定性的 `RUN_TAG`，并据此设置：
+
+- `OUTPUT_DIR=${PROJECT_DIR}/cache/models/${RUN_TAG}`；
+- `CACHE_DIR=${PROJECT_DIR}/cache/train/s1<data1>_s2<data2>_l<max_length>_m<mask_id>`；
+- `WANDB_PROJECT=flashmtp-training-v2.3-student`；
+- `WANDB_NAME=<128 字符内的关键配置摘要>_<RUN_TAG hash>`；
+- `WANDB_RUN_ID=<模型/数据/并行摘要>_<RUN_TAG hash>`。
+
+这些值均可用同名环境变量覆盖；`OUTPUT_ROOT` 可单独改变默认输出根目录。相同参数会
+得到相同路径和 W&B id，适合多节点共享存储和恢复。相同配置要启动独立实验时设置
+`RUN_SUFFIX=<tag>`；不使用 W&B 时设置 `REPORT_TO=none`。
+
+`STAGE1_TRAIN_DATA_PATH` 和 `STAGE2_TRAIN_DATA_PATH` 分别控制蒸馏数据与监督训练
+数据。fresh 或 Stage 1 恢复时，在加载完 tokenizer 后会立即并行预处理两套数据：
+共享存储的分布式训练由 global rank 0 构建 Stage 1 cache、global rank 1 同时构建
+Stage 2 cache；单进程调试则使用两个线程。cache 分别位于 `stage1/`、`stage2/`
+命名空间。若两个路径相同，只构建一次共享 cache；旧的 `TRAIN_DATA_PATH` 仍可作为
+两个变量的共同回退。`STAGE1_BUILD_DATASET_NUM_PROC` 和
+`STAGE2_BUILD_DATASET_NUM_PROC` 可分别设置内部 map 进程数，未设置时都回退到
+`BUILD_DATASET_NUM_PROC`。
+
+节点信息沿用 v2 的 `PET_*` 默认值：
+
+| 最终变量 | 默认来源 |
+| --- | --- |
+| `NNODES` | `PET_NNODES` → `NNODES` → `1` |
+| `NODE_RANK` | `PET_NODE_RANK` → `NODE_RANK` → `0` |
+| `NPROC_PER_NODE` | `NPROC_PER_NODE` → `PET_NPROC_PER_NODE` → 可见 GPU 数 |
+| `MASTER_ADDR` | `MASTER_ADDR` → `PET_MASTER_ADDR` → `127.0.0.1` |
+| `MASTER_PORT` | `MASTER_PORT` → `PET_MASTER_PORT` → `29502` |
+
+`--dt qz` 由 shell 启动器消费并默认设置 `WANDB_MODE=offline`，不会传给 Python。
+也支持 `--dt a800` 和 `--dt h100`。
 
 先在两台机器分别用各自的 `NODE_RANK=0/1` 执行 `DRY_RUN=1`，确认展开后的
 torchrun 命令一致。正式启动时删除 `DRY_RUN=1`，通常先启动 node 1，再立即启动
@@ -119,8 +149,9 @@ RESUME_FROM=/shared/checkpoints/student_two_stage/stage2/epoch_0_step_20000 \
 bash scripts/run_training_flashmtp_two_stage.sh
 ```
 
-恢复需要保持相同 world size、`TP_SIZE` 和 `SHARD_DRAFT_BY_TP`，因为 optimizer
-state 按 global rank 分片保存，而且 checkpoint 会记录 draft 数据分片模式。
+恢复需要保持相同 world size、`TP_SIZE`、`SHARD_DRAFT_BY_TP`、两阶段数据路径和自动命名所用的
+关键参数，因为 optimizer state 按 global rank 分片保存，而且 checkpoint 会记录
+draft 数据分片模式。原训练若覆盖过 `OUTPUT_DIR`，恢复时也必须传回同一目录。
 
 ## 4. 启动前检查
 

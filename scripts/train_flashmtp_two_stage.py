@@ -32,6 +32,7 @@ from scripts.flashmtp_training import (
     build_draft_model,
     build_target_and_components,
     build_train_dataloader,
+    build_two_stage_dataloaders,
     hidden_states_to_cuda,
     load_training_state,
     log_cuda_peak,
@@ -58,6 +59,16 @@ def parse_args():
     add_common_args(parser)
     parser.add_argument("--teacher-draft-path")
     parser.add_argument(
+        "--stage1-train-data-path",
+        help="Stage 1 distillation JSONL (falls back to --train-data-path).",
+    )
+    parser.add_argument(
+        "--stage2-train-data-path",
+        help="Stage 2 supervised JSONL (falls back to --train-data-path).",
+    )
+    parser.add_argument("--stage1-build-dataset-num-proc", type=int)
+    parser.add_argument("--stage2-build-dataset-num-proc", type=int)
+    parser.add_argument(
         "--student-init-mode",
         choices=STUDENT_INIT_MODES,
         help=(
@@ -83,6 +94,27 @@ def parse_args():
     parser.add_argument("--stage2-base-ce-decay-gamma", type=float)
     args = parser.parse_args()
     validate_common_args(parser, args)
+    args.stage1_train_data_path = (
+        args.stage1_train_data_path or args.train_data_path
+    )
+    args.stage2_train_data_path = (
+        args.stage2_train_data_path or args.train_data_path
+    )
+    if not args.stage1_train_data_path:
+        parser.error(
+            "--stage1-train-data-path is required (or provide --train-data-path)"
+        )
+    if not args.stage2_train_data_path:
+        parser.error(
+            "--stage2-train-data-path is required (or provide --train-data-path)"
+        )
+    for name in (
+        "stage1_build_dataset_num_proc",
+        "stage2_build_dataset_num_proc",
+    ):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
     for name in ("stage1_epochs", "stage2_epochs", "accumulation_steps"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -248,6 +280,22 @@ def main():
             "--tp-size must match the resumed checkpoint: "
             f"saved={int(resume_state['tp_size'])}, requested={int(args.tp_size)}."
         )
+    stage1_data_identity = os.path.realpath(args.stage1_train_data_path)
+    stage2_data_identity = os.path.realpath(args.stage2_train_data_path)
+    for stage, current_identity in (
+        ("stage1", stage1_data_identity),
+        ("stage2", stage2_data_identity),
+    ):
+        key = f"{stage}_train_data_identity"
+        if (
+            resume_state is not None
+            and resume_state.get(key) is not None
+            and resume_state[key] != current_identity
+        ):
+            raise ValueError(
+                f"{stage} dataset must match the resumed checkpoint: "
+                f"saved={resume_state[key]!r}, provided={current_identity!r}."
+            )
     student_init_mode = _resolve_student_init_mode(
         args.student_init_mode, resume_state
     )
@@ -326,7 +374,19 @@ def main():
     target, tokenizer, components, mask_token_id = build_target_and_components(
         args, drafts_for_target
     )
-    dataloader = build_train_dataloader(args, tokenizer)
+    if resume_stage in (None, "stage1"):
+        stage1_dataloader, stage2_dataloader = build_two_stage_dataloaders(
+            args, tokenizer
+        )
+    else:
+        stage1_dataloader = None
+        stage2_dataloader = build_train_dataloader(
+            args,
+            tokenizer,
+            train_data_path=args.stage2_train_data_path,
+            cache_namespace="stage2",
+            num_proc=args.stage2_build_dataset_num_proc,
+        )
 
     teacher_online = None
     if teacher is not None:
@@ -368,7 +428,9 @@ def main():
             max_grad_norm=args.max_grad_norm,
             warmup_ratio=args.stage1_warmup_ratio,
             total_steps=stage_total_steps(
-                dataloader, args.stage1_epochs, args.accumulation_steps
+                stage1_dataloader,
+                args.stage1_epochs,
+                args.accumulation_steps,
             ),
         )
         if resume_stage == "stage1":
@@ -387,10 +449,10 @@ def main():
     torch.cuda.reset_peak_memory_stats()
 
     for epoch in range(stage1_start_epoch, args.stage1_epochs) if stage1_optimizer is not None else ():
-        dataloader.sampler.set_epoch(epoch)
+        stage1_dataloader.sampler.set_epoch(epoch)
         student.train()
         teacher.eval()
-        iterator = tqdm(dataloader, desc=f"Stage1 epoch {epoch}") if dist.get_rank() == 0 else dataloader
+        iterator = tqdm(stage1_dataloader, desc=f"Stage1 epoch {epoch}") if dist.get_rank() == 0 else stage1_dataloader
         for batch_idx, data in enumerate(iterator):
             if epoch == stage1_start_epoch and batch_idx < stage1_start_batch:
                 continue
@@ -491,6 +553,8 @@ def main():
                         "teacher_checkpoint_identity": teacher_identity,
                         "shard_draft_by_tp": bool(args.shard_draft_by_tp),
                         "tp_size": int(args.tp_size),
+                        "stage1_train_data_identity": stage1_data_identity,
+                        "stage2_train_data_identity": stage2_data_identity,
                     },
                 )
         stage1_start_batch = 0
@@ -518,6 +582,8 @@ def main():
                 "teacher_checkpoint_identity": teacher_identity,
                 "shard_draft_by_tp": bool(args.shard_draft_by_tp),
                 "tp_size": int(args.tp_size),
+                "stage1_train_data_identity": stage1_data_identity,
+                "stage2_train_data_identity": stage2_data_identity,
             },
         )
         memory = log_cuda_peak("stage1")
@@ -550,6 +616,8 @@ def main():
                 "teacher_checkpoint_identity": teacher_identity,
                 "shard_draft_by_tp": bool(args.shard_draft_by_tp),
                 "tp_size": int(args.tp_size),
+                "stage1_train_data_identity": stage1_data_identity,
+                "stage2_train_data_identity": stage2_data_identity,
             },
         )
     # drafts_for_target also owns the teacher.  Keeping that list alive would
@@ -580,7 +648,9 @@ def main():
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.stage2_warmup_ratio,
         total_steps=stage_total_steps(
-            dataloader, args.stage2_epochs, args.accumulation_steps
+            stage2_dataloader,
+            args.stage2_epochs,
+            args.accumulation_steps,
         ),
     )
     if resume_stage == "stage2":
@@ -593,9 +663,9 @@ def main():
         stage2_start_epoch = stage2_start_batch = stage2_step = 0
 
     for epoch in range(stage2_start_epoch, args.stage2_epochs):
-        dataloader.sampler.set_epoch(args.stage1_epochs + epoch)
+        stage2_dataloader.sampler.set_epoch(epoch)
         student.train()
-        iterator = tqdm(dataloader, desc=f"Stage2 epoch {epoch}") if dist.get_rank() == 0 else dataloader
+        iterator = tqdm(stage2_dataloader, desc=f"Stage2 epoch {epoch}") if dist.get_rank() == 0 else stage2_dataloader
         for batch_idx, data in enumerate(iterator):
             if epoch == stage2_start_epoch and batch_idx < stage2_start_batch:
                 continue
@@ -685,6 +755,8 @@ def main():
                         "teacher_checkpoint_identity": teacher_identity,
                         "shard_draft_by_tp": bool(args.shard_draft_by_tp),
                         "tp_size": int(args.tp_size),
+                        "stage1_train_data_identity": stage1_data_identity,
+                        "stage2_train_data_identity": stage2_data_identity,
                     },
                 )
         stage2_start_batch = 0
@@ -710,6 +782,8 @@ def main():
             "teacher_checkpoint_identity": teacher_identity,
             "shard_draft_by_tp": bool(args.shard_draft_by_tp),
             "tp_size": int(args.tp_size),
+            "stage1_train_data_identity": stage1_data_identity,
+            "stage2_train_data_identity": stage2_data_identity,
         },
     )
     memory = log_cuda_peak("stage2")

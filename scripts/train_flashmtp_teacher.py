@@ -59,6 +59,8 @@ def parse_args():
     parser.add_argument("--markov-teacher-forcing-ratio", type=float, default=1.0)
     args = parser.parse_args()
     validate_common_args(parser, args)
+    if not args.train_data_path:
+        parser.error("--train-data-path is required for teacher training")
     if args.resume_from and args.init_from:
         parser.error("--resume-from and --init-from are mutually exclusive")
     if args.num_epochs <= 0:
