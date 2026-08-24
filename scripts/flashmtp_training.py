@@ -288,9 +288,30 @@ def _build_processed_dataset(
     )
 
 
+def _has_valid_anchor_supervision(value, *, block_size: int) -> bool:
+    """Match the anchor sampler's per-example supervision requirements."""
+    loss_mask = torch.as_tensor(value["loss_mask"]).reshape(-1)
+    minimum = 2 * int(block_size)
+    if int(loss_mask.sum().item()) < minimum:
+        return False
+    max_anchor = int(loss_mask.numel()) - int(block_size)
+    if max_anchor < 1:
+        return False
+    current = loss_mask[1 : max_anchor + 1] > 0.5
+    following = loss_mask[2 : max_anchor + 2] > 0.5
+    return bool((current & following).any().item())
+
+
 def _prepare_dataloader(args, dataset, *, train_data_path: str):
     minimum = 2 * int(args.block_size)
-    dataset = dataset.filter(lambda value: value["loss_mask"].sum() >= minimum)
+    dataset = dataset.filter(
+        _has_valid_anchor_supervision,
+        fn_kwargs={"block_size": int(args.block_size)},
+        desc=(
+            "Filtering examples with at least "
+            f"{minimum} labels and one trainable anchor"
+        ),
+    )
     dataloader = prepare_dp_dataloaders(
         dataset,
         args.batch_size,

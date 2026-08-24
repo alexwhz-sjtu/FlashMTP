@@ -69,6 +69,27 @@ class CountingHead(nn.Linear):
 
 
 class CurrentFlashMTPArchitectureTest(unittest.TestCase):
+    def test_dataset_filter_requires_a_trainable_anchor(self):
+        from scripts.flashmtp_training import _has_valid_anchor_supervision
+
+        # Eight supervised tokens satisfy the old count-only filter, but the
+        # only adjacent pair is too close to the end for a full block.
+        tail_only = torch.zeros(16)
+        tail_only[[1, 3, 5, 7, 9, 11, 14, 15]] = 1
+        self.assertFalse(
+            _has_valid_anchor_supervision(
+                {"loss_mask": tail_only}, block_size=4
+            )
+        )
+
+        trainable = tail_only.clone()
+        trainable[4] = 1
+        self.assertTrue(
+            _has_valid_anchor_supervision(
+                {"loss_mask": trainable}, block_size=4
+            )
+        )
+
     def test_two_stage_dataset_preprocessing_starts_concurrently(self):
         args = SimpleNamespace(
             stage1_train_data_path="/data/stage1.jsonl",
