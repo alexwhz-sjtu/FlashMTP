@@ -58,6 +58,8 @@ bash scripts/run_training_flashmtp_teacher.sh --dt h100
 | `MARKOV_RANK`        | 串行头低秩维度                                     |
 
 
+
+
 ## Student 两阶段
 
 入口：`run_training_flashmtp_two_stage.sh` → `train_flashmtp_two_stage.py`。
@@ -89,7 +91,7 @@ labels 和有效位置 mask；student 串行头不参与优化。
 cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2.3
 source .venv/bin/activate
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
-
+export WANDB_MODE=offline
 /inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/stop_keeper.sh
 
 TARGET_MODEL='/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B' \

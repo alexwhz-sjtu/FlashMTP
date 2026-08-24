@@ -161,6 +161,7 @@ python -m compileall -q scripts specforge tests
 python -m unittest discover -s tests -v
 ```
 
-若使用 W&B，所有节点都应能读取 `WANDB_API_KEY` 或有效的 `~/.netrc`。若显存
+W&B 在线模式下所有节点都应能读取 `WANDB_API_KEY` 或有效的 `~/.netrc`；
+`WANDB_MODE=offline` 不需要 API key，指标保存在本地 W&B 目录。若显存
 不足，先降低 `NUM_ANCHORS`，其次降低 `MAX_LENGTH`；不要改变 teacher checkpoint
 定义的 block、G、CHS、draft depth 或 Markov head 结构。

@@ -13,6 +13,14 @@ logger = logging.getLogger("specforge.utils")
 
 # WandB API rejects run Name (and typically Id) longer than 128 characters.
 _WANDB_STR_MAX_LEN = 128
+_WANDB_NO_LOGIN_MODES = frozenset({"offline", "dryrun", "disabled"})
+
+
+def _wandb_requires_login() -> bool:
+    """Return whether the configured W&B mode needs online credentials."""
+    return os.environ.get("WANDB_MODE", "online").strip().lower() not in (
+        _WANDB_NO_LOGIN_MODES
+    )
 
 
 def _clip_wandb_identifier(value: Optional[str], field: str) -> Optional[str]:
@@ -120,6 +128,9 @@ class WandbTracker(Tracker):
                 "To use --report-to wandb, you must install wandb: 'pip install wandb'"
             )
 
+        if not _wandb_requires_login():
+            return
+
         if args.wandb_key is not None:
             return
 
@@ -150,7 +161,8 @@ class WandbTracker(Tracker):
     def __init__(self, args, output_dir: str):
         super().__init__(args, output_dir)
         if self.rank == 0:
-            wandb.login(key=args.wandb_key)
+            if _wandb_requires_login():
+                wandb.login(key=args.wandb_key)
             # wandb_run_id: optional stable id from launch scripts; resume="allow" continues an
             # existing run or creates one (resume="must" would fail on first start).
             init_kwargs = {
