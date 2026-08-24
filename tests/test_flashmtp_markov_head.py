@@ -252,6 +252,30 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
         self.assertTrue(torch.isin(anchors, torch.tensor([4, 5])).all())
         self.assertFalse((anchors == 2).any())
 
+    def test_anchor_sampling_keeps_sparse_rows_after_position_sort(self):
+        model = make_model(block_size=2)
+        wrapper = OnlineFlashMTPModel(
+            draft_model=model,
+            target_lm_head=nn.Linear(16, 31, bias=False),
+            target_embed_tokens=nn.Embedding(31, 16),
+            mask_token_id=30,
+            block_size=2,
+            num_anchors=8,
+        )
+        loss_mask = torch.zeros(2, 12)
+        loss_mask[0, 8:10] = 1
+        loss_mask[1, 2:10] = 1
+
+        anchors, keep = wrapper.sample_anchor_positions(12, loss_mask)
+
+        self.assertEqual(int(keep[0].sum()), 1)
+        self.assertEqual(anchors[0, keep[0]].tolist(), [8])
+        self.assertEqual(int(keep[1].sum()), 7)
+        for row in range(loss_mask.size(0)):
+            selected = anchors[row, keep[row]]
+            self.assertTrue((loss_mask[row, selected] > 0.5).all())
+            self.assertTrue((loss_mask[row, selected + 1] > 0.5).all())
+
     def test_inference_mask_embedding_does_not_expand_output_vocab(self):
         model = make_model()
         model.mask_token_id = 31

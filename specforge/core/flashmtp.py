@@ -302,11 +302,18 @@ class OnlineFlashMTPModel(nn.Module):
             raise ValueError("No valid anchor positions in this batch.")
         random_values = torch.rand_like(valid, dtype=torch.float32)
         random_values.masked_fill_(~valid, 2.0)
-        indices = random_values.argsort(dim=1)[:, :num].sort(dim=1).values
-        keep = (
-            torch.arange(num, device=loss_mask.device).unsqueeze(0)
-            < counts.unsqueeze(1)
-        )
+        indices = random_values.argsort(dim=1)[:, :num]
+        # Rows with fewer than ``num`` valid anchors are padded by argsort with
+        # invalid positions.  Move those padding entries behind the real
+        # anchors *before* sorting by sequence position.  Sorting the raw
+        # indices first would interleave padding with real anchors while the
+        # old prefix-shaped keep mask still marked the first ``count`` entries
+        # as valid, potentially discarding every supervised anchor in a row.
+        selected_valid = torch.gather(valid, 1, indices)
+        padding_position = max_anchor + 1
+        indices = indices.masked_fill(~selected_valid, padding_position)
+        indices = indices.sort(dim=1).values
+        keep = indices != padding_position
         return torch.where(keep, indices, torch.zeros_like(indices)), keep
 
     def _build_labels_and_weights(
