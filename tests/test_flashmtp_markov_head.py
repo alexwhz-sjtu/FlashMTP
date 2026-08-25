@@ -29,6 +29,7 @@ from specforge.modeling.draft.flashmtp import (
     FlashMTPDraftModel,
 )
 from specforge.optimizer import BF16Optimizer
+from specforge.data.utils import DataCollatorWithPadding
 
 
 def make_model(role="pivot_q_student", *, block_size=4, g=3, w=4):
@@ -69,6 +70,60 @@ class CountingHead(nn.Linear):
 
 
 class CurrentFlashMTPArchitectureTest(unittest.TestCase):
+    def test_training_collator_matches_v2_dynamic_batch_padding(self):
+        with mock.patch(
+            "specforge.data.utils.torch.distributed.get_world_size", return_value=1
+        ):
+            collator = DataCollatorWithPadding()
+
+        short = {
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "attention_mask": torch.ones(1, 3, dtype=torch.long),
+            "loss_mask": torch.ones(1, 3, dtype=torch.long),
+        }
+        long = {
+            "input_ids": torch.tensor([[4, 5, 6, 7, 8]]),
+            "attention_mask": torch.ones(1, 5, dtype=torch.long),
+            "loss_mask": torch.ones(1, 5, dtype=torch.long),
+        }
+
+        batch = collator([short, long])
+
+        self.assertEqual(batch["input_ids"].shape, (2, 5))
+        self.assertTrue(
+            torch.equal(batch["input_ids"][0], torch.tensor([1, 2, 3, 0, 0]))
+        )
+        self.assertTrue(
+            torch.equal(batch["attention_mask"][0], torch.tensor([1, 1, 1, 0, 0]))
+        )
+        self.assertTrue(
+            torch.equal(batch["loss_mask"][0], torch.tensor([1, 1, 1, 0, 0]))
+        )
+
+    def test_training_dataloader_does_not_force_max_length_padding(self):
+        args = SimpleNamespace(
+            block_size=4,
+            batch_size=2,
+            dataloader_num_workers=0,
+            max_length=10240,
+        )
+        dataset = mock.Mock()
+        dataset.filter.return_value = dataset
+        sentinel = [object()]
+
+        with (
+            mock.patch.object(
+                flashmtp_training, "prepare_dp_dataloaders", return_value=sentinel
+            ) as prepare,
+            mock.patch.object(flashmtp_training, "get_dp_group", return_value="dp"),
+        ):
+            result = flashmtp_training._prepare_dataloader(
+                args, dataset, train_data_path="/data/train.jsonl"
+            )
+
+        self.assertIs(result, sentinel)
+        self.assertNotIn("pad_to_length", prepare.call_args.kwargs)
+
     def test_dataset_filter_requires_a_trainable_anchor(self):
         from scripts.flashmtp_training import _has_valid_anchor_supervision
 
@@ -557,11 +612,12 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
         head = CountingHead()
         student = torch.randn(1, 2, 3, 16, requires_grad=True)
         teacher = torch.randn(1, 2, 3, 16, requires_grad=True)
-        loss, _, _ = compute_stage1_distillation_loss(
+        loss, _, _, _ = compute_stage1_distillation_loss(
             student_hidden=student,
             teacher_hidden=teacher,
             lm_head=head,
             raw_weight_mask=torch.ones(1, 2, 3),
+            labels=torch.zeros(1, 2, 3, dtype=torch.long),
             tv_weight=1.0,
             hidden_weight=1.0,
             smooth_l1_beta=1.0,
@@ -581,11 +637,12 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
             teacher[:, 1].fill_(float("nan"))
         weights = torch.tensor([[[1.0, 1.0, 1.0], [0.0, 0.0, 0.0]]])
 
-        loss, tv_loss, hidden_loss = compute_stage1_distillation_loss(
+        loss, tv_loss, hidden_loss, _ = compute_stage1_distillation_loss(
             student_hidden=student,
             teacher_hidden=teacher,
             lm_head=head,
             raw_weight_mask=weights,
+            labels=torch.zeros(1, 2, 3, dtype=torch.long),
             tv_weight=1.0,
             hidden_weight=1.0,
             smooth_l1_beta=1.0,
@@ -599,6 +656,40 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(student.grad).all())
         self.assertTrue(torch.isfinite(head.weight.grad).all())
         self.assertTrue(torch.equal(student.grad[:, 1], torch.zeros_like(student.grad[:, 1])))
+        self.assertIsNone(teacher.grad)
+
+    def test_stage1_zero_hidden_weight_skips_smooth_l1_and_reports_prefix(self):
+        student = torch.tensor(
+            [[[[0.0, 3.0, 0.0], [0.0, 0.0, 3.0], [3.0, 0.0, 0.0]],
+              [[0.0, 3.0, 0.0], [3.0, 0.0, 0.0], [0.0, 0.0, 3.0]]]],
+            requires_grad=True,
+        )
+        teacher = torch.zeros_like(student, requires_grad=True)
+        labels = torch.tensor([[[1, 2, 2], [1, 2, 2]]])
+
+        with mock.patch(
+            "specforge.core.flashmtp.F.smooth_l1_loss",
+            side_effect=AssertionError("SmoothL1 should be skipped"),
+        ):
+            loss, tv_loss, hidden_loss, prefix_acc = (
+                compute_stage1_distillation_loss(
+                    student_hidden=student,
+                    teacher_hidden=teacher,
+                    lm_head=nn.Identity(),
+                    raw_weight_mask=torch.ones(1, 2, 3),
+                    labels=labels,
+                    tv_weight=1.0,
+                    hidden_weight=0.0,
+                    smooth_l1_beta=1.0,
+                    loss_decay_gamma=None,
+                )
+            )
+
+        self.assertTrue(torch.equal(loss, tv_loss))
+        self.assertEqual(hidden_loss.item(), 0.0)
+        self.assertEqual(prefix_acc.item(), 2.5)
+        loss.backward()
+        self.assertIsNotNone(student.grad)
         self.assertIsNone(teacher.grad)
 
     def test_serial_head_copy_does_not_touch_backbone(self):

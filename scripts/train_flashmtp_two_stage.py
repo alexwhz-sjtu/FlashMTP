@@ -503,11 +503,12 @@ def main():
                 seq_len=input_ids.size(1),
                 return_backbone=True,
             )
-            loss, tv_loss, hidden_loss = compute_stage1_distillation_loss(
+            loss, tv_loss, hidden_loss, prefix_acc = compute_stage1_distillation_loss(
                 student_hidden=student_hidden,
                 teacher_hidden=teacher_hidden,
                 lm_head=components.lm_head,
                 raw_weight_mask=student_batch.raw_weight_mask,
+                labels=student_batch.labels,
                 tv_weight=args.stage1_tv_weight,
                 hidden_weight=args.stage1_hidden_weight,
                 smooth_l1_beta=args.stage1_smooth_l1_beta,
@@ -521,19 +522,30 @@ def main():
                 grad_norm = stage1_optimizer.step()
                 micro_steps = 0
             if global_step % args.log_interval == 0:
-                metrics = torch.stack([loss.detach(), tv_loss.detach(), hidden_loss.detach()])
+                metrics = torch.stack(
+                    [
+                        loss.detach(),
+                        tv_loss.detach(),
+                        hidden_loss.detach(),
+                        prefix_acc.detach(),
+                    ]
+                )
                 dist.all_reduce(metrics)
                 metrics /= dist.get_world_size()
                 payload = {
                     "stage1/loss": metrics[0].item(),
                     "stage1/tv": metrics[1].item(),
                     "stage1/hidden": metrics[2].item(),
+                    "stage1/prefix_acc": metrics[3].item(),
                     "stage1/lr": stage1_optimizer.get_learning_rate(),
                 }
                 if grad_norm is not None:
                     payload["stage1/grad_norm"] = grad_norm
                 tracker.log(payload, step=global_step)
-                print_on_rank0(f"stage1 step={global_step} loss={metrics[0]:.4f}")
+                print_on_rank0(
+                    f"stage1 step={global_step} loss={metrics[0]:.4f} "
+                    f"prefix_acc={metrics[3]:.4f}"
+                )
             if global_step % args.save_interval == 0 and micro_steps == 0:
                 save_checkpoint(
                     output_dir=args.output_dir,

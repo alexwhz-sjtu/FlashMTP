@@ -675,12 +675,13 @@ def compute_stage1_distillation_loss(
     teacher_hidden: torch.Tensor,
     lm_head: nn.Module,
     raw_weight_mask: torch.Tensor,
+    labels: torch.Tensor,
     tv_weight: float,
     hidden_weight: float,
     smooth_l1_beta: float,
     loss_decay_gamma: Optional[float],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Active-position FP32 TV + SmoothL1 distillation with a detached teacher."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return Stage-1 loss components and label-based prefix accuracy."""
     offsets = torch.arange(raw_weight_mask.size(-1), device=raw_weight_mask.device)
     decay = (
         torch.ones_like(offsets, dtype=torch.float32)
@@ -697,20 +698,37 @@ def compute_stage1_distillation_loss(
     denominator = active_weights.sum().clamp_min(1e-6)
     with torch.no_grad():
         teacher_probs = F.softmax(lm_head(teacher_active).float(), dim=-1)
-    student_probs = F.softmax(lm_head(student_active).float(), dim=-1)
+    student_logits = lm_head(student_active).float()
+    student_probs = F.softmax(student_logits, dim=-1)
     tv_values = (student_probs - teacher_probs).abs().sum(dim=-1)
     tv_loss = (tv_values * active_weights).sum() / denominator
-    hidden_values = F.smooth_l1_loss(
-        student_active.float(),
-        teacher_active.detach().float(),
-        reduction="none",
-        beta=float(smooth_l1_beta),
-    ).mean(dim=-1)
-    hidden_loss = (hidden_values * active_weights).sum() / denominator
+    if float(hidden_weight) > 0:
+        hidden_values = F.smooth_l1_loss(
+            student_active.float(),
+            teacher_active.detach().float(),
+            reduction="none",
+            beta=float(smooth_l1_beta),
+        ).mean(dim=-1)
+        hidden_loss = (hidden_values * active_weights).sum() / denominator
+    else:
+        hidden_loss = student_hidden.new_zeros((), dtype=torch.float32)
+    with torch.no_grad():
+        predictions = torch.zeros_like(labels)
+        predictions[active_positions] = student_logits.argmax(dim=-1)
+        valid = raw_weight_mask > 0
+        correct = (predictions == labels) & valid
+        prefix = correct.cumprod(dim=-1).sum(dim=-1).float() + 1.0
+        valid_blocks = valid.any(dim=-1)
+        prefix_acc = (
+            prefix[valid_blocks].mean()
+            if bool(valid_blocks.any())
+            else student_hidden.new_zeros(())
+        )
     return (
         float(tv_weight) * tv_loss + float(hidden_weight) * hidden_loss,
         tv_loss,
         hidden_loss,
+        prefix_acc,
     )
 
 

@@ -318,7 +318,6 @@ def _prepare_dataloader(args, dataset, *, train_data_path: str):
         num_workers=args.dataloader_num_workers,
         shuffle=True,
         process_group=get_dp_group(),
-        pad_to_length=args.max_length,
     )
     if len(dataloader) == 0:
         raise ValueError(
