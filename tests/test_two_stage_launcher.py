@@ -23,6 +23,8 @@ def _base_env() -> dict[str, str]:
         "STAGE2_TRAIN_DATA_PATH",
         "STAGE1_BUILD_DATASET_NUM_PROC",
         "STAGE2_BUILD_DATASET_NUM_PROC",
+        "STUDENT_NUM_DRAFT_LAYERS",
+        "NUM_DRAFT_LAYERS",
     ):
         env.pop(name, None)
     env.update(
@@ -97,6 +99,42 @@ class TwoStageLauncherTest(unittest.TestCase):
         )
         self.assertIn("--stage1-build-dataset-num-proc 12", command)
         self.assertIn("--stage2-build-dataset-num-proc 24", command)
+
+    def test_shared_partial_forwards_student_depth(self):
+        env = _base_env()
+        env.update(
+            STUDENT_INIT_MODE="shared_partial",
+            STUDENT_NUM_DRAFT_LAYERS="3",
+        )
+
+        completed = subprocess.run(
+            ["bash", str(LAUNCHER)],
+            cwd=PROJECT_DIR,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+
+        self.assertIn("--student-init-mode shared_partial", completed.stdout)
+        self.assertIn("--student-num-draft-layers 3", completed.stdout)
+
+    def test_fresh_shared_partial_requires_student_depth(self):
+        env = _base_env()
+        env["STUDENT_INIT_MODE"] = "shared_partial"
+
+        completed = subprocess.run(
+            ["bash", str(LAUNCHER)],
+            cwd=PROJECT_DIR,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("requires STUDENT_NUM_DRAFT_LAYERS", completed.stderr)
 
     def test_multinode_rejects_loopback_master(self):
         env = _base_env()

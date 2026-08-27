@@ -48,5 +48,5 @@ bash scripts/run_training_flashmtp_teacher.sh \
   --dataloader-num-workers 8 \
   --report-to wandb \
   --wandb-project flashmtp-trainingv2-full \
-  --wandb-name flashmtp-v2.3-teacher-2n16g-targettp1-draftdp16-sglang025-r320-a768-aug1-qwen3-4b-maxlen10240-acc2 \
-  --wandb-run-id flashmtp-v2-3-teacher-2n16g-targettp1-draftdp16-sglang025-r320-a768-aug1-qwen3-4b-maxlen10240-acc2
+  --wandb-name "${WANDB_NAME:-flashmtp-v2.3-teacher-2n16g-targettp1-draftdp16-sglang025-r320-a768-aug1-qwen3-4b-maxlen10240-acc2}" \
+  --wandb-run-id "${WANDB_RUN_ID:-flashmtp-v2-3-teacher-2n16g-targettp1-draftdp16-sglang025-r320-a768-aug1-qwen3-4b-maxlen10240-acc2}"

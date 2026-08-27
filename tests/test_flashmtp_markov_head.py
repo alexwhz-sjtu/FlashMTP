@@ -10,8 +10,10 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from scripts.train_flashmtp_two_stage import (
     SHARED_BACKBONE_MODULES,
+    _copy_partial_shared_backbone,
     _copy_serial_head,
     _copy_shared_backbone,
+    _evenly_spaced_teacher_layer_ids,
     _resolve_student_init_mode,
 )
 from scripts import flashmtp_training
@@ -32,19 +34,21 @@ from specforge.optimizer import BF16Optimizer
 from specforge.data.utils import DataCollatorWithPadding
 
 
-def make_model(role="pivot_q_student", *, block_size=4, g=3, w=4):
+def make_model(
+    role="pivot_q_student", *, block_size=4, g=3, w=4, num_draft_layers=1
+):
     config = Qwen3Config(
         vocab_size=31,
         hidden_size=16,
         intermediate_size=32,
-        num_hidden_layers=1,
+        num_hidden_layers=num_draft_layers,
         num_attention_heads=2,
         num_key_value_heads=1,
         head_dim=8,
     )
     config.num_target_layers = 4
     config.block_size = block_size
-    config.layer_types = ["full_attention"]
+    config.layer_types = ["full_attention"] * num_draft_layers
     config._attn_implementation = "eager"
     config.flashmtp_config = {
         "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
@@ -734,6 +738,58 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
         for name, value in student.history_fuse.state_dict().items():
             self.assertTrue(torch.equal(value, history_before[name]))
 
+    def test_shared_partial_evenly_copies_teacher_backbone_layers(self):
+        teacher = make_model("swa_teacher", num_draft_layers=5)
+        student = make_model("pivot_q_student", num_draft_layers=3)
+        with torch.no_grad():
+            for layer_id, layer in enumerate(teacher.layers):
+                for parameter in layer.parameters():
+                    parameter.fill_(float(layer_id + 1))
+            for module_name in SHARED_BACKBONE_MODULES[1:]:
+                for parameter in getattr(teacher, module_name).parameters():
+                    parameter.fill_(0.25)
+            for parameter in teacher.markov_head.parameters():
+                parameter.fill_(0.5)
+        serial_before = {
+            name: value.detach().clone()
+            for name, value in student.markov_head.state_dict().items()
+        }
+
+        copied_ids = _copy_partial_shared_backbone(teacher, student)
+
+        self.assertEqual(copied_ids, [0, 2, 4])
+        for student_layer, expected in zip(
+            student.layers, (1.0, 3.0, 5.0), strict=True
+        ):
+            for parameter in student_layer.parameters():
+                self.assertTrue(torch.all(parameter == expected))
+        for module_name in SHARED_BACKBONE_MODULES[1:]:
+            for parameter in getattr(student, module_name).parameters():
+                self.assertTrue(torch.all(parameter == 0.25))
+        for name, value in student.markov_head.state_dict().items():
+            self.assertTrue(torch.equal(value, serial_before[name]))
+
+    def test_shared_partial_requires_deeper_teacher(self):
+        with self.assertRaisesRegex(ValueError, "teacher draft depth"):
+            _evenly_spaced_teacher_layer_ids(3, 3)
+        with self.assertRaisesRegex(ValueError, "teacher draft depth"):
+            _copy_partial_shared_backbone(
+                make_model("swa_teacher", num_draft_layers=2),
+                make_model("pivot_q_student", num_draft_layers=3),
+            )
+
+    def test_serial_head_copy_allows_different_backbone_depths(self):
+        teacher = make_model("swa_teacher", num_draft_layers=5)
+        student = make_model("pivot_q_student", num_draft_layers=3)
+        with torch.no_grad():
+            for parameter in teacher.markov_head.parameters():
+                parameter.fill_(0.125)
+
+        _copy_serial_head(teacher, student)
+
+        for parameter in student.markov_head.parameters():
+            self.assertTrue(torch.all(parameter == 0.125))
+
     def test_student_init_mode_is_checkpoint_stable(self):
         self.assertEqual(_resolve_student_init_mode(None, None), "scratch")
         self.assertEqual(_resolve_student_init_mode("shared_init", None), "shared_init")
@@ -747,6 +803,13 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "metadata is inconsistent"):
             _resolve_student_init_mode(None, inconsistent)
+        partial_state = {
+            "student_init_mode": "shared_partial",
+            "shared_backbone_inherited": True,
+        }
+        self.assertEqual(
+            _resolve_student_init_mode(None, partial_state), "shared_partial"
+        )
 
 
 if __name__ == "__main__":

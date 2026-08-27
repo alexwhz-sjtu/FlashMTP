@@ -72,10 +72,16 @@ shell 启动器沿用 v2 的集群默认值，优先读取 `PET_NNODES`、`PET_N
 `OUTPUT_DIR` 及 W&B name/id；同一共享存储上的所有节点会得到相同值。设置
 `RUN_SUFFIX` 可区分同参数的新实验，所有自动值也都能用同名环境变量覆盖。
 
-`STUDENT_INIT_MODE` 支持 `scratch`（默认）和 `shared_init`。`shared_init`
+`STUDENT_INIT_MODE` 支持 `scratch`（默认）、`shared_init` 和 `shared_partial`。`shared_init`
 在 fresh Stage 1 开始前复制 teacher 的 `layers`、`norm`、
 `layer_depth_embedding` 和 `context_norm`；teacher-only 历史融合参数与
 串行 head 不在此时复制。模式会写入 checkpoint，恢复时自动沿用。
+
+`shared_partial` 用于 teacher draft backbone 更深的情况。Fresh 训练必须设置
+`STUDENT_NUM_DRAFT_LAYERS`（Python 参数为 `--student-num-draft-layers`），并要求
+teacher depth 严格大于 student depth。Student 层从 teacher 层按首尾对齐均匀
+抽取，例如 5 层 teacher 到 3 层 student 的映射为 `[0, 2, 4]`；其余共享 norm
+照常复制。Stage 2 的串行 head 仍直接继承 teacher，与 backbone 深度无关。
 
 Stage 1：
 

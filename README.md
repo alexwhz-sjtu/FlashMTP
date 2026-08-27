@@ -59,6 +59,11 @@ teacher 复制并行 backbone、CHS 编码和相关 norm，但不复制历史融
 串行 head，随后释放 teacher，用 label 的 final CE、target TV 和 base CE 训练完整
 student。两阶段分别创建 optimizer 和 cosine/warmup scheduler。
 
+若 student draft 比 teacher 浅，可设置 `STUDENT_INIT_MODE=shared_partial` 和
+`STUDENT_NUM_DRAFT_LAYERS=N`。该模式要求 teacher 层数严格大于 student，按首尾
+对齐的均匀索引抽取 teacher backbone 层初始化 student；共享 norm 仍完整复制，
+历史融合模块不复制，Stage 2 串行 head 仍从 teacher 直接继承。
+
 Stage 1 和 Stage 2 使用独立数据变量、缓存和 dataloader；fresh/Stage 1 启动时会
 同时预处理两套数据。若二者相同，也可继续只设置兼容变量 `TRAIN_DATA_PATH`，数据
 只会预处理一次。

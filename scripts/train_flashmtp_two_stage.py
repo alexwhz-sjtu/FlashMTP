@@ -45,13 +45,14 @@ from scripts.flashmtp_training import (
 )
 
 
-STUDENT_INIT_MODES = ("scratch", "shared_init")
+STUDENT_INIT_MODES = ("scratch", "shared_init", "shared_partial")
 SHARED_BACKBONE_MODULES = (
     "layers",
     "norm",
     "layer_depth_embedding",
     "context_norm",
 )
+SHARED_BACKBONE_NON_LAYER_MODULES = SHARED_BACKBONE_MODULES[1:]
 
 
 def parse_args():
@@ -73,8 +74,18 @@ def parse_args():
         choices=STUDENT_INIT_MODES,
         help=(
             "Fresh Stage 1 initialization. 'scratch' randomly initializes the "
-            "student; 'shared_init' copies the teacher's shared parallel backbone. "
+            "student; 'shared_init' copies the teacher's shared parallel backbone; "
+            "'shared_partial' initializes a shallower student from evenly spaced "
+            "teacher backbone layers. "
             "On resume, the checkpoint mode is used when this option is omitted."
+        ),
+    )
+    parser.add_argument(
+        "--student-num-draft-layers",
+        type=int,
+        help=(
+            "Student backbone depth for a fresh shared_partial run. The teacher "
+            "must have more draft layers. Resume uses the checkpoint depth."
         ),
     )
     parser.add_argument("--stage1-epochs", type=int, required=True)
@@ -127,6 +138,11 @@ def parse_args():
             parser.error(f"--{name.replace('_', '-')} must be in [0, 1]")
     if args.stage1_smooth_l1_beta < 0:
         parser.error("--stage1-smooth-l1-beta must be non-negative")
+    if (
+        args.student_num_draft_layers is not None
+        and args.student_num_draft_layers <= 0
+    ):
+        parser.error("--student-num-draft-layers must be positive")
     if args.stage1_tv_weight < 0 or args.stage1_hidden_weight < 0:
         parser.error("Stage 1 loss weights must be non-negative")
     if args.stage1_tv_weight + args.stage1_hidden_weight == 0:
@@ -142,6 +158,14 @@ def parse_args():
         parser.error("At least one Stage 2 loss weight must be positive")
     if args.resume_from is None and args.teacher_draft_path is None:
         parser.error("--teacher-draft-path is required for fresh training")
+    if (
+        args.resume_from is None
+        and args.student_init_mode == "shared_partial"
+        and args.student_num_draft_layers is None
+    ):
+        parser.error(
+            "--student-num-draft-layers is required for a fresh shared_partial run"
+        )
     get_tracker_class(args.report_to).validate_args(parser, args)
     return args
 
@@ -181,7 +205,7 @@ def _resolve_student_init_mode(requested_mode, resume_state) -> str:
             f"Checkpoint has unsupported student_init_mode={saved_mode!r}."
         )
     saved_inherited = resume_state.get("shared_backbone_inherited")
-    expected_inherited = saved_mode == "shared_init"
+    expected_inherited = saved_mode in ("shared_init", "shared_partial")
     if saved_inherited is not None and bool(saved_inherited) != expected_inherited:
         raise ValueError(
             "Checkpoint shared-backbone metadata is inconsistent with "
@@ -193,6 +217,33 @@ def _resolve_student_init_mode(requested_mode, resume_state) -> str:
             f"saved={saved_mode!r}, requested={requested_mode!r}."
         )
     return saved_mode
+
+
+def _shared_backbone_inherited(student_init_mode: str) -> bool:
+    return student_init_mode in ("shared_init", "shared_partial")
+
+
+def _non_depth_structure_signature(draft: FlashMTPDraftModel) -> tuple:
+    signature = _structure_signature(draft)
+    return signature[:4] + signature[5:]
+
+
+def _evenly_spaced_teacher_layer_ids(
+    teacher_depth: int, student_depth: int
+) -> list[int]:
+    if teacher_depth <= student_depth:
+        raise ValueError(
+            "shared_partial requires teacher draft depth to be greater than "
+            f"student draft depth, got teacher={teacher_depth}, student={student_depth}"
+        )
+    if student_depth <= 0:
+        raise ValueError(f"Student draft depth must be positive, got {student_depth}")
+    if student_depth == 1:
+        return [teacher_depth - 1]
+    return [
+        int(round(i * (teacher_depth - 1) / (student_depth - 1)))
+        for i in range(student_depth)
+    ]
 
 
 def _copy_shared_backbone(
@@ -207,6 +258,37 @@ def _copy_shared_backbone(
         student_module = getattr(student, module_name)
         teacher_module = getattr(teacher, module_name)
         student_module.load_state_dict(teacher_module.state_dict(), strict=True)
+
+
+def _copy_partial_shared_backbone(
+    teacher: FlashMTPDraftModel, student: FlashMTPDraftModel
+) -> list[int]:
+    """Initialize a shallower student from evenly spaced teacher layers."""
+    if not teacher.is_teacher or not student.is_student:
+        raise ValueError(
+            "Partial shared init requires an swa_teacher and a pivot_q_student"
+        )
+    if _non_depth_structure_signature(teacher) != _non_depth_structure_signature(
+        student
+    ):
+        raise ValueError(
+            "Teacher/student structures except draft depth must match for "
+            "shared_partial init"
+        )
+    teacher_layer_ids = _evenly_spaced_teacher_layer_ids(
+        len(teacher.layers), len(student.layers)
+    )
+    for student_layer, teacher_layer_id in zip(
+        student.layers, teacher_layer_ids, strict=True
+    ):
+        student_layer.load_state_dict(
+            teacher.layers[teacher_layer_id].state_dict(), strict=True
+        )
+    for module_name in SHARED_BACKBONE_NON_LAYER_MODULES:
+        getattr(student, module_name).load_state_dict(
+            getattr(teacher, module_name).state_dict(), strict=True
+        )
+    return teacher_layer_ids
 
 
 def _set_student_stage1_trainable(student: FlashMTPDraftModel) -> None:
@@ -341,19 +423,57 @@ def main():
             ).cuda()
             if not student.is_student:
                 raise ValueError("Stage 1 checkpoint must contain a pivot_q_student")
-            if _structure_signature(student) != _structure_signature(teacher):
-                raise ValueError("Stage 1 student structure no longer matches the teacher")
+            if student_init_mode == "shared_partial":
+                if _non_depth_structure_signature(
+                    student
+                ) != _non_depth_structure_signature(teacher):
+                    raise ValueError(
+                        "Stage 1 student structure except draft depth no longer "
+                        "matches the teacher"
+                    )
+                _evenly_spaced_teacher_layer_ids(
+                    len(teacher.layers), len(student.layers)
+                )
+            elif _structure_signature(student) != _structure_signature(teacher):
+                raise ValueError(
+                    "Stage 1 student structure no longer matches the teacher"
+                )
+            if (
+                args.student_num_draft_layers is not None
+                and int(args.student_num_draft_layers) != len(student.layers)
+            ):
+                raise ValueError(
+                    "--student-num-draft-layers must match the resumed checkpoint: "
+                    f"saved={len(student.layers)}, "
+                    f"requested={int(args.student_num_draft_layers)}"
+                )
+            args.num_draft_layers = student.config.num_hidden_layers
         else:
+            student_config = copy.deepcopy(teacher.config)
+            if student_init_mode == "shared_partial":
+                _evenly_spaced_teacher_layer_ids(
+                    len(teacher.layers), int(args.student_num_draft_layers)
+                )
+                student_config.num_hidden_layers = int(
+                    args.student_num_draft_layers
+                )
             student = build_draft_model(
                 args,
                 model_role="pivot_q_student",
-                source_config=copy.deepcopy(teacher.config),
+                source_config=student_config,
             )
             if student_init_mode == "shared_init":
                 _copy_shared_backbone(teacher, student)
                 print_on_rank0(
                     "Initialized student shared parallel backbone from teacher"
                 )
+            elif student_init_mode == "shared_partial":
+                teacher_layer_ids = _copy_partial_shared_backbone(teacher, student)
+                print_on_rank0(
+                    "Initialized student shared parallel backbone from teacher "
+                    f"layers {teacher_layer_ids}"
+                )
+            args.num_draft_layers = student.config.num_hidden_layers
     else:
         student = FlashMTPDraftModel.from_pretrained(
             args.resume_from,
@@ -362,6 +482,15 @@ def main():
         ).cuda()
         if not student.is_student:
             raise ValueError("Transition/Stage 2 checkpoint must contain a pivot_q_student")
+        if (
+            args.student_num_draft_layers is not None
+            and int(args.student_num_draft_layers) != len(student.layers)
+        ):
+            raise ValueError(
+                "--student-num-draft-layers must match the resumed checkpoint: "
+                f"saved={len(student.layers)}, "
+                f"requested={int(args.student_num_draft_layers)}"
+            )
         if not bool(resume_state.get("serial_head_inherited")):
             raise ValueError("Transition/Stage 2 checkpoint has no inherited serial head")
         _sync_args_from_model(args, student)
@@ -561,7 +690,9 @@ def main():
                         "global_step": global_step,
                         "serial_head_inherited": False,
                         "student_init_mode": student_init_mode,
-                        "shared_backbone_inherited": student_init_mode == "shared_init",
+                        "shared_backbone_inherited": _shared_backbone_inherited(
+                            student_init_mode
+                        ),
                         "teacher_checkpoint_identity": teacher_identity,
                         "shard_draft_by_tp": bool(args.shard_draft_by_tp),
                         "tp_size": int(args.tp_size),
@@ -590,7 +721,9 @@ def main():
                 "global_step": global_step,
                 "serial_head_inherited": False,
                 "student_init_mode": student_init_mode,
-                "shared_backbone_inherited": student_init_mode == "shared_init",
+                "shared_backbone_inherited": _shared_backbone_inherited(
+                    student_init_mode
+                ),
                 "teacher_checkpoint_identity": teacher_identity,
                 "shard_draft_by_tp": bool(args.shard_draft_by_tp),
                 "tp_size": int(args.tp_size),
@@ -624,7 +757,9 @@ def main():
                 "global_step": global_step,
                 "serial_head_inherited": True,
                 "student_init_mode": student_init_mode,
-                "shared_backbone_inherited": student_init_mode == "shared_init",
+                "shared_backbone_inherited": _shared_backbone_inherited(
+                    student_init_mode
+                ),
                 "teacher_checkpoint_identity": teacher_identity,
                 "shard_draft_by_tp": bool(args.shard_draft_by_tp),
                 "tp_size": int(args.tp_size),
@@ -763,7 +898,9 @@ def main():
                         "global_step": global_step,
                         "serial_head_inherited": True,
                         "student_init_mode": student_init_mode,
-                        "shared_backbone_inherited": student_init_mode == "shared_init",
+                        "shared_backbone_inherited": _shared_backbone_inherited(
+                            student_init_mode
+                        ),
                         "teacher_checkpoint_identity": teacher_identity,
                         "shard_draft_by_tp": bool(args.shard_draft_by_tp),
                         "tp_size": int(args.tp_size),
@@ -790,7 +927,9 @@ def main():
             "global_step": global_step,
             "serial_head_inherited": True,
             "student_init_mode": student_init_mode,
-            "shared_backbone_inherited": student_init_mode == "shared_init",
+            "shared_backbone_inherited": _shared_backbone_inherited(
+                student_init_mode
+            ),
             "teacher_checkpoint_identity": teacher_identity,
             "shard_draft_by_tp": bool(args.shard_draft_by_tp),
             "tp_size": int(args.tp_size),
