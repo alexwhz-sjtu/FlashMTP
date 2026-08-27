@@ -3,8 +3,9 @@ from copy import deepcopy
 from typing import Callable, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
-from transformers import DynamicCache
+from transformers import AutoConfig, DynamicCache
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from ...utils import print_on_rank0
@@ -23,6 +24,23 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
+try:
+    from torch.nn.attention.flex_attention import flex_attention
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+    from transformers.models.gemma4.modeling_gemma4 import (
+        Gemma4RMSNorm,
+        Gemma4TextMLP,
+        Gemma4TextRotaryEmbedding,
+        apply_rotary_pos_emb as apply_gemma4_rotary_pos_emb,
+    )
+except (ImportError, ModuleNotFoundError):  # Transformers < 5 keeps Qwen usable.
+    flex_attention = None
+    Gemma4TextConfig = None
+    Gemma4RMSNorm = None
+    Gemma4TextMLP = None
+    Gemma4TextRotaryEmbedding = None
+    apply_gemma4_rotary_pos_emb = None
+
 
 def _cuda_sync_time(device: torch.device) -> float:
     if device.type == "cuda":
@@ -38,6 +56,55 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     logits = logits / temperature
     probs = torch.softmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
+
+
+def is_gemma4_config(config) -> bool:
+    config = getattr(config, "text_config", config)
+    return str(getattr(config, "model_type", "")).startswith("gemma4")
+
+
+def get_target_input_embeddings(target: nn.Module) -> nn.Module:
+    getter = getattr(target, "get_input_embeddings", None)
+    if callable(getter):
+        embedding = getter()
+        if embedding is not None:
+            return embedding
+    for path in (("model", "language_model", "embed_tokens"), ("model", "embed_tokens"), ("language_model", "embed_tokens")):
+        obj = target
+        for name in path:
+            obj = getattr(obj, name, None)
+            if obj is None:
+                break
+        if obj is not None:
+            return obj
+    raise AttributeError("Could not locate target input embeddings")
+
+
+def get_target_lm_head(target: nn.Module) -> nn.Module:
+    getter = getattr(target, "get_output_embeddings", None)
+    if callable(getter):
+        head = getter()
+        if head is not None:
+            return head
+    for path in (("lm_head",), ("model", "language_model", "lm_head"), ("language_model", "lm_head")):
+        obj = target
+        for name in path:
+            obj = getattr(obj, name, None)
+            if obj is None:
+                break
+        if obj is not None:
+            return obj
+    # Tied Gemma checkpoints may omit a physical lm_head.
+    embedding = get_target_input_embeddings(target)
+    head = nn.Linear(embedding.embedding_dim, embedding.num_embeddings, bias=False).to(
+        device=embedding.weight.device, dtype=embedding.weight.dtype
+    )
+    head.weight = embedding.weight
+    return head.requires_grad_(False)
+
+
+def create_target_cache(target: nn.Module) -> DynamicCache:
+    return DynamicCache(config=target.config)
 
 
 STOCHASTIC_VERIFICATION_MODES = ("match", "rejection")
@@ -464,6 +531,127 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
+class Gemma4FlashMTPAttention(nn.Module):
+    """Gemma 4 global attention used by the five-layer FlashMTP draft."""
+
+    def __init__(self, config, layer_idx: int, pivot_fuse_mode: str):
+        super().__init__()
+        if Gemma4RMSNorm is None:
+            raise ImportError("Gemma4 FlashMTP requires Transformers with Gemma4 support")
+        self.config = config
+        self.layer_idx = int(layer_idx)
+        self.pivot_fuse_mode = pivot_fuse_mode
+        self.num_attention_heads = int(config.num_attention_heads)
+        self.head_dim = int(config.global_head_dim)
+        self.use_alternative_attention = bool(config.attention_k_eq_v)
+        self.num_key_value_heads = int(
+            config.num_global_key_value_heads
+            if self.use_alternative_attention
+            else config.num_key_value_heads
+        )
+        self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
+        self.scaling = 1.0
+        self.attention_dropout = float(config.attention_dropout)
+        bias = bool(config.attention_bias)
+        self.q_proj = nn.Linear(config.hidden_size, self.num_attention_heads * self.head_dim, bias=bias)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=bias)
+        self.v_proj = None if self.use_alternative_attention else nn.Linear(
+            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=bias
+        )
+        self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim, config.hidden_size, bias=bias)
+        self.q_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.v_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=False)
+
+    def _repeat_kv(self, states: torch.Tensor) -> torch.Tensor:
+        return states if self.num_key_value_groups == 1 else states.repeat_interleave(
+            self.num_key_value_groups, dim=1
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        target_hidden: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask=None,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ):
+        bsz, q_len = hidden_states.shape[:-1]
+        ctx_len = target_hidden.shape[1]
+        q = self.q_norm(self.q_proj(hidden_states).view(
+            bsz, q_len, self.num_attention_heads, self.head_dim
+        )).transpose(1, 2)
+        k_ctx = self.k_proj(target_hidden)
+        k_noise = self.k_proj(hidden_states)
+        if self.use_alternative_attention:
+            v_ctx, v_noise = k_ctx, k_noise
+        else:
+            v_ctx, v_noise = self.v_proj(target_hidden), self.v_proj(hidden_states)
+        k = torch.cat([k_ctx, k_noise], dim=1).view(
+            bsz, ctx_len + q_len, self.num_key_value_heads, self.head_dim
+        )
+        v = torch.cat([v_ctx, v_noise], dim=1).view(
+            bsz, ctx_len + q_len, self.num_key_value_heads, self.head_dim
+        )
+        k = self.k_norm(k).transpose(1, 2)
+        v = self.v_norm(v).transpose(1, 2)
+        cos, sin = position_embeddings
+        q = apply_gemma4_rotary_pos_emb(q, cos[:, -q_len:, :], sin[:, -q_len:, :], unsqueeze_dim=1)
+        k = apply_gemma4_rotary_pos_emb(k, cos, sin, unsqueeze_dim=1)
+        if past_key_values is not None:
+            k, v = past_key_values.update(
+                k, v, self.layer_idx,
+                {"sin": sin, "cos": cos, "cache_position": cache_position},
+            )
+        k, v = self._repeat_kv(k), self._repeat_kv(v)
+        if flex_attention is not None and attention_mask is not None and str(
+            getattr(self.config, "_attn_implementation", "")
+        ) == "flex_attention":
+            out = flex_attention(q, k, v, block_mask=attention_mask, scale=self.scaling)
+        else:
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attention_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=bool(kwargs.get("is_causal", False)), scale=self.scaling,
+            )
+        out = out.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
+        return self.o_proj(out), None
+
+
+class Gemma4FlashMTPDecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, config, layer_idx: int, chs_concat_mode: str, pivot_fuse_mode: str):
+        super().__init__()
+        del chs_concat_mode
+        if bool(getattr(config, "enable_moe_block", False)):
+            raise ValueError("Gemma4 FlashMTP does not support MoE draft blocks")
+        self.self_attn = Gemma4FlashMTPAttention(config, layer_idx, pivot_fuse_mode)
+        self.mlp = Gemma4TextMLP(config, layer_idx)
+        self.input_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_feedforward_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_feedforward_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.register_buffer("layer_scalar", torch.ones(1))
+
+    def forward(self, target_hidden=None, hidden_states=None, attention_mask=None,
+                past_key_value=None, cache_position=None, position_embeddings=None, **kwargs):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states, target_hidden=target_hidden,
+            attention_mask=attention_mask, past_key_values=past_key_value,
+            cache_position=cache_position, position_embeddings=position_embeddings,
+            **kwargs,
+        )[0]
+        hidden_states = residual + self.post_attention_layernorm(hidden_states)
+        residual = hidden_states
+        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + self.post_feedforward_layernorm(hidden_states)
+        return hidden_states * self.layer_scalar
+
+
 class FlashMTPDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3FlashMTPDecoderLayer"]
@@ -471,6 +659,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
     def __init__(self, config) -> None:
         super().__init__(config)
         self.config = config
+        self.model_family = "gemma4" if is_gemma4_config(config) else "qwen3"
+        if self.model_family == "gemma4" and Gemma4RMSNorm is None:
+            raise ImportError("Install the isolated Gemma4 environment to load this draft")
         flashmtp_config = getattr(config, "flashmtp_config", {}) or {}
         self.chs_concat_mode = "feature"
         flashmtp_config["chs_concat_mode"] = "feature"
@@ -564,9 +755,14 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self._compiled_serial_sampler_cache: dict[tuple[str, float], Callable] = {}
         config.flashmtp_config = flashmtp_config
 
+        decoder_cls = (
+            Gemma4FlashMTPDecoderLayer
+            if self.model_family == "gemma4"
+            else Qwen3FlashMTPDecoderLayer
+        )
         self.layers = nn.ModuleList(
             [
-                Qwen3FlashMTPDecoderLayer(
+                decoder_cls(
                     config,
                     layer_idx,
                     self.chs_concat_mode,
@@ -575,8 +771,13 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3RotaryEmbedding(config)
+        norm_cls = Gemma4RMSNorm if self.model_family == "gemma4" else Qwen3RMSNorm
+        self.norm = norm_cls(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = (
+            Gemma4TextRotaryEmbedding(config, layer_type="full_attention")
+            if self.model_family == "gemma4"
+            else Qwen3RotaryEmbedding(config)
+        )
         self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
         self._last_decode_stats = {}
@@ -592,6 +793,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             self.layer_depth_embedding = None
         elif self.pivot_fuse_mode == "attention_fuse":
             self.fc = None
+            if self.model_family == "gemma4":
+                raise ValueError("Gemma4 currently supports linear_fuse or prefix_condition")
             self.pivot_attn_fuse = PivotAttentionFuse(config)
             self.layer_depth_embedding = None
         else:
@@ -599,9 +802,9 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             self.pivot_attn_fuse = None
             self.layer_depth_embedding = nn.Embedding(config.num_target_layers, h)
 
-        self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hidden_norm = norm_cls(config.hidden_size, eps=config.rms_norm_eps)
         print_on_rank0(
-            f"FlashMTP: pivot_fuse_mode={self.pivot_fuse_mode}, "
+            f"FlashMTP: family={self.model_family}, pivot_fuse_mode={self.pivot_fuse_mode}, "
             f"num_middle_layers_n={self.num_middle_layers_n}, "
             f"target_layer_ids={self.target_layer_ids}, "
             f"include_embedding_chs={self.include_embedding_chs}, "
@@ -613,6 +816,14 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         )
 
         self.post_init()
+
+    def project_base_logits(self, lm_head: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+        logits = lm_head(hidden_states)
+        softcap = getattr(self.config, "final_logit_softcapping", None)
+        if self.model_family == "gemma4" and softcap is not None:
+            softcap = float(softcap)
+            logits = torch.tanh(logits / softcap) * softcap
+        return logits
 
     @property
     def chs_len_per_block(self) -> int:
@@ -747,7 +958,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         if self.markov_head is None or markov_output_uses_base_lm_head(
             self.markov_output_mode
         ):
-            base_logits = lm_head(draft_hidden)
+            base_logits = self.project_base_logits(lm_head, draft_hidden)
         if self.markov_head is None:
             assert base_logits is not None
             return sample(base_logits, temperature), base_logits
@@ -885,7 +1096,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         position_ids = torch.arange(
             output_ids.shape[1], device=target.device
         ).unsqueeze(0)
-        past_key_values_target = DynamicCache()
+        past_key_values_target = create_target_cache(target)
 
         if target.device.type == "cuda":
             torch.cuda.synchronize(target.device)
@@ -944,7 +1155,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             block_start_abs = int(start)
             slot0_tid = int(output_ids[0, start].item())
 
-            noise_embedding = target.model.embed_tokens(draft_input_ids)
+            noise_embedding = get_target_input_embeddings(target)(draft_input_ids)
             if target.device.type == "cuda":
                 torch.cuda.synchronize(target.device)
             draft_start = time.perf_counter()
@@ -971,7 +1182,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 is_causal=False,
             )
             draft_hidden = self._prediction_hidden(block_hidden)
-            lm_head = target.lm_head
+            lm_head = get_target_lm_head(target)
             sampled_draft_tokens, draft_logits = self.sample_draft_tokens(
                 draft_hidden=draft_hidden,
                 lm_head=lm_head,
@@ -1150,7 +1361,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 ]
 
         return output_ids
-
     @torch.inference_mode()
     def spec_generate(
         self,
@@ -1213,7 +1423,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             .expand(bsz, -1)
         )
 
-        past_key_values_target = DynamicCache()
+        past_key_values_target = create_target_cache(target)
 
         # Prefill stage (not included in decode wall time)
         output = target(
@@ -1256,7 +1466,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 )
             else:
                 draft_block_pos = draft_target_pos
-            noise_embedding = target.model.embed_tokens(draft_input_ids)
+            noise_embedding = get_target_input_embeddings(target)(draft_input_ids)
             chs = self.chs_len_per_block
             if self.local_position:
                 ctx_pos_part = torch.zeros(
@@ -1280,7 +1490,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 is_causal=False,
             )
             draft_hidden = self._prediction_hidden(block_hidden)
-            lm_head = target.lm_head
+            lm_head = get_target_lm_head(target)
             draft_temperature = temperature if use_rejection_sampling else 0.0
             sampled_draft_tokens, draft_logits = self.sample_draft_tokens(
                 draft_hidden=draft_hidden,
@@ -1372,3 +1582,28 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 ]
 
         return output_ids
+
+
+# This named class gives Gemma checkpoints an explicit, stable architecture
+# while retaining FlashMTPDraftModel and all of its parameter names for Qwen.
+class Gemma4FlashMTPDraftModel(FlashMTPDraftModel):
+    if Gemma4TextConfig is not None:
+        config_class = Gemma4TextConfig
+    _no_split_modules = ["Gemma4FlashMTPDecoderLayer"]
+
+
+def flashmtp_draft_class_from_config(config):
+    return Gemma4FlashMTPDraftModel if is_gemma4_config(config) else FlashMTPDraftModel
+
+
+def load_flashmtp_draft_model(model_name_or_path: str, **kwargs):
+    config = kwargs.pop("config", None)
+    if config is None:
+        config = AutoConfig.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=kwargs.get("trust_remote_code", False),
+        )
+    config = getattr(config, "text_config", config)
+    return flashmtp_draft_class_from_config(config).from_pretrained(
+        model_name_or_path, config=config, **kwargs
+    )

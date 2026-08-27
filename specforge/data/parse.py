@@ -41,6 +41,7 @@ class GeneralParser(Parser):
     def __init__(self, tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate):
         super().__init__(tokenizer, chat_template)
         self.system_prompt = chat_template.system_prompt
+        self.assistant_loss_prefix = chat_template.assistant_loss_prefix or ""
         self.user_message_separator = f"{chat_template.end_of_turn_token}"
         self.assistant_message_separator = f"{chat_template.assistant_header}"
         self.set_assistant_pattern(chat_template)
@@ -121,8 +122,9 @@ class GeneralParser(Parser):
                         break
                 messages.append(sentence)
 
+            render_messages = self._prepare_render_messages(messages)
             try:
-                conversation = self.apply_chat_template(messages, **kwargs)
+                conversation = self.apply_chat_template(render_messages, **kwargs)
             except (ValueError, TypeError):
                 # Fallback rendering for tokenizers without built-in chat_template
                 warnings.warn(
@@ -138,7 +140,7 @@ class GeneralParser(Parser):
                 if bos_token:
                     parts.append(bos_token)
 
-                for msg in messages:
+                for msg in render_messages:
                     if msg["role"] == "system":
                         parts.append(msg["content"])
                     elif msg["role"] == "user":
@@ -167,6 +169,10 @@ class GeneralParser(Parser):
 
         for match in matches:
             content_start_char = match.start(1)
+            if self.assistant_loss_prefix and conversation.startswith(
+                self.assistant_loss_prefix, content_start_char
+            ):
+                content_start_char += len(self.assistant_loss_prefix)
             content_end_char = match.end(1)
 
             # --- Core Alternative Operation: Calculate Token Index Based on Prefix String Length ---
@@ -195,6 +201,23 @@ class GeneralParser(Parser):
             if actual_start < actual_end:
                 loss_mask[actual_start:actual_end] = 1
         return input_ids, loss_mask
+
+    def _prepare_render_messages(self, messages):
+        if not self.assistant_loss_prefix:
+            return messages
+        rendered = []
+        for message in messages:
+            if message["role"] != "assistant":
+                rendered.append(message)
+                continue
+            content = message["content"]
+            if not isinstance(content, str):
+                raise TypeError("assistant content must be text")
+            item = dict(message)
+            if not content.startswith(self.assistant_loss_prefix):
+                item["content"] = self.assistant_loss_prefix + content
+            rendered.append(item)
+        return rendered
 
 
 class HarmonyParser(Parser):

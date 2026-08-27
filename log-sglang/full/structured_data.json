@@ -1,0 +1,160 @@
+[
+  {
+    "dataset": "longbench_v2_64000_32000_structured_data",
+    "runner": "baseline",
+    "backend": "fa3",
+    "concurrency": 1,
+    "question_index": 0,
+    "warmup": true,
+    "response": "Based on the provided employee dataset and general industry trends for internal promotion to senior management, the combination of factors most likely to predict high potential is:\n\n**The \"High-Performance Technical/Functional Leader\" Profile:**\n*   **Department:** **IT (Information Technology)** or **Engineering** (specifically within **Research & Development** or **Corporate** units).\n*   **Tenure:** **Moderate to Long (8–15 years)**.\n*   **Salary:** **High ($160,000 – $200,000+)** with a **Bonus % of 0.20 (20%) or higher**.\n\n### Detailed Analysis of the Prediction\n\n#### 1. Department: IT & Engineering (R&D Focus)\n*   **Data Observation:** The dataset shows a high concentration of \"Director\" and \"Vice President\" titles within the **IT** and **Engineering** departments, particularly those associated with **Research & Development (R&D)** or **Corporate** business units.\n*   **Reasoning:** In modern corporate structures, IT and R&D are strategic growth engines. Employees in these departments often have the most visibility into company-wide operations, digital transformation, and product innovation.\n*   **Specific Roles:** \"Technical Architect,\" \"Enterprise Architect,\" \"IT Systems Architect,\" and \"Engineering Manager\" are common stepping stones to C-suite or VP roles.\n*   **Example from Data:**\n    *   *E00549 (Isabella Xi):* Vice President, Marketing R&D, Asian, 41, Salary $249,270.\n    *   *E04116 (David Barnes):* Director, IT Corporate, Caucasian, 64, Salary $186,503.\n    *   *E03574 (John Moore):* Vice President, IT Speciality Products, Caucasian, 52, Salary $199,808.\n\n#### 2. Tenure: The \"Sweet Spot\" (8–15 Years)\n*   **Data Observation:** While there are employees with very short tenures (1–2 years) and very long tenures (20+ years), the most successful senior leaders in the dataset often fall in the **8–15 year** range.\n*   **Reasoning:**\n    *   **< 5 Years:** Often lack the institutional",
+    "meta_info": {
+      "id": "7391c9a9f52e4fbaa0a21e7adfebffc8",
+      "finish_reason": {
+        "type": "length",
+        "length": 512
+      },
+      "prompt_tokens": 58211,
+      "weight_version": "default",
+      "total_retractions": 0,
+      "model_decode_time": 2.9909543991088867,
+      "model_decode_start_time": 1787064166.1125739,
+      "model_decode_finish_time": 1787064169.1035283,
+      "queue_time": 0.0,
+      "prefill_waiting_latency": null,
+      "prefill_launch_latency": null,
+      "completion_tokens": 512,
+      "cached_tokens": 0,
+      "cached_tokens_details": null,
+      "dp_rank": null,
+      "e2e_latency": 5.1452135923318565,
+      "response_sent_to_client_ts": 1787064169.107054
+    },
+    "client_latency_s": 5.148636808153242
+  },
+  {
+    "dataset": "longbench_v2_64000_32000_structured_data",
+    "runner": "baseline",
+    "backend": "fa3",
+    "concurrency": 1,
+    "question_index": 1,
+    "warmup": false,
+    "response": "Based on the provided employee dataset and general industry trends for internal promotion to senior management, the combination of factors most likely to predict high potential is:\n\n**The \"High-Performance Technical/Functional Leader\" Profile:**\n*   **Department:** **IT (Information Technology)** or **Engineering** (specifically within **Research & Development** or **Corporate** units).\n*   **Tenure:** **Moderate to Long (8–15 years)**.\n*   **Salary:** **High ($160,000 – $200,000+)** with a **Bonus % of 0.20 (20%) or higher**.\n\n### Detailed Analysis of the Prediction\n\n#### 1. Department: IT & Engineering (R&D Focus)\n*   **Data Observation:** The dataset shows a high concentration of \"Director\" and \"Vice President\" titles within the **IT** and **Engineering** departments, particularly those associated with **Research & Development (R&D)** or **Corporate** business units.\n*   **Reasoning:** In modern corporate structures, IT and R&D are strategic growth engines. Employees in these departments often have the most visibility into company-wide operations, digital transformation, and product innovation.\n*   **Specific Roles:** \"Technical Architect,\" \"Enterprise Architect,\" \"IT Systems Architect,\" and \"Engineering Manager\" are common stepping stones to C-suite or VP roles.\n*   **Example from Data:**\n    *   *E00549 (Isabella Xi):* Vice President, Marketing R&D, Asian, 41, Salary $249,270.\n    *   *E04116 (David Barnes):* Director, IT Corporate, Caucasian, 64, Salary $186,503.\n    *   *E03574 (John Moore):* Vice President, IT Speciality Products, Caucasian, 52, Salary $199,808.\n\n#### 2. Tenure: The \"Sweet Spot\" (8–15 Years)\n*   **Data Observation:** While there are employees with very short tenures (1–2 years) and very long tenures (20+ years), the most successful senior leaders in the dataset often fall in the **8–15 year** range.\n*   **Reasoning:**\n    *   **< 5 Years:** Often lack the institutional",
+    "meta_info": {
+      "id": "00131dded0c54b4891e96c9040346b22",
+      "finish_reason": {
+        "type": "length",
+        "length": 512
+      },
+      "prompt_tokens": 58211,
+      "weight_version": "default",
+      "total_retractions": 0,
+      "model_decode_time": 2.9839260578155518,
+      "model_decode_start_time": 1787064169.2717454,
+      "model_decode_finish_time": 1787064172.2556715,
+      "queue_time": 0.0,
+      "prefill_waiting_latency": null,
+      "prefill_launch_latency": null,
+      "completion_tokens": 512,
+      "cached_tokens": 57344,
+      "cached_tokens_details": null,
+      "dp_rank": null,
+      "e2e_latency": 3.1461059316061437,
+      "response_sent_to_client_ts": 1787064172.2592013
+    },
+    "client_latency_s": 3.1495933099649847
+  },
+  {
+    "dataset": "longbench_v2_64000_32000_structured_data",
+    "runner": "flashmtp",
+    "backend": "fa3",
+    "concurrency": 1,
+    "question_index": 0,
+    "warmup": true,
+    "response": "Based on the provided employee dataset and general industry trends for internal promotion to senior management, the combination of factors most likely to predict high potential is:\n\n**The \"High-Performance Technical/Functional Leader\" Profile:**\n*   **Department:** **IT (Information Technology)** or **Engineering** (specifically within **Research & Development** or **Corporate** units).\n*   **Tenure:** **Moderate to Long (8–15 years)**.\n*   **Salary:** **High ($160,000 – $200,000+)** with a **Bonus % of 0.20 (20%) or higher**.\n\n### Detailed Reasoning\n\n#### 1. Department: IT & Engineering (R&D Focus)\n*   **Data Observation:** The dataset shows a high concentration of \"Director\" and \"Vice President\" titles within the **IT** and **Engineering** departments, particularly those associated with **Research & Development (R&D)** or **Corporate** business units.\n*   **Industry Trend:** In modern corporate structures, IT and R&D are often the primary drivers of innovation and digital transformation. Employees in these departments who demonstrate leadership in complex technical projects are frequently fast-tracked into senior management roles (e.g., CTO, VP of Engineering) because their skills are directly tied to revenue generation and strategic growth.\n*   **Specific Roles:** Look for titles like *Technical Architect, Enterprise Architect, IT Systems Architect,* or *Engineering Manager*. These roles often serve as the direct pipeline to senior executive positions.\n\n#### 2. Tenure: The \"Sweet Spot\" (8–15 Years)\n*   **Data Observation:**\n    *   Employees with **< 3 years** of tenure (e.g., hired in 2019–2021) are typically in individual contributor or junior management roles. They lack the institutional knowledge required for C-suite or VP roles.\n    *   Employees with **> 20 years** of tenure (e.g., hired before 2005) are often in senior roles already, but the data shows a mix of those who have plateaued and those who have risen.\n    *   **The Sweet Spot:** Employees hired between **2008 and 2014** (10–15 years tenure) represent the most likely candidates for *future* promotion. They have survived multiple economic cycles, understand the company culture deeply",
+    "meta_info": {
+      "id": "6e292b0f1109481ea9173655eacf5b9f",
+      "finish_reason": {
+        "type": "length",
+        "length": 512
+      },
+      "prompt_tokens": 58211,
+      "weight_version": "default",
+      "total_retractions": 0,
+      "model_decode_time": 2.5046167373657227,
+      "model_decode_start_time": 1787064420.7379034,
+      "model_decode_finish_time": 1787064423.24252,
+      "queue_time": 0.0,
+      "prefill_waiting_latency": null,
+      "prefill_launch_latency": null,
+      "completion_tokens": 512,
+      "cached_tokens": 0,
+      "cached_tokens_details": null,
+      "dp_rank": null,
+      "e2e_latency": 4.759970603976399,
+      "spec_accept_rate": 0.18896103896103897,
+      "spec_accept_length": 2.327272727272727,
+      "spec_accept_token_num": 291,
+      "spec_draft_token_num": 1540,
+      "spec_verify_ct": 220,
+      "spec_accept_histogram": [
+        79,
+        61,
+        50,
+        13,
+        1,
+        10,
+        5,
+        1
+      ],
+      "response_sent_to_client_ts": 1787064423.2466507
+    },
+    "client_latency_s": 4.763057315256447
+  },
+  {
+    "dataset": "longbench_v2_64000_32000_structured_data",
+    "runner": "flashmtp",
+    "backend": "fa3",
+    "concurrency": 1,
+    "question_index": 1,
+    "warmup": false,
+    "response": "Based on the provided employee dataset and general industry trends for internal promotion to senior management, the combination of factors most likely to predict high potential is:\n\n**The \"High-Performance Core\" Profile:**\n*   **Department:** **IT (Information Technology)** or **Engineering** (specifically within **Research & Development**).\n*   **Tenure:** **Moderate to Long (8–15 years)**.\n*   **Salary:** **High (Top 20% of the dataset, typically >$160,000)**.\n\n### Detailed Analysis of the Prediction\n\n#### 1. Department: IT & Engineering (R&D)\n*   **Data Observation:** The dataset shows a high concentration of \"Director\" and \"Vice President\" titles within the **IT** and **Engineering** departments, particularly in the **Research & Development** business unit.\n*   **Reasoning:** In modern corporate structures, IT and R&D are strategic growth engines. Employees in these departments often have the most visibility into company-wide operations and innovation.\n*   **Evidence from Data:**\n    *   *Isabella Xi* (VP, Marketing/R&D) and *Evelyn Dinh* (Director, Sales/R&D) show that R&D is a hub for leadership.\n    *   *Dylan Choi* (VP, IT) and *Adam Dang* (Director, Sales/R&D) illustrate that technical leadership often transitions to executive roles.\n    *   Employees in \"Manufacturing\" or \"Sales\" often have lower average salaries and fewer VP/Director titles compared to the technical arms of the company in this specific dataset.\n\n#### 2. Tenure: The \"Sweet Spot\" (8–15 Years)\n*   **Data Observation:** Looking at the \"Hire Date\" column, many current Directors and VPs were hired between **2005 and 2012**.\n    *   *Theodore Dinh* (Hired 1997, Technical Architect) and *Eli Jones* (Hired 1999, Manager) represent the \"Old Guard\" but are often in specialized technical roles rather than general management.\n    *   *Austin Vo* (Hired 1995) and *Lucy Alexander* (Hired 2014) show that long tenure is common among leaders.\n*   **Reasoning:**\n    *   **< 5 Years:**",
+    "meta_info": {
+      "id": "1e137fd9aebd494587afdcc9af049c4d",
+      "finish_reason": {
+        "type": "length",
+        "length": 512
+      },
+      "prompt_tokens": 58211,
+      "weight_version": "default",
+      "total_retractions": 0,
+      "model_decode_time": 2.3954062461853027,
+      "model_decode_start_time": 1787064423.4300659,
+      "model_decode_finish_time": 1787064425.825472,
+      "queue_time": 0.0,
+      "prefill_waiting_latency": null,
+      "prefill_launch_latency": null,
+      "completion_tokens": 512,
+      "cached_tokens": 58176,
+      "cached_tokens_details": null,
+      "dp_rank": null,
+      "e2e_latency": 2.5777352759614587,
+      "spec_accept_rate": 0.19893190921228304,
+      "spec_accept_length": 2.392523364485981,
+      "spec_accept_token_num": 298,
+      "spec_draft_token_num": 1498,
+      "spec_verify_ct": 214,
+      "spec_accept_histogram": [
+        82,
+        52,
+        44,
+        14,
+        5,
+        8,
+        7,
+        2
+      ],
+      "response_sent_to_client_ts": 1787064425.829982
+    },
+    "client_latency_s": 2.581175222992897
+  }
+]

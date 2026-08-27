@@ -145,6 +145,18 @@ class LogitsProcessorForEAGLE3(torch.nn.Module):
         aux_hidden_states: Optional[torch.Tensor] = None,
         hidden_states_before_norm: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
+        # Some multimodal/hybrid SGLang models return ``(last_hidden,
+        # aux_hidden_list)`` from their language backbone but do not unpack it
+        # before calling the logits processor.  Normalize that convention here.
+        if isinstance(hidden_states, tuple):
+            if len(hidden_states) != 2:
+                raise ValueError(
+                    "Expected (last_hidden_states, aux_hidden_states), got "
+                    f"a tuple of length {len(hidden_states)}"
+                )
+            hidden_states, captured_aux = hidden_states
+            if aux_hidden_states is None:
+                aux_hidden_states = captured_aux
         logits_metadata.forward_mode = ForwardMode.DECODE
         ret = replaced_logits_processor_forward_for_eagle3(
             self.logits_processor,

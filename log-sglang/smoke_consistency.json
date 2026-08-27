@@ -1,0 +1,229 @@
+[
+  {
+    "dataset": "alpaca",
+    "runner": "baseline",
+    "backend": "fa3",
+    "concurrency": 1,
+    "question_index": 0,
+    "warmup": true,
+    "response": "She is unhappy because she believes nobody loves her.",
+    "meta_info": {
+      "id": "80cb76a58367493f85c35178632dd8f4",
+      "finish_reason": {
+        "type": "stop",
+        "matched": 248046
+      },
+      "prompt_tokens": 40,
+      "weight_version": "default",
+      "total_retractions": 0,
+      "model_decode_time": 0.05306100845336914,
+      "model_decode_start_time": 1787062431.9669597,
+      "model_decode_finish_time": 1787062432.0200207,
+      "queue_time": 0.0,
+      "prefill_waiting_latency": null,
+      "prefill_launch_latency": null,
+      "completion_tokens": 11,
+      "cached_tokens": 0,
+      "cached_tokens_details": null,
+      "dp_rank": null,
+      "e2e_latency": 0.13610947597771883,
+      "response_sent_to_client_ts": 1787062432.0205486
+    },
+    "client_latency_s": 0.13807280827313662
+  },
+  {
+    "dataset": "alpaca",
+    "runner": "baseline",
+    "backend": "fa3",
+    "concurrency": 1,
+    "question_index": 1,
+    "warmup": false,
+    "response": "She is unhappy because she believes nobody loves her.",
+    "meta_info": {
+      "id": "577b620ba25a4790b5f329e773d8379a",
+      "finish_reason": {
+        "type": "stop",
+        "matched": 248046
+      },
+      "prompt_tokens": 40,
+      "weight_version": "default",
+      "total_retractions": 0,
+      "model_decode_time": 0.052863121032714844,
+      "model_decode_start_time": 1787062432.0855756,
+      "model_decode_finish_time": 1787062432.1384387,
+      "queue_time": 0.0,
+      "prefill_waiting_latency": null,
+      "prefill_launch_latency": null,
+      "completion_tokens": 11,
+      "cached_tokens": 0,
+      "cached_tokens_details": null,
+      "dp_rank": null,
+      "e2e_latency": 0.11399073200300336,
+      "response_sent_to_client_ts": 1787062432.1389327
+    },
+    "client_latency_s": 0.11586152203381062
+  },
+  {
+    "dataset": "alpaca",
+    "runner": "baseline",
+    "backend": "fa3",
+    "concurrency": 1,
+    "question_index": 2,
+    "warmup": false,
+    "response": "Neural networks are the foundational architecture behind modern **Deep Learning**, a subset of Artificial Intelligence (AI) that has revolutionized how machines perceive, learn, and make decisions. Inspired loosely by the biological structure of the human brain, they are designed to recognize complex patterns in data that traditional algorithms often miss.\n\nHere is",
+    "meta_info": {
+      "id": "280cbc01faf44263b58b781efd517496",
+      "finish_reason": {
+        "type": "length",
+        "length": 64
+      },
+      "prompt_tokens": 22,
+      "weight_version": "default",
+      "total_retractions": 0,
+      "model_decode_time": 0.3328521251678467,
+      "model_decode_start_time": 1787062432.330445,
+      "model_decode_finish_time": 1787062432.6632972,
+      "queue_time": 0.0,
+      "prefill_waiting_latency": null,
+      "prefill_launch_latency": null,
+      "completion_tokens": 64,
+      "cached_tokens": 0,
+      "cached_tokens_details": null,
+      "dp_rank": null,
+      "e2e_latency": 0.5232563358731568,
+      "response_sent_to_client_ts": 1787062432.6638985
+    },
+    "client_latency_s": 0.5250304089859128
+  },
+  {
+    "dataset": "alpaca",
+    "runner": "flashmtp",
+    "backend": "fa3",
+    "concurrency": 1,
+    "question_index": 0,
+    "warmup": true,
+    "response": "She is unhappy because she believes nobody loves her.",
+    "meta_info": {
+      "id": "a6a1ea27eec446849d65f85d5e011f4b",
+      "finish_reason": {
+        "type": "stop",
+        "matched": 248046
+      },
+      "prompt_tokens": 40,
+      "weight_version": "default",
+      "total_retractions": 0,
+      "model_decode_time": 0.0575714111328125,
+      "model_decode_start_time": 1787062622.8791132,
+      "model_decode_finish_time": 1787062622.9366846,
+      "queue_time": 0.0,
+      "prefill_waiting_latency": null,
+      "prefill_launch_latency": null,
+      "completion_tokens": 11,
+      "cached_tokens": 0,
+      "cached_tokens_details": null,
+      "dp_rank": null,
+      "e2e_latency": 0.14438514364883304,
+      "spec_accept_rate": 0.2,
+      "spec_accept_length": 2.2,
+      "spec_accept_token_num": 7,
+      "spec_draft_token_num": 35,
+      "spec_verify_ct": 5,
+      "spec_accept_histogram": [
+        0,
+        4,
+        0,
+        1
+      ],
+      "response_sent_to_client_ts": 1787062622.9372516
+    },
+    "client_latency_s": 0.14624397736042738
+  },
+  {
+    "dataset": "alpaca",
+    "runner": "flashmtp",
+    "backend": "fa3",
+    "concurrency": 1,
+    "question_index": 1,
+    "warmup": false,
+    "response": "She is unhappy because she believes nobody loves her.",
+    "meta_info": {
+      "id": "51505c50bd984f309d40f4e064dacc21",
+      "finish_reason": {
+        "type": "stop",
+        "matched": 248046
+      },
+      "prompt_tokens": 40,
+      "weight_version": "default",
+      "total_retractions": 0,
+      "model_decode_time": 0.05769658088684082,
+      "model_decode_start_time": 1787062623.0077348,
+      "model_decode_finish_time": 1787062623.0654314,
+      "queue_time": 0.0,
+      "prefill_waiting_latency": null,
+      "prefill_launch_latency": null,
+      "completion_tokens": 11,
+      "cached_tokens": 0,
+      "cached_tokens_details": null,
+      "dp_rank": null,
+      "e2e_latency": 0.12449667183682323,
+      "spec_accept_rate": 0.2,
+      "spec_accept_length": 2.2,
+      "spec_accept_token_num": 7,
+      "spec_draft_token_num": 35,
+      "spec_verify_ct": 5,
+      "spec_accept_histogram": [
+        0,
+        4,
+        0,
+        1
+      ],
+      "response_sent_to_client_ts": 1787062623.065935
+    },
+    "client_latency_s": 0.12624720390886068
+  },
+  {
+    "dataset": "alpaca",
+    "runner": "flashmtp",
+    "backend": "fa3",
+    "concurrency": 1,
+    "question_index": 2,
+    "warmup": false,
+    "response": "Neural networks are the foundational architecture behind modern **Deep Learning**, a subset of Artificial Intelligence (AI) that has revolutionized how machines perceive, learn, and make decisions. Inspired loosely by the biological structure of the human brain, they are designed to recognize complex patterns in data that traditional algorithms often miss.\n\nHere is",
+    "meta_info": {
+      "id": "fa48e0e2c833466cb02e43ef8a70c34f",
+      "finish_reason": {
+        "type": "length",
+        "length": 64
+      },
+      "prompt_tokens": 22,
+      "weight_version": "default",
+      "total_retractions": 0,
+      "model_decode_time": 0.26813507080078125,
+      "model_decode_start_time": 1787062623.2612736,
+      "model_decode_finish_time": 1787062623.5294087,
+      "queue_time": 0.0,
+      "prefill_waiting_latency": null,
+      "prefill_launch_latency": null,
+      "completion_tokens": 64,
+      "cached_tokens": 0,
+      "cached_tokens_details": null,
+      "dp_rank": null,
+      "e2e_latency": 0.4624784691259265,
+      "spec_accept_rate": 0.22857142857142856,
+      "spec_accept_length": 2.56,
+      "spec_accept_token_num": 40,
+      "spec_draft_token_num": 175,
+      "spec_verify_ct": 25,
+      "spec_accept_histogram": [
+        9,
+        4,
+        7,
+        1,
+        1,
+        3
+      ],
+      "response_sent_to_client_ts": 1787062623.5300725
+    },
+    "client_latency_s": 0.4643387203104794
+  }
+]

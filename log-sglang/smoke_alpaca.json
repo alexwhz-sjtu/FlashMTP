@@ -1,0 +1,113 @@
+[
+  {
+    "dataset": "alpaca",
+    "runner": "flashmtp",
+    "backend": "fa3",
+    "concurrency": 1,
+    "question_index": 0,
+    "warmup": true,
+    "response": "Here are three essential good to help!",
+    "meta_info": {
+      "id": "03a0016966284c1e9ff0faddaf26ae06",
+      "finish_reason": {
+        "type": "length",
+        "length": 8
+      },
+      "prompt_tokens": 19,
+      "weight_version": "default",
+      "total_retractions": 0,
+      "model_decode_time": 0.053349971771240234,
+      "model_decode_start_time": 1787059979.7465057,
+      "model_decode_finish_time": 1787059979.7998557,
+      "queue_time": 0.0,
+      "prefill_waiting_latency": null,
+      "prefill_launch_latency": null,
+      "completion_tokens": 8,
+      "cached_tokens": 0,
+      "cached_tokens_details": null,
+      "dp_rank": null,
+      "e2e_latency": 0.26905463775619864,
+      "spec_accept_rate": 0.05714285714285714,
+      "spec_accept_length": 1.6,
+      "spec_accept_token_num": 2,
+      "spec_draft_token_num": 35,
+      "spec_verify_ct": 5,
+      "response_sent_to_client_ts": 1787059979.8004203
+    },
+    "client_latency_s": 0.27113195694983006
+  },
+  {
+    "dataset": "alpaca",
+    "runner": "flashmtp",
+    "backend": "fa3",
+    "concurrency": 1,
+    "question_index": 1,
+    "warmup": false,
+    "response": "The answer depends on the context matters of",
+    "meta_info": {
+      "id": "04e9f42297304980918d2ac337402a60",
+      "finish_reason": {
+        "type": "length",
+        "length": 8
+      },
+      "prompt_tokens": 19,
+      "weight_version": "default",
+      "total_retractions": 0,
+      "model_decode_time": 0.043121337890625,
+      "model_decode_start_time": 1787059979.8777692,
+      "model_decode_finish_time": 1787059979.9208906,
+      "queue_time": 0.0,
+      "prefill_waiting_latency": null,
+      "prefill_launch_latency": null,
+      "completion_tokens": 8,
+      "cached_tokens": 0,
+      "cached_tokens_details": null,
+      "dp_rank": null,
+      "e2e_latency": 0.11641810415312648,
+      "spec_accept_rate": 0.10714285714285714,
+      "spec_accept_length": 2.0,
+      "spec_accept_token_num": 3,
+      "spec_draft_token_num": 28,
+      "spec_verify_ct": 4,
+      "response_sent_to_client_ts": 1787059979.9213362
+    },
+    "client_latency_s": 0.11847598990425467
+  },
+  {
+    "dataset": "alpaca",
+    "runner": "flashmtp",
+    "backend": "fa3",
+    "concurrency": 1,
+    "question_index": 2,
+    "warmup": false,
+    "response": "An atom is the fundamental building blocks and",
+    "meta_info": {
+      "id": "af0c74e0fc6546f79bd732fde58747fc",
+      "finish_reason": {
+        "type": "length",
+        "length": 8
+      },
+      "prompt_tokens": 19,
+      "weight_version": "default",
+      "total_retractions": 0,
+      "model_decode_time": 0.032094717025756836,
+      "model_decode_start_time": 1787059979.9930155,
+      "model_decode_finish_time": 1787059980.0251102,
+      "queue_time": 0.0,
+      "prefill_waiting_latency": null,
+      "prefill_launch_latency": null,
+      "completion_tokens": 8,
+      "cached_tokens": 0,
+      "cached_tokens_details": null,
+      "dp_rank": null,
+      "e2e_latency": 0.10233899485319853,
+      "spec_accept_rate": 0.19047619047619047,
+      "spec_accept_length": 2.6666666666666665,
+      "spec_accept_token_num": 4,
+      "spec_draft_token_num": 21,
+      "spec_verify_ct": 3,
+      "response_sent_to_client_ts": 1787059980.0255291
+    },
+    "client_latency_s": 0.10409880708903074
+  }
+]

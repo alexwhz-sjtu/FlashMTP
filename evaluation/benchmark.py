@@ -19,8 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
-from specforge.modeling.draft.flashmtp import sample
+from specforge.modeling.draft.flashmtp import FlashMTPDraftModel, create_target_cache, sample
 
 from evaluation import distributed as dist
 from evaluation.model_loading import load_flashmtp_benchmark_models
@@ -588,7 +587,7 @@ def target_generate(
     position_ids = torch.arange(max_length, device=input_ids.device).unsqueeze(0).expand(
         batch_size_dim, -1
     )
-    past_key_values_target = DynamicCache()
+    past_key_values_target = create_target_cache(target)
     stop_tensor = (
         torch.tensor(stop_token_ids, device=input_ids.device, dtype=torch.long)
         if stop_token_ids
@@ -732,6 +731,7 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=10)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--output-json", type=str, default=None)
     parser.add_argument(
         "--stochastic-verification-mode",
         choices=("match", "rejection"),
@@ -858,7 +858,12 @@ def main() -> None:
         )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-    stop_token_ids = [token_id for token_id in [tokenizer.eos_token_id] if token_id is not None]
+    eos_token_id = getattr(target.generation_config, "eos_token_id", None)
+    if eos_token_id is None:
+        eos_token_id = tokenizer.eos_token_id
+    if isinstance(eos_token_id, int):
+        eos_token_id = [eos_token_id]
+    stop_token_ids = list(dict.fromkeys(int(x) for x in (eos_token_id or [])))
     dataset = load_benchmark_dataset(args.dataset)
     dataset = select_max_samples(dataset, args.max_samples)
 
@@ -975,6 +980,13 @@ def main() -> None:
         config_block_size,
         title=f"Overall (batch_size={args.batch_size})",
     )
+    if args.output_json:
+        output_path = Path(args.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps({"dataset": args.dataset, **overall_stats}, indent=2),
+            encoding="utf-8",
+        )
 
     category_groups = group_responses_by_category(responses)
     if len(category_groups) > 1 or (

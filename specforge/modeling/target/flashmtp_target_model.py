@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import inspect
+from types import MethodType
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -76,6 +78,12 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
 
         tp_size = dist.get_world_size(get_tp_group())
         dtype_arg = torch_dtype if torch_dtype is not None else "auto"
+        # SGLang's ServerArgs evolves quickly (for example, 0.5.17 removed the
+        # old piecewise-CUDA-graph fields used by 0.5.9).  The shared backend
+        # config still carries those fields for older environments, so pass
+        # only parameters supported by the installed SGLang runtime.
+        supported_server_args = set(inspect.signature(ServerArgs).parameters)
+        kwargs = {key: value for key, value in kwargs.items() if key in supported_server_args}
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
@@ -91,20 +99,59 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
         model_config = ModelConfig.from_server_args(server_args)
 
-        model_runner = SGLangRunner(
+        runner_kwargs = dict(
             model_config=model_config,
             mem_fraction_static=server_args.mem_fraction_static,
             gpu_id=torch.cuda.current_device(),
-            tp_rank=dist.get_rank(get_tp_group()),
-            tp_size=server_args.tp_size,
-            moe_ep_rank=moe_ep_rank,
-            moe_ep_size=server_args.ep_size,
-            pp_rank=0,
-            pp_size=1,
             server_args=server_args,
             nccl_port=None,
             is_draft_worker=False,
         )
+        runner_base_parameters = inspect.signature(SGLangRunner.__mro__[1]).parameters
+        if "ps" in runner_base_parameters:
+            from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+
+            attn_cp_size = server_args.attn_cp_size
+            attn_dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
+            attn_tp_size = server_args.tp_size // attn_cp_size // attn_dp_size
+            tp_rank = dist.get_rank(get_tp_group())
+            runner_kwargs["ps"] = ParallelState(
+                tp_rank=tp_rank,
+                tp_size=server_args.tp_size,
+                pp_rank=0,
+                pp_size=1,
+                dp_rank=0,
+                dp_size=server_args.dp_size,
+                attn_tp_rank=tp_rank % attn_tp_size,
+                attn_tp_size=attn_tp_size,
+                attn_cp_rank=(tp_rank // attn_tp_size) % attn_cp_size,
+                attn_cp_size=attn_cp_size,
+                attn_dp_rank=tp_rank // (attn_tp_size * attn_cp_size),
+                attn_dp_size=attn_dp_size,
+                moe_ep_rank=moe_ep_rank,
+                moe_ep_size=server_args.ep_size,
+                moe_dp_rank=0,
+                moe_dp_size=server_args.moe_dp_size,
+                dcp_size=server_args.dcp_size,
+                gpu_id=torch.cuda.current_device(),
+            )
+        else:
+            runner_kwargs.update(
+                tp_rank=dist.get_rank(get_tp_group()),
+                tp_size=server_args.tp_size,
+                moe_ep_rank=moe_ep_rank,
+                moe_ep_size=server_args.ep_size,
+                pp_rank=0,
+                pp_size=1,
+            )
+        model_runner = SGLangRunner(**runner_kwargs)
+        # SGLang >= 0.5.17 splits model loading from KV/request-pool
+        # allocation.  The embedded training runner bypasses Scheduler, which
+        # normally performs this second phase, so initialize the pools here.
+        if model_runner.req_to_token_pool is None:
+            model_runner.alloc_memory_pool()
+        if not hasattr(model_runner, "attn_backend"):
+            model_runner.init_attention_backends()
         wrap_eagle3_logits_processors_in_module(
             model_runner.model, return_full_logits=False
         )
@@ -128,6 +175,79 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         super().set_capture_layers(layer_ids)
         if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
             self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
+        else:
+            self._install_generic_layer_capture(layer_ids)
+
+    def _install_generic_layer_capture(self, layer_ids: List[int]) -> None:
+        """Add intermediate-state capture to SGLang models missing EAGLE3 hooks.
+
+        SGLang 0.5.9's Qwen3.5 implementation supports inference but does not
+        yet expose ``set_eagle3_layers_to_capture``.  Its language backbone has
+        the same residual convention as the other SGLang decoder models, so
+        layer forward hooks can recover the post-layer hidden state without
+        modifying the installed SGLang package.
+        """
+        top_model = self.model_runner.model
+        language_model = getattr(top_model, "model", None)
+        layers = getattr(language_model, "layers", None)
+        if language_model is None or layers is None:
+            raise NotImplementedError(
+                f"{type(top_model).__name__} does not support intermediate-layer "
+                "capture and has no hookable language-model layers."
+            )
+
+        num_layers = len(layers)
+        invalid_ids = [idx for idx in layer_ids if idx < 0 or idx >= num_layers]
+        if invalid_ids:
+            raise ValueError(
+                f"Invalid capture layer ids {invalid_ids} for {num_layers} layers."
+            )
+
+        # The normalized final state is already returned separately by the
+        # logits processor.  Capture only non-final layers as auxiliary states.
+        aux_layer_ids = [idx for idx in layer_ids if idx != num_layers - 1]
+        language_model._flashmtp_capture_layer_ids = aux_layer_ids
+
+        if not hasattr(language_model, "_flashmtp_capture_handles"):
+            handles = []
+
+            def make_hook(layer_idx):
+                def capture_hook(_module, _inputs, output):
+                    wanted = getattr(
+                        language_model, "_flashmtp_capture_layer_ids", []
+                    )
+                    if layer_idx not in wanted:
+                        return
+                    if not isinstance(output, tuple) or len(output) < 2:
+                        raise ValueError(
+                            "Generic SGLang layer capture expects "
+                            "(hidden_states, residual) output."
+                        )
+                    hidden, residual = output[:2]
+                    state = hidden if residual is None else hidden + residual
+                    language_model._flashmtp_captured[layer_idx] = state
+
+                return capture_hook
+
+            for layer_idx, layer in enumerate(layers):
+                handles.append(layer.register_forward_hook(make_hook(layer_idx)))
+            language_model._flashmtp_capture_handles = handles
+
+            original_forward = language_model.forward
+
+            def forward_with_capture(this, *args, **kwargs):
+                this._flashmtp_captured = {}
+                final_hidden = original_forward(*args, **kwargs)
+                wanted = this._flashmtp_capture_layer_ids
+                missing = [idx for idx in wanted if idx not in this._flashmtp_captured]
+                if missing:
+                    raise RuntimeError(
+                        f"Failed to capture SGLang hidden states for layers {missing}."
+                    )
+                aux_hidden = [this._flashmtp_captured[idx] for idx in wanted]
+                return final_hidden, aux_hidden
+
+            language_model.forward = MethodType(forward_with_capture, language_model)
 
     @staticmethod
     def _unpack_runner_output(runner_output):
@@ -167,6 +287,8 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
 
     @torch.no_grad
     def _extend(self, reqs):
+        from array import array
+
         from sglang.srt.managers.schedule_batch import ScheduleBatch
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -192,6 +314,16 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
             page_size=self.model_runner.server_args.page_size,
         )
         tree_cache = RadixCache(cache_params)
+
+        # SGLang >= 0.5.17 represents the admitted prefill span explicitly.
+        # The full Scheduler normally initializes these fields before creating
+        # a ScheduleBatch; the embedded training path must do the same.
+        for req in reqs:
+            if getattr(req, "extend_range", None) is None:
+                req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
+                req.set_extend_range(
+                    len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+                )
 
         batch = ScheduleBatch.init_new(
             reqs=reqs,
@@ -221,9 +353,19 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
                 offload_tags=set(),
             )
 
-        model_worker_batch = batch.get_model_worker_batch()
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        if hasattr(batch, "get_model_worker_batch"):
+            model_worker_batch = batch.get_model_worker_batch()
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        else:
+            # SGLang >= 0.5.17 constructs ForwardBatch directly from the
+            # scheduler batch and accepts capture mode as an explicit override.
+            forward_batch = ForwardBatch.init_new(
+                batch,
+                self.model_runner,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                return_hidden_states_before_norm=False,
+            )
 
         runner_output = self.model_runner.forward(forward_batch)
         output = self._unpack_runner_output(runner_output)

@@ -55,14 +55,14 @@ bash scripts/run_training_flashmtp.sh --dt h100
 # ["linear_fuse", "attention_fuse", "prefix_condition"]
 cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2
 source .venv/bin/activate
-NUM_MIDDLE_LAYERS_N=16 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=8 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=pb_80k MAX_LENGTH=4096 NUM_ANCHORS=512 BLOCK_SIZE=8 LOCAL_POSITION=true \
+NUM_MIDDLE_LAYERS_N=14 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=8 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=pb_80k MAX_LENGTH=4096 NUM_ANCHORS=512 BLOCK_SIZE=8 LOCAL_POSITION=true \
 LOSS_DECAY_GAMMA=4 BASE_LM_CE_DECAY_GAMMA=12 BASE_LM_CE_WEIGHT=0.06 FINAL_CE_WEIGHT=0.1 TV_LOSS_WEIGHT=1.0 \
-MARKOV_HEAD_TYPE=rnn_easy MARKOV_OUTPUT_MODE=additive MARKOV_RANK=256 \
+MARKOV_HEAD_TYPE=rnn_easy MARKOV_OUTPUT_MODE=additive MARKOV_RANK=512 \
 NPROC_PER_NODE=8 TP_SIZE=1 SHARD_DRAFT_BY_TP=1 CE_CHUNK_SIZE=4096 \
 LEARNING_RATE=5e-4 \
 TRAIN_DATA_PATH="/share/dai-sys/wanghanzhen/projects/MTP/training_data/open_perfectblend_80k_qwen3_8b.jsonl" \
 TARGET_MODEL_BACKEND=sglang SGLANG_MEM_FRACTION_STATIC=0.3 \
-TARGET_MODEL=/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B \
+TARGET_MODEL=/share/dai-sys/wanghanzhen/models/Qwen/Qwen3-8B \
 MODEL_TAG='Qwen3-8B' \
 bash scripts/run_training_flashmtp.sh --dt h100
 ```

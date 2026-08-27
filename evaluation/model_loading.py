@@ -9,7 +9,7 @@ import torch
 from loguru import logger
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
+from specforge.modeling.draft.flashmtp import FlashMTPDraftModel, load_flashmtp_draft_model
 
 
 def resolve_mask_token_id(
@@ -155,7 +155,7 @@ def load_flashmtp_benchmark_models(
         trust_remote_code=getattr(args, "trust_remote_code", False),
     ).to(device).eval()
 
-    draft_model = FlashMTPDraftModel.from_pretrained(
+    draft_model = load_flashmtp_draft_model(
         args.draft_name_or_path,
         attn_implementation=attn_impl,
         dtype=torch.bfloat16,

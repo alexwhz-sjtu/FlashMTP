@@ -8,7 +8,37 @@ import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
+
+
+def load_model_text_config(model_path: str, cache_dir: Optional[str] = None):
+    """Load a text config, including newer multimodal models unknown to Transformers.
+
+    Qwen3.5 checkpoints use a top-level ``qwen3_5_moe`` config with the language
+    model fields nested under ``text_config``.  Older Transformers releases can
+    still train a Llama-based draft from those fields even if they cannot
+    instantiate the target architecture itself (the target is served by SGLang).
+    """
+    try:
+        config = AutoConfig.from_pretrained(model_path, cache_dir=cache_dir)
+        return getattr(config, "text_config", config)
+    except ValueError as exc:
+        config_path = os.path.join(model_path, "config.json")
+        if not os.path.isfile(config_path):
+            raise exc
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_config = json.load(f)
+        text_config = dict(raw_config.get("text_config", raw_config))
+        for key in (
+            "tie_word_embeddings",
+            "bos_token_id",
+            "eos_token_id",
+            "pad_token_id",
+        ):
+            if key not in text_config and key in raw_config:
+                text_config[key] = raw_config[key]
+        return PretrainedConfig.from_dict(text_config)
 
 
 class TargetEmbeddingsAndHead(nn.Module):
@@ -40,9 +70,7 @@ class TargetEmbeddingsAndHead(nn.Module):
     ) -> "TargetEmbeddingsAndHead":
 
         # 1. Load Config
-        config = AutoConfig.from_pretrained(
-            model_path, cache_dir=cache_dir, trust_remote_code=trust_remote_code
-        )
+        config = load_model_text_config(model_path, cache_dir=cache_dir)
         instance = cls(config)
 
         if embed_key is None:
@@ -78,6 +106,18 @@ class TargetEmbeddingsAndHead(nn.Module):
     def _load_weights(
         self, model_path: str, embed_key: str, lm_head_key: str, tie_weights: bool
     ):
+        embed_candidates = (
+            embed_key,
+            "model.language_model.embed_tokens.weight",
+            "model.embed_tokens.weight",
+            "language_model.embed_tokens.weight",
+        )
+        head_candidates = (
+            lm_head_key,
+            "lm_head.weight",
+            "model.language_model.lm_head.weight",
+            "language_model.lm_head.weight",
+        )
         index_files = glob.glob(os.path.join(model_path, "*.index.json"))
         weight_map = {}
         files_to_load = {}
@@ -87,15 +127,22 @@ class TargetEmbeddingsAndHead(nn.Module):
                 index = json.load(f)
             weight_map = index.get("weight_map", {})
 
-            if embed_key in weight_map:
+            if embed_key not in weight_map:
+                embed_key = next(
+                    (key for key in embed_candidates if key in weight_map), None
+                )
+            if embed_key is not None:
                 files_to_load[embed_key] = weight_map[embed_key]
             else:
                 raise ValueError(
-                    f"Embedding key '{embed_key}' not found in weight map."
+                    "Embedding weight not found in weight map. Tried the requested "
+                    "key and known text-model embedding keys."
                 )
 
             if not tie_weights:
-                if lm_head_key in weight_map:
+                resolved_head = next((key for key in head_candidates if key in weight_map), None)
+                if resolved_head is not None:
+                    lm_head_key = resolved_head
                     files_to_load[lm_head_key] = weight_map[lm_head_key]
                 else:
                     print(
@@ -109,9 +156,22 @@ class TargetEmbeddingsAndHead(nn.Module):
             if not target_file:
                 raise FileNotFoundError("No checkpoint found.")
 
+            available_keys = set()
+            if target_file.endswith(".safetensors"):
+                with safe_open(target_file, framework="pt") as f:
+                    available_keys = set(f.keys())
+            embed_key = next((key for key in embed_candidates if key in available_keys), None)
+            if embed_key is None:
+                raise ValueError("Embedding weight not found in the checkpoint")
             files_to_load[embed_key] = os.path.basename(target_file)
             if not tie_weights:
-                files_to_load[lm_head_key] = os.path.basename(target_file)
+                resolved_head = next((key for key in head_candidates if key in available_keys), None)
+                if resolved_head is None:
+                    print("LM head is absent; treating it as tied to the input embedding.")
+                    tie_weights = True
+                else:
+                    lm_head_key = resolved_head
+                    files_to_load[lm_head_key] = os.path.basename(target_file)
 
         loaded_keys = set()
 

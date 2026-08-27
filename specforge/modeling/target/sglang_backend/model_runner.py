@@ -3,16 +3,13 @@ import os
 
 import torch
 from sglang.srt.distributed import (
+    get_attn_tp_group,
     get_pp_group,
     get_tp_group,
     get_world_group,
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
-)
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
-    initialize_dp_attention,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import (
@@ -44,6 +41,20 @@ logger = logging.getLogger(__name__)
 
 
 class SGLangRunner(ModelRunner):
+
+    def __init__(self, *args, **kwargs):
+        # SGLang >= 0.5.17 stores rank metadata in a ParallelState object.
+        # Preserve the legacy attributes used by this embedded runner while
+        # remaining compatible with the older constructor used by .venv.
+        ps = kwargs.get("ps")
+        if ps is not None:
+            self.tp_rank = ps.tp_rank
+            self.tp_size = ps.tp_size
+            self.pp_rank = ps.pp_rank
+            self.pp_size = ps.pp_size
+            self.moe_ep_rank = ps.moe_ep_rank
+            self.moe_ep_size = ps.moe_ep_size
+        super().__init__(*args, **kwargs)
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -150,7 +161,7 @@ class SGLangRunner(ModelRunner):
         )
         self.tp_group = get_tp_group()
         self.pp_group = get_pp_group()
-        self.attention_tp_group = get_attention_tp_group()
+        self.attention_tp_group = get_attn_tp_group()
 
         # Check memory for tensor parallelism
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -170,4 +181,7 @@ class SGLangRunner(ModelRunner):
         logger.info(
             f"Init torch distributed ends. mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
         )
+        # Newer SGLang defers KV-pool allocation until after model loading and
+        # uses this snapshot to calculate the available cache capacity.
+        self.pre_model_load_memory = min_per_gpu_memory
         return min_per_gpu_memory

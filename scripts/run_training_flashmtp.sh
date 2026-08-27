@@ -3,11 +3,12 @@
 
 set -e
 
-# 自动激活虚拟环境
+# 自动激活虚拟环境；默认保持旧 Qwen 环境，Gemma4 wrapper 显式覆盖。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
-if [ -f "${PROJECT_DIR}/.venv/bin/activate" ]; then
-    source "${PROJECT_DIR}/.venv/bin/activate"
+FLASHMTP_VENV="${FLASHMTP_VENV:-${PROJECT_DIR}/.venv}"
+if [ -f "${FLASHMTP_VENV}/bin/activate" ]; then
+    source "${FLASHMTP_VENV}/bin/activate"
 fi
 
 cd "${PROJECT_DIR}"
@@ -126,7 +127,9 @@ fi
 
 
 TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
+DRAFT_CONFIG_PATH="${DRAFT_CONFIG_PATH:-}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.25}"
+SGLANG_ATTENTION_BACKEND="${SGLANG_ATTENTION_BACKEND:-flashinfer}"
 SGLANG_MAX_TOTAL_TOKENS="${SGLANG_MAX_TOTAL_TOKENS:-}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-}"
 CE_CHUNK_SIZE="${CE_CHUNK_SIZE:-2048}"
@@ -161,7 +164,7 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-50000}"
 
 # Tracker 参数
 REPORT_TO="${REPORT_TO:-wandb}"
-WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-trainingv2-full}"
+WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-v2new}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
 WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v2_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}2}"
@@ -286,6 +289,10 @@ LAUNCHER=(
 # 构建可选参数
 OPTIONAL_ARGS=""
 
+if [ -n "${DRAFT_CONFIG_PATH}" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --draft-config-path ${DRAFT_CONFIG_PATH}"
+fi
+
 if [ -n "${EVAL_DATA_PATH}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --eval-data-path ${EVAL_DATA_PATH}"
 fi
@@ -341,6 +348,7 @@ case "$(echo "${LEFT_SHIFT}" | tr '[:upper:]' '[:lower:]')" in
 esac
 
 if [ "${TARGET_MODEL_BACKEND}" = "sglang" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --sglang-attention-backend ${SGLANG_ATTENTION_BACKEND}"
     # SGLang profiles KV pool as: free_mem_after_weights - pre_load_mem * (1 - mem_fraction).
     # With ~14B weights on 80GB H100, mem_fraction < ~0.21 yields negative KV capacity.
     if awk "BEGIN {exit !(${SGLANG_MEM_FRACTION_STATIC} < 0.22)}"; then

@@ -35,12 +35,20 @@ from specforge.distributed import (
     get_tp_data_shard,
     init_distributed,
 )
-from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
+from specforge.modeling.draft.flashmtp import (
+    FlashMTPDraftModel,
+    flashmtp_draft_class_from_config,
+    load_flashmtp_draft_model,
+    is_gemma4_config,
+)
 from specforge.modeling.target.flashmtp_target_model import (
     FlashMTPTargetModel,
     get_flashmtp_target_model,
 )
-from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
+from specforge.modeling.target.target_utils import (
+    TargetEmbeddingsAndHead,
+    load_model_text_config,
+)
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
 from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
@@ -319,14 +327,19 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
 
     if args.draft_config_path:
         draft_config = AutoConfig.from_pretrained(args.draft_config_path)
+        draft_config = getattr(draft_config, "text_config", draft_config)
+        target_config = load_model_text_config(args.target_model_path)
         print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
     else:
-        target_config = AutoConfig.from_pretrained(args.target_model_path)
-        draft_config = AutoConfig.from_pretrained(args.target_model_path)
-        draft_config.num_hidden_layers = args.num_draft_layers
-        draft_config.block_size = args.block_size
-        draft_config.num_target_layers = target_config.num_hidden_layers
+        target_config = load_model_text_config(args.target_model_path)
+        draft_config = load_model_text_config(args.target_model_path)
         print_on_rank0("Auto-generated draft config from target model")
+
+    # Command-line architecture settings are authoritative for both generated
+    # and explicit draft configs.
+    draft_config.num_hidden_layers = args.num_draft_layers
+    draft_config.block_size = args.block_size
+    draft_config.num_target_layers = target_config.num_hidden_layers
 
     if (
         not hasattr(draft_config, "flashmtp_config")
@@ -349,9 +362,14 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
-    _sync_config_layer_types_to_draft_depth(draft_config)
+    if is_gemma4_config(draft_config):
+        draft_config.layer_types = ["full_attention"] * args.num_draft_layers
+    else:
+        _sync_config_layer_types_to_draft_depth(draft_config)
 
-    draft_model = FlashMTPDraftModel(draft_config).cuda().to(torch.bfloat16)
+    draft_cls = flashmtp_draft_class_from_config(draft_config)
+    draft_config.architectures = [draft_cls.__name__]
+    draft_model = draft_cls(draft_config).cuda().to(torch.bfloat16)
 
     capture_layer_ids = list(draft_model.target_layer_ids)
     if args.tv_loss_weight != 0.0 and draft_model.markov_head is not None:
@@ -688,7 +706,7 @@ def main():
     resume_state = None
     draft_weights_from_checkpoint = False
     if draft_model_last_checkpoint:
-        loaded_model = FlashMTPDraftModel.from_pretrained(
+        loaded_model = load_flashmtp_draft_model(
             draft_model_last_checkpoint, torch_dtype=torch.bfloat16
         )
         requested_markov = (
@@ -798,8 +816,8 @@ def main():
     print_on_rank0("Loading target embeddings and head...")
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         args.target_model_path,
-        embed_key="model.embed_tokens.weight",  # Adjust if Qwen/Llama differs
-        lm_head_key="lm_head.weight",
+        embed_key=None,
+        lm_head_key=None,
         device="cuda",
         trust_remote_code=args.trust_remote_code,
     )

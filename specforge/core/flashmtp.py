@@ -597,13 +597,13 @@ class OnlineFlashMTPModel(nn.Module):
         ) -> torch.Tensor:
             if markov_head is None:
                 assert lm_head is not None
-                return lm_head(oh).float()
+                return self.draft_model.project_base_logits(lm_head, oh).float()
             assert latent is not None
             head_logits = markov_head.project_logits(latent).float()
             if not markov_output_uses_base_lm_head(output_mode):
                 return head_logits
             assert lm_head is not None
-            return lm_head(oh).float() + head_logits
+            return self.draft_model.project_base_logits(lm_head, oh).float() + head_logits
 
         def _chunk_ce_and_tv(
             oh: torch.Tensor,
@@ -640,7 +640,9 @@ class OnlineFlashMTPModel(nn.Module):
                 return ce_sum, ce_sum.new_zeros(())
 
             assert target_lm_head is not None
-            target_logits_chunk = target_lm_head(target_oh).float()
+            target_logits_chunk = self.draft_model.project_base_logits(
+                target_lm_head, target_oh
+            ).float()
             draft_probs = F.softmax(logits_chunk.float(), dim=-1)
             target_probs = F.softmax(target_logits_chunk, dim=-1)
             tv_per_position = (draft_probs - target_probs).abs().sum(dim=-1)
@@ -656,7 +658,9 @@ class OnlineFlashMTPModel(nn.Module):
             active_chunk = weights_chunk > 0
             if not active_chunk.any():
                 return weights_chunk.new_zeros(())
-            logits_chunk = base_lm_head(oh[active_chunk]).float()
+            logits_chunk = self.draft_model.project_base_logits(
+                base_lm_head, oh[active_chunk]
+            ).float()
             targets_chunk = targets_chunk[active_chunk]
             weights_chunk = weights_chunk[active_chunk].float()
             if (targets_chunk < 0).any() or (

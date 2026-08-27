@@ -76,19 +76,35 @@ def parse_arguments():
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--model", type=str, required=True)
     model_group.add_argument(
+        "--model-type",
+        type=str,
+        default="qwen",
+        choices=("qwen", "gemma4", "gpt-oss"),
+        help="Target family. qwen keeps the original regen schema "
+        "(role=assistant, optional thinking). gpt-oss uses Harmony "
+        "assistant_analysis / assistant_final for FlashMTP CHAT_TEMPLATE=gpt-oss.",
+    )
+    model_group.add_argument(
         "--is-reasoning-model",
         action="store_true",
-        help="Whether the model is a reasoning model",
+        help="Whether the model is a reasoning model (qwen thinking / extra reasoning_content)",
     )
     model_group.add_argument(
         "--is-gpt-oss",
         action="store_true",
-        help="Whether the model is a GPT-OSS model",
+        help="Deprecated alias for --model-type gpt-oss.",
     )
     model_group.add_argument(
         "--enable-thinking",
         action="store_true",
         help="Enable thinking mode for the model (affects enable_thinking in chat_template_kwargs)",
+    )
+    model_group.add_argument(
+        "--reasoning-effort",
+        type=str,
+        default="random",
+        choices=("low", "medium", "high", "random"),
+        help="Only used when --model-type gpt-oss. Default random (low/medium/high weighted).",
     )
 
     # sampling params
@@ -158,6 +174,11 @@ def parse_arguments():
         "--resume",
         action="store_true",
         help="Resume from existing output file, skip already processed samples",
+    )
+    data_group.add_argument(
+        "--retry-errors",
+        action="store_true",
+        help="With --resume, retry records from the error file and replace that file.",
     )
     data_group.add_argument(
         "--parquet-presample-size",
@@ -440,6 +461,13 @@ def compute_context_length(conversations: List[Dict[str, Any]]) -> int:
     return length
 
 
+def record_id_key(record: Dict[str, Any]) -> Optional[str]:
+    """Return a stable key for ID-aware resume, or None for legacy rows."""
+    if "id" not in record:
+        return None
+    return json.dumps(record["id"], ensure_ascii=False, sort_keys=True)
+
+
 def build_query_kwargs(args, messages, max_tokens=None):
     effective_max_tokens = max_tokens if max_tokens is not None else args.max_tokens
 
@@ -456,14 +484,45 @@ def build_query_kwargs(args, messages, max_tokens=None):
         query_kwargs["presence_penalty"] = args.repetition_penalty
 
     extra_body = {"chat_template_kwargs": {"enable_thinking": args.enable_thinking}}
-    
+
     if args.top_k is not None:
         extra_body["top_k"] = args.top_k
     if extra_body:
         query_kwargs["extra_body"] = extra_body
-    if args.is_gpt_oss:
-        query_kwargs["reasoning_effort"] = get_random_reasoning_effort()
+    if args.model_type == "gpt-oss":
+        effort = (
+            get_random_reasoning_effort()
+            if args.reasoning_effort == "random"
+            else args.reasoning_effort
+        )
+        query_kwargs["reasoning_effort"] = effort
+        query_kwargs["extra_body"]["chat_template_kwargs"]["reasoning_effort"] = effort
     return query_kwargs
+
+
+def _append_assistant_turn(args, regenerated_messages, api_messages, message_obj) -> None:
+    """Write one assistant turn. qwen keeps role=assistant; gpt-oss splits Harmony channels."""
+    response_text = message_obj.content
+    if args.model_type == "gpt-oss":
+        thinking_text = getattr(message_obj, "reasoning_content", None) or ""
+        api_messages.append({"role": "assistant", "content": response_text or ""})
+        if thinking_text:
+            regenerated_messages.append(
+                {"role": "assistant_analysis", "content": thinking_text}
+            )
+        regenerated_messages.append(
+            {"role": "assistant_final", "content": response_text or ""}
+        )
+        return
+
+    resp_msg = {
+        "role": "assistant",
+        "content": response_text,
+    }
+    if args.is_reasoning_model:
+        resp_msg["thinking"] = message_obj.reasoning_content
+        print(f"Reasoning content: {resp_msg['thinking']}")
+    regenerated_messages.append(resp_msg)
 
 
 def call_sglang(
@@ -477,22 +536,36 @@ def call_sglang(
 
     messages = data["conversations"]
     regenerated_messages = []
+    # gpt-oss stores Harmony channel roles on disk but must send plain
+    # user/assistant messages to the Chat Completions API.
+    api_messages = regenerated_messages if args.model_type != "gpt-oss" else []
+
+    skip_assistant_roles = {"assistant"}
+    if args.model_type == "gpt-oss":
+        skip_assistant_roles.update(
+            {"assistant_analysis", "assistant_final", "assistant_commentary"}
+        )
 
     # ignore data which starts with an assistant message
-    if messages[0]["role"] == "assistant":
+    if messages[0]["role"] in skip_assistant_roles:
         data["status"] = "error"
         data["error"] = "Data starts with an assistant message"
         return data
 
     for message in messages:
-        if message["role"] == "system":
+        role = message["role"]
+        if role == "system":
             regenerated_messages.append(message)
-        elif message["role"] == "assistant":
+            if api_messages is not regenerated_messages:
+                api_messages.append(message)
+        elif role in skip_assistant_roles:
             continue
-        elif message["role"] == "user":
+        elif role == "user":
             regenerated_messages.append(message)
+            if api_messages is not regenerated_messages:
+                api_messages.append({"role": "user", "content": message["content"]})
 
-            query_kwargs = build_query_kwargs(args, regenerated_messages, max_tokens)
+            query_kwargs = build_query_kwargs(args, api_messages, max_tokens)
 
             try:
                 resp = client.chat.completions.create(**query_kwargs)
@@ -500,20 +573,20 @@ def call_sglang(
                 data["status"] = "error"
                 data["error"] = str(e)
                 return data
-            response_text = resp.choices[0].message.content
-            resp_msg = {
-                "role": "assistant",
-                "content": response_text,
-            }
-            if args.is_reasoning_model:
-                resp_msg["thinking"] = resp.choices[0].message.reasoning_content
-                print(f"Reasoning content: {resp_msg['thinking']}")
-            regenerated_messages.append(resp_msg)
+            _append_assistant_turn(
+                args, regenerated_messages, api_messages, resp.choices[0].message
+            )
         else:
             data["status"] = "error"
-            data["error"] = f"Invalid message role: {message['role']}"
+            data["error"] = f"Invalid message role: {role}"
             return data
     data["conversations"] = regenerated_messages
+    if args.model_type == "gpt-oss":
+        data["reasoning_effort"] = (
+            get_random_reasoning_effort()
+            if args.reasoning_effort == "random"
+            else args.reasoning_effort
+        )
     data["status"] = "success"
     return data
 
@@ -521,6 +594,8 @@ def call_sglang(
 def main():
     # Parse command line arguments
     args = parse_arguments()
+    if args.is_gpt_oss:
+        args.model_type = "gpt-oss"
 
     if args.parquet_presample_size is not None:
         if not args.input_file_path.endswith(".parquet"):
@@ -548,6 +623,7 @@ def main():
 
     print(f"Configuration:")
     print(f"  Model path: {args.model}")
+    print(f"  Model type: {args.model_type}")
     print(f"  Max tokens: {args.max_tokens}")
     print(f"  Concurrency: {args.concurrency}")
     print(f"  Temperature: {args.temperature}")
@@ -561,18 +637,40 @@ def main():
     )
 
     skip_lines = 0
+    processed_record_ids = set()
     error_file_path = output_file_path.replace(".jsonl", "_error.jsonl")
 
     if args.resume and os.path.exists(output_file_path):
-        existing_success = sum(1 for _ in open(output_file_path))
+        existing_success = 0
+        with open(output_file_path, encoding="utf-8") as existing_file:
+            for line in existing_file:
+                if not line.strip():
+                    continue
+                existing_success += 1
+                key = record_id_key(json.loads(line))
+                if key is not None:
+                    processed_record_ids.add(key)
         existing_error = 0
         if os.path.exists(error_file_path):
-            existing_error = sum(1 for _ in open(error_file_path))
-        skip_lines = existing_success + existing_error
+            with open(error_file_path, encoding="utf-8") as existing_error_file:
+                for line in existing_error_file:
+                    if not line.strip():
+                        continue
+                    existing_error += 1
+                    key = record_id_key(json.loads(line))
+                    if key is not None and not args.retry_errors:
+                        processed_record_ids.add(key)
+        skip_lines = existing_success + (0 if args.retry_errors else existing_error)
         print(f"Resume mode enabled:")
         print(f"  Found {existing_success} successful samples in output file")
         print(f"  Found {existing_error} error samples in error file")
-        print(f"  Skipping first {skip_lines} input samples")
+        if args.retry_errors and existing_error:
+            print("  Error samples will be retried and the error file replaced")
+        if len(processed_record_ids) == skip_lines:
+            print(f"  Skipping {skip_lines} input samples by stable record ID")
+        else:
+            processed_record_ids.clear()
+            print(f"  Stable IDs unavailable; skipping first {skip_lines} input samples")
         print("-" * 50)
 
         if skip_lines >= total_records:
@@ -605,6 +703,7 @@ def main():
 
     # Determine file open mode based on resume flag
     file_mode = "a" if (args.resume and skip_lines > 0) else "w"
+    error_file_mode = "w" if args.retry_errors else file_mode
     print(
         f"Regenerating dataset and saving the output to {output_file_path} and error log to {error_file_path}"
     )
@@ -620,8 +719,8 @@ def main():
 
     # Create progress bar
     with (
-        open(output_file_path, file_mode) as output_file_handle,
-        open(error_file_path, file_mode) as error_file_handle,
+        open(output_file_path, file_mode, buffering=1, encoding="utf-8") as output_file_handle,
+        open(error_file_path, error_file_mode, buffering=1, encoding="utf-8") as error_file_handle,
     ):
         executor = ThreadPoolExecutor(
             max_workers=args.concurrency * len(valid_server_addresses)
@@ -634,20 +733,28 @@ def main():
             args.parquet_presample_size,
             args.parquet_presample_seed,
         )
-        pbar = tqdm(total=total_records, desc="Processing", initial=skip_lines)
+        pbar = tqdm(
+            total=total_records,
+            desc="Processing",
+            initial=skip_lines if not processed_record_ids else 0,
+        )
         start_server_index = 0
 
-        if skip_lines > 0:
+        if skip_lines > 0 and not processed_record_ids:
             print(f"Skipping {skip_lines} already processed samples...")
             for _ in range(skip_lines):
                 next(input_records, None)
             print(f"Resuming from sample {skip_lines + 1}")
 
+        submitted_samples = 0
         for data in input_records:
-            if (
-                args.num_samples is not None
-                and success_samples + error_samples >= args.num_samples
-            ):
+            if processed_record_ids:
+                key = record_id_key(data)
+                if key is not None and key in processed_record_ids:
+                    pbar.update(1)
+                    continue
+
+            if args.num_samples is not None and submitted_samples >= args.num_samples:
                 break
 
             # find server address with the least waiting requests
@@ -666,6 +773,7 @@ def main():
                             error_file_handle.write(
                                 json.dumps(regen_data, ensure_ascii=False) + "\n"
                             )
+                            error_file_handle.flush()
                             error_samples += 1
                         else:
                             ctx_len = compute_context_length(
@@ -681,6 +789,7 @@ def main():
                             output_file_handle.write(
                                 json.dumps(regen_data, ensure_ascii=False) + "\n"
                             )
+                            output_file_handle.flush()
                             success_samples += 1
                         waiting_queue[server_address].remove(req_future)
                         finished_on_request = True
@@ -695,6 +804,7 @@ def main():
                 data,
             )
             waiting_queue[server_address].append(req_future)
+            submitted_samples += 1
             pbar.update(1)
 
         # deal with all the remaining requests
@@ -705,6 +815,7 @@ def main():
                     error_file_handle.write(
                         json.dumps(regen_data, ensure_ascii=False) + "\n"
                     )
+                    error_file_handle.flush()
                     error_samples += 1
                 else:
                     ctx_len = compute_context_length(
@@ -720,6 +831,7 @@ def main():
                     output_file_handle.write(
                         json.dumps(regen_data, ensure_ascii=False) + "\n"
                     )
+                    output_file_handle.flush()
                     success_samples += 1
 
     print(f"\nProcessing completed!")

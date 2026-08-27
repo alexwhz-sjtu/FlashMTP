@@ -22,6 +22,10 @@ class ChatTemplate(BaseModel):
     parser_type: str = "general"
     assistant_pattern_type: str = "general"
     enable_thinking: bool = False
+    # Text rendered after the assistant header but excluded from supervision.
+    # Gemma 4 uses this to represent an explicitly empty thought channel when
+    # non-thinking generation is requested.
+    assistant_loss_prefix: str | None = None
 
 
 class TemplateRegistry:
@@ -114,6 +118,17 @@ TEMPLATE_REGISTRY.register(
         user_header="<|im_start|>user\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|im_end|>\n",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="gemma4",
+    template=ChatTemplate(
+        assistant_header="<|turn>model\n",
+        user_header="<|turn>user\n",
+        system_prompt=None,
+        end_of_turn_token="<turn|>\n",
+        assistant_loss_prefix="<|channel>thought\n<channel|>",
     ),
 )
 
@@ -318,5 +333,19 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<|im_end|>\n",
         parser_type="thinking",
         enable_thinking=True,
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="qwen3.5-instruct",
+    template=ChatTemplate(
+        # Qwen3.5 renders an empty think block when enable_thinking=False.
+        # Keep it in the header so only response tokens enter the loss mask.
+        assistant_header="<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        user_header="<|im_start|>user\n",
+        system_prompt="",
+        end_of_turn_token="<|im_end|>\n",
+        parser_type="general",
+        enable_thinking=False,
     ),
 )
