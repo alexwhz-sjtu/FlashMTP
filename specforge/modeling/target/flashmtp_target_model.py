@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import inspect
 from types import MethodType
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -20,6 +20,90 @@ class FlashMTPTargetOutput:
     input_ids: torch.Tensor  # [batch, seq_len]
     attention_mask: torch.Tensor  # [batch, seq_len]
     loss_mask: torch.Tensor  # [batch, seq_len]
+
+
+@dataclass
+class TempRolloutPrefillOutput:
+    """Captured target states plus live true-sequence paged KV."""
+
+    hidden_states: Union[
+        torch.Tensor, Tuple[torch.Tensor, ...], Dict[int, torch.Tensor]
+    ]
+    handle: "TempRolloutPrefillHandle"
+
+
+class TempRolloutPrefillHandle:
+    """Own immutable true-prefix KV and private greedy-rollout branches."""
+
+    def __init__(
+        self,
+        target_model: "SGLangFlashMTPTargetModel",
+        parent_reqs: List[Any],
+        true_token_ids: List[List[int]],
+        prefix_indices: List[torch.Tensor],
+        tree_cache: Any,
+    ) -> None:
+        # Keep this as a regular object: FSDP recursively rebuilds dataclass
+        # kwargs and would otherwise try to cast the live SGLang state.
+        self.target_model = target_model
+        self.parent_reqs = parent_reqs
+        self.true_token_ids = true_token_ids
+        self.prefix_indices = prefix_indices
+        self.tree_cache = tree_cache
+        # Created on the first private-token extend, then reused in-place by
+        # ScheduleBatch.prepare_for_decode for all remaining rollout positions.
+        self.branch_batch: Optional[Any] = None
+        self.branch_scatter_indices: List[Tuple[int, int]] = []
+        self.branch_scatter_tensor: Optional[torch.Tensor] = None
+        self.branch_true_prefix_lens: List[int] = []
+        self.branch_num_generated = 0
+        self.branch_initialized = False
+        self.closed = False
+
+    def extend_step(
+        self,
+        anchor_positions: torch.Tensor,
+        generated_ids: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Append one generated token per active branch and return its hidden."""
+        if self.closed:
+            raise RuntimeError("temp-rollout prefill handle is already closed.")
+        return self.target_model._temp_rollout_extend_step(
+            self, anchor_positions, generated_ids, active_mask
+        )
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.target_model._clear_memory_pools()
+        self.branch_batch = None
+        self.branch_scatter_indices.clear()
+        self.branch_scatter_tensor = None
+        self.branch_true_prefix_lens.clear()
+        self.branch_initialized = False
+        self.closed = True
+
+    def __enter__(self) -> "TempRolloutPrefillHandle":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+
+def build_temp_rollout_branch_fill_ids(
+    true_token_ids: List[int], anchor: int, generated_ids: List[int]
+) -> Tuple[List[int], int]:
+    """Build an independent ``true_prefix + private_generation`` branch."""
+    prefix_len = int(anchor) + 1
+    if prefix_len <= 0 or prefix_len > len(true_token_ids):
+        raise ValueError(
+            f"Invalid temp-rollout anchor {anchor} for true length "
+            f"{len(true_token_ids)}."
+        )
+    if not generated_ids:
+        raise ValueError("temp-rollout branch requires one generated token.")
+    return true_token_ids[:prefix_len] + generated_ids, prefix_len
 
 
 class FlashMTPTargetModel(ABC):
@@ -54,6 +138,15 @@ class FlashMTPTargetModel(ABC):
     def set_capture_layers(self, layer_ids: List[int]) -> None:
         """Set which layers' hidden states to capture."""
         self.capture_layer_ids = layer_ids
+
+    def temp_rollout_prefill(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> TempRolloutPrefillOutput:
+        raise NotImplementedError(
+            "temp-rollout training currently requires the SGLang backend."
+        )
 
 
 class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
@@ -285,27 +378,9 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
             layers.append(last_hidden)
         return tuple(layers)
 
-    @torch.no_grad
-    def _extend(self, reqs):
-        from array import array
-
-        from sglang.srt.managers.schedule_batch import ScheduleBatch
-        from sglang.srt.managers.scheduler import Scheduler
+    def _new_tree_cache(self):
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
         from sglang.srt.mem_cache.radix_cache import RadixCache
-        from sglang.srt.model_executor.forward_batch_info import (
-            CaptureHiddenMode,
-            ForwardBatch,
-        )
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
-
-        from .sglang_backend.utils import LogitsProcessorForEAGLE3
-
-        for _, module in self.model_runner.model.named_modules():
-            if isinstance(module, LogitsProcessorForEAGLE3):
-                module.return_last_hidden_states = True
-                module.return_logits = False
 
         cache_params = CacheInitParams(
             disable=False,
@@ -313,28 +388,26 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
             token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
             page_size=self.model_runner.server_args.page_size,
         )
-        tree_cache = RadixCache(cache_params)
+        return RadixCache(cache_params)
 
-        # SGLang >= 0.5.17 represents the admitted prefill span explicitly.
-        # The full Scheduler normally initializes these fields before creating
-        # a ScheduleBatch; the embedded training path must do the same.
-        for req in reqs:
-            if getattr(req, "extend_range", None) is None:
-                req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
-                req.set_extend_range(
-                    len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-                )
+    def _clear_memory_pools(self) -> None:
+        """Clear all embedded-runner request slots and KV after a microbatch."""
+        self.model_runner.req_to_token_pool.clear()
+        self.model_runner.token_to_kv_pool_allocator.clear()
 
-        batch = ScheduleBatch.init_new(
-            reqs=reqs,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
-            tree_cache=tree_cache,
-            model_config=self.model_runner.model_config,
-            enable_overlap=False,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-        )
-        batch.prepare_for_extend()
+    def _set_logits_processor_output(self, *, return_last_hidden: bool) -> None:
+        from .sglang_backend.utils import LogitsProcessorForEAGLE3
+
+        for _, module in self.model_runner.model.named_modules():
+            if isinstance(module, LogitsProcessorForEAGLE3):
+                module.return_last_hidden_states = bool(return_last_hidden)
+                module.return_logits = False
+
+    def _prepare_mlp_sync(self, batch) -> None:
+        """Populate SGLang's TP/DP metadata for an embedded batch."""
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 
         if require_mlp_sync(self.model_runner.server_args):
             Scheduler.prepare_mlp_sync_batch_raw(
@@ -353,48 +426,361 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
                 offload_tags=set(),
             )
 
+    def _prepare_extend_batch(self, reqs, *, tree_cache):
+        """Allocate request slots/KV and prepare a persistent extend batch."""
+        from array import array
+
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        # SGLang >= 0.5.17 represents the admitted prefill span explicitly.
+        # The full Scheduler normally initializes these fields before creating
+        # a ScheduleBatch; the embedded training path must do the same.
+        for req in reqs:
+            if getattr(req, "extend_range", None) is None and hasattr(
+                req, "set_extend_range"
+            ):
+                req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
+                req.set_extend_range(
+                    len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+                )
+
+        batch = ScheduleBatch.init_new(
+            reqs=reqs,
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
+            tree_cache=tree_cache,
+            model_config=self.model_runner.model_config,
+            enable_overlap=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+        )
+        batch.prepare_for_extend()
+        self._prepare_mlp_sync(batch)
+        return batch
+
+    def _forward_prepared_batch(self, batch, *, capture_full: bool):
+        """Run one already prepared extend/decode batch and return raw output."""
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardBatch,
+        )
+
+        self._set_logits_processor_output(return_last_hidden=True)
+
+        capture_mode = CaptureHiddenMode.FULL if capture_full else CaptureHiddenMode.NULL
         if hasattr(batch, "get_model_worker_batch"):
             model_worker_batch = batch.get_model_worker_batch()
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-            forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            forward_batch.capture_hidden_mode = capture_mode
         else:
             # SGLang >= 0.5.17 constructs ForwardBatch directly from the
             # scheduler batch and accepts capture mode as an explicit override.
             forward_batch = ForwardBatch.init_new(
                 batch,
                 self.model_runner,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
+                capture_hidden_mode=capture_mode,
                 return_hidden_states_before_norm=False,
             )
 
-        runner_output = self.model_runner.forward(forward_batch)
-        output = self._unpack_runner_output(runner_output)
+        return self._unpack_runner_output(self.model_runner.forward(forward_batch))
 
-        input_lens = [len(req.origin_input_ids) for req in reqs]
+    @torch.no_grad()
+    def _run_extend(self, reqs, *, tree_cache, capture_full: bool):
+        """Run an embedded SGLang extend without releasing its paged KV."""
+        batch = self._prepare_extend_batch(reqs, tree_cache=tree_cache)
+        output = self._forward_prepared_batch(batch, capture_full=capture_full)
+        extend_lens = [int(req.extend_input_len) for req in reqs]
         last_hidden_list = None
         if (
-            hasattr(output, "aux_hidden_states")
-            and output.aux_hidden_states is not None
+            hasattr(output, "last_hidden_states")
+            and output.last_hidden_states is not None
         ):
-            hidden_states_list = torch.split(
-                output.aux_hidden_states, input_lens, dim=0
+            last_hidden_list = torch.split(
+                output.last_hidden_states, extend_lens, dim=0
             )
-            if (
-                hasattr(output, "last_hidden_states")
-                and output.last_hidden_states is not None
-            ):
-                last_hidden_list = torch.split(
-                    output.last_hidden_states, input_lens, dim=0
-                )
-        elif hasattr(output, "hidden_states") and output.hidden_states is not None:
-            hidden_states_list = torch.split(output.hidden_states, input_lens, dim=0)
-        else:
-            raise ValueError("SGLang output does not contain hidden states.")
 
-        self.model_runner.req_to_token_pool.clear()
-        self.model_runner.token_to_kv_pool_allocator.clear()
+        hidden_states_list = None
+        if capture_full:
+            if (
+                hasattr(output, "aux_hidden_states")
+                and output.aux_hidden_states is not None
+            ):
+                hidden_states_list = torch.split(
+                    output.aux_hidden_states, extend_lens, dim=0
+                )
+            elif hasattr(output, "hidden_states") and output.hidden_states is not None:
+                hidden_states_list = torch.split(
+                    output.hidden_states, extend_lens, dim=0
+                )
+            else:
+                raise ValueError("SGLang prefill output does not contain hidden states.")
 
         return hidden_states_list, last_hidden_list
+
+    @torch.no_grad
+    def _extend(self, reqs):
+        """Compatibility path used by baseline training; release KV immediately."""
+        tree_cache = self._new_tree_cache()
+        try:
+            return self._run_extend(reqs, tree_cache=tree_cache, capture_full=True)
+        finally:
+            self._clear_memory_pools()
+
+    @torch.no_grad()
+    def temp_rollout_prefill(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> TempRolloutPrefillOutput:
+        """Prefill true data once and retain its KV for independent anchors."""
+        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        if input_ids.ndim != 2 or attention_mask.shape != input_ids.shape:
+            raise ValueError("input_ids and attention_mask must have shape [batch, seq].")
+        if input_ids.size(0) != 1:
+            raise ValueError(
+                "temp-rollout requires batch_size=1 per target rank; anchors in "
+                "that sample are still generated in one batched extend per step."
+            )
+        if int(self.model_runner.server_args.page_size) != 1:
+            raise ValueError(
+                "temp-rollout arbitrary-anchor KV sharing requires SGLang "
+                f"page_size=1, got {self.model_runner.server_args.page_size}."
+            )
+
+        sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
+        reqs: List[Any] = []
+        true_token_ids: List[List[int]] = []
+        for batch_idx in range(input_ids.size(0)):
+            valid_len = int(attention_mask[batch_idx].sum().item())
+            ids = input_ids[batch_idx, :valid_len].tolist()
+            req = Req(
+                rid=f"temp-rollout-parent-{batch_idx}",
+                origin_input_text="",
+                origin_input_ids=ids,
+                sampling_params=sampling_params,
+            )
+            req.fill_ids = req.origin_input_ids
+            req.extend_input_len = len(ids)
+            reqs.append(req)
+            true_token_ids.append(ids)
+
+        tree_cache = self._new_tree_cache()
+        try:
+            hidden_list, last_hidden_list = self._run_extend(
+                reqs, tree_cache=tree_cache, capture_full=True
+            )
+            if hidden_list is None or last_hidden_list is None:
+                raise ValueError(
+                    "SGLang temp-rollout prefill did not return required states."
+                )
+
+            req_pool = self.model_runner.req_to_token_pool.req_to_token
+            prefix_indices = [
+                req_pool[req.req_pool_idx, : len(ids)].to(torch.int64).clone()
+                for req, ids in zip(reqs, true_token_ids)
+            ]
+            batched_aux = torch.stack(list(hidden_list), dim=0)
+            batched_last = torch.stack(list(last_hidden_list), dim=0)
+            layer_tensors = self._aux_hidden_to_layer_tuple(
+                batched_aux, batched_last
+            )
+            captured_ids = self.capture_layer_ids or []
+            num_layers = getattr(
+                self.model_runner.model_config, "num_hidden_layers", None
+            )
+            if num_layers is not None and len(captured_ids) < num_layers:
+                hidden_states = {
+                    layer_id: layer_tensors[idx]
+                    for idx, layer_id in enumerate(captured_ids)
+                }
+            else:
+                hidden_states = layer_tensors
+
+            handle = TempRolloutPrefillHandle(
+                target_model=self,
+                parent_reqs=reqs,
+                true_token_ids=true_token_ids,
+                prefix_indices=prefix_indices,
+                tree_cache=tree_cache,
+            )
+            return TempRolloutPrefillOutput(
+                hidden_states=hidden_states, handle=handle
+            )
+        except Exception:
+            self._clear_memory_pools()
+            raise
+
+    @torch.no_grad()
+    def _temp_rollout_extend_step(
+        self,
+        handle: TempRolloutPrefillHandle,
+        anchor_positions: torch.Tensor,
+        generated_ids: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Append one token with a persistent SGLang branch decode batch."""
+        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        if anchor_positions.ndim != 2 or generated_ids.ndim != 3:
+            raise ValueError("anchors must be [B,N] and generated_ids [B,N,S].")
+        if generated_ids.shape[:2] != anchor_positions.shape:
+            raise ValueError("generated_ids batch/block dimensions must match anchors.")
+        if active_mask.shape != anchor_positions.shape:
+            raise ValueError("active_mask must match anchor_positions.")
+        batch_size, num_blocks = anchor_positions.shape
+        if batch_size != len(handle.true_token_ids):
+            raise ValueError("temp-rollout branch batch does not match prefill.")
+        if generated_ids.size(-1) < 1:
+            raise ValueError("generated_ids must contain the newest token.")
+
+        hidden_size = int(self.model_runner.model_config.hidden_size)
+        result = torch.zeros(
+            batch_size,
+            num_blocks,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=generated_ids.device,
+        )
+        expected_generation = handle.branch_num_generated + 1
+        if generated_ids.size(-1) != expected_generation:
+            raise RuntimeError(
+                "temp-rollout persistent batch received a non-consecutive step: "
+                f"expected {expected_generation} generated tokens, got "
+                f"{generated_ids.size(-1)}."
+            )
+
+        # The first private token is admitted through one extend. This creates
+        # the Req objects, request-pool rows, and ScheduleBatch that all later
+        # positions reuse through prepare_for_decode.
+        if not handle.branch_initialized:
+            sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
+            reqs: List[Any] = []
+            scatter_indices: List[Tuple[int, int]] = []
+            true_prefix_lens: List[int] = []
+            anchors_cpu = anchor_positions.detach().cpu()
+            generated_cpu = generated_ids.detach().cpu()
+            active_cpu = active_mask.detach().cpu()
+            for batch_idx in range(batch_size):
+                true_ids = handle.true_token_ids[batch_idx]
+                true_locs = handle.prefix_indices[batch_idx]
+                for block_idx in range(num_blocks):
+                    if not bool(active_cpu[batch_idx, block_idx]):
+                        continue
+                    anchor = int(anchors_cpu[batch_idx, block_idx])
+                    branch_ids = generated_cpu[batch_idx, block_idx].tolist()
+                    fill_ids, true_prefix_len = build_temp_rollout_branch_fill_ids(
+                        true_ids, anchor, branch_ids
+                    )
+                    req = Req(
+                        rid=f"temp-rollout-branch-{batch_idx}-{block_idx}",
+                        origin_input_text="",
+                        origin_input_ids=fill_ids,
+                        sampling_params=sampling_params,
+                    )
+                    req.prefix_indices = true_locs[:true_prefix_len]
+                    req.fill_ids = fill_ids
+                    req.extend_input_len = 1
+                    reqs.append(req)
+                    scatter_indices.append((batch_idx, block_idx))
+                    true_prefix_lens.append(true_prefix_len)
+
+            handle.branch_initialized = True
+            handle.branch_num_generated = 1
+            handle.branch_scatter_indices = scatter_indices
+            handle.branch_true_prefix_lens = true_prefix_lens
+            if not reqs:
+                return result
+            handle.branch_scatter_tensor = torch.tensor(
+                scatter_indices,
+                dtype=torch.long,
+                device=generated_ids.device,
+            )
+            batch = self._prepare_extend_batch(
+                reqs, tree_cache=handle.tree_cache
+            )
+            handle.branch_batch = batch
+            output = self._forward_prepared_batch(batch, capture_full=False)
+        else:
+            handle.branch_num_generated = generated_ids.size(-1)
+            batch = handle.branch_batch
+            if batch is None or not handle.branch_scatter_indices:
+                return result
+
+            assert handle.branch_scatter_tensor is not None
+            scatter = handle.branch_scatter_tensor
+            running_active = active_mask[scatter[:, 0], scatter[:, 1]]
+            if not bool(running_active.all().item()):
+                keep_indices = (
+                    running_active.nonzero(as_tuple=False).flatten().cpu().tolist()
+                )
+                keep_set = set(keep_indices)
+                req_pool = self.model_runner.req_to_token_pool
+                kv_allocator = self.model_runner.token_to_kv_pool_allocator
+                token_table = req_pool.req_to_token
+                for index, req in enumerate(batch.reqs):
+                    if index in keep_set:
+                        continue
+                    seq_len = int(batch.seq_lens_cpu[index])
+                    true_prefix_len = handle.branch_true_prefix_lens[index]
+                    private_pages = token_table[
+                        req.req_pool_idx, true_prefix_len:seq_len
+                    ].clone()
+                    kv_allocator.free(private_pages)
+                    req_pool.free(req)
+
+                if not keep_indices:
+                    handle.branch_batch = None
+                    handle.branch_scatter_indices = []
+                    handle.branch_scatter_tensor = None
+                    handle.branch_true_prefix_lens = []
+                    return result
+
+                batch.filter_batch(keep_indices=keep_indices)
+                handle.branch_scatter_indices = [
+                    handle.branch_scatter_indices[index]
+                    for index in keep_indices
+                ]
+                handle.branch_true_prefix_lens = [
+                    handle.branch_true_prefix_lens[index]
+                    for index in keep_indices
+                ]
+                handle.branch_scatter_tensor = scatter[
+                    torch.tensor(
+                        keep_indices, dtype=torch.long, device=scatter.device
+                    )
+                ]
+                scatter = handle.branch_scatter_tensor
+
+            # Decode consumes the newest token directly from GPU. No new Req,
+            # request-slot allocation, page-table reconstruction, or token D2H.
+            batch.output_ids = generated_ids[
+                scatter[:, 0], scatter[:, 1], -1
+            ].to(torch.long)
+            batch.prepare_for_decode()
+            self._prepare_mlp_sync(batch)
+            output = self._forward_prepared_batch(batch, capture_full=False)
+
+        if (
+            not hasattr(output, "last_hidden_states")
+            or output.last_hidden_states is None
+        ):
+            raise ValueError(
+                "SGLang persistent temp-rollout did not return final hidden states."
+            )
+        last_hidden = output.last_hidden_states
+        scatter = handle.branch_scatter_tensor
+        assert scatter is not None
+        if last_hidden.shape != (scatter.size(0), hidden_size):
+            raise ValueError(
+                "Unexpected persistent temp-rollout hidden shape: "
+                f"expected {(scatter.size(0), hidden_size)}, "
+                f"got {tuple(last_hidden.shape)}."
+            )
+        result[scatter[:, 0], scatter[:, 1]] = last_hidden
+        return result
 
     @torch.no_grad()
     def generate_flashmtp_data(

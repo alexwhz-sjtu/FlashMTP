@@ -185,6 +185,21 @@ def parse_args():
         default=0.1,
         help="Half-width r for uniform noise U(-r, r) when --add-noise is set.",
     )
+    model_group.add_argument(
+        "--temp-rollout",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Replace the temperature-generated suffix labels with deterministic "
+        "target greedy rollouts from every sampled anchor. All anchors share "
+        "only their immutable true prefix and keep private branch KV.",
+    )
+    model_group.add_argument(
+        "--temp-rollout-projection-chunk-size",
+        type=int,
+        default=64,
+        help="Number of anchor hidden states projected through the frozen target "
+        "lm_head at once during each greedy rollout step.",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -324,6 +339,27 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         trust_remote_code=args.trust_remote_code,
         **target_model_kwargs,
     )
+    if args.temp_rollout:
+        request_capacity = int(target_model.model_runner.req_to_token_pool.size)
+        required_requests = int(args.num_anchors) + int(args.batch_size)
+        if request_capacity < required_requests:
+            raise ValueError(
+                "SGLang request pool is too small for temp-rollout: "
+                f"capacity={request_capacity}, required>={required_requests}. "
+                "Increase --max-running-requests."
+            )
+        kv_capacity = int(
+            target_model.model_runner.token_to_kv_pool_allocator.size
+        )
+        recommended_kv = int(args.max_length) + int(args.num_anchors) * (
+            int(args.block_size) - 1
+        )
+        print_on_rank0(
+            "temp-rollout SGLang capacity: "
+            f"requests={request_capacity} (required {required_requests}), "
+            f"KV={kv_capacity} tokens (worst-case recommendation "
+            f"{recommended_kv})."
+        )
 
     if args.draft_config_path:
         draft_config = AutoConfig.from_pretrained(args.draft_config_path)
@@ -372,7 +408,9 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     draft_model = draft_cls(draft_config).cuda().to(torch.bfloat16)
 
     capture_layer_ids = list(draft_model.target_layer_ids)
-    if args.tv_loss_weight != 0.0 and draft_model.markov_head is not None:
+    if args.temp_rollout or (
+        args.tv_loss_weight != 0.0 and draft_model.markov_head is not None
+    ):
         final_target_layer_id = draft_model.config.num_target_layers - 1
         if final_target_layer_id not in capture_layer_ids:
             capture_layer_ids.append(final_target_layer_id)
@@ -659,6 +697,19 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
+    if args.temp_rollout:
+        if args.target_model_backend != "sglang":
+            raise ValueError("--temp-rollout requires --target-model-backend sglang.")
+        if args.batch_size != 1:
+            raise ValueError(
+                "--temp-rollout currently requires --batch-size 1; anchors inside "
+                "the sample are fully batched."
+            )
+        if args.temp_rollout_projection_chunk_size <= 0:
+            raise ValueError(
+                "--temp-rollout-projection-chunk-size must be positive."
+            )
+
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
 
@@ -798,6 +849,7 @@ def main():
     draft_model.config.flashmtp_config["target_hidden_noise_ratio"] = float(
         args.target_hidden_noise_ratio
     )
+    draft_model.config.flashmtp_config["temp_rollout"] = bool(args.temp_rollout)
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
@@ -821,6 +873,7 @@ def main():
         device="cuda",
         trust_remote_code=args.trust_remote_code,
     )
+    target_vocab_size = int(target_components.lm_head.weight.shape[0])
     _ensure_embed_vocab_for_mask(target_components, mask_token_id)
 
     flashmtp_model = OnlineFlashMTPModel(
@@ -841,6 +894,12 @@ def main():
         target_hidden_noise_ratio=args.target_hidden_noise_ratio,
         ce_chunk_size=args.ce_chunk_size,
         left_shift=args.left_shift,
+        temp_rollout_enabled=args.temp_rollout,
+        temp_rollout_projection_chunk_size=(
+            args.temp_rollout_projection_chunk_size
+        ),
+        target_vocab_size=target_vocab_size,
+        eos_token_id=tokenizer.eos_token_id,
     )
     print_on_rank0(
         f"target hidden noise: add_noise={args.add_noise}, "
@@ -850,7 +909,9 @@ def main():
         f"tv_loss_weight={args.tv_loss_weight}, "
         f"base_lm_ce_weight={args.base_lm_ce_weight}, "
         f"base_lm_ce_decay_gamma={args.base_lm_ce_decay_gamma}"
-        f", left_shift={args.left_shift}"
+        f", left_shift={args.left_shift}, temp_rollout={args.temp_rollout}, "
+        f"temp_rollout_projection_chunk_size="
+        f"{args.temp_rollout_projection_chunk_size}"
     )
 
     online_flashmtp = flashmtp_model
@@ -934,12 +995,20 @@ def main():
             attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
 
-            # here target output is the full sequence
-            target_output = target_model.generate_flashmtp_data(
-                input_ids, attention_mask, loss_mask
-            )
-
-            hidden_states = target_output.hidden_states
+            temp_rollout_handle = None
+            if args.temp_rollout:
+                prefill_output = target_model.temp_rollout_prefill(
+                    input_ids, attention_mask
+                )
+                temp_rollout_handle = prefill_output.handle
+                hidden_states = prefill_output.hidden_states
+            else:
+                # Baseline: target output is the full true sequence and KV is
+                # released immediately by the target backend.
+                target_output = target_model.generate_flashmtp_data(
+                    input_ids, attention_mask, loss_mask
+                )
+                hidden_states = target_output.hidden_states
             if isinstance(hidden_states, dict):
                 hidden_states = {
                     layer_id: h.cuda() if not h.is_cuda else h
@@ -958,15 +1027,29 @@ def main():
                     f"{len(hidden_states) if isinstance(hidden_states, dict) else len(hidden_states)}"
                 )
 
-            (
-                anchor_positions,
-                block_keep_mask,
-                target_hidden,
-                target_prediction_hidden,
-            ) = online_flashmtp.prepare_training_tensors(
-                input_ids, hidden_states, loss_mask
-            )
-            del target_output, hidden_states
+            if args.temp_rollout:
+                (
+                    anchor_positions,
+                    block_keep_mask,
+                    target_hidden,
+                    target_anchor_hidden,
+                ) = online_flashmtp.prepare_temp_rollout_tensors(
+                    input_ids, hidden_states, loss_mask
+                )
+                target_prediction_hidden = None
+                del prefill_output
+            else:
+                (
+                    anchor_positions,
+                    block_keep_mask,
+                    target_hidden,
+                    target_prediction_hidden,
+                ) = online_flashmtp.prepare_training_tensors(
+                    input_ids, hidden_states, loss_mask
+                )
+                target_anchor_hidden = None
+                del target_output
+            del hidden_states
 
             if args.shard_draft_by_tp:
                 input_ids = get_tp_data_shard(input_ids)
@@ -974,29 +1057,40 @@ def main():
                 anchor_positions = get_tp_data_shard(anchor_positions)
                 block_keep_mask = get_tp_data_shard(block_keep_mask)
                 target_hidden = get_tp_data_shard(target_hidden)
+                if target_anchor_hidden is not None:
+                    target_anchor_hidden = get_tp_data_shard(
+                        target_anchor_hidden
+                    )
                 if target_prediction_hidden is not None:
                     target_prediction_hidden = get_tp_data_shard(
                         target_prediction_hidden
                     )
 
-            (
-                loss,
-                accuracy,
-                prefix_acc,
-                final_ce_loss,
-                base_ce_loss,
-                tv_loss,
-            ) = flashmtp_model(
-                input_ids=input_ids,
-                loss_mask=loss_mask,
-                anchor_positions=anchor_positions,
-                block_keep_mask=block_keep_mask,
-                target_hidden=target_hidden,
-                target_prediction_hidden=target_prediction_hidden,
-            )
+            try:
+                (
+                    loss,
+                    accuracy,
+                    prefix_acc,
+                    final_ce_loss,
+                    base_ce_loss,
+                    tv_loss,
+                ) = flashmtp_model(
+                    input_ids=input_ids,
+                    loss_mask=loss_mask,
+                    anchor_positions=anchor_positions,
+                    block_keep_mask=block_keep_mask,
+                    target_hidden=target_hidden,
+                    target_prediction_hidden=target_prediction_hidden,
+                    target_anchor_hidden=target_anchor_hidden,
+                    temp_rollout_context=temp_rollout_handle,
+                )
+            finally:
+                if temp_rollout_handle is not None:
+                    temp_rollout_handle.close()
             del (
                 target_hidden,
                 target_prediction_hidden,
+                target_anchor_hidden,
                 anchor_positions,
                 block_keep_mask,
             )

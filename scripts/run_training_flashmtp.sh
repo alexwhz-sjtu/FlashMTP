@@ -40,6 +40,12 @@ CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
 PIVOT_FUSE_MODE="${PIVOT_FUSE_MODE:-linear_fuse}"
 NUM_MIDDLE_LAYERS_N="${NUM_MIDDLE_LAYERS_N:-5}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
+TEMP_ROLLOUT="${TEMP_ROLLOUT:-false}"
+TEMP_ROLLOUT_PROJECTION_CHUNK_SIZE="${TEMP_ROLLOUT_PROJECTION_CHUNK_SIZE:-512}"
+TEMP_ROLLOUT_ENABLED=0
+case "$(echo "${TEMP_ROLLOUT}" | tr '[:upper:]' '[:lower:]')" in
+    true|1|yes) TEMP_ROLLOUT_ENABLED=1 ;;
+esac
 
 # 恢复训练
 RESUME="${RESUME:-}"
@@ -126,7 +132,11 @@ else
 fi
 
 
-TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
+if [ "${TEMP_ROLLOUT_ENABLED}" = "1" ]; then
+    TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-sglang}"
+else
+    TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
+fi
 DRAFT_CONFIG_PATH="${DRAFT_CONFIG_PATH:-}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.25}"
 SGLANG_ATTENTION_BACKEND="${SGLANG_ATTENTION_BACKEND:-flashinfer}"
@@ -140,7 +150,10 @@ ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
 SHARD_DRAFT_BY_TP="${SHARD_DRAFT_BY_TP:-1}"
 # Per DP rank: target sees TRAIN_BATCH_SIZE samples; each TP rank trains one draft slice.
 TRAIN_BATCH_SIZE="${BATCH_SIZE}"
-if [ "${TP_SIZE}" -gt 1 ] && [ "${SHARD_DRAFT_BY_TP}" = "1" ]; then
+if [ "${TEMP_ROLLOUT_ENABLED}" = "1" ]; then
+    TRAIN_BATCH_SIZE=1
+    SHARD_DRAFT_BY_TP=0
+elif [ "${TP_SIZE}" -gt 1 ] && [ "${SHARD_DRAFT_BY_TP}" = "1" ]; then
     if [ "${BATCH_SIZE}" -eq 1 ]; then
         TRAIN_BATCH_SIZE="${TP_SIZE}"
     fi
@@ -207,6 +220,7 @@ echo "模型配置:"
 echo "  草稿模型层数: ${NUM_DRAFT_LAYERS}"
 echo "  块大小: ${BLOCK_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
+echo "  temp-rollout: ${TEMP_ROLLOUT} (greedy target branch labels)"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
 echo "  最终CE权重: ${FINAL_CE_WEIGHT}"
@@ -358,13 +372,25 @@ if [ "${TARGET_MODEL_BACKEND}" = "sglang" ]; then
     fi
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION_STATIC}"
     if [ -z "${SGLANG_MAX_TOTAL_TOKENS}" ]; then
-        SGLANG_MAX_TOTAL_TOKENS=$((TRAIN_BATCH_SIZE * MAX_LENGTH))
+        if [ "${TEMP_ROLLOUT_ENABLED}" = "1" ]; then
+            SGLANG_MAX_TOTAL_TOKENS=$((MAX_LENGTH + NUM_ANCHORS * (BLOCK_SIZE - 1)))
+        else
+            SGLANG_MAX_TOTAL_TOKENS=$((TRAIN_BATCH_SIZE * MAX_LENGTH))
+        fi
     fi
     if [ -z "${SGLANG_MAX_RUNNING_REQUESTS}" ]; then
-        SGLANG_MAX_RUNNING_REQUESTS=${TRAIN_BATCH_SIZE}
+        if [ "${TEMP_ROLLOUT_ENABLED}" = "1" ]; then
+            SGLANG_MAX_RUNNING_REQUESTS=$((NUM_ANCHORS + TRAIN_BATCH_SIZE))
+        else
+            SGLANG_MAX_RUNNING_REQUESTS=${TRAIN_BATCH_SIZE}
+        fi
     fi
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --sglang-max-total-tokens ${SGLANG_MAX_TOTAL_TOKENS}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --sglang-max-running-requests ${SGLANG_MAX_RUNNING_REQUESTS}"
+fi
+
+if [ "${TEMP_ROLLOUT_ENABLED}" = "1" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --temp-rollout --temp-rollout-projection-chunk-size ${TEMP_ROLLOUT_PROJECTION_CHUNK_SIZE}"
 fi
 
 if [ "${TP_SIZE}" -gt 1 ] && [ "${SHARD_DRAFT_BY_TP}" = "1" ]; then

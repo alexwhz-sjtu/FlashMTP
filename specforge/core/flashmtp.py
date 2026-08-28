@@ -1,7 +1,7 @@
 # coding=utf-8
 """FlashMTP Training Wrapper."""
 
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -155,6 +155,34 @@ def prepare_target_prediction_hidden(
     )
 
 
+def prepare_target_anchor_hidden(
+    hidden_states: HiddenStatesInput,
+    anchor_positions: torch.Tensor,
+    num_transformer_layers: int,
+) -> torch.Tensor:
+    """Gather final target hidden at each anchor; it predicts rollout token 1."""
+    last_layer_id = num_transformer_layers - 1
+    if isinstance(hidden_states, dict):
+        if last_layer_id not in hidden_states:
+            raise ValueError(
+                "Target model did not capture its final layer for temp-rollout."
+            )
+        last_hidden = hidden_states[last_layer_id]
+    else:
+        offset = infer_hidden_states_embedding_offset(
+            hidden_states, num_transformer_layers
+        )
+        last_hidden = hidden_states[last_layer_id + offset]
+    safe_positions = anchor_positions.clamp(max=last_hidden.size(1) - 1)
+    return torch.gather(
+        last_hidden,
+        dim=1,
+        index=safe_positions.unsqueeze(-1).expand(
+            -1, -1, last_hidden.size(-1)
+        ),
+    )
+
+
 def add_noise_to_target_hidden(
     target_hidden: torch.Tensor,
     noise_ratio: float = 0.1,
@@ -272,6 +300,10 @@ class OnlineFlashMTPModel(nn.Module):
         target_hidden_noise_ratio: float = 0.1,
         ce_chunk_size: int = 2048,
         left_shift: Optional[bool] = None,
+        temp_rollout_enabled: bool = False,
+        temp_rollout_projection_chunk_size: int = 64,
+        target_vocab_size: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -309,6 +341,24 @@ class OnlineFlashMTPModel(nn.Module):
                 f"{target_hidden_noise_ratio}."
             )
         self.ce_chunk_size = max(int(ce_chunk_size), 1)
+        self.temp_rollout_enabled = bool(temp_rollout_enabled)
+        self.temp_rollout_projection_chunk_size = max(
+            int(temp_rollout_projection_chunk_size), 1
+        )
+        lm_head_vocab_size = int(self.lm_head.weight.shape[0])
+        self.target_vocab_size = (
+            lm_head_vocab_size
+            if target_vocab_size is None
+            else int(target_vocab_size)
+        )
+        if not 0 < self.target_vocab_size <= lm_head_vocab_size:
+            raise ValueError(
+                "target_vocab_size must be within the target lm_head: "
+                f"got {self.target_vocab_size}, head={lm_head_vocab_size}."
+            )
+        self.eos_token_id = (
+            None if eos_token_id is None else int(eos_token_id)
+        )
         configured_left_shift = bool(getattr(draft_model, "left_shift", False))
         self.left_shift = (
             configured_left_shift if left_shift is None else bool(left_shift)
@@ -506,6 +556,116 @@ class OnlineFlashMTPModel(nn.Module):
             target_hidden,
             target_prediction_hidden,
         )
+
+    def prepare_temp_rollout_tensors(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: HiddenStatesInput,
+        loss_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample anchors and gather compact CHS plus each anchor's final hidden."""
+        seq_len = input_ids.size(1)
+        anchor_positions, block_keep_mask = self._sample_anchor_positions(
+            seq_len, loss_mask, input_ids.device
+        )
+        target_hidden = prepare_target_hidden(
+            hidden_states,
+            anchor_positions,
+            self.draft_model.target_layer_ids,
+            self.draft_model.config.num_target_layers,
+        )
+        if self.add_noise:
+            target_hidden = add_noise_to_target_hidden(
+                target_hidden,
+                noise_ratio=self.target_hidden_noise_ratio,
+            )
+        target_anchor_hidden = prepare_target_anchor_hidden(
+            hidden_states,
+            anchor_positions,
+            self.draft_model.config.num_target_layers,
+        )
+        return (
+            anchor_positions,
+            block_keep_mask,
+            target_hidden,
+            target_anchor_hidden,
+        )
+
+    @torch.no_grad()
+    def _temp_rollout_greedy(
+        self,
+        *,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+        target_anchor_hidden: torch.Tensor,
+        rollout_context: Any,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Generate target labels with K anchor-parallel greedy decode rounds.
+
+        The first distribution uses the final target hidden at the true anchor.
+        Every later round appends only the newest generated token to that
+        anchor's private paged-KV branch. No branch can observe another anchor.
+        """
+        if target_anchor_hidden.shape[:2] != anchor_positions.shape:
+            raise ValueError(
+                "target_anchor_hidden must have leading shape [B,N], got "
+                f"{tuple(target_anchor_hidden.shape)} for anchors "
+                f"{tuple(anchor_positions.shape)}."
+            )
+        prediction_length = self.block_size - 1
+        generated = torch.zeros(
+            *anchor_positions.shape,
+            prediction_length,
+            dtype=torch.long,
+            device=anchor_positions.device,
+        )
+        valid_positions = torch.zeros_like(generated, dtype=torch.bool)
+        alive = block_keep_mask.bool().clone()
+        current_hidden = target_anchor_hidden.detach()
+        predecessor_hidden = [] if self.tv_loss_weight != 0.0 else None
+
+        for position in range(prediction_length):
+            if predecessor_hidden is not None:
+                predecessor_hidden.append(current_hidden.unsqueeze(2))
+            valid_positions[..., position] = alive
+
+            flat_hidden = current_hidden.reshape(-1, current_hidden.size(-1))
+            flat_alive = alive.reshape(-1)
+            flat_tokens = torch.zeros(
+                flat_hidden.size(0), dtype=torch.long, device=flat_hidden.device
+            )
+            active_indices = flat_alive.nonzero(as_tuple=False).flatten()
+            for start in range(
+                0, active_indices.numel(), self.temp_rollout_projection_chunk_size
+            ):
+                selected = active_indices[
+                    start : start + self.temp_rollout_projection_chunk_size
+                ]
+                logits = self._lm_head_module(current_hidden)(
+                    flat_hidden.index_select(0, selected)
+                )
+                logits = logits[..., : self.target_vocab_size]
+                flat_tokens[selected] = logits.argmax(dim=-1)
+            step_tokens = flat_tokens.view_as(alive)
+            generated[..., position] = step_tokens
+
+            next_alive = alive
+            if self.eos_token_id is not None:
+                next_alive = alive & step_tokens.ne(self.eos_token_id)
+            if position + 1 < prediction_length:
+                current_hidden = rollout_context.extend_step(
+                    anchor_positions,
+                    generated[..., : position + 1],
+                    next_alive,
+                ).detach()
+            alive = next_alive
+
+        stacked_hidden = (
+            torch.cat(predecessor_hidden, dim=2)
+            if predecessor_hidden is not None
+            else None
+        )
+        return generated, valid_positions, stacked_hidden
 
     def _lm_head_module(self, output_hidden: torch.Tensor) -> nn.Module:
         return self.lm_head
@@ -789,6 +949,8 @@ class OnlineFlashMTPModel(nn.Module):
         block_keep_mask: Optional[torch.Tensor] = None,
         target_hidden: Optional[torch.Tensor] = None,
         target_prediction_hidden: Optional[torch.Tensor] = None,
+        target_anchor_hidden: Optional[torch.Tensor] = None,
+        temp_rollout_context: Any = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -800,6 +962,9 @@ class OnlineFlashMTPModel(nn.Module):
         """Parallel block-wise training forward pass."""
         bsz, seq_len = input_ids.shape
         device = input_ids.device
+
+        rollout_ids = None
+        rollout_validity = None
 
         if target_hidden is None:
             if hidden_states is None:
@@ -822,6 +987,7 @@ class OnlineFlashMTPModel(nn.Module):
                 )
             if (
                 target_prediction_hidden is None
+                and not self.temp_rollout_enabled
                 and self.tv_loss_weight != 0.0
                 and self.draft_model.markov_head is not None
             ):
@@ -835,6 +1001,35 @@ class OnlineFlashMTPModel(nn.Module):
         elif anchor_positions is None or block_keep_mask is None:
             raise ValueError(
                 "anchor_positions and block_keep_mask are required when target_hidden is precomputed."
+            )
+
+        if self.temp_rollout_enabled:
+            if temp_rollout_context is None or target_anchor_hidden is None:
+                raise ValueError(
+                    "temp-rollout requires target_anchor_hidden and a live "
+                    "temp_rollout_context."
+                )
+            if target_prediction_hidden is not None:
+                raise ValueError(
+                    "temp-rollout target_prediction_hidden must come from the "
+                    "greedy branches, not the original temperature-sampled suffix."
+                )
+            (
+                rollout_ids,
+                rollout_validity,
+                target_prediction_hidden,
+            ) = self._temp_rollout_greedy(
+                anchor_positions=anchor_positions,
+                block_keep_mask=block_keep_mask,
+                target_anchor_hidden=target_anchor_hidden,
+                rollout_context=temp_rollout_context,
+            )
+            # Target branch KV is no longer needed during the draft backbone.
+            # Releasing it here materially reduces the peak of the live graph.
+            temp_rollout_context.close()
+        elif temp_rollout_context is not None or target_anchor_hidden is not None:
+            raise ValueError(
+                "temp-rollout tensors were provided but temp_rollout_enabled is false."
             )
 
         target_hidden = self._prepend_embedding_chs(
@@ -892,16 +1087,36 @@ class OnlineFlashMTPModel(nn.Module):
         valid_label_mask = label_indices < seq_len
         safe_label_indices = label_indices.clamp(max=seq_len - 1)
 
-        target_ids = torch.gather(
-            input_ids.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
-            2,
-            safe_label_indices,
-        )
+        if rollout_ids is None:
+            target_ids = torch.gather(
+                input_ids.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
+                2,
+                safe_label_indices,
+            )
+            target_validity = torch.ones_like(target_ids, dtype=torch.bool)
+        elif self.left_shift:
+            target_ids = rollout_ids
+            target_validity = rollout_validity
+        else:
+            anchor_token_ids = torch.gather(input_ids, 1, anchor_positions)
+            target_ids = torch.cat(
+                [anchor_token_ids.unsqueeze(-1), rollout_ids], dim=-1
+            )
+            target_validity = torch.cat(
+                [block_keep_mask.unsqueeze(-1).bool(), rollout_validity], dim=-1
+            )
+        if target_ids.shape != safe_label_indices.shape:
+            raise ValueError(
+                "temp-rollout label alignment mismatch: "
+                f"labels={tuple(target_ids.shape)}, "
+                f"positions={tuple(safe_label_indices.shape)}."
+            )
 
         # --- Weight mask: block validity * bounds * loss_mask ---
         draft_len = self._draft_block_len()
         weight_mask = block_keep_mask.unsqueeze(-1).expand(-1, -1, draft_len).float()
         weight_mask = weight_mask * valid_label_mask.float()
+        weight_mask = weight_mask * target_validity.float()
 
         if not self.left_shift:
             pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
