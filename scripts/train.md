@@ -51,6 +51,44 @@ bash scripts/run_training_flashmtp.sh --dt h100
 
 适用于本地 / 单节点 H100 等环境，快速验证配置：
 
+### Target / Draft 分离模式
+
+每台机器独立运行一条 target→draft 数据流水线。下面的配置将本节点
+local rank 0..5 用作 target，6..7 用作 draft；每个 target producer
+处理 2 条数据，每个 draft rank 接收 6 条数据。多机时样本不会跨节点
+传输，只有所有 draft ranks 组成的 FSDP group 会执行必要的跨机训练通信。
+
+```bash
+cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2_dist
+source .venv/bin/activate
+DISAGGREGATE=true \
+RANK_TARGET_PER_NODE=6 RANK_DRAFT_PER_NODE=2 \
+TARGET_TP_SIZE=1 NODE_BATCH_SIZE=12 \
+DRAFT_MICRO_BATCH_SIZE=6 PIPELINE_DEPTH=2 \
+NPROC_PER_NODE=8 \
+NUM_MIDDLE_LAYERS_N=10 NUM_DRAFT_LAYERS=5 NUM_EPOCHS=4 PIVOT_FUSE_MODE=prefix_condition DATA_NUM_SAMPLES=pb_temp1_20k MAX_LENGTH=4096 NUM_ANCHORS=320 BLOCK_SIZE=8 LOCAL_POSITION=true \
+LOSS_DECAY_GAMMA=4 BASE_LM_CE_DECAY_GAMMA=12 BASE_LM_CE_WEIGHT=0.06 FINAL_CE_WEIGHT=0.1 TV_LOSS_WEIGHT=1.0 \
+MARKOV_HEAD_TYPE=rnn_easy MARKOV_OUTPUT_MODE=additive MARKOV_RANK=320 \
+NPROC_PER_NODE=8 TP_SIZE=1 SHARD_DRAFT_BY_TP=0 CE_CHUNK_SIZE=4096 \
+SAVE_INTERVAL=10000 \
+TEMP_ROLLOUT=false \
+LEARNING_RATE=5e-4 \
+TRAIN_DATA_PATH="/share/dai-sys/wanghanzhen/projects/MTP/training_data/generated/qwen3-4b/open_perfectblend_20k_balanced_think_off_temp1.0_topp0.9_n4_maxnew4096.jsonl" \
+TARGET_MODEL_BACKEND=sglang SGLANG_MEM_FRACTION_STATIC=0.3 \
+TARGET_MODEL=/share/dai-sys/wanghanzhen/models/Qwen/Qwen3-4B \
+MODEL_TAG='Qwen3-4B' \
+bash scripts/run_training_flashmtp.sh --dt h100
+```
+
+`TV_LOSS_WEIGHT>0` 且启用 Markov head 时，target 只发送对应 causal
+位置的最后层 hidden state。draft rank 使用本地 frozen target `lm_head`
+分块计算 target logits；词表 logits 不通过节点内 bridge 传输。draft rank
+同时保留 frozen `embed_tokens`，但不会加载 target backbone 或 KV pool。
+
+多机示例只需在每台机器设置相同的上述参数，并分别设置
+`NNODES`、`NODE_RANK`、`MASTER_ADDR` 和 `MASTER_PORT`。target TP group 和
+target→draft bridge 均由 local rank 构造，不会跨节点。
+
 ```plaintext
 # ["linear_fuse", "attention_fuse", "prefix_condition"]
 cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2
@@ -177,6 +215,13 @@ bash scripts/run_training_flashmtp.sh --dt qz > "whz_mtp_logs/train_flashmtp_qz_
 | `BASE_LM_CE_DECAY_GAMMA` | —             | 辅助 CE 独立衰减系数（不设则均匀权重）                 |
 | `CHAT_TEMPLATE`          | —             | 对话模板（`qwen` / `llama3`）               |
 | `DATA_NUM_SAMPLES`       | 40000         | 训练样本数                                 |
+| `DISAGGREGATE`           | false         | 启用每节点 target/draft 分离流水线              |
+| `RANK_TARGET_PER_NODE`   | 6             | 每节点 target GPU 数                      |
+| `RANK_DRAFT_PER_NODE`    | 2             | 每节点 draft GPU 数                       |
+| `TARGET_TP_SIZE`         | `TP_SIZE`     | target 节点内 TP；禁止跨节点                   |
+| `NODE_BATCH_SIZE`        | `BATCH_SIZE`  | 每节点每个 pipeline step 的唯一样本数            |
+| `DRAFT_MICRO_BATCH_SIZE` | —             | 每个 draft rank 的训练 micro batch         |
+| `PIPELINE_DEPTH`         | 2             | 节点内 P2P 预分配 buffer 数                  |
 | `--dt`                   | a800          | 设备类型：`qz` / `a800` / `h100`           |
 
 

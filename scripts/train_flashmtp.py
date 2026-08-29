@@ -174,18 +174,6 @@ def parse_args():
         "block in training). CHS rotary prefix uses zeros. Target model still uses global ids.",
     )
     model_group.add_argument(
-        "--add-noise",
-        action="store_true",
-        help="Add uniform noise U(-r, r) to each selected-layer target hidden before draft "
-        "forward (default r=0.1 from --target-hidden-noise-ratio).",
-    )
-    model_group.add_argument(
-        "--target-hidden-noise-ratio",
-        type=float,
-        default=0.1,
-        help="Half-width r for uniform noise U(-r, r) when --add-noise is set.",
-    )
-    model_group.add_argument(
         "--temp-rollout",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -196,9 +184,10 @@ def parse_args():
     model_group.add_argument(
         "--temp-rollout-projection-chunk-size",
         type=int,
-        default=64,
+        default=0,
         help="Number of anchor hidden states projected through the frozen target "
-        "lm_head at once during each greedy rollout step.",
+        "lm_head at once during each greedy rollout step. 0 projects all "
+        "active anchors together (default; no chunking).",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -258,6 +247,14 @@ def parse_args():
     output_group.add_argument("--eval-interval", type=int, default=1000)
     output_group.add_argument("--save-interval", type=int, default=1000)
 
+    profiling_group = parser.add_argument_group("profiling")
+    profiling_group.add_argument(
+        "--profile",
+        action="store_true",
+        help="Measure and report per-stage training timings. Disabled by "
+        "default to avoid CUDA-event, synchronization, and wall-clock overhead.",
+    )
+
     optimization_group = parser.add_argument_group("optimization")
     optimization_group.add_argument(
         "--tp-size",
@@ -271,6 +268,28 @@ def parse_args():
 
     dist_group = parser.add_argument_group("distributed")
     dist_group.add_argument("--dist-timeout", type=int, default=30)
+    dist_group.add_argument(
+        "--disaggregate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Place target producers and draft trainers on disjoint per-node ranks.",
+    )
+    dist_group.add_argument("--target-ranks-per-node", type=int, default=None)
+    dist_group.add_argument("--draft-ranks-per-node", type=int, default=None)
+    dist_group.add_argument(
+        "--target-tp-size",
+        type=int,
+        default=None,
+        help="Target TP size in disaggregate mode; TP groups never cross nodes.",
+    )
+    dist_group.add_argument(
+        "--node-batch-size",
+        type=int,
+        default=None,
+        help="Unique samples produced per node and pipeline step.",
+    )
+    dist_group.add_argument("--draft-micro-batch-size", type=int, default=None)
+    dist_group.add_argument("--pipeline-depth", type=int, default=2)
 
     # SGLang specific args
     sglang_group = parser.add_argument_group("sglang backend")
@@ -697,6 +716,17 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
+    if args.disaggregate:
+        try:
+            from scripts.train_flashmtp_disaggregate import run_disaggregated
+        except ModuleNotFoundError:
+            # ``torchrun scripts/train_flashmtp.py`` puts ``scripts/`` rather
+            # than the project root at sys.path[0].
+            from train_flashmtp_disaggregate import run_disaggregated
+
+        run_disaggregated(args)
+        return
+
     if args.temp_rollout:
         if args.target_model_backend != "sglang":
             raise ValueError("--temp-rollout requires --target-model-backend sglang.")
@@ -705,9 +735,10 @@ def main():
                 "--temp-rollout currently requires --batch-size 1; anchors inside "
                 "the sample are fully batched."
             )
-        if args.temp_rollout_projection_chunk_size <= 0:
+        if args.temp_rollout_projection_chunk_size < 0:
             raise ValueError(
-                "--temp-rollout-projection-chunk-size must be positive."
+                "--temp-rollout-projection-chunk-size must be non-negative; "
+                "use 0 to disable chunking."
             )
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
@@ -845,10 +876,6 @@ def main():
         draft_model.markov_output_mode
     )
     draft_model.config.flashmtp_config["markov_rank"] = int(draft_model.markov_rank)
-    draft_model.config.flashmtp_config["add_noise"] = bool(args.add_noise)
-    draft_model.config.flashmtp_config["target_hidden_noise_ratio"] = float(
-        args.target_hidden_noise_ratio
-    )
     draft_model.config.flashmtp_config["temp_rollout"] = bool(args.temp_rollout)
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
@@ -890,8 +917,6 @@ def main():
         base_lm_ce_weight=args.base_lm_ce_weight,
         base_lm_ce_decay_gamma=args.base_lm_ce_decay_gamma,
         chs_concat_mode="feature",
-        add_noise=args.add_noise,
-        target_hidden_noise_ratio=args.target_hidden_noise_ratio,
         ce_chunk_size=args.ce_chunk_size,
         left_shift=args.left_shift,
         temp_rollout_enabled=args.temp_rollout,
@@ -902,8 +927,6 @@ def main():
         eos_token_id=tokenizer.eos_token_id,
     )
     print_on_rank0(
-        f"target hidden noise: add_noise={args.add_noise}, "
-        f"ratio={args.target_hidden_noise_ratio}, "
         f"ce_chunk_size={args.ce_chunk_size}, "
         f"final_ce_weight={args.final_ce_weight}, "
         f"tv_loss_weight={args.tv_loss_weight}, "
@@ -966,7 +989,7 @@ def main():
     tracker = create_tracker(args, args.output_dir)
     print_on_rank0("Tracker initialized successfully.")
 
-    last_time = time.time()
+    last_time = time.time() if args.profile else None
     accumulated_micro_steps = 0
     checkpoint_pending = False
     last_grad_norm = None
@@ -1139,18 +1162,18 @@ def main():
                 )
 
             if dist.get_rank() == 0:
-                elapsed = time.time() - last_time
-                last_time = time.time()
-                progress_bar.set_postfix(
-                    {
-                        "loss": f"{loss.item():.4f}",
-                        "acc": f"{accuracy.item():.4f}",
-                        "pfx": f"{prefix_acc.item():.4f}",
-                        "final_ce": f"{final_ce_loss.item():.4f}",
-                        "tv": f"{tv_loss.item():.4f}",
-                        "iter_time": f"{elapsed:.2f}s",
-                    }
-                )
+                postfix = {
+                    "loss": f"{loss.item():.4f}",
+                    "acc": f"{accuracy.item():.4f}",
+                    "pfx": f"{prefix_acc.item():.4f}",
+                    "final_ce": f"{final_ce_loss.item():.4f}",
+                    "tv": f"{tv_loss.item():.4f}",
+                }
+                if args.profile:
+                    now = time.time()
+                    postfix["iter_time"] = f"{now - last_time:.2f}s"
+                    last_time = now
+                progress_bar.set_postfix(postfix)
 
             if checkpoint_pending and accumulated_micro_steps == 0:
                 save_checkpoint(

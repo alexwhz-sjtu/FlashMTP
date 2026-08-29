@@ -41,10 +41,20 @@ PIVOT_FUSE_MODE="${PIVOT_FUSE_MODE:-linear_fuse}"
 NUM_MIDDLE_LAYERS_N="${NUM_MIDDLE_LAYERS_N:-5}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
 TEMP_ROLLOUT="${TEMP_ROLLOUT:-false}"
-TEMP_ROLLOUT_PROJECTION_CHUNK_SIZE="${TEMP_ROLLOUT_PROJECTION_CHUNK_SIZE:-512}"
+TEMP_ROLLOUT_PROJECTION_CHUNK_SIZE="${TEMP_ROLLOUT_PROJECTION_CHUNK_SIZE:-0}"
 TEMP_ROLLOUT_ENABLED=0
 case "$(echo "${TEMP_ROLLOUT}" | tr '[:upper:]' '[:lower:]')" in
     true|1|yes) TEMP_ROLLOUT_ENABLED=1 ;;
+esac
+if [ "${TEMP_ROLLOUT_ENABLED}" = "1" ]; then
+    TEMP_ROLLOUT_TAG="temprollout1"
+else
+    TEMP_ROLLOUT_TAG="temprollout0"
+fi
+PROFILE="${PROFILE:-false}"
+PROFILE_ENABLED=0
+case "$(echo "${PROFILE}" | tr '[:upper:]' '[:lower:]')" in
+    true|1|yes) PROFILE_ENABLED=1 ;;
 esac
 
 # 恢复训练
@@ -111,6 +121,15 @@ export MASTER_ADDR
 export MASTER_PORT
 TP_SIZE="${TP_SIZE:-1}"
 DIST_TIMEOUT="${DIST_TIMEOUT:-120}"
+DISAGGREGATE="${DISAGGREGATE:-false}"
+DISAGGREGATE_ENABLED=0
+case "$(echo "${DISAGGREGATE}" | tr '[:upper:]' '[:lower:]')" in
+    true|1|yes) DISAGGREGATE_ENABLED=1 ;;
+esac
+RANK_TARGET_PER_NODE="${RANK_TARGET_PER_NODE:-6}"
+RANK_DRAFT_PER_NODE="${RANK_DRAFT_PER_NODE:-2}"
+TARGET_TP_SIZE="${TARGET_TP_SIZE:-${TP_SIZE}}"
+PIPELINE_DEPTH="${PIPELINE_DEPTH:-2}"
 
 # 模型参数（OUTPUT_DIR 依赖 BLOCK_SIZE，须早于 dt 分支）
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
@@ -148,9 +167,27 @@ CE_CHUNK_SIZE="${CE_CHUNK_SIZE:-2048}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
 SHARD_DRAFT_BY_TP="${SHARD_DRAFT_BY_TP:-1}"
+NODE_BATCH_SIZE="${NODE_BATCH_SIZE:-${BATCH_SIZE}}"
+DRAFT_MICRO_BATCH_SIZE="${DRAFT_MICRO_BATCH_SIZE:-}"
 # Per DP rank: target sees TRAIN_BATCH_SIZE samples; each TP rank trains one draft slice.
 TRAIN_BATCH_SIZE="${BATCH_SIZE}"
-if [ "${TEMP_ROLLOUT_ENABLED}" = "1" ]; then
+if [ "${DISAGGREGATE_ENABLED}" = "1" ]; then
+    if [ "${NPROC_PER_NODE}" -ne $((RANK_TARGET_PER_NODE + RANK_DRAFT_PER_NODE)) ]; then
+        echo "错误: disaggregate 要求 NPROC_PER_NODE = RANK_TARGET_PER_NODE + RANK_DRAFT_PER_NODE" >&2
+        exit 1
+    fi
+    if [ $((RANK_TARGET_PER_NODE % TARGET_TP_SIZE)) -ne 0 ]; then
+        echo "错误: RANK_TARGET_PER_NODE 必须能被 TARGET_TP_SIZE 整除" >&2
+        exit 1
+    fi
+    TARGET_PRODUCERS_PER_NODE=$((RANK_TARGET_PER_NODE / TARGET_TP_SIZE))
+    if [ $((NODE_BATCH_SIZE % TARGET_PRODUCERS_PER_NODE)) -ne 0 ] || [ $((NODE_BATCH_SIZE % RANK_DRAFT_PER_NODE)) -ne 0 ]; then
+        echo "错误: NODE_BATCH_SIZE 必须能被 target producer 数和 draft rank 数整除" >&2
+        exit 1
+    fi
+    TRAIN_BATCH_SIZE=$((NODE_BATCH_SIZE / TARGET_PRODUCERS_PER_NODE))
+    SHARD_DRAFT_BY_TP=0
+elif [ "${TEMP_ROLLOUT_ENABLED}" = "1" ]; then
     TRAIN_BATCH_SIZE=1
     SHARD_DRAFT_BY_TP=0
 elif [ "${TP_SIZE}" -gt 1 ] && [ "${SHARD_DRAFT_BY_TP}" = "1" ]; then
@@ -177,11 +214,26 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-50000}"
 
 # Tracker 参数
 REPORT_TO="${REPORT_TO:-wandb}"
-WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-v2new}"
+WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-data}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
-# 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v2_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}2}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_v2_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${MODEL_TAG}2}"
+# 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照。
+# W&B rejects names longer than 128 characters. Keep a readable prefix and a
+# stable hash suffix so fully automatic names remain valid and collision-safe.
+shorten_wandb_value() {
+    local value="$1"
+    if [ "${#value}" -le 128 ]; then
+        printf '%s' "${value}"
+        return
+    fi
+    local digest
+    digest="$(printf '%s' "${value}" | sha256sum | cut -c1-16)"
+    printf '%s-%s' "${value:0:111}" "${digest}"
+}
+
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v2_${TEMP_ROLLOUT_TAG}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_v2_${TEMP_ROLLOUT_TAG}_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${MODEL_TAG}}"
+WANDB_RUN_ID="$(shorten_wandb_value "${WANDB_RUN_ID}")"
+WANDB_NAME="$(shorten_wandb_value "${WANDB_NAME}")"
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen}"
@@ -221,6 +273,7 @@ echo "  草稿模型层数: ${NUM_DRAFT_LAYERS}"
 echo "  块大小: ${BLOCK_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  temp-rollout: ${TEMP_ROLLOUT} (greedy target branch labels)"
+echo "  profile: ${PROFILE} (per-stage timing)"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
 echo "  最终CE权重: ${FINAL_CE_WEIGHT}"
@@ -250,12 +303,24 @@ echo "  NODE_RANK: ${NODE_RANK}"
 echo "  MASTER_ADDR: ${MASTER_ADDR}"
 echo "  MASTER_PORT: ${MASTER_PORT}"
 echo "  TP_SIZE: ${TP_SIZE}"
+if [ "${DISAGGREGATE_ENABLED}" = "1" ]; then
+    echo "  disaggregate: on"
+    echo "  target ranks/node: ${RANK_TARGET_PER_NODE}"
+    echo "  draft ranks/node: ${RANK_DRAFT_PER_NODE}"
+    echo "  target TP: ${TARGET_TP_SIZE}"
+    echo "  producers/node: ${TARGET_PRODUCERS_PER_NODE}"
+    echo "  node batch: ${NODE_BATCH_SIZE}"
+    echo "  target local batch: ${TRAIN_BATCH_SIZE}"
+    echo "  draft local batch: $((NODE_BATCH_SIZE / RANK_DRAFT_PER_NODE))"
+    echo "  global batch: $((NODE_BATCH_SIZE * NNODES * ACCUMULATION_STEPS))"
+    echo "  pipeline depth: ${PIPELINE_DEPTH}"
+fi
 echo "------------------------------------------"
 echo "Tracker: ${REPORT_TO}"
 if [ "${REPORT_TO}" = "wandb" ]; then
     echo "  WandB目录: ${WANDB_DIR}"
-    if [ -n "${WANDB_RUN_NAME}" ]; then
-        echo "  WandB run 名称: ${WANDB_RUN_NAME}"
+    if [ -n "${WANDB_NAME}" ]; then
+        echo "  WandB run 名称: ${WANDB_NAME}"
     fi
     if [ -n "${WANDB_RUN_ID}" ]; then
         echo "  WandB run id: ${WANDB_RUN_ID} (离线: offline-run-${WANDB_RUN_ID})"
@@ -373,14 +438,14 @@ if [ "${TARGET_MODEL_BACKEND}" = "sglang" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION_STATIC}"
     if [ -z "${SGLANG_MAX_TOTAL_TOKENS}" ]; then
         if [ "${TEMP_ROLLOUT_ENABLED}" = "1" ]; then
-            SGLANG_MAX_TOTAL_TOKENS=$((MAX_LENGTH + NUM_ANCHORS * (BLOCK_SIZE - 1)))
+            SGLANG_MAX_TOTAL_TOKENS=$((TRAIN_BATCH_SIZE * MAX_LENGTH + TRAIN_BATCH_SIZE * NUM_ANCHORS * (BLOCK_SIZE - 1)))
         else
             SGLANG_MAX_TOTAL_TOKENS=$((TRAIN_BATCH_SIZE * MAX_LENGTH))
         fi
     fi
     if [ -z "${SGLANG_MAX_RUNNING_REQUESTS}" ]; then
         if [ "${TEMP_ROLLOUT_ENABLED}" = "1" ]; then
-            SGLANG_MAX_RUNNING_REQUESTS=$((NUM_ANCHORS + TRAIN_BATCH_SIZE))
+            SGLANG_MAX_RUNNING_REQUESTS=$((TRAIN_BATCH_SIZE * (NUM_ANCHORS + 1)))
         else
             SGLANG_MAX_RUNNING_REQUESTS=${TRAIN_BATCH_SIZE}
         fi
@@ -391,6 +456,17 @@ fi
 
 if [ "${TEMP_ROLLOUT_ENABLED}" = "1" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --temp-rollout --temp-rollout-projection-chunk-size ${TEMP_ROLLOUT_PROJECTION_CHUNK_SIZE}"
+fi
+
+if [ "${PROFILE_ENABLED}" = "1" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --profile"
+fi
+
+if [ "${DISAGGREGATE_ENABLED}" = "1" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --disaggregate --target-ranks-per-node ${RANK_TARGET_PER_NODE} --draft-ranks-per-node ${RANK_DRAFT_PER_NODE} --target-tp-size ${TARGET_TP_SIZE} --node-batch-size ${NODE_BATCH_SIZE} --pipeline-depth ${PIPELINE_DEPTH}"
+    if [ -n "${DRAFT_MICRO_BATCH_SIZE}" ]; then
+        OPTIONAL_ARGS="${OPTIONAL_ARGS} --draft-micro-batch-size ${DRAFT_MICRO_BATCH_SIZE}"
+    fi
 fi
 
 if [ "${TP_SIZE}" -gt 1 ] && [ "${SHARD_DRAFT_BY_TP}" = "1" ]; then

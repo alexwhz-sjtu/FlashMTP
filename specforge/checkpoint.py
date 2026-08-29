@@ -51,6 +51,7 @@ def save_distributed_training_state(
     *,
     rank: Optional[int] = None,
     world_size: Optional[int] = None,
+    process_group: Optional[dist.ProcessGroup] = None,
 ) -> None:
     """Save rank-local optimizer state and a rank-0 compatibility file.
 
@@ -58,6 +59,11 @@ def save_distributed_training_state(
     writes its local optimizer shard.  Only after every shard is durable does
     rank 0 publish ``training_state.pt``.
     """
+    if process_group is not None:
+        rank = dist.get_rank(process_group) if rank is None else rank
+        world_size = (
+            dist.get_world_size(process_group) if world_size is None else world_size
+        )
     rank, world_size = _rank_and_world_size(rank, world_size)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -74,7 +80,7 @@ def save_distributed_training_state(
         )
 
     if dist.is_initialized():
-        dist.barrier()
+        dist.barrier(group=process_group)
 
     if rank == 0:
         _atomic_torch_save(
@@ -82,7 +88,7 @@ def save_distributed_training_state(
         )
 
     if dist.is_initialized():
-        dist.barrier()
+        dist.barrier(group=process_group)
 
 
 def load_distributed_training_state(
@@ -91,8 +97,14 @@ def load_distributed_training_state(
     map_location: Any = "cpu",
     rank: Optional[int] = None,
     world_size: Optional[int] = None,
+    process_group: Optional[dist.ProcessGroup] = None,
 ) -> Optional[dict[str, Any]]:
     """Load this rank's optimizer shard, with legacy checkpoint fallback."""
+    if process_group is not None:
+        rank = dist.get_rank(process_group) if rank is None else rank
+        world_size = (
+            dist.get_world_size(process_group) if world_size is None else world_size
+        )
     rank, world_size = _rank_and_world_size(rank, world_size)
     ranked_path = ranked_training_state_path(checkpoint_dir, rank)
     common_path = os.path.join(checkpoint_dir, "training_state.pt")

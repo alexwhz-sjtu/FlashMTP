@@ -45,7 +45,12 @@ class Tracker(abc.ABC):
     def __init__(self, args, output_dir: str):
         self.args = args
         self.output_dir = output_dir
-        self.rank = dist.get_rank()
+        global_rank = dist.get_rank()
+        primary_global_rank = int(getattr(args, "tracker_global_rank", 0))
+        # Trackers historically use ``rank == 0`` internally. Allow a role-
+        # specific coordinator (the first draft rank in disaggregate mode)
+        # without changing each backend implementation.
+        self.rank = 0 if global_rank == primary_global_rank else global_rank + 1
         self.is_initialized = False
 
     @classmethod

@@ -1,5 +1,6 @@
 import logging
 import inspect
+import os
 from typing import Optional
 
 import sglang.srt.distributed.parallel_state as parallel_state
@@ -12,13 +13,73 @@ from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     compute_dp_attention_world_info,
 )
-from sglang.srt.runtime_context import get_flags
+try:
+    from sglang.srt.runtime_context import get_flags
+except ImportError:  # SGLang 0.5.9
+    get_flags = None
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
-from specforge.distributed import get_tp_group as get_specforge_tp_group
+from specforge.distributed import (
+    get_disaggregated_topology,
+    get_tp_group as get_specforge_tp_group,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _coordinator_from_existing_group(group, local_rank: int) -> GroupCoordinator:
+    """Wrap a SpecForge process group without creating another communicator.
+
+    GroupCoordinator normally calls ``dist.new_group`` on the default world.
+    In disaggregated mode only target ranks enter SGLang initialization, so
+    doing that would wait forever for the draft ranks.  The target TP groups
+    were already created collectively by ``init_disaggregated``; populate the
+    small GroupCoordinator state directly and reuse that group instead.
+    """
+    coordinator = object.__new__(GroupCoordinator)
+    coordinator.unique_name = f"specforge_target_tp_{dist.get_rank()}"
+    coordinator.rank = dist.get_rank()
+    coordinator.local_rank = local_rank
+    coordinator.device_group = group
+    # TP=1 SGLang CPU collectives are no-ops.  The one unconditional monitored
+    # barrier during model loading is skipped by SGLangRunner.load_model.
+    coordinator.cpu_group = group
+    coordinator.local_size = int(os.environ.get("LOCAL_SIZE", "0"))
+    coordinator.device = torch.device("cuda", local_rank)
+    coordinator.device_module = torch.cuda
+    coordinator.ranks = dist.get_process_group_ranks(group)
+    coordinator.world_size = dist.get_world_size(group)
+    coordinator.rank_in_group = dist.get_rank(group)
+    coordinator.active_ranks = torch.ones(
+        coordinator.world_size, dtype=torch.int32, device=coordinator.device
+    )
+    coordinator.active_ranks_cpu = torch.ones(
+        coordinator.world_size, dtype=torch.int32
+    )
+
+    coordinator.use_pynccl = False
+    coordinator.pynccl_use_current_stream = False
+    coordinator.use_pymscclpp = False
+    coordinator.use_custom_allreduce = False
+    coordinator.use_torch_symm_mem_all_reduce = False
+    coordinator.use_hpu_communicator = False
+    coordinator.use_xpu_communicator = False
+    coordinator.use_npu_communicator = False
+    coordinator.use_message_queue_broadcaster = False
+    coordinator.pynccl_comm = None
+    coordinator.pymscclpp_comm = None
+    coordinator.ca_comm = None
+    coordinator.qr_comm = None
+    coordinator.torch_symm_mem_comm = None
+    coordinator.hpu_communicator = None
+    coordinator.xpu_communicator = None
+    coordinator.npu_communicator = None
+    coordinator.mq_broadcaster = None
+    coordinator.is_symmetric_memory_enabled = lambda *args, **kwargs: False
+    coordinator.use_symmetric_memory = lambda *args, **kwargs: False
+    coordinator.is_allocation_symmetric = lambda *args, **kwargs: False
+    return coordinator
 
 
 def init_model_parallel_group(*args, **kwargs):
@@ -45,6 +106,18 @@ def init_distributed_environment(
     ), "distributed environment should be initialized first"
 
     tp_group = get_specforge_tp_group()
+    topology = get_disaggregated_topology()
+    if topology is not None:
+        if topology.target_tp_size != 1:
+            raise NotImplementedError(
+                "embedded SGLang communicator reuse currently supports "
+                "disaggregated TARGET_TP_SIZE=1 only."
+            )
+        parallel_state._WORLD = _coordinator_from_existing_group(
+            tp_group, local_rank
+        )
+        return
+
     world_size = dist.get_world_size()
     tp_size = dist.get_world_size(tp_group)
     num_tp_groups = world_size // tp_size
@@ -112,6 +185,27 @@ def initialize_model_parallel(
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
     """
+    topology = get_disaggregated_topology()
+    if topology is not None:
+        if tensor_model_parallel_size != 1 or pipeline_model_parallel_size != 1:
+            raise NotImplementedError(
+                "disaggregated embedded SGLang group reuse requires target TP=PP=1."
+            )
+        # Every SGLang parallel dimension is a singleton for this mode.  Reuse
+        # the already-created target TP coordinator and avoid any new_group on
+        # the 8-rank default world (draft ranks never enter this function).
+        world = parallel_state._WORLD
+        parallel_state._TP = world
+        parallel_state._PP = world
+        parallel_state._MOE_EP = world
+        parallel_state._MOE_TP = world
+        parallel_state._ATTN_CP = world
+        parallel_state._ATTN_TP = world
+        parallel_state._MOE_DP = world
+        if duplicate_tp_group:
+            parallel_state._PDMUX_PREFILL_TP_GROUP = world
+        return
+
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = parallel_state._WORLD.world_size
@@ -352,20 +446,29 @@ def initialize_dp_attention(
 
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
-    # SGLang 0.5.17 moved the enable flag and buffer metadata into its
-    # process-local runtime context, and compute_dp_attention_world_info now
-    # returns four values.  Keep this adapter compatible with that layout.
-    flags = get_flags().dp
-    flags.enabled = enable_dp_attention
-    flags.max_len_with_idle = (
-        getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
-    )
-    (
-        dp_attention._ATTN_DP_RANK,
-        dp_attention._ATTN_DP_SIZE,
-    ) = compute_dp_attention_world_info(
+    world_info = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
-    )[2:4]
+    )
+    if get_flags is not None:
+        # SGLang >= 0.5.17 stores the enable flag in runtime context and
+        # returns (..., dp_rank, dp_size).
+        flags = get_flags().dp
+        flags.enabled = enable_dp_attention
+        flags.max_len_with_idle = (
+            getattr(model_config.hf_config, "hybrid_override_pattern", None)
+            is not None
+        )
+        dp_attention._ATTN_DP_RANK, dp_attention._ATTN_DP_SIZE = world_info[-2:]
+    else:
+        # SGLang 0.5.9 returns (attn_tp_rank, attn_tp_size, dp_rank) and
+        # keeps process-local flags as module globals.
+        dp_attention._ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
+        dp_attention._ATTN_DP_RANK = world_info[-1]
+        dp_attention._ATTN_DP_SIZE = dp_size if enable_dp_attention else 1
+        if hasattr(dp_attention, "_LOCAL_ATTN_DP_RANK"):
+            dp_attention._LOCAL_ATTN_DP_RANK = dp_attention._ATTN_DP_RANK
+        if hasattr(dp_attention, "_LOCAL_ATTN_DP_SIZE"):
+            dp_attention._LOCAL_ATTN_DP_SIZE = dp_attention._ATTN_DP_SIZE
 
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,

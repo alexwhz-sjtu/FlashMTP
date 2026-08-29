@@ -538,11 +538,6 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
 
         if input_ids.ndim != 2 or attention_mask.shape != input_ids.shape:
             raise ValueError("input_ids and attention_mask must have shape [batch, seq].")
-        if input_ids.size(0) != 1:
-            raise ValueError(
-                "temp-rollout requires batch_size=1 per target rank; anchors in "
-                "that sample are still generated in one batched extend per step."
-            )
         if int(self.model_runner.server_args.page_size) != 1:
             raise ValueError(
                 "temp-rollout arbitrary-anchor KV sharing requires SGLang "
@@ -581,8 +576,28 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
                 req_pool[req.req_pool_idx, : len(ids)].to(torch.int64).clone()
                 for req, ids in zip(reqs, true_token_ids)
             ]
-            batched_aux = torch.stack(list(hidden_list), dim=0)
-            batched_last = torch.stack(list(last_hidden_list), dim=0)
+            padded_length = input_ids.size(1)
+
+            def _pad_sequence(hidden: torch.Tensor) -> torch.Tensor:
+                if hidden.size(0) > padded_length:
+                    raise ValueError(
+                        "SGLang returned more hidden positions than the padded input: "
+                        f"{hidden.size(0)} > {padded_length}."
+                    )
+                if hidden.size(0) == padded_length:
+                    return hidden
+                return torch.nn.functional.pad(
+                    hidden, (0, 0, 0, padded_length - hidden.size(0))
+                )
+
+            # Requests may have different true lengths. Pad only the returned
+            # hidden tensors; their paged KV remains allocated at true length.
+            batched_aux = torch.stack(
+                [_pad_sequence(hidden) for hidden in hidden_list], dim=0
+            )
+            batched_last = torch.stack(
+                [_pad_sequence(hidden) for hidden in last_hidden_list], dim=0
+            )
             layer_tensors = self._aux_hidden_to_layer_tuple(
                 batched_aux, batched_last
             )
@@ -803,10 +818,12 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         for idx, (curr_ids, curr_attn, curr_loss) in enumerate(
             zip(input_ids_list, attn_mask_list, loss_mask_list)
         ):
+            valid_len = int(curr_attn.sum().item())
+            true_ids = curr_ids.view(-1)[:valid_len].tolist()
             req = Req(
                 rid=str(idx),
                 origin_input_text="",
-                origin_input_ids=curr_ids.view(-1).tolist(),
+                origin_input_ids=true_ids,
                 sampling_params=sampling_params,
             )
             req.fill_ids = req.origin_input_ids
@@ -816,11 +833,25 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
 
         hidden_states_list, last_hidden_list = self._extend(reqs)
 
-        batched_aux = torch.cat([h.unsqueeze(0) for h in hidden_states_list], dim=0)
+        padded_length = input_ids.size(1)
+
+        def _pad_sequence(hidden: torch.Tensor) -> torch.Tensor:
+            if hidden.size(0) > padded_length:
+                raise ValueError(
+                    f"Target hidden length {hidden.size(0)} exceeds padded input "
+                    f"length {padded_length}."
+                )
+            return torch.nn.functional.pad(
+                hidden, (0, 0, 0, padded_length - hidden.size(0))
+            )
+
+        batched_aux = torch.stack(
+            [_pad_sequence(h) for h in hidden_states_list], dim=0
+        )
         batched_last = None
         if last_hidden_list is not None:
-            batched_last = torch.cat(
-                [h.unsqueeze(0) for h in last_hidden_list], dim=0
+            batched_last = torch.stack(
+                [_pad_sequence(h) for h in last_hidden_list], dim=0
             )
 
         hidden_size = self.model_runner.model_config.hidden_size

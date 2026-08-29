@@ -183,24 +183,6 @@ def prepare_target_anchor_hidden(
     )
 
 
-def add_noise_to_target_hidden(
-    target_hidden: torch.Tensor,
-    noise_ratio: float = 0.1,
-    preserve_first_slot: bool = False,
-) -> torch.Tensor:
-    """Add uniform noise to conditioning slots (training augmentation).
-
-    Samples i.i.d. from U(-noise_ratio, noise_ratio) per element (default U(-0.1, 0.1)).
-    ``preserve_first_slot`` keeps the fixed raw-embedding prefix unchanged.
-    """
-    if noise_ratio <= 0:
-        return target_hidden
-    noise = torch.empty_like(target_hidden).uniform_(-noise_ratio, noise_ratio)
-    if preserve_first_slot:
-        noise[..., 0, :] = 0
-    return target_hidden + noise
-
-
 def create_flashmtp_block_mask(
     anchor_positions: torch.Tensor,
     block_keep_mask: torch.Tensor,
@@ -278,6 +260,47 @@ def create_flashmtp_block_mask(
     )
 
 
+def create_flashmtp_dense_mask(
+    block_keep_mask: torch.Tensor,
+    chs_len_per_block: int,
+    block_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Dense additive equivalent of ``create_flashmtp_block_mask``.
+
+    This keeps eager/SDPA debug runs from compiling a FlexAttention BlockMask.
+    """
+    bsz, num_blocks = block_keep_mask.shape
+    q_len = num_blocks * block_size
+    context_len = num_blocks * chs_len_per_block
+    kv_len = context_len + q_len
+    device = block_keep_mask.device
+    q_block = torch.arange(q_len, device=device) // block_size
+    kv_index = torch.arange(kv_len, device=device)
+    is_context = kv_index < context_len
+    context_block = kv_index // chs_len_per_block
+    draft_block = (kv_index - context_len).clamp(min=0) // block_size
+    own_context = is_context.unsqueeze(0) & (
+        context_block.unsqueeze(0) == q_block.unsqueeze(1)
+    )
+    own_draft = (~is_context).unsqueeze(0) & (
+        draft_block.unsqueeze(0) == q_block.unsqueeze(1)
+    )
+    valid = block_keep_mask[:, q_block].unsqueeze(-1)
+    allowed = torch.where(
+        valid,
+        (own_context | own_draft).unsqueeze(0),
+        own_context.unsqueeze(0),
+    )
+    mask = torch.full(
+        (bsz, 1, q_len, kv_len),
+        torch.finfo(dtype).min,
+        dtype=dtype,
+        device=device,
+    )
+    return mask.masked_fill(allowed.unsqueeze(1), 0)
+
+
 class OnlineFlashMTPModel(nn.Module):
     """FlashMTP online training wrapper with block-wise CE loss."""
 
@@ -296,12 +319,10 @@ class OnlineFlashMTPModel(nn.Module):
         base_lm_ce_weight: float = 0.0,
         base_lm_ce_decay_gamma: Optional[float] = None,
         chs_concat_mode: str = "feature",
-        add_noise: bool = False,
-        target_hidden_noise_ratio: float = 0.1,
         ce_chunk_size: int = 2048,
         left_shift: Optional[bool] = None,
         temp_rollout_enabled: bool = False,
-        temp_rollout_projection_chunk_size: int = 64,
+        temp_rollout_projection_chunk_size: int = 0,
         target_vocab_size: Optional[int] = None,
         eos_token_id: Optional[int] = None,
     ):
@@ -333,18 +354,16 @@ class OnlineFlashMTPModel(nn.Module):
         if self.final_ce_weight + self.tv_loss_weight + self.base_lm_ce_weight == 0:
             raise ValueError("At least one FlashMTP loss weight must be positive.")
         self.base_lm_ce_decay_gamma = base_lm_ce_decay_gamma
-        self.add_noise = add_noise
-        self.target_hidden_noise_ratio = float(target_hidden_noise_ratio)
-        if self.target_hidden_noise_ratio < 0:
-            raise ValueError(
-                "target_hidden_noise_ratio must be non-negative, got "
-                f"{target_hidden_noise_ratio}."
-            )
         self.ce_chunk_size = max(int(ce_chunk_size), 1)
         self.temp_rollout_enabled = bool(temp_rollout_enabled)
-        self.temp_rollout_projection_chunk_size = max(
-            int(temp_rollout_projection_chunk_size), 1
+        self.temp_rollout_projection_chunk_size = int(
+            temp_rollout_projection_chunk_size
         )
+        if self.temp_rollout_projection_chunk_size < 0:
+            raise ValueError(
+                "temp_rollout_projection_chunk_size must be non-negative; "
+                "use 0 to disable chunking."
+            )
         lm_head_vocab_size = int(self.lm_head.weight.shape[0])
         self.target_vocab_size = (
             lm_head_vocab_size
@@ -536,11 +555,6 @@ class OnlineFlashMTPModel(nn.Module):
             self.draft_model.target_layer_ids,
             self.draft_model.config.num_target_layers,
         )
-        if self.add_noise:
-            target_hidden = add_noise_to_target_hidden(
-                target_hidden,
-                noise_ratio=self.target_hidden_noise_ratio,
-            )
         target_prediction_hidden = None
         if self.tv_loss_weight != 0.0 and self.draft_model.markov_head is not None:
             target_prediction_hidden = prepare_target_prediction_hidden(
@@ -574,11 +588,6 @@ class OnlineFlashMTPModel(nn.Module):
             self.draft_model.target_layer_ids,
             self.draft_model.config.num_target_layers,
         )
-        if self.add_noise:
-            target_hidden = add_noise_to_target_hidden(
-                target_hidden,
-                noise_ratio=self.target_hidden_noise_ratio,
-            )
         target_anchor_hidden = prepare_target_anchor_hidden(
             hidden_states,
             anchor_positions,
@@ -635,11 +644,14 @@ class OnlineFlashMTPModel(nn.Module):
                 flat_hidden.size(0), dtype=torch.long, device=flat_hidden.device
             )
             active_indices = flat_alive.nonzero(as_tuple=False).flatten()
-            for start in range(
-                0, active_indices.numel(), self.temp_rollout_projection_chunk_size
-            ):
+            projection_chunk_size = (
+                max(active_indices.numel(), 1)
+                if self.temp_rollout_projection_chunk_size == 0
+                else self.temp_rollout_projection_chunk_size
+            )
+            for start in range(0, active_indices.numel(), projection_chunk_size):
                 selected = active_indices[
-                    start : start + self.temp_rollout_projection_chunk_size
+                    start : start + projection_chunk_size
                 ]
                 logits = self._lm_head_module(current_hidden)(
                     flat_hidden.index_select(0, selected)
@@ -951,6 +963,8 @@ class OnlineFlashMTPModel(nn.Module):
         target_prediction_hidden: Optional[torch.Tensor] = None,
         target_anchor_hidden: Optional[torch.Tensor] = None,
         temp_rollout_context: Any = None,
+        rollout_ids: Optional[torch.Tensor] = None,
+        rollout_validity: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -962,9 +976,6 @@ class OnlineFlashMTPModel(nn.Module):
         """Parallel block-wise training forward pass."""
         bsz, seq_len = input_ids.shape
         device = input_ids.device
-
-        rollout_ids = None
-        rollout_validity = None
 
         if target_hidden is None:
             if hidden_states is None:
@@ -980,11 +991,6 @@ class OnlineFlashMTPModel(nn.Module):
                 self.draft_model.target_layer_ids,
                 self.draft_model.config.num_target_layers,
             )
-            if self.add_noise:
-                target_hidden = add_noise_to_target_hidden(
-                    target_hidden,
-                    noise_ratio=self.target_hidden_noise_ratio,
-                )
             if (
                 target_prediction_hidden is None
                 and not self.temp_rollout_enabled
@@ -1004,30 +1010,48 @@ class OnlineFlashMTPModel(nn.Module):
             )
 
         if self.temp_rollout_enabled:
-            if temp_rollout_context is None or target_anchor_hidden is None:
-                raise ValueError(
-                    "temp-rollout requires target_anchor_hidden and a live "
-                    "temp_rollout_context."
+            prepared_rollout = rollout_ids is not None or rollout_validity is not None
+            if prepared_rollout:
+                if rollout_ids is None or rollout_validity is None:
+                    raise ValueError(
+                        "prepared temp-rollout requires both ids and validity."
+                    )
+                if temp_rollout_context is not None or target_anchor_hidden is not None:
+                    raise ValueError(
+                        "prepared temp-rollout cannot include a live target KV context."
+                    )
+            else:
+                if temp_rollout_context is None or target_anchor_hidden is None:
+                    raise ValueError(
+                        "temp-rollout requires prepared rollout tensors or a live "
+                        "target KV context."
+                    )
+                if target_prediction_hidden is not None:
+                    raise ValueError(
+                        "live temp-rollout target_prediction_hidden must be generated "
+                        "from its greedy branches."
+                    )
+                (
+                    rollout_ids,
+                    rollout_validity,
+                    target_prediction_hidden,
+                ) = self._temp_rollout_greedy(
+                    anchor_positions=anchor_positions,
+                    block_keep_mask=block_keep_mask,
+                    target_anchor_hidden=target_anchor_hidden,
+                    rollout_context=temp_rollout_context,
                 )
-            if target_prediction_hidden is not None:
-                raise ValueError(
-                    "temp-rollout target_prediction_hidden must come from the "
-                    "greedy branches, not the original temperature-sampled suffix."
-                )
-            (
+                # Target branch KV is no longer needed during the draft backbone.
+                temp_rollout_context.close()
+        elif any(
+            value is not None
+            for value in (
+                temp_rollout_context,
+                target_anchor_hidden,
                 rollout_ids,
                 rollout_validity,
-                target_prediction_hidden,
-            ) = self._temp_rollout_greedy(
-                anchor_positions=anchor_positions,
-                block_keep_mask=block_keep_mask,
-                target_anchor_hidden=target_anchor_hidden,
-                rollout_context=temp_rollout_context,
             )
-            # Target branch KV is no longer needed during the draft backbone.
-            # Releasing it here materially reduces the peak of the live graph.
-            temp_rollout_context.close()
-        elif temp_rollout_context is not None or target_anchor_hidden is not None:
+        ):
             raise ValueError(
                 "temp-rollout tensors were provided but temp_rollout_enabled is false."
             )
@@ -1057,13 +1081,21 @@ class OnlineFlashMTPModel(nn.Module):
             )
         full_rotary_position_ids = torch.cat([ctx_pos_flat, draft_position_ids], dim=-1)
 
-        flashmtp_attn_mask = create_flashmtp_block_mask(
-            anchor_positions=anchor_positions,
-            block_keep_mask=block_keep_mask,
-            chs_len_per_block=chs,
-            block_size=self._draft_block_len(),
-            device=device,
-        )
+        if self.attention_backend == "flex_attention":
+            flashmtp_attn_mask = create_flashmtp_block_mask(
+                anchor_positions=anchor_positions,
+                block_keep_mask=block_keep_mask,
+                chs_len_per_block=chs,
+                block_size=self._draft_block_len(),
+                device=device,
+            )
+        else:
+            flashmtp_attn_mask = create_flashmtp_dense_mask(
+                block_keep_mask=block_keep_mask,
+                chs_len_per_block=chs,
+                block_size=self._draft_block_len(),
+                dtype=target_hidden.dtype,
+            )
 
         output_hidden = self.draft_model(
             position_ids=draft_position_ids,

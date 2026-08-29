@@ -2,6 +2,7 @@ import logging
 import os
 
 import torch
+import torch.distributed as dist
 from sglang.srt.distributed import (
     get_attn_tp_group,
     get_pp_group,
@@ -55,6 +56,23 @@ class SGLangRunner(ModelRunner):
             self.moe_ep_rank = ps.moe_ep_rank
             self.moe_ep_size = ps.moe_ep_size
         super().__init__(*args, **kwargs)
+
+    def load_model(self):
+        """Skip SGLang's load barrier for a reused singleton target TP group."""
+        world = get_world_group()
+        if world.world_size != 1 or dist.get_backend(world.cpu_group) == "gloo":
+            return super().load_model()
+
+        original_monitored_barrier = dist.monitored_barrier
+
+        def singleton_monitored_barrier(*args, **kwargs):
+            return None
+
+        dist.monitored_barrier = singleton_monitored_barrier
+        try:
+            return super().load_model()
+        finally:
+            dist.monitored_barrier = original_monitored_barrier
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")

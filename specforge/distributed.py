@@ -1,4 +1,5 @@
 from datetime import timedelta
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
@@ -16,6 +17,67 @@ _DRAFT_DP_GROUP = None
 _DRAFT_SP_GROUP = None
 _SP_ULYSSES_GROUP = None
 _SP_RING_GROUP = None
+_DISAGG_TOPOLOGY = None
+_BRIDGE_GROUP = None
+
+
+@dataclass(frozen=True)
+class DisaggregatedTopology:
+    """Role and process-group metadata for node-local target/draft pipelines."""
+
+    rank: int
+    local_rank: int
+    node_rank: int
+    nnodes: int
+    nproc_per_node: int
+    target_ranks_per_node: int
+    draft_ranks_per_node: int
+    target_tp_size: int
+    role: str
+    target_replica_local_rank: Optional[int]
+    target_tp_rank: Optional[int]
+    target_tp_leader_global_rank: Optional[int]
+    draft_local_rank: Optional[int]
+    target_tp_group: Optional[dist.ProcessGroup]
+    bridge_group: Optional[dist.ProcessGroup]
+    draft_group: Optional[dist.ProcessGroup]
+
+    @property
+    def target_replicas_per_node(self) -> int:
+        return self.target_ranks_per_node // self.target_tp_size
+
+    @property
+    def is_target(self) -> bool:
+        return self.role == "target"
+
+    @property
+    def is_draft(self) -> bool:
+        return self.role == "draft"
+
+    @property
+    def is_target_leader(self) -> bool:
+        return self.is_target and self.target_tp_rank == 0
+
+    @property
+    def draft_global_ranks(self) -> list[int]:
+        return [
+            node * self.nproc_per_node + self.target_ranks_per_node + local
+            for node in range(self.nnodes)
+            for local in range(self.draft_ranks_per_node)
+        ]
+
+    @property
+    def node_target_leader_ranks(self) -> list[int]:
+        base = self.node_rank * self.nproc_per_node
+        return [
+            base + replica * self.target_tp_size
+            for replica in range(self.target_replicas_per_node)
+        ]
+
+    @property
+    def node_draft_ranks(self) -> list[int]:
+        base = self.node_rank * self.nproc_per_node + self.target_ranks_per_node
+        return [base + local for local in range(self.draft_ranks_per_node)]
 
 
 def get_tp_group():
@@ -61,6 +123,153 @@ def get_sp_ulysses_group():
 def get_sp_ring_group():
     global _SP_RING_GROUP
     return _SP_RING_GROUP
+
+
+def get_disaggregated_topology() -> Optional[DisaggregatedTopology]:
+    return _DISAGG_TOPOLOGY
+
+
+def get_bridge_group():
+    return _BRIDGE_GROUP
+
+
+def init_disaggregated(
+    *,
+    timeout: int,
+    target_ranks_per_node: int,
+    draft_ranks_per_node: int,
+    target_tp_size: int,
+) -> DisaggregatedTopology:
+    """Initialize node-local target pipelines and a global draft training group.
+
+    Every rank calls every ``new_group`` in the same order. Target TP and bridge
+    groups contain ranks from exactly one node; only the draft group spans nodes.
+    """
+    import os
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        backend="nccl",
+        timeout=timedelta(minutes=timeout),
+        device_id=torch.device("cuda", local_rank),
+    )
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    # torchrun always exports LOCAL_RANK; using it avoids modulo assumptions when
+    # CUDA_VISIBLE_DEVICES differs between nodes.
+    nproc_per_node = target_ranks_per_node + draft_ranks_per_node
+    if world_size % nproc_per_node != 0:
+        raise ValueError(
+            f"WORLD_SIZE={world_size} must be divisible by per-node ranks "
+            f"{nproc_per_node}."
+        )
+    if target_ranks_per_node <= 0 or draft_ranks_per_node <= 0:
+        raise ValueError("target and draft ranks per node must both be positive.")
+    if target_ranks_per_node % target_tp_size != 0:
+        raise ValueError(
+            f"target_ranks_per_node={target_ranks_per_node} must be divisible by "
+            f"target_tp_size={target_tp_size}."
+        )
+    nnodes = world_size // nproc_per_node
+    node_rank = rank // nproc_per_node
+    if local_rank >= nproc_per_node:
+        raise ValueError(
+            f"LOCAL_RANK={local_rank} is outside configured per-node world "
+            f"size {nproc_per_node}."
+        )
+
+    target_replicas = target_ranks_per_node // target_tp_size
+    current_tp_group = None
+    current_bridge_group = None
+    current_draft_group = None
+
+    # Node-local TP groups. No rank list can cross a node boundary.
+    for node in range(nnodes):
+        node_base = node * nproc_per_node
+        for replica in range(target_replicas):
+            ranks = list(
+                range(
+                    node_base + replica * target_tp_size,
+                    node_base + (replica + 1) * target_tp_size,
+                )
+            )
+            group = dist.new_group(ranks=ranks, backend="nccl")
+            if rank in ranks:
+                current_tp_group = group
+
+    # One local bridge communicator per node: target TP leaders and local draft.
+    for node in range(nnodes):
+        node_base = node * nproc_per_node
+        leaders = [
+            node_base + replica * target_tp_size
+            for replica in range(target_replicas)
+        ]
+        drafts = [
+            node_base + target_ranks_per_node + local
+            for local in range(draft_ranks_per_node)
+        ]
+        ranks = leaders + drafts
+        group = dist.new_group(ranks=ranks, backend="nccl")
+        if rank in ranks:
+            current_bridge_group = group
+
+    draft_ranks = [
+        node * nproc_per_node + target_ranks_per_node + local
+        for node in range(nnodes)
+        for local in range(draft_ranks_per_node)
+    ]
+    draft_group = dist.new_group(ranks=draft_ranks, backend="nccl")
+    if rank in draft_ranks:
+        current_draft_group = draft_group
+
+    role = "target" if local_rank < target_ranks_per_node else "draft"
+    target_replica = local_rank // target_tp_size if role == "target" else None
+    target_tp_rank = local_rank % target_tp_size if role == "target" else None
+    leader_rank = (
+        node_rank * nproc_per_node + target_replica * target_tp_size
+        if target_replica is not None
+        else None
+    )
+    draft_local_rank = (
+        local_rank - target_ranks_per_node if role == "draft" else None
+    )
+    topology = DisaggregatedTopology(
+        rank=rank,
+        local_rank=local_rank,
+        node_rank=node_rank,
+        nnodes=nnodes,
+        nproc_per_node=nproc_per_node,
+        target_ranks_per_node=target_ranks_per_node,
+        draft_ranks_per_node=draft_ranks_per_node,
+        target_tp_size=target_tp_size,
+        role=role,
+        target_replica_local_rank=target_replica,
+        target_tp_rank=target_tp_rank,
+        target_tp_leader_global_rank=leader_rank,
+        draft_local_rank=draft_local_rank,
+        target_tp_group=current_tp_group,
+        bridge_group=current_bridge_group,
+        draft_group=current_draft_group,
+    )
+
+    global _TP_GROUP, _DP_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
+    global _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DISAGG_TOPOLOGY, _BRIDGE_GROUP
+    _TP_GROUP = current_tp_group
+    _DP_GROUP = current_draft_group
+    _DRAFT_DP_GROUP = current_draft_group
+    _DRAFT_SP_GROUP = None
+    _SP_ULYSSES_GROUP = None
+    _SP_RING_GROUP = None
+    _DISAGG_TOPOLOGY = topology
+    _BRIDGE_GROUP = current_bridge_group
+    print_with_rank(
+        f"disaggregate role={role}, node={node_rank}, local_rank={local_rank}, "
+        f"target_tp_rank={target_tp_rank}, draft_local_rank={draft_local_rank}"
+    )
+    # Initialize every new NCCL communicator before compute/P2P starts.
+    dist.barrier()
+    return topology
 
 
 def init_distributed(
@@ -122,12 +331,20 @@ def init_distributed(
 
 def destroy_distributed():
     global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP
-    dist.destroy_process_group(_TP_GROUP)
-    dist.destroy_process_group(_DP_GROUP)
-    dist.destroy_process_group(_SP_ULYSSES_GROUP)
-    dist.destroy_process_group(_SP_RING_GROUP)
-    dist.destroy_process_group(_DRAFT_DP_GROUP)
-    dist.destroy_process_group(_DRAFT_SP_GROUP)
+    seen = set()
+    for group in (
+        _TP_GROUP,
+        _DP_GROUP,
+        _SP_ULYSSES_GROUP,
+        _SP_RING_GROUP,
+        _DRAFT_DP_GROUP,
+        _DRAFT_SP_GROUP,
+        _BRIDGE_GROUP,
+    ):
+        if group is None or group in seen:
+            continue
+        seen.add(group)
+        dist.destroy_process_group(group)
     dist.destroy_process_group()
 
 

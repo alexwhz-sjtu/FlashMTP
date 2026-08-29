@@ -14,6 +14,7 @@ class BF16Optimizer:
         max_grad_norm=0.5,
         total_steps=800_000,
         warmup_ratio=0.015,
+        process_group=None,
     ):
         # TODO: For now, we only support cosine annealing warmup lr scheduler and AdamW optimizer
         # TODO: We should make these parameters configurable
@@ -22,6 +23,7 @@ class BF16Optimizer:
         self.model = model
         self.model_params = [p for p in model.parameters() if p.requires_grad]
         self.max_grad_norm = float(max_grad_norm)
+        self.process_group = process_group
         if self.max_grad_norm <= 0:
             raise ValueError(f"max_grad_norm must be positive, got {max_grad_norm}.")
         self.fp32_params = [
@@ -76,7 +78,14 @@ class BF16Optimizer:
 
         if dist.is_available() and dist.is_initialized():
             # Communication payload: exactly one 0-D scalar, never gradients.
-            dist.all_reduce(local_squared_norm, op=dist.ReduceOp.SUM)
+            if self.process_group is None:
+                dist.all_reduce(local_squared_norm, op=dist.ReduceOp.SUM)
+            else:
+                dist.all_reduce(
+                    local_squared_norm,
+                    op=dist.ReduceOp.SUM,
+                    group=self.process_group,
+                )
         return local_squared_norm.sqrt()
 
     def step(self) -> float:

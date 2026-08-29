@@ -99,7 +99,7 @@ FlashMTP 是一种面向投机解码（speculative decoding）的草稿模型训
 3. **构造草稿输入**：
    - 每个 block 第 0 位：anchor 处的**真实 token embedding**；
    - 第 $1 \sim B-1$ 位：**MASK token** embedding。
-4. **提取 Pivot**：在 $\max(a-1, 0)$ 处 gather 各选中层的 hidden states，可选训练增强（默认关闭 `add_noise`）；经 prefix_condition 预处理后 reshape 为 $(B, N \cdot S, H)$。
+4. **提取 Pivot**：在 $\max(a-1, 0)$ 处 gather 各选中层的 hidden states；经 prefix_condition 预处理后 reshape 为 $(B, N \cdot S, H)$。
 5. **草稿并行前向**：$N$ 个 block 拼成一次前向（草稿序列总长 $N \cdot B$，上下文总长 $N \cdot S$），Flex Attention 保证 block 间隔离；CHS 与草稿 RoPE 按 LOCAL_POSITION 规则构造。
 6. **标签与损失**：
    - 位置 $k$（$k \ge 1$）预测 token $y_{a+k}$（同位预测）；

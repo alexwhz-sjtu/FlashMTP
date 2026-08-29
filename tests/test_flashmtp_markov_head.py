@@ -9,7 +9,6 @@ from transformers import Qwen3Config
 
 from specforge.core.flashmtp import (
     OnlineFlashMTPModel,
-    add_noise_to_target_hidden,
     prepare_target_hidden,
     prepare_target_prediction_hidden,
 )
@@ -75,14 +74,6 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         # Only configured CHS layers are prepared outside FSDP. The fixed
         # embedding slot is added later, after FSDP unshards the table.
         self.assertEqual(tuple(target_hidden.shape), (1, 1, 2, 16))
-
-    def test_embedding_chs_slot_is_not_perturbed_by_hidden_noise(self) -> None:
-        target_hidden = torch.zeros(2, 3, 4, 5)
-        noisy = add_noise_to_target_hidden(
-            target_hidden, noise_ratio=0.1, preserve_first_slot=True
-        )
-        self.assertTrue(torch.equal(noisy[:, :, 0], target_hidden[:, :, 0]))
-        self.assertFalse(torch.equal(noisy[:, :, 1:], target_hidden[:, :, 1:]))
 
     def test_training_chs_prepends_anchor_predecessor_embedding(self) -> None:
         embeddings = torch.arange(1 * 6 * 3, dtype=torch.float32).view(1, 6, 3)
