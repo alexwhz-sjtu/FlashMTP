@@ -74,6 +74,36 @@ class BF16OptimizerSafetyTest(unittest.TestCase):
         self.assertEqual(reduced_tensors[0].ndim, 0)
         self.assertEqual(reduced_tensors[0].numel(), 1)
 
+    def test_frozen_stage2_parameter_joins_without_resetting_scheduler(self) -> None:
+        model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 1))
+        parameters = list(model.parameters())
+        for parameter in model[1].parameters():
+            parameter.requires_grad_(False)
+        optimizer = BF16Optimizer(
+            model,
+            parameters=parameters,
+            lr=1e-3,
+            max_grad_norm=10.0,
+            total_steps=10,
+            warmup_ratio=0.2,
+        )
+        for parameter in model[0].parameters():
+            parameter.grad = torch.ones_like(parameter)
+        optimizer.step()
+        scheduler_epoch_after_stage1 = optimizer.scheduler.last_epoch
+        head_before = model[1].weight.detach().clone()
+
+        for parameter in model[1].parameters():
+            parameter.requires_grad_(True)
+            parameter.grad = torch.ones_like(parameter)
+        optimizer.step()
+
+        self.assertEqual(
+            optimizer.scheduler.last_epoch,
+            scheduler_epoch_after_stage1 + 1,
+        )
+        self.assertFalse(torch.equal(model[1].weight, head_before))
+
 
 if __name__ == "__main__":
     unittest.main()

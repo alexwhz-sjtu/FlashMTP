@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, Optional, Union
 
@@ -297,12 +298,24 @@ class OnlineFlashMTPModel(nn.Module):
         if valid.size(1):
             valid[:, 0] = False
         counts = valid.sum(dim=1)
-        num = min(self.num_anchors, int(counts.max().item()))
-        if num <= 0:
+        num_valid = min(self.num_anchors, int(counts.max().item()))
+        if num_valid <= 0:
             raise ValueError("No valid anchor positions in this batch.")
+        # FlexAttention's generated kernels tile the query dimension in chunks
+        # of 128.  Dynamic per-batch padding can otherwise produce a final
+        # partial tile (for example, 78 blocks * 13 query tokens) that triggers
+        # an illegal access in the Triton backward kernel.  Pad only the block
+        # dimension to the next safe tile; these extra blocks are marked
+        # invalid below and therefore contribute neither labels nor loss.
+        query_len = int(self.draft_model.draft_query_length)
+        block_alignment = 128 // math.gcd(128, query_len)
+        num = (
+            (num_valid + block_alignment - 1) // block_alignment
+        ) * block_alignment
         random_values = torch.rand_like(valid, dtype=torch.float32)
         random_values.masked_fill_(~valid, 2.0)
-        indices = random_values.argsort(dim=1)[:, :num]
+        selected_width = min(num, valid.size(1))
+        indices = random_values.argsort(dim=1)[:, :selected_width]
         # Rows with fewer than ``num`` valid anchors are padded by argsort with
         # invalid positions.  Move those padding entries behind the real
         # anchors *before* sorting by sequence position.  Sorting the raw
@@ -312,6 +325,16 @@ class OnlineFlashMTPModel(nn.Module):
         selected_valid = torch.gather(valid, 1, indices)
         padding_position = max_anchor + 1
         indices = indices.masked_fill(~selected_valid, padding_position)
+        if selected_width < num:
+            indices = torch.cat(
+                [
+                    indices,
+                    indices.new_full(
+                        (indices.size(0), num - selected_width), padding_position
+                    ),
+                ],
+                dim=1,
+            )
         indices = indices.sort(dim=1).values
         keep = indices != padding_position
         return torch.where(keep, indices, torch.zeros_like(indices)), keep
@@ -623,6 +646,58 @@ class OnlineFlashMTPModel(nn.Module):
             total, accuracy, prefix_acc, final_ce, base_ce, tv_loss
         )
 
+    def compute_serial_logits(
+        self,
+        prediction_hidden: torch.Tensor,
+        batch: PreparedFlashMTPBatch,
+    ) -> torch.Tensor:
+        """Return active final logits produced through the serial head.
+
+        Stage 1 uses this path for teacher/student distribution distillation.
+        Keeping it on ``OnlineFlashMTPModel`` also ensures the student's frozen
+        serial-head parameters are accessed from inside ``FSDP.forward``.
+        """
+        active_positions = batch.binary_eval_mask.bool()
+        if not active_positions.any():
+            raise ValueError("Serial-head distillation has no supervised positions.")
+
+        prediction_hidden = torch.where(
+            active_positions.unsqueeze(-1),
+            prediction_hidden,
+            torch.zeros_like(prediction_hidden),
+        )
+        prev_token_ids = torch.where(
+            active_positions,
+            batch.prev_token_ids,
+            torch.zeros_like(batch.prev_token_ids),
+        )
+        initial_prev_token_ids = batch.initial_prev_token_ids
+        if initial_prev_token_ids is not None:
+            initial_prev_token_ids = torch.where(
+                batch.block_keep_mask,
+                initial_prev_token_ids,
+                torch.zeros_like(initial_prev_token_ids),
+            )
+
+        markov_head = self.draft_model.markov_head
+        if markov_head is None:
+            raise ValueError("Stage 1 serial KL requires a serial Markov head.")
+        latent = markov_head.forward_teacher_forcing(
+            hidden_states=prediction_hidden,
+            prev_token_ids=prev_token_ids,
+            output_mode=self.draft_model.markov_output_mode,
+            initial_prev_token_ids=initial_prev_token_ids,
+        )
+        serial_logits = markov_head.project_logits(
+            latent[active_positions]
+        ).float()
+        if markov_output_uses_base_lm_head(self.draft_model.markov_output_mode):
+            serial_logits = (
+                self.lm_head(prediction_hidden[active_positions]).float()
+                + serial_logits
+            )
+        return serial_logits
+
     def forward(
         self,
         *,
@@ -635,6 +710,7 @@ class OnlineFlashMTPModel(nn.Module):
         prepared_batch: Optional[PreparedFlashMTPBatch] = None,
         seq_len: Optional[int] = None,
         return_backbone: bool = False,
+        return_backbone_and_serial_logits: bool = False,
         target_logits_are_gathered: bool = False,
     ):
         if prepared_batch is None:
@@ -651,6 +727,10 @@ class OnlineFlashMTPModel(nn.Module):
         if seq_len is None:
             raise ValueError("seq_len is required with prepared_batch")
         prediction_hidden = self.forward_backbone(prepared_batch, seq_len=seq_len)
+        if return_backbone_and_serial_logits:
+            return prediction_hidden, self.compute_serial_logits(
+                prediction_hidden, prepared_batch
+            )
         if return_backbone:
             return prediction_hidden
         if target_prefill_logits is None:
@@ -673,15 +753,16 @@ def compute_stage1_distillation_loss(
     *,
     student_hidden: torch.Tensor,
     teacher_hidden: torch.Tensor,
-    lm_head: nn.Module,
+    student_serial_logits: torch.Tensor,
+    teacher_serial_logits: torch.Tensor,
     raw_weight_mask: torch.Tensor,
     labels: torch.Tensor,
-    tv_weight: float,
+    kl_weight: float,
     hidden_weight: float,
     smooth_l1_beta: float,
     loss_decay_gamma: Optional[float],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return Stage-1 loss components and label-based prefix accuracy."""
+    """Return forward-KL, hidden loss, and serial-head prefix accuracy."""
     offsets = torch.arange(raw_weight_mask.size(-1), device=raw_weight_mask.device)
     decay = (
         torch.ones_like(offsets, dtype=torch.float32)
@@ -692,16 +773,32 @@ def compute_stage1_distillation_loss(
     active_positions = weights > 0
     if not active_positions.any():
         raise ValueError("Stage-1 distillation has no supervised positions.")
+    active_count = int(active_positions.sum().item())
+    if student_serial_logits.ndim != 2 or student_serial_logits.size(0) != active_count:
+        raise ValueError(
+            "Student serial logits must contain one row per active Stage-1 "
+            f"position; got {tuple(student_serial_logits.shape)} for {active_count} positions."
+        )
+    if teacher_serial_logits.shape != student_serial_logits.shape:
+        raise ValueError(
+            "Teacher/student serial-logit shapes must match, got "
+            f"{tuple(teacher_serial_logits.shape)} and "
+            f"{tuple(student_serial_logits.shape)}."
+        )
     active_weights = weights[active_positions].float()
     student_active = student_hidden[active_positions]
     teacher_active = teacher_hidden[active_positions]
     denominator = active_weights.sum().clamp_min(1e-6)
     with torch.no_grad():
-        teacher_probs = F.softmax(lm_head(teacher_active).float(), dim=-1)
-    student_logits = lm_head(student_active).float()
-    student_probs = F.softmax(student_logits, dim=-1)
-    tv_values = (student_probs - teacher_probs).abs().sum(dim=-1)
-    tv_loss = (tv_values * active_weights).sum() / denominator
+        teacher_log_probs = F.log_softmax(
+            teacher_serial_logits.detach().float(), dim=-1
+        )
+        teacher_probs = teacher_log_probs.exp()
+    student_log_probs = F.log_softmax(student_serial_logits.float(), dim=-1)
+    kl_values = (
+        teacher_probs * (teacher_log_probs - student_log_probs)
+    ).sum(dim=-1)
+    kl_loss = (kl_values * active_weights).sum() / denominator
     if float(hidden_weight) > 0:
         hidden_values = F.smooth_l1_loss(
             student_active.float(),
@@ -714,7 +811,7 @@ def compute_stage1_distillation_loss(
         hidden_loss = student_hidden.new_zeros((), dtype=torch.float32)
     with torch.no_grad():
         predictions = torch.zeros_like(labels)
-        predictions[active_positions] = student_logits.argmax(dim=-1)
+        predictions[active_positions] = student_serial_logits.argmax(dim=-1)
         valid = raw_weight_mask > 0
         correct = (predictions == labels) & valid
         prefix = correct.cumprod(dim=-1).sum(dim=-1).float() + 1.0
@@ -725,8 +822,8 @@ def compute_stage1_distillation_loss(
             else student_hidden.new_zeros(())
         )
     return (
-        float(tv_weight) * tv_loss + float(hidden_weight) * hidden_loss,
-        tv_loss,
+        float(kl_weight) * kl_loss + float(hidden_weight) * hidden_loss,
+        kl_loss,
         hidden_loss,
         prefix_acc,
     )

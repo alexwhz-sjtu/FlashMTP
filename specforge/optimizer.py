@@ -1,3 +1,5 @@
+import warnings
+
 import torch
 import torch.distributed as dist
 
@@ -14,13 +16,20 @@ class BF16Optimizer:
         max_grad_norm=0.5,
         total_steps=800_000,
         warmup_ratio=0.015,
+        parameters=None,
     ):
         # TODO: For now, we only support cosine annealing warmup lr scheduler and AdamW optimizer
         # TODO: We should make these parameters configurable
         #   These magic numbers: weight_decay=0.0, max_grad_norm=0.5, total_steps=800k, warmup_steps=12k are copied from
         #   https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/ds_config.json
         self.model = model
-        self.model_params = [p for p in model.parameters() if p.requires_grad]
+        self.model_params = (
+            [p for p in model.parameters() if p.requires_grad]
+            if parameters is None
+            else list(parameters)
+        )
+        if not self.model_params:
+            raise ValueError("BF16Optimizer requires at least one model parameter.")
         self.max_grad_norm = float(max_grad_norm)
         if self.max_grad_norm <= 0:
             raise ValueError(f"max_grad_norm must be positive, got {max_grad_norm}.")
@@ -203,7 +212,12 @@ class BF16Optimizer:
 
         return loaded > 0, loaded, skipped, missing
 
-    def load_state_dict(self, state_dict, load_optimizer: bool = True) -> bool:
+    def load_state_dict(
+        self,
+        state_dict,
+        load_optimizer: bool = True,
+        load_scheduler: bool = True,
+    ) -> bool:
         loaded_optimizer = False
         if load_optimizer:
             ckpt_opt = state_dict["optimizer_state_dict"]
@@ -234,9 +248,23 @@ class BF16Optimizer:
                         "Could not restore optimizer state; Adam moments will be "
                         "reinitialized while scheduler state is still restored."
                     )
-        self.scheduler.load_state_dict(state_dict["scheduler_state_dict"])
-        print_on_rank0("Successfully loaded scheduler state_dict.")
+        if load_scheduler:
+            self.scheduler.load_state_dict(state_dict["scheduler_state_dict"])
+            print_on_rank0("Successfully loaded scheduler state_dict.")
         return loaded_optimizer
+
+    def advance_scheduler(self, completed_steps: int) -> None:
+        """Position a fresh scheduler for legacy checkpoint migration."""
+        completed_steps = int(completed_steps)
+        if completed_steps < 0:
+            raise ValueError("completed_steps must be non-negative")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            for _ in range(completed_steps):
+                self.scheduler.step()
+        print_on_rank0(
+            f"Advanced continuous scheduler to optimizer step {completed_steps}."
+        )
 
     def state_dict(self):
         return {

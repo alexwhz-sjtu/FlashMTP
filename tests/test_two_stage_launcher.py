@@ -68,6 +68,11 @@ class TwoStageLauncherTest(unittest.TestCase):
         self.assertIn("--nproc_per_node 2", command)
         self.assertIn("--tp-size 2", command)
         self.assertIn("--report-to none", command)
+        self.assertIn("--learning-rate 5e-4", command)
+        self.assertIn("--warmup-ratio 0.04", command)
+        self.assertIn("--stage1-kl-weight 1.0", command)
+        self.assertNotIn("--stage2-learning-rate", command)
+        self.assertIn("Ignoring STAGE2_LEARNING_RATE=2e-4", completed.stderr)
 
     def test_separate_stage_datasets_and_build_workers_are_forwarded(self):
         env = _base_env()

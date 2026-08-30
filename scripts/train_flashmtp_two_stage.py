@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Distill an SWA teacher into PivotQ, then fine-tune with label losses."""
+"""Distill through a frozen serial head, then fine-tune the full student."""
 
 import argparse
 import copy
@@ -73,10 +73,12 @@ def parse_args():
         "--student-init-mode",
         choices=STUDENT_INIT_MODES,
         help=(
-            "Fresh Stage 1 initialization. 'scratch' randomly initializes the "
-            "student; 'shared_init' copies the teacher's shared parallel backbone; "
+            "Fresh Stage 1 backbone initialization. 'scratch' randomly initializes "
+            "the parallel backbone; 'shared_init' copies the teacher's shared "
+            "parallel backbone; "
             "'shared_partial' initializes a shallower student from evenly spaced "
-            "teacher backbone layers. "
+            "teacher backbone layers. The serial head is inherited from the teacher "
+            "in every mode. "
             "On resume, the checkpoint mode is used when this option is omitted."
         ),
     )
@@ -89,15 +91,30 @@ def parse_args():
         ),
     )
     parser.add_argument("--stage1-epochs", type=int, required=True)
-    parser.add_argument("--stage1-learning-rate", type=float, required=True)
-    parser.add_argument("--stage1-warmup-ratio", type=float, required=True)
-    parser.add_argument("--stage1-tv-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        help="Base LR for the single optimizer/scheduler shared by both stages.",
+    )
+    parser.add_argument(
+        "--warmup-ratio",
+        type=float,
+        help="Warmup ratio over the combined Stage1+Stage2 optimizer steps.",
+    )
+    parser.add_argument("--stage1-learning-rate", type=float)
+    parser.add_argument("--stage1-warmup-ratio", type=float)
+    parser.add_argument("--stage1-kl-weight", type=float)
+    parser.add_argument(
+        "--stage1-tv-weight",
+        type=float,
+        help="Deprecated alias for --stage1-kl-weight.",
+    )
     parser.add_argument("--stage1-hidden-weight", type=float, default=1.0)
     parser.add_argument("--stage1-smooth-l1-beta", type=float, default=1.0)
     parser.add_argument("--stage1-loss-decay-gamma", type=float)
     parser.add_argument("--stage2-epochs", type=int, required=True)
-    parser.add_argument("--stage2-learning-rate", type=float, required=True)
-    parser.add_argument("--stage2-warmup-ratio", type=float, required=True)
+    parser.add_argument("--stage2-learning-rate", type=float)
+    parser.add_argument("--stage2-warmup-ratio", type=float)
     parser.add_argument("--stage2-final-ce-weight", type=float, default=1.0)
     parser.add_argument("--stage2-tv-weight", type=float, default=1.0)
     parser.add_argument("--stage2-base-ce-weight", type=float, default=0.0)
@@ -129,13 +146,41 @@ def parse_args():
     for name in ("stage1_epochs", "stage2_epochs", "accumulation_steps"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.learning_rate is None:
+        args.learning_rate = args.stage1_learning_rate
+    if args.learning_rate is None or args.learning_rate <= 0:
+        parser.error(
+            "--learning-rate must be positive (legacy --stage1-learning-rate "
+            "is also accepted)"
+        )
+    if args.warmup_ratio is None:
+        args.warmup_ratio = args.stage1_warmup_ratio
+    if args.warmup_ratio is None or not 0.0 <= args.warmup_ratio <= 1.0:
+        parser.error(
+            "--warmup-ratio must be in [0, 1] (legacy "
+            "--stage1-warmup-ratio is also accepted)"
+        )
     for name in ("stage1_learning_rate", "stage2_learning_rate"):
-        if getattr(args, name) <= 0:
+        value = getattr(args, name)
+        if value is not None and value <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     for name in ("stage1_warmup_ratio", "stage2_warmup_ratio"):
         value = getattr(args, name)
-        if not 0.0 <= value <= 1.0:
+        if value is not None and not 0.0 <= value <= 1.0:
             parser.error(f"--{name.replace('_', '-')} must be in [0, 1]")
+    if args.stage1_kl_weight is not None and args.stage1_tv_weight is not None:
+        parser.error(
+            "Pass only --stage1-kl-weight; --stage1-tv-weight is a deprecated alias"
+        )
+    args.stage1_kl_weight = (
+        args.stage1_kl_weight
+        if args.stage1_kl_weight is not None
+        else (
+            args.stage1_tv_weight
+            if args.stage1_tv_weight is not None
+            else 1.0
+        )
+    )
     if args.stage1_smooth_l1_beta < 0:
         parser.error("--stage1-smooth-l1-beta must be non-negative")
     if (
@@ -143,9 +188,9 @@ def parse_args():
         and args.student_num_draft_layers <= 0
     ):
         parser.error("--student-num-draft-layers must be positive")
-    if args.stage1_tv_weight < 0 or args.stage1_hidden_weight < 0:
+    if args.stage1_kl_weight < 0 or args.stage1_hidden_weight < 0:
         parser.error("Stage 1 loss weights must be non-negative")
-    if args.stage1_tv_weight + args.stage1_hidden_weight == 0:
+    if args.stage1_kl_weight + args.stage1_hidden_weight == 0:
         parser.error("At least one Stage 1 loss weight must be positive")
     stage2_weights = (
         args.stage2_final_ce_weight,
@@ -383,6 +428,26 @@ def main():
     )
     args.student_init_mode = student_init_mode
     print_on_rank0(f"Student init mode: {student_init_mode}")
+    print_on_rank0(
+        "Continuous two-stage LR schedule: "
+        f"lr={args.learning_rate:g}, warmup_ratio={args.warmup_ratio:g}"
+    )
+    if (
+        args.stage2_learning_rate is not None
+        and args.stage2_learning_rate != args.learning_rate
+    ):
+        print_on_rank0(
+            "Ignoring legacy --stage2-learning-rate="
+            f"{args.stage2_learning_rate:g}; both stages now share one schedule."
+        )
+    if (
+        args.stage2_warmup_ratio is not None
+        and args.stage2_warmup_ratio != args.warmup_ratio
+    ):
+        print_on_rank0(
+            "Ignoring legacy --stage2-warmup-ratio="
+            f"{args.stage2_warmup_ratio:g}; warmup runs once over the combined schedule."
+        )
     provided_teacher_identity = (
         os.path.realpath(args.teacher_draft_path) if args.teacher_draft_path else None
     )
@@ -474,6 +539,14 @@ def main():
                     f"layers {teacher_layer_ids}"
                 )
             args.num_draft_layers = student.config.num_hidden_layers
+
+        # Stage 1 always distills through the teacher's trained serial head.
+        # The student owns a copy so it is checkpointed and can be unfrozen in
+        # Stage 2 without retaining the teacher model.
+        _copy_serial_head(teacher, student)
+        print_on_rank0(
+            "Initialized student serial head from teacher; frozen during Stage 1"
+        )
     else:
         student = FlashMTPDraftModel.from_pretrained(
             args.resume_from,
@@ -495,10 +568,10 @@ def main():
             raise ValueError("Transition/Stage 2 checkpoint has no inherited serial head")
         _sync_args_from_model(args, student)
 
-    if resume_stage in (None, "stage1"):
-        _set_student_stage1_trainable(student)
-    else:
-        _set_student_stage2_trainable(student)
+    # Wrap FSDP and construct the optimizer with every parameter that may be
+    # trained in either stage. Stage 1 freezes the serial head only after this
+    # complete parameter set has been registered with both.
+    _set_student_stage2_trainable(student)
     drafts_for_target = [student] if teacher is None else [teacher, student]
     target, tokenizer, components, mask_token_id = build_target_and_components(
         args, drafts_for_target
@@ -549,21 +622,6 @@ def main():
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
     )
-    stage1_optimizer = None
-    if resume_stage in (None, "stage1"):
-        stage1_optimizer = BF16Optimizer(
-            student,
-            lr=args.stage1_learning_rate,
-            max_grad_norm=args.max_grad_norm,
-            warmup_ratio=args.stage1_warmup_ratio,
-            total_steps=stage_total_steps(
-                stage1_dataloader,
-                args.stage1_epochs,
-                args.accumulation_steps,
-            ),
-        )
-        if resume_stage == "stage1":
-            stage1_optimizer.load_state_dict(resume_state)
     tracker = create_tracker(args, args.output_dir)
     if resume_stage == "stage1":
         stage1_start_epoch, stage1_start_batch, stage1_step, global_step = resume_cursor(
@@ -574,10 +632,133 @@ def main():
         global_step = int(resume_state.get("global_step", 0))
     else:
         stage1_start_epoch = stage1_start_batch = stage1_step = global_step = 0
+    stage2_schedule_steps = stage_total_steps(
+        stage2_dataloader,
+        args.stage2_epochs,
+        args.accumulation_steps,
+    )
+    if stage1_dataloader is not None:
+        stage1_schedule_steps = stage_total_steps(
+            stage1_dataloader,
+            args.stage1_epochs,
+            args.accumulation_steps,
+        )
+        computed_schedule_steps = stage1_schedule_steps + stage2_schedule_steps
+    else:
+        stage1_schedule_steps = 0
+        completed_legacy_steps = (
+            int(resume_state.get("optimizer_step", 0))
+            if resume_state is not None
+            and resume_state.get("optimizer_step") is not None
+            else (global_step + args.accumulation_steps - 1)
+            // args.accumulation_steps
+        )
+        computed_schedule_steps = completed_legacy_steps + stage2_schedule_steps
+    continuous_checkpoint = bool(
+        resume_state is not None
+        and resume_state.get("continuous_two_stage_scheduler")
+    )
+    if continuous_checkpoint:
+        for key, requested in (
+            ("scheduler_learning_rate", args.learning_rate),
+            ("scheduler_warmup_ratio", args.warmup_ratio),
+        ):
+            if (
+                resume_state.get(key) is not None
+                and float(resume_state[key]) != float(requested)
+            ):
+                raise ValueError(
+                    "Continuous scheduler configuration must match the resumed "
+                    f"checkpoint: {key} saved={resume_state[key]!r}, "
+                    f"requested={requested!r}."
+                )
+    scheduler_total_steps = (
+        int(resume_state["scheduler_total_steps"])
+        if continuous_checkpoint
+        else computed_schedule_steps
+    )
+    if scheduler_total_steps <= 0:
+        raise ValueError("The combined Stage1+Stage2 schedule has no optimizer steps.")
+    if (
+        continuous_checkpoint
+        and stage1_dataloader is not None
+        and scheduler_total_steps != computed_schedule_steps
+    ):
+        raise ValueError(
+            "Combined scheduler length must match the resumed checkpoint: "
+            f"saved={scheduler_total_steps}, requested={computed_schedule_steps}."
+        )
+
+    # Register the complete Stage-2 trainable set once, then freeze the serial
+    # head for Stage 1 without rebuilding either optimizer or scheduler.
+    _set_student_stage1_trainable(student)
+    stage1_optimizer_parameters = [
+        parameter for parameter in student.parameters() if parameter.requires_grad
+    ]
+    stage1_parameter_ids = {id(parameter) for parameter in stage1_optimizer_parameters}
+    _set_student_stage2_trainable(student)
+    stage2_optimizer_parameters = [
+        parameter for parameter in student.parameters() if parameter.requires_grad
+    ]
+    # Preserve the exact legacy Stage-1 parameter prefix so its Adam moments
+    # remain positionally compatible, then append parameters first unfrozen in
+    # Stage 2 (the serial head).
+    continuous_parameter_order = stage1_optimizer_parameters + [
+        parameter
+        for parameter in stage2_optimizer_parameters
+        if id(parameter) not in stage1_parameter_ids
+    ]
+    optimizer_parameter_order = (
+        str(resume_state.get("optimizer_parameter_order", "stage1_then_stage2"))
+        if continuous_checkpoint
+        else (
+            "model_order"
+            if resume_stage == "stage2"
+            else "stage1_then_stage2"
+        )
+    )
+    if optimizer_parameter_order not in ("stage1_then_stage2", "model_order"):
+        raise ValueError(
+            "Unsupported optimizer_parameter_order in checkpoint: "
+            f"{optimizer_parameter_order!r}."
+        )
+    optimizer_parameters = (
+        stage2_optimizer_parameters
+        if optimizer_parameter_order == "model_order"
+        else continuous_parameter_order
+    )
+    optimizer = BF16Optimizer(
+        student,
+        parameters=optimizer_parameters,
+        lr=args.learning_rate,
+        max_grad_norm=args.max_grad_norm,
+        warmup_ratio=args.warmup_ratio,
+        total_steps=scheduler_total_steps,
+    )
+    optimizer_step = (
+        int(resume_state.get("optimizer_step", 0))
+        if resume_state is not None
+        and resume_state.get("optimizer_step") is not None
+        else (global_step + args.accumulation_steps - 1)
+        // args.accumulation_steps
+    )
+    if resume_state is not None:
+        optimizer.load_state_dict(
+            resume_state,
+            load_scheduler=continuous_checkpoint,
+        )
+        if not continuous_checkpoint:
+            print_on_rank0(
+                "Migrating legacy per-stage scheduler state to the continuous "
+                "two-stage schedule."
+            )
+            optimizer.advance_scheduler(optimizer_step)
+    if resume_stage in (None, "stage1"):
+        _set_student_stage1_trainable(student)
     micro_steps = 0
     torch.cuda.reset_peak_memory_stats()
 
-    for epoch in range(stage1_start_epoch, args.stage1_epochs) if stage1_optimizer is not None else ():
+    for epoch in range(stage1_start_epoch, args.stage1_epochs) if resume_stage in (None, "stage1") else ():
         stage1_dataloader.sampler.set_epoch(epoch)
         student.train()
         teacher.eval()
@@ -627,34 +808,47 @@ def main():
                 teacher_hidden = teacher_online.forward_backbone(
                     teacher_batch, seq_len=input_ids.size(1)
                 )
-            student_hidden = fsdp(
+                teacher_serial_logits = teacher_online.compute_serial_logits(
+                    teacher_hidden, teacher_batch
+                )
+            student_hidden, student_serial_logits = fsdp(
                 prepared_batch=student_batch,
                 seq_len=input_ids.size(1),
-                return_backbone=True,
+                return_backbone_and_serial_logits=True,
             )
-            loss, tv_loss, hidden_loss, prefix_acc = compute_stage1_distillation_loss(
+            loss, kl_loss, hidden_loss, prefix_acc = compute_stage1_distillation_loss(
                 student_hidden=student_hidden,
                 teacher_hidden=teacher_hidden,
-                lm_head=components.lm_head,
+                student_serial_logits=student_serial_logits,
+                teacher_serial_logits=teacher_serial_logits,
                 raw_weight_mask=student_batch.raw_weight_mask,
                 labels=student_batch.labels,
-                tv_weight=args.stage1_tv_weight,
+                kl_weight=args.stage1_kl_weight,
                 hidden_weight=args.stage1_hidden_weight,
                 smooth_l1_beta=args.stage1_smooth_l1_beta,
                 loss_decay_gamma=args.stage1_loss_decay_gamma,
             )
-            del hidden_states, teacher_hidden, student_hidden, teacher_batch, student_batch
+            del (
+                hidden_states,
+                teacher_hidden,
+                teacher_serial_logits,
+                student_hidden,
+                student_serial_logits,
+                teacher_batch,
+                student_batch,
+            )
             (loss / args.accumulation_steps).backward()
             micro_steps += 1
             grad_norm = None
             if micro_steps == args.accumulation_steps:
-                grad_norm = stage1_optimizer.step()
+                grad_norm = optimizer.step()
+                optimizer_step += 1
                 micro_steps = 0
             if global_step % args.log_interval == 0:
                 metrics = torch.stack(
                     [
                         loss.detach(),
-                        tv_loss.detach(),
+                        kl_loss.detach(),
                         hidden_loss.detach(),
                         prefix_acc.detach(),
                     ]
@@ -662,14 +856,14 @@ def main():
                 dist.all_reduce(metrics)
                 metrics /= dist.get_world_size()
                 payload = {
-                    "stage1/loss": metrics[0].item(),
-                    "stage1/tv": metrics[1].item(),
-                    "stage1/hidden": metrics[2].item(),
-                    "stage1/prefix_acc": metrics[3].item(),
-                    "stage1/lr": stage1_optimizer.get_learning_rate(),
+                    "train/loss": metrics[0].item(),
+                    "train/kl": metrics[1].item(),
+                    "train/hidden": metrics[2].item(),
+                    "train/prefix_acc": metrics[3].item(),
+                    "train/lr": optimizer.get_learning_rate(),
                 }
                 if grad_norm is not None:
-                    payload["stage1/grad_norm"] = grad_norm
+                    payload["train/grad_norm"] = grad_norm
                 tracker.log(payload, step=global_step)
                 print_on_rank0(
                     f"stage1 step={global_step} loss={metrics[0]:.4f} "
@@ -681,14 +875,20 @@ def main():
                     name=f"stage1/epoch_{epoch}_step_{stage1_step}",
                     fsdp_model=fsdp,
                     draft_model=student,
-                    optimizer=stage1_optimizer,
+                    optimizer=optimizer,
                     metadata={
                         "training_stage": "stage1",
                         "stage_epoch": epoch,
                         "next_batch_in_epoch": batch_idx + 1,
                         "stage_step": stage1_step,
                         "global_step": global_step,
-                        "serial_head_inherited": False,
+                        "serial_head_inherited": True,
+                        "continuous_two_stage_scheduler": True,
+                        "scheduler_total_steps": scheduler_total_steps,
+                        "scheduler_learning_rate": args.learning_rate,
+                        "scheduler_warmup_ratio": args.warmup_ratio,
+                        "optimizer_step": optimizer_step,
+                        "optimizer_parameter_order": optimizer_parameter_order,
                         "student_init_mode": student_init_mode,
                         "shared_backbone_inherited": _shared_backbone_inherited(
                             student_init_mode
@@ -702,24 +902,31 @@ def main():
                 )
         stage1_start_batch = 0
 
-    if stage1_optimizer is not None:
+    if resume_stage in (None, "stage1"):
         if micro_steps:
-            stage1_optimizer.scale_model_gradients(args.accumulation_steps / micro_steps)
-            stage1_optimizer.step()
+            optimizer.scale_model_gradients(args.accumulation_steps / micro_steps)
+            optimizer.step()
+            optimizer_step += 1
             micro_steps = 0
         save_checkpoint(
             output_dir=args.output_dir,
             name="stage1/final",
             fsdp_model=fsdp,
             draft_model=student,
-            optimizer=stage1_optimizer,
+            optimizer=optimizer,
             metadata={
                 "training_stage": "stage1",
                 "stage_epoch": args.stage1_epochs,
                 "next_batch_in_epoch": 0,
                 "stage_step": stage1_step,
                 "global_step": global_step,
-                "serial_head_inherited": False,
+                "serial_head_inherited": True,
+                "continuous_two_stage_scheduler": True,
+                "scheduler_total_steps": scheduler_total_steps,
+                "scheduler_learning_rate": args.learning_rate,
+                "scheduler_warmup_ratio": args.warmup_ratio,
+                "optimizer_step": optimizer_step,
+                "optimizer_parameter_order": optimizer_parameter_order,
                 "student_init_mode": student_init_mode,
                 "shared_backbone_inherited": _shared_backbone_inherited(
                     student_init_mode
@@ -734,21 +941,19 @@ def main():
         memory = log_cuda_peak("stage1")
         tracker.log(
             {
-                "stage1/cuda_peak_allocated_gib": memory["allocated_gib"],
-                "stage1/cuda_peak_reserved_gib": memory["reserved_gib"],
+                "train/cuda_peak_allocated_gib": memory["allocated_gib"],
+                "train/cuda_peak_reserved_gib": memory["reserved_gib"],
             },
             step=global_step,
         )
 
-        with FSDP.summon_full_params(fsdp, writeback=True):
-            _copy_serial_head(teacher, student)
         _set_student_stage2_trainable(student)
         save_checkpoint(
             output_dir=args.output_dir,
             name="transition",
             fsdp_model=fsdp,
             draft_model=student,
-            optimizer=stage1_optimizer,
+            optimizer=optimizer,
             metadata={
                 "training_stage": "transition",
                 "stage_epoch": 0,
@@ -756,6 +961,12 @@ def main():
                 "stage_step": 0,
                 "global_step": global_step,
                 "serial_head_inherited": True,
+                "continuous_two_stage_scheduler": True,
+                "scheduler_total_steps": scheduler_total_steps,
+                "scheduler_learning_rate": args.learning_rate,
+                "scheduler_warmup_ratio": args.warmup_ratio,
+                "optimizer_step": optimizer_step,
+                "optimizer_parameter_order": optimizer_parameter_order,
                 "student_init_mode": student_init_mode,
                 "shared_backbone_inherited": _shared_backbone_inherited(
                     student_init_mode
@@ -769,7 +980,7 @@ def main():
         )
     # drafts_for_target also owns the teacher.  Keeping that list alive would
     # silently retain the full teacher on every rank throughout Stage 2.
-    del teacher_online, teacher, stage1_optimizer, drafts_for_target
+    del teacher_online, teacher, drafts_for_target
     target.set_capture_layers(student.target_layer_ids)
     gc.collect()
     torch.cuda.empty_cache()
@@ -783,25 +994,13 @@ def main():
     )
     tracker.log(
         {
-            "stage2/post_teacher_release_allocated_gib": post_release_allocated,
-            "stage2/post_teacher_release_reserved_gib": post_release_reserved,
+            "train/post_teacher_release_allocated_gib": post_release_allocated,
+            "train/post_teacher_release_reserved_gib": post_release_reserved,
         },
         step=global_step,
     )
 
-    stage2_optimizer = BF16Optimizer(
-        student,
-        lr=args.stage2_learning_rate,
-        max_grad_norm=args.max_grad_norm,
-        warmup_ratio=args.stage2_warmup_ratio,
-        total_steps=stage_total_steps(
-            stage2_dataloader,
-            args.stage2_epochs,
-            args.accumulation_steps,
-        ),
-    )
     if resume_stage == "stage2":
-        stage2_optimizer.load_state_dict(resume_state)
         stage2_start_epoch, stage2_start_batch, stage2_step, restored_global = resume_cursor(
             resume_state, "stage2"
         )
@@ -862,7 +1061,8 @@ def main():
             micro_steps += 1
             grad_norm = None
             if micro_steps == args.accumulation_steps:
-                grad_norm = stage2_optimizer.step()
+                grad_norm = optimizer.step()
+                optimizer_step += 1
                 micro_steps = 0
             if global_step % args.log_interval == 0:
                 metrics = torch.stack(
@@ -871,16 +1071,16 @@ def main():
                 dist.all_reduce(metrics)
                 metrics /= dist.get_world_size()
                 payload = {
-                    "stage2/loss": metrics[0].item(),
-                    "stage2/accuracy": metrics[1].item(),
-                    "stage2/prefix_acc": metrics[2].item(),
-                    "stage2/final_ce": metrics[3].item(),
-                    "stage2/base_ce": metrics[4].item(),
-                    "stage2/tv": metrics[5].item(),
-                    "stage2/lr": stage2_optimizer.get_learning_rate(),
+                    "train/loss": metrics[0].item(),
+                    "train/accuracy": metrics[1].item(),
+                    "train/prefix_acc": metrics[2].item(),
+                    "train/final_ce": metrics[3].item(),
+                    "train/base_ce": metrics[4].item(),
+                    "train/tv": metrics[5].item(),
+                    "train/lr": optimizer.get_learning_rate(),
                 }
                 if grad_norm is not None:
-                    payload["stage2/grad_norm"] = grad_norm
+                    payload["train/grad_norm"] = grad_norm
                 tracker.log(payload, step=global_step)
                 print_on_rank0(f"stage2 step={global_step} loss={metrics[0]:.4f}")
             if global_step % args.save_interval == 0 and micro_steps == 0:
@@ -889,7 +1089,7 @@ def main():
                     name=f"stage2/epoch_{epoch}_step_{stage2_step}",
                     fsdp_model=fsdp,
                     draft_model=student,
-                    optimizer=stage2_optimizer,
+                    optimizer=optimizer,
                     metadata={
                         "training_stage": "stage2",
                         "stage_epoch": epoch,
@@ -897,6 +1097,12 @@ def main():
                         "stage_step": stage2_step,
                         "global_step": global_step,
                         "serial_head_inherited": True,
+                        "continuous_two_stage_scheduler": True,
+                        "scheduler_total_steps": scheduler_total_steps,
+                        "scheduler_learning_rate": args.learning_rate,
+                        "scheduler_warmup_ratio": args.warmup_ratio,
+                        "optimizer_step": optimizer_step,
+                        "optimizer_parameter_order": optimizer_parameter_order,
                         "student_init_mode": student_init_mode,
                         "shared_backbone_inherited": _shared_backbone_inherited(
                             student_init_mode
@@ -911,14 +1117,15 @@ def main():
         stage2_start_batch = 0
 
     if micro_steps:
-        stage2_optimizer.scale_model_gradients(args.accumulation_steps / micro_steps)
-        stage2_optimizer.step()
+        optimizer.scale_model_gradients(args.accumulation_steps / micro_steps)
+        optimizer.step()
+        optimizer_step += 1
     save_checkpoint(
         output_dir=args.output_dir,
         name="final",
         fsdp_model=fsdp,
         draft_model=student,
-        optimizer=stage2_optimizer,
+        optimizer=optimizer,
         metadata={
             "training_stage": "stage2",
             "stage_epoch": args.stage2_epochs,
@@ -926,6 +1133,12 @@ def main():
             "stage_step": stage2_step,
             "global_step": global_step,
             "serial_head_inherited": True,
+            "continuous_two_stage_scheduler": True,
+            "scheduler_total_steps": scheduler_total_steps,
+            "scheduler_learning_rate": args.learning_rate,
+            "scheduler_warmup_ratio": args.warmup_ratio,
+            "optimizer_step": optimizer_step,
+            "optimizer_parameter_order": optimizer_parameter_order,
             "student_init_mode": student_init_mode,
             "shared_backbone_inherited": _shared_backbone_inherited(
                 student_init_mode
@@ -940,8 +1153,8 @@ def main():
     memory = log_cuda_peak("stage2")
     tracker.log(
         {
-            "stage2/cuda_peak_allocated_gib": memory["allocated_gib"],
-            "stage2/cuda_peak_reserved_gib": memory["reserved_gib"],
+            "train/cuda_peak_allocated_gib": memory["allocated_gib"],
+            "train/cuda_peak_reserved_gib": memory["reserved_gib"],
         },
         step=global_step,
     )

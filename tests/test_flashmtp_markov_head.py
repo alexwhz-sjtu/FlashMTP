@@ -15,6 +15,8 @@ from scripts.train_flashmtp_two_stage import (
     _copy_shared_backbone,
     _evenly_spaced_teacher_layer_ids,
     _resolve_student_init_mode,
+    _set_student_stage1_trainable,
+    _set_student_stage2_trainable,
 )
 from scripts import flashmtp_training
 from scripts.flashmtp_training import resume_cursor
@@ -35,7 +37,14 @@ from specforge.data.utils import DataCollatorWithPadding
 
 
 def make_model(
-    role="pivot_q_student", *, block_size=4, g=3, w=4, num_draft_layers=1
+    role="pivot_q_student",
+    *,
+    block_size=4,
+    g=3,
+    w=4,
+    num_draft_layers=1,
+    markov_head_type="vanilla",
+    markov_output_mode="additive",
 ):
     config = Qwen3Config(
         vocab_size=31,
@@ -56,8 +65,8 @@ def make_model(
         "swa_window_size": w,
         "anchor_group_size": g,
         "chs_num_layers": 2,
-        "markov_head_type": "vanilla",
-        "markov_output_mode": "additive",
+        "markov_head_type": markov_head_type,
+        "markov_output_mode": markov_output_mode,
         "markov_rank": 4,
     }
     return FlashMTPDraftModel(config)
@@ -307,9 +316,10 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
 
         anchors, keep = wrapper.sample_anchor_positions(8, loss_mask)
 
-        self.assertTrue(keep.all())
-        self.assertTrue(torch.isin(anchors, torch.tensor([4, 5])).all())
-        self.assertFalse((anchors == 2).any())
+        valid_anchors = anchors[keep]
+        self.assertEqual(valid_anchors.numel(), 2)
+        self.assertTrue(torch.isin(valid_anchors, torch.tensor([4, 5])).all())
+        self.assertFalse((valid_anchors == 2).any())
 
     def test_anchor_sampling_keeps_sparse_rows_after_position_sort(self):
         model = make_model(block_size=2)
@@ -455,21 +465,22 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(gathered_logits, head(selected_hidden)))
 
-    def test_stage_optimizers_and_schedulers_are_independent(self):
-        stage1_model = nn.Linear(2, 2)
-        stage2_model = nn.Linear(2, 2)
-        stage1 = BF16Optimizer(
-            stage1_model, lr=1e-3, total_steps=10, warmup_ratio=0.2
+    def test_two_stages_share_one_combined_scheduler(self):
+        model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+        all_parameters = list(model.parameters())
+        for parameter in model[1].parameters():
+            parameter.requires_grad_(False)
+        optimizer = BF16Optimizer(
+            model,
+            parameters=all_parameters,
+            lr=1e-3,
+            total_steps=30,
+            warmup_ratio=0.1,
         )
-        stage2 = BF16Optimizer(
-            stage2_model, lr=2e-4, total_steps=20, warmup_ratio=0.1
-        )
-        self.assertIsNot(stage1.optimizer, stage2.optimizer)
-        self.assertIsNot(stage1.scheduler, stage2.scheduler)
-        self.assertEqual(stage1.scheduler.warmup_epochs, 2)
-        self.assertEqual(stage2.scheduler.warmup_epochs, 2)
-        self.assertEqual(stage1.scheduler.after_scheduler.T_max, 8)
-        self.assertEqual(stage2.scheduler.after_scheduler.T_max, 18)
+
+        self.assertEqual(len(optimizer.model_params), len(all_parameters))
+        self.assertEqual(optimizer.scheduler.warmup_epochs, 3)
+        self.assertEqual(optimizer.scheduler.after_scheduler.T_max, 27)
 
     def test_supervised_logits_are_projected_once(self):
         model = make_model()
@@ -613,88 +624,158 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
             )
 
     def test_stage1_teacher_is_detached(self):
-        head = CountingHead()
         student = torch.randn(1, 2, 3, 16, requires_grad=True)
         teacher = torch.randn(1, 2, 3, 16, requires_grad=True)
+        student_logits = torch.randn(6, 31, requires_grad=True)
+        teacher_logits = torch.randn(6, 31, requires_grad=True)
         loss, _, _, _ = compute_stage1_distillation_loss(
             student_hidden=student,
             teacher_hidden=teacher,
-            lm_head=head,
+            student_serial_logits=student_logits,
+            teacher_serial_logits=teacher_logits,
             raw_weight_mask=torch.ones(1, 2, 3),
             labels=torch.zeros(1, 2, 3, dtype=torch.long),
-            tv_weight=1.0,
+            kl_weight=1.0,
             hidden_weight=1.0,
             smooth_l1_beta=1.0,
             loss_decay_gamma=2.0,
         )
         loss.backward()
         self.assertIsNotNone(student.grad)
+        self.assertIsNotNone(student_logits.grad)
         self.assertIsNone(teacher.grad)
-        self.assertEqual(head.calls, 2)
+        self.assertIsNone(teacher_logits.grad)
+
+    def test_stage1_forward_kl_is_zero_for_matching_distributions(self):
+        student = torch.randn(1, 1, 3, 4, requires_grad=True)
+        teacher = torch.randn_like(student)
+        logits = torch.randn(3, 31)
+
+        loss, kl_loss, hidden_loss, _ = compute_stage1_distillation_loss(
+            student_hidden=student,
+            teacher_hidden=teacher,
+            student_serial_logits=logits.clone().requires_grad_(),
+            teacher_serial_logits=logits.clone(),
+            raw_weight_mask=torch.ones(1, 1, 3),
+            labels=torch.zeros(1, 1, 3, dtype=torch.long),
+            kl_weight=2.0,
+            hidden_weight=0.0,
+            smooth_l1_beta=1.0,
+            loss_decay_gamma=None,
+        )
+
+        self.assertAlmostEqual(kl_loss.item(), 0.0, places=6)
+        self.assertAlmostEqual(loss.item(), 0.0, places=6)
+        self.assertEqual(hidden_loss.item(), 0.0)
+
+    def test_frozen_direct_serial_head_backpropagates_only_to_hidden(self):
+        model = make_model(
+            markov_head_type="rnn_easy",
+            markov_output_mode="direct",
+        )
+        model.markov_head.requires_grad_(False)
+        wrapper = OnlineFlashMTPModel(
+            draft_model=model,
+            target_lm_head=nn.Linear(16, 31, bias=False),
+            target_embed_tokens=nn.Embedding(31, 16),
+            mask_token_id=30,
+            block_size=4,
+        )
+        hidden = torch.randn(1, 1, 3, 16, requires_grad=True)
+        weights = torch.ones(1, 1, 3)
+        batch = PreparedFlashMTPBatch(
+            anchor_positions=torch.tensor([[2]]),
+            block_keep_mask=torch.ones(1, 1, dtype=torch.bool),
+            target_hidden=torch.empty(1, 1, 2, 16),
+            shared_fused_history=None,
+            query_embeddings=torch.empty(1, 1, 6, 16),
+            token_keep_mask=torch.ones(1, 1, 3, dtype=torch.bool),
+            token_position_ids=torch.zeros(1, 1, 3, dtype=torch.long),
+            labels=torch.zeros(1, 1, 3, dtype=torch.long),
+            prev_token_ids=torch.tensor([[[1, 2, 3]]]),
+            raw_weight_mask=weights,
+            binary_eval_mask=weights.bool(),
+            initial_prev_token_ids=torch.tensor([[1]]),
+        )
+
+        wrapper.compute_serial_logits(hidden, batch).sum().backward()
+
+        self.assertIsNotNone(hidden.grad)
+        self.assertGreater(hidden.grad.abs().sum().item(), 0.0)
+        self.assertTrue(
+            all(parameter.grad is None for parameter in model.markov_head.parameters())
+        )
 
     def test_stage1_masked_nan_does_not_contaminate_loss(self):
-        head = CountingHead()
         student = torch.randn(1, 2, 3, 16, requires_grad=True)
         teacher = torch.randn(1, 2, 3, 16, requires_grad=True)
         with torch.no_grad():
             student[:, 1].fill_(float("nan"))
             teacher[:, 1].fill_(float("nan"))
         weights = torch.tensor([[[1.0, 1.0, 1.0], [0.0, 0.0, 0.0]]])
+        student_logits = torch.randn(3, 31, requires_grad=True)
+        teacher_logits = torch.randn(3, 31, requires_grad=True)
 
-        loss, tv_loss, hidden_loss, _ = compute_stage1_distillation_loss(
+        loss, kl_loss, hidden_loss, _ = compute_stage1_distillation_loss(
             student_hidden=student,
             teacher_hidden=teacher,
-            lm_head=head,
+            student_serial_logits=student_logits,
+            teacher_serial_logits=teacher_logits,
             raw_weight_mask=weights,
             labels=torch.zeros(1, 2, 3, dtype=torch.long),
-            tv_weight=1.0,
+            kl_weight=1.0,
             hidden_weight=1.0,
             smooth_l1_beta=1.0,
             loss_decay_gamma=2.0,
         )
 
         self.assertTrue(torch.isfinite(loss))
-        self.assertTrue(torch.isfinite(tv_loss))
+        self.assertTrue(torch.isfinite(kl_loss))
         self.assertTrue(torch.isfinite(hidden_loss))
         loss.backward()
         self.assertTrue(torch.isfinite(student.grad).all())
-        self.assertTrue(torch.isfinite(head.weight.grad).all())
+        self.assertTrue(torch.isfinite(student_logits.grad).all())
         self.assertTrue(torch.equal(student.grad[:, 1], torch.zeros_like(student.grad[:, 1])))
         self.assertIsNone(teacher.grad)
+        self.assertIsNone(teacher_logits.grad)
 
     def test_stage1_zero_hidden_weight_skips_smooth_l1_and_reports_prefix(self):
-        student = torch.tensor(
+        student_logits = torch.tensor(
             [[[[0.0, 3.0, 0.0], [0.0, 0.0, 3.0], [3.0, 0.0, 0.0]],
               [[0.0, 3.0, 0.0], [3.0, 0.0, 0.0], [0.0, 0.0, 3.0]]]],
-            requires_grad=True,
-        )
-        teacher = torch.zeros_like(student, requires_grad=True)
+        ).reshape(6, 3).requires_grad_()
+        teacher_logits = torch.zeros_like(student_logits, requires_grad=True)
+        student = torch.randn(1, 2, 3, 4, requires_grad=True)
+        teacher = torch.randn_like(student, requires_grad=True)
         labels = torch.tensor([[[1, 2, 2], [1, 2, 2]]])
 
         with mock.patch(
             "specforge.core.flashmtp.F.smooth_l1_loss",
             side_effect=AssertionError("SmoothL1 should be skipped"),
         ):
-            loss, tv_loss, hidden_loss, prefix_acc = (
+            loss, kl_loss, hidden_loss, prefix_acc = (
                 compute_stage1_distillation_loss(
                     student_hidden=student,
                     teacher_hidden=teacher,
-                    lm_head=nn.Identity(),
+                    student_serial_logits=student_logits,
+                    teacher_serial_logits=teacher_logits,
                     raw_weight_mask=torch.ones(1, 2, 3),
                     labels=labels,
-                    tv_weight=1.0,
+                    kl_weight=1.0,
                     hidden_weight=0.0,
                     smooth_l1_beta=1.0,
                     loss_decay_gamma=None,
                 )
             )
 
-        self.assertTrue(torch.equal(loss, tv_loss))
+        self.assertTrue(torch.equal(loss, kl_loss))
         self.assertEqual(hidden_loss.item(), 0.0)
         self.assertEqual(prefix_acc.item(), 2.5)
         loss.backward()
-        self.assertIsNotNone(student.grad)
+        self.assertIsNone(student.grad)
+        self.assertIsNotNone(student_logits.grad)
         self.assertIsNone(teacher.grad)
+        self.assertIsNone(teacher_logits.grad)
 
     def test_serial_head_copy_does_not_touch_backbone(self):
         teacher = make_model("swa_teacher")
@@ -707,6 +788,26 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
         self.assertTrue(torch.equal(before, student.layers[0].self_attn.q_proj.weight))
         for parameter in student.markov_head.parameters():
             self.assertTrue(torch.all(parameter == 0.25))
+
+    def test_stage1_freezes_serial_head_and_stage2_unfreezes_it(self):
+        student = make_model("pivot_q_student")
+
+        _set_student_stage1_trainable(student)
+        self.assertTrue(any(parameter.requires_grad for parameter in student.layers.parameters()))
+        self.assertTrue(
+            all(
+                not parameter.requires_grad
+                for parameter in student.markov_head.parameters()
+            )
+        )
+
+        _set_student_stage2_trainable(student)
+        self.assertTrue(
+            all(
+                parameter.requires_grad
+                for parameter in student.markov_head.parameters()
+            )
+        )
 
     def test_shared_init_copies_only_parallel_backbone(self):
         teacher = make_model("swa_teacher")
