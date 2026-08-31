@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -27,6 +28,15 @@ except ImportError:
 HiddenStatesInput = Union[
     tuple[torch.Tensor, ...], list[torch.Tensor], Dict[int, torch.Tensor]
 ]
+
+
+def fsdp_global_weighted_mean(local_numerator, local_denominator, group=None):
+    denominator = local_denominator.detach().float().clone()
+    world_size = 1
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(denominator, op=dist.ReduceOp.SUM, group=group)
+        world_size = dist.get_world_size(group)
+    return local_numerator * (world_size / denominator.clamp_min(1e-6))
 
 
 def infer_hidden_states_embedding_offset(
@@ -514,7 +524,7 @@ class OnlineFlashMTPModel(nn.Module):
 
     @staticmethod
     def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        return (values * weights).sum() / weights.sum().clamp_min(1e-6)
+        return fsdp_global_weighted_mean((values * weights).sum(), weights.sum())
 
     def compute_supervised_loss(
         self,
@@ -637,11 +647,15 @@ class OnlineFlashMTPModel(nn.Module):
             predictions = torch.zeros_like(batch.labels)
             predictions[active_positions] = final_logits.argmax(dim=-1)
             valid = batch.binary_eval_mask
-            accuracy = ((predictions == batch.labels) & valid).sum().float() / valid.sum().clamp_min(1)
+            accuracy = fsdp_global_weighted_mean(
+                ((predictions == batch.labels) & valid).sum().float(), valid.sum()
+            )
             correct = (predictions == batch.labels) & valid
             prefix = correct.cumprod(dim=-1).sum(dim=-1).float() + 1.0
             valid_blocks = batch.block_keep_mask & valid.any(dim=-1)
-            prefix_acc = prefix[valid_blocks].mean() if bool(valid_blocks.any()) else prediction_hidden.new_zeros(())
+            prefix_acc = fsdp_global_weighted_mean(
+                prefix[valid_blocks].sum(), valid_blocks.sum()
+            )
         return FlashMTPLossOutput(
             total, accuracy, prefix_acc, final_ce, base_ce, tv_loss
         )
@@ -788,7 +802,7 @@ def compute_stage1_distillation_loss(
     active_weights = weights[active_positions].float()
     student_active = student_hidden[active_positions]
     teacher_active = teacher_hidden[active_positions]
-    denominator = active_weights.sum().clamp_min(1e-6)
+    denominator = active_weights.sum()
     with torch.no_grad():
         teacher_log_probs = F.log_softmax(
             teacher_serial_logits.detach().float(), dim=-1
@@ -798,7 +812,10 @@ def compute_stage1_distillation_loss(
     kl_values = (
         teacher_probs * (teacher_log_probs - student_log_probs)
     ).sum(dim=-1)
-    kl_loss = (kl_values * active_weights).sum() / denominator
+    global_scale = fsdp_global_weighted_mean(
+        active_weights.new_ones(()), denominator
+    )
+    kl_loss = (kl_values * active_weights).sum() * global_scale
     if float(hidden_weight) > 0:
         hidden_values = F.smooth_l1_loss(
             student_active.float(),
@@ -806,7 +823,7 @@ def compute_stage1_distillation_loss(
             reduction="none",
             beta=float(smooth_l1_beta),
         ).mean(dim=-1)
-        hidden_loss = (hidden_values * active_weights).sum() / denominator
+        hidden_loss = (hidden_values * active_weights).sum() * global_scale
     else:
         hidden_loss = student_hidden.new_zeros((), dtype=torch.float32)
     with torch.no_grad():
@@ -816,10 +833,8 @@ def compute_stage1_distillation_loss(
         correct = (predictions == labels) & valid
         prefix = correct.cumprod(dim=-1).sum(dim=-1).float() + 1.0
         valid_blocks = valid.any(dim=-1)
-        prefix_acc = (
-            prefix[valid_blocks].mean()
-            if bool(valid_blocks.any())
-            else student_hidden.new_zeros(())
+        prefix_acc = fsdp_global_weighted_mean(
+            prefix[valid_blocks].sum(), valid_blocks.sum()
         )
     return (
         float(kl_weight) * kl_loss + float(hidden_weight) * hidden_loss,
