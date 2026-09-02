@@ -12,7 +12,10 @@ from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     compute_dp_attention_world_info,
 )
-from sglang.srt.runtime_context import get_flags
+try:
+    from sglang.srt.runtime_context import get_flags
+except ImportError:  # SGLang 0.5.9
+    get_flags = None
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
@@ -352,20 +355,29 @@ def initialize_dp_attention(
 
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
-    # SGLang 0.5.17 moved the enable flag and buffer metadata into its
-    # process-local runtime context, and compute_dp_attention_world_info now
-    # returns four values.  Keep this adapter compatible with that layout.
-    flags = get_flags().dp
-    flags.enabled = enable_dp_attention
-    flags.max_len_with_idle = (
-        getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
-    )
-    (
-        dp_attention._ATTN_DP_RANK,
-        dp_attention._ATTN_DP_SIZE,
-    ) = compute_dp_attention_world_info(
+    world_info = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
-    )[2:4]
+    )
+    if get_flags is not None:
+        # SGLang >= 0.5.17 stores the enable flag in runtime context and
+        # returns (..., dp_rank, dp_size).
+        flags = get_flags().dp
+        flags.enabled = enable_dp_attention
+        flags.max_len_with_idle = (
+            getattr(model_config.hf_config, "hybrid_override_pattern", None)
+            is not None
+        )
+        dp_attention._ATTN_DP_RANK, dp_attention._ATTN_DP_SIZE = world_info[-2:]
+    else:
+        # SGLang 0.5.9 returns (attn_tp_rank, attn_tp_size, dp_rank) and
+        # keeps process-local flags as module globals.
+        dp_attention._ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
+        dp_attention._ATTN_DP_RANK = world_info[-1]
+        dp_attention._ATTN_DP_SIZE = dp_size if enable_dp_attention else 1
+        if hasattr(dp_attention, "_LOCAL_ATTN_DP_RANK"):
+            dp_attention._LOCAL_ATTN_DP_RANK = dp_attention._ATTN_DP_RANK
+        if hasattr(dp_attention, "_LOCAL_ATTN_DP_SIZE"):
+            dp_attention._LOCAL_ATTN_DP_SIZE = dp_attention._ATTN_DP_SIZE
 
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,

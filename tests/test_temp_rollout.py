@@ -15,18 +15,26 @@ class _IdentityLMHead(torch.nn.Module):
     def __init__(self, vocab_size: int):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.eye(vocab_size), requires_grad=False)
+        self.batch_sizes = []
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        self.batch_sizes.append(hidden_states.size(0))
         return hidden_states @ self.weight.T
 
 
 class _FakeRolloutModel:
     _temp_rollout_greedy = OnlineFlashMTPModel._temp_rollout_greedy
     _lm_head_module = OnlineFlashMTPModel._lm_head_module
+    _needs_target_distribution_hidden = (
+        OnlineFlashMTPModel._needs_target_distribution_hidden
+    )
 
     def __init__(self, *, prediction_length: int, eos_token_id=None):
         self.block_size = prediction_length + 1
         self.tv_loss_weight = 1.0
+        self.final_forward_kl_weight = 0.0
+        self.base_lm_forward_kl_weight = 0.0
+        self.draft_model = SimpleNamespace(markov_head=object())
         self.temp_rollout_projection_chunk_size = 1
         self.target_vocab_size = 6
         self.eos_token_id = eos_token_id
@@ -71,6 +79,7 @@ class TempRolloutTest(unittest.TestCase):
 
     def test_anchor_parallel_autoregressive_greedy(self):
         model = _FakeRolloutModel(prediction_length=3)
+        model.temp_rollout_projection_chunk_size = 0
         context = _FakeRolloutContext(model.target_vocab_size)
         anchors = torch.tensor([[3, 9]])
         keep = torch.tensor([[True, True]])
@@ -93,9 +102,11 @@ class TempRolloutTest(unittest.TestCase):
         # Both anchors are extended together at each step, but with private IDs.
         self.assertEqual(context.calls[0][1].tolist(), [[[1], [2]]])
         self.assertEqual(context.calls[1][1].tolist(), [[[1, 2], [2, 3]]])
+        self.assertEqual(model.lm_head.batch_sizes, [2, 2, 2])
 
     def test_eos_is_valid_and_later_positions_are_masked(self):
         model = _FakeRolloutModel(prediction_length=3, eos_token_id=2)
+        model.temp_rollout_projection_chunk_size = 0
         context = _FakeRolloutContext(model.target_vocab_size)
         anchors = torch.tensor([[3, 9]])
         keep = torch.tensor([[True, True]])

@@ -106,7 +106,11 @@ def main():
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
         final_ce_weight=args.final_ce_weight,
+        final_forward_kl_weight=args.final_forward_kl_weight,
         tv_loss_weight=args.tv_loss_weight,
+        base_lm_ce_weight=args.base_lm_ce_weight,
+        base_lm_forward_kl_weight=args.base_lm_forward_kl_weight,
+        base_lm_ce_decay_gamma=args.base_lm_ce_decay_gamma,
         chs_concat_mode="feature",
         add_noise=args.add_noise,
         target_hidden_noise_ratio=args.target_hidden_noise_ratio,
@@ -201,6 +205,8 @@ def main():
             final_ce_loss,
             base_ce_loss,
             tv_loss,
+            final_forward_kl_loss,
+            base_forward_kl_loss,
         ) = flashmtp_model(
             input_ids=input_ids,
             loss_mask=loss_mask,
@@ -215,7 +221,16 @@ def main():
         log_mem(f"09_step{step}_after_backward")
 
         flashmtp_model.zero_grad(set_to_none=True)
-        del loss, accuracy, prefix_acc, final_ce_loss, base_ce_loss, tv_loss
+        del (
+            loss,
+            accuracy,
+            prefix_acc,
+            final_ce_loss,
+            base_ce_loss,
+            tv_loss,
+            final_forward_kl_loss,
+            base_forward_kl_loss,
+        )
         del (
             target_hidden,
             target_prediction_hidden,

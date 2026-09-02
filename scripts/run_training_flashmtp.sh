@@ -41,7 +41,7 @@ PIVOT_FUSE_MODE="${PIVOT_FUSE_MODE:-linear_fuse}"
 NUM_MIDDLE_LAYERS_N="${NUM_MIDDLE_LAYERS_N:-5}"
 NUM_ANCHORS="${NUM_ANCHORS:-512}"
 TEMP_ROLLOUT="${TEMP_ROLLOUT:-false}"
-TEMP_ROLLOUT_PROJECTION_CHUNK_SIZE="${TEMP_ROLLOUT_PROJECTION_CHUNK_SIZE:-512}"
+TEMP_ROLLOUT_PROJECTION_CHUNK_SIZE="${TEMP_ROLLOUT_PROJECTION_CHUNK_SIZE:-0}"
 TEMP_ROLLOUT_ENABLED=0
 case "$(echo "${TEMP_ROLLOUT}" | tr '[:upper:]' '[:lower:]')" in
     true|1|yes) TEMP_ROLLOUT_ENABLED=1 ;;
@@ -76,8 +76,14 @@ if [[ "$MARKOV_HEAD_TYPE" == "gated" && "$MARKOV_OUTPUT_MODE" == "direct" ]]; th
 fi
 MARKOV_RANK="${MARKOV_RANK:-256}"
 FINAL_CE_WEIGHT="${FINAL_CE_WEIGHT:-1.0}"
+FINAL_FORWARD_KL_WEIGHT="${FINAL_FORWARD_KL_WEIGHT:-0.0}"
 TV_LOSS_WEIGHT="${TV_LOSS_WEIGHT:-1.0}"
-MARKOV_TAG="mh${MARKOV_HEAD_TYPE}_${MARKOV_OUTPUT_MODE}_r${MARKOV_RANK}_ce${FINAL_CE_WEIGHT}_tv${TV_LOSS_WEIGHT}"
+BASE_LM_FORWARD_KL_WEIGHT="${BASE_LM_FORWARD_KL_WEIGHT:-0.0}"
+FORWARD_KL_TAG=""
+if awk "BEGIN {exit !((${FINAL_FORWARD_KL_WEIGHT} > 0) || (${BASE_LM_FORWARD_KL_WEIGHT} > 0))}"; then
+    FORWARD_KL_TAG="_fklf${FINAL_FORWARD_KL_WEIGHT}_fklb${BASE_LM_FORWARD_KL_WEIGHT}"
+fi
+MARKOV_TAG="mh${MARKOV_HEAD_TYPE}_${MARKOV_OUTPUT_MODE}_r${MARKOV_RANK}_ce${FINAL_CE_WEIGHT}_tv${TV_LOSS_WEIGHT}${FORWARD_KL_TAG}"
 
 # 草稿块内 position_ids：CHS RoPE 前缀全 0，draft 为 1..block_size（默认 false 为全局 anchor 位置）
 LOCAL_POSITION="${LOCAL_POSITION:-false}"
@@ -172,16 +178,31 @@ BASE_LM_CE_DECAY_GAMMA="${BASE_LM_CE_DECAY_GAMMA:-}"
 
 # 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-20000}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-50000}"
 
 # Tracker 参数
 REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-v2new}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
-# 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v2_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}2}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_v2_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${MODEL_TAG}2}"
+# 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照。
+# W&B rejects names longer than 128 characters. Keep a readable prefix and a
+# stable hash suffix so fully automatic names remain valid and collision-safe.
+shorten_wandb_value() {
+    local value="$1"
+    if [ "${#value}" -le 128 ]; then
+        printf '%s' "${value}"
+        return
+    fi
+    local digest
+    digest="$(printf '%s' "${value}" | sha256sum | cut -c1-16)"
+    printf '%s-%s' "${value:0:111}" "${digest}"
+}
+
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_v2_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_v2_n${NUM_MIDDLE_LAYERS_N}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${LEFT_SHIFT_TAG}_${MARKOV_TAG}_wb_${BASE_LM_CE_WEIGHT}_bgemma_${BASE_LM_CE_DECAY_GAMMA}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${MODEL_TAG}}"
+WANDB_RUN_ID="$(shorten_wandb_value "${WANDB_RUN_ID}")"
+WANDB_NAME="$(shorten_wandb_value "${WANDB_NAME}")"
 
 # 数据参数
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen}"
@@ -224,8 +245,10 @@ echo "  temp-rollout: ${TEMP_ROLLOUT} (greedy target branch labels)"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
 echo "  最终CE权重: ${FINAL_CE_WEIGHT}"
+echo "  Final forward KL权重: ${FINAL_FORWARD_KL_WEIGHT}"
 echo "  串行Head TV权重: ${TV_LOSS_WEIGHT}"
 echo "  Base LM CE权重: ${BASE_LM_CE_WEIGHT}"
+echo "  Base LM forward KL权重: ${BASE_LM_FORWARD_KL_WEIGHT}"
 echo "  Base LM CE衰减Gamma: ${BASE_LM_CE_DECAY_GAMMA:-未设置(均匀权重)}"
 echo "  串行Head: ${MARKOV_HEAD_TYPE}"
 echo "  Head输出模式: ${MARKOV_OUTPUT_MODE}"
@@ -317,9 +340,10 @@ fi
 
 if awk "BEGIN {exit !(${BASE_LM_CE_WEIGHT} > 0)}"; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --base-lm-ce-weight ${BASE_LM_CE_WEIGHT}"
-    if [ -n "${BASE_LM_CE_DECAY_GAMMA}" ]; then
-        OPTIONAL_ARGS="${OPTIONAL_ARGS} --base-lm-ce-decay-gamma ${BASE_LM_CE_DECAY_GAMMA}"
-    fi
+fi
+if awk "BEGIN {exit !((${BASE_LM_CE_WEIGHT} > 0) || (${BASE_LM_FORWARD_KL_WEIGHT} > 0))}" \
+    && [ -n "${BASE_LM_CE_DECAY_GAMMA}" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --base-lm-ce-decay-gamma ${BASE_LM_CE_DECAY_GAMMA}"
 fi
 
 if [ -n "${IS_PREFORMATTED}" ]; then
@@ -435,7 +459,9 @@ EXIT_CODE=0
     --markov-output-mode ${MARKOV_OUTPUT_MODE} \
     --markov-rank ${MARKOV_RANK} \
     --final-ce-weight ${FINAL_CE_WEIGHT} \
+    --final-forward-kl-weight ${FINAL_FORWARD_KL_WEIGHT} \
     --tv-loss-weight ${TV_LOSS_WEIGHT} \
+    --base-lm-forward-kl-weight ${BASE_LM_FORWARD_KL_WEIGHT} \
     --seed 42 \
     ${OPTIONAL_ARGS} 2>&1 || EXIT_CODE=$?
 

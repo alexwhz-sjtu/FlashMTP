@@ -126,6 +126,12 @@ def parse_args():
         help="Weight for the final serial-head cross-entropy loss.",
     )
     model_group.add_argument(
+        "--final-forward-kl-weight",
+        type=float,
+        default=0.0,
+        help="Weight for forward KL(p_target || q_final). 0 disables.",
+    )
+    model_group.add_argument(
         "--tv-loss-weight",
         type=float,
         default=1.0,
@@ -140,10 +146,16 @@ def parse_args():
         "Total loss = L_final + λ * L_base. 0 disables.",
     )
     model_group.add_argument(
+        "--base-lm-forward-kl-weight",
+        type=float,
+        default=0.0,
+        help="Weight for forward KL(p_target || q_base). 0 disables.",
+    )
+    model_group.add_argument(
         "--base-lm-ce-decay-gamma",
         type=float,
         default=None,
-        help="Separate gamma for exponential decay on the auxiliary base LM CE. "
+        help="Separate gamma for exponential decay on base LM CE/forward KL. "
         "None disables decay (uniform weights over valid prediction slots).",
     )
     model_group.add_argument(
@@ -196,9 +208,10 @@ def parse_args():
     model_group.add_argument(
         "--temp-rollout-projection-chunk-size",
         type=int,
-        default=64,
+        default=0,
         help="Number of anchor hidden states projected through the frozen target "
-        "lm_head at once during each greedy rollout step.",
+        "lm_head at once during each greedy rollout step. 0 projects all "
+        "active anchors together (default; no chunking).",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -309,9 +322,19 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         raise ValueError(
             f"--final-ce-weight must be non-negative, got {args.final_ce_weight}."
         )
+    if args.final_forward_kl_weight < 0:
+        raise ValueError(
+            "--final-forward-kl-weight must be non-negative, got "
+            f"{args.final_forward_kl_weight}."
+        )
     if args.tv_loss_weight < 0:
         raise ValueError(
             f"--tv-loss-weight must be non-negative, got {args.tv_loss_weight}."
+        )
+    if args.base_lm_forward_kl_weight < 0:
+        raise ValueError(
+            "--base-lm-forward-kl-weight must be non-negative, got "
+            f"{args.base_lm_forward_kl_weight}."
         )
     if args.markov_head_type == "none" and args.markov_output_mode == "direct":
         raise ValueError(
@@ -408,8 +431,11 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     draft_model = draft_cls(draft_config).cuda().to(torch.bfloat16)
 
     capture_layer_ids = list(draft_model.target_layer_ids)
-    if args.temp_rollout or (
-        args.tv_loss_weight != 0.0 and draft_model.markov_head is not None
+    if (
+        args.temp_rollout
+        or (args.tv_loss_weight != 0.0 and draft_model.markov_head is not None)
+        or args.final_forward_kl_weight > 0.0
+        or args.base_lm_forward_kl_weight > 0.0
     ):
         final_target_layer_id = draft_model.config.num_target_layers - 1
         if final_target_layer_id not in capture_layer_ids:
@@ -643,6 +669,8 @@ def record_metrics(
     final_ce_loss: float | None = None,
     base_lm_ce_loss: float | None = None,
     tv_loss: float | None = None,
+    final_forward_kl_loss: float | None = None,
+    base_lm_forward_kl_loss: float | None = None,
     grad_norm: float | None = None,
 ) -> None:
     logdict = {}
@@ -660,6 +688,10 @@ def record_metrics(
         logdict[f"{mode}/base_lm_ce_loss"] = base_lm_ce_loss
     if tv_loss is not None:
         logdict[f"{mode}/tv_loss"] = tv_loss
+    if final_forward_kl_loss is not None:
+        logdict[f"{mode}/final_forward_kl_loss"] = final_forward_kl_loss
+    if base_lm_forward_kl_loss is not None:
+        logdict[f"{mode}/base_lm_forward_kl_loss"] = base_lm_forward_kl_loss
     if grad_norm is not None:
         logdict[f"{mode}/grad_norm"] = grad_norm
 
@@ -672,6 +704,10 @@ def record_metrics(
         extra += f", BaseCE: {base_lm_ce_loss:.4f}"
     if tv_loss is not None:
         extra += f", TV: {tv_loss:.4f}"
+    if final_forward_kl_loss is not None:
+        extra += f", FinalFKL: {final_forward_kl_loss:.4f}"
+    if base_lm_forward_kl_loss is not None:
+        extra += f", BaseFKL: {base_lm_forward_kl_loss:.4f}"
     if grad_norm is not None:
         extra += f", GradNorm: {grad_norm:.4f}"
     print_on_rank0(
@@ -705,9 +741,10 @@ def main():
                 "--temp-rollout currently requires --batch-size 1; anchors inside "
                 "the sample are fully batched."
             )
-        if args.temp_rollout_projection_chunk_size <= 0:
+        if args.temp_rollout_projection_chunk_size < 0:
             raise ValueError(
-                "--temp-rollout-projection-chunk-size must be positive."
+                "--temp-rollout-projection-chunk-size must be non-negative; "
+                "use 0 to disable chunking."
             )
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
@@ -886,8 +923,10 @@ def main():
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
         final_ce_weight=args.final_ce_weight,
+        final_forward_kl_weight=args.final_forward_kl_weight,
         tv_loss_weight=args.tv_loss_weight,
         base_lm_ce_weight=args.base_lm_ce_weight,
+        base_lm_forward_kl_weight=args.base_lm_forward_kl_weight,
         base_lm_ce_decay_gamma=args.base_lm_ce_decay_gamma,
         chs_concat_mode="feature",
         add_noise=args.add_noise,
@@ -906,8 +945,10 @@ def main():
         f"ratio={args.target_hidden_noise_ratio}, "
         f"ce_chunk_size={args.ce_chunk_size}, "
         f"final_ce_weight={args.final_ce_weight}, "
+        f"final_forward_kl_weight={args.final_forward_kl_weight}, "
         f"tv_loss_weight={args.tv_loss_weight}, "
         f"base_lm_ce_weight={args.base_lm_ce_weight}, "
+        f"base_lm_forward_kl_weight={args.base_lm_forward_kl_weight}, "
         f"base_lm_ce_decay_gamma={args.base_lm_ce_decay_gamma}"
         f", left_shift={args.left_shift}, temp_rollout={args.temp_rollout}, "
         f"temp_rollout_projection_chunk_size="
@@ -1074,6 +1115,8 @@ def main():
                     final_ce_loss,
                     base_ce_loss,
                     tv_loss,
+                    final_forward_kl_loss,
+                    base_forward_kl_loss,
                 ) = flashmtp_model(
                     input_ids=input_ids,
                     loss_mask=loss_mask,
@@ -1109,18 +1152,26 @@ def main():
                 final_ce_log = final_ce_loss.clone()
                 base_ce_log = base_ce_loss.clone()
                 tv_loss_log = tv_loss.clone()
+                final_forward_kl_log = final_forward_kl_loss.clone()
+                base_forward_kl_log = base_forward_kl_loss.clone()
                 dist.all_reduce(loss_log)
                 dist.all_reduce(acc_log)
                 dist.all_reduce(pfx_log)
                 dist.all_reduce(final_ce_log)
                 dist.all_reduce(base_ce_log)
                 dist.all_reduce(tv_loss_log)
+                dist.all_reduce(final_forward_kl_log)
+                dist.all_reduce(base_forward_kl_log)
                 loss_log = loss_log / dist.get_world_size()
                 acc_log = acc_log / dist.get_world_size()
                 pfx_log = pfx_log / dist.get_world_size()
                 final_ce_log = final_ce_log / dist.get_world_size()
                 base_ce_log = base_ce_log / dist.get_world_size()
                 tv_loss_log = tv_loss_log / dist.get_world_size()
+                final_forward_kl_log = (
+                    final_forward_kl_log / dist.get_world_size()
+                )
+                base_forward_kl_log = base_forward_kl_log / dist.get_world_size()
 
                 record_metrics(
                     args,
@@ -1135,6 +1186,8 @@ def main():
                     final_ce_loss=final_ce_log.item(),
                     base_lm_ce_loss=base_ce_log.item(),
                     tv_loss=tv_loss_log.item(),
+                    final_forward_kl_loss=final_forward_kl_log.item(),
+                    base_lm_forward_kl_loss=base_forward_kl_log.item(),
                     grad_norm=last_grad_norm,
                 )
 
@@ -1148,6 +1201,8 @@ def main():
                         "pfx": f"{prefix_acc.item():.4f}",
                         "final_ce": f"{final_ce_loss.item():.4f}",
                         "tv": f"{tv_loss.item():.4f}",
+                        "final_fkl": f"{final_forward_kl_loss.item():.4f}",
+                        "base_fkl": f"{base_forward_kl_loss.item():.4f}",
                         "iter_time": f"{elapsed:.2f}s",
                     }
                 )

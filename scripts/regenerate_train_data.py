@@ -42,6 +42,7 @@ python scripts/regenerate_train_data.py \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --concurrency 64 \
     --num-samples 50000 \
+    --num-generations-per-sample 4 \
     --enable-thinking \
     --server-address localhost:30000 \
     --temperature 0.8 \
@@ -55,6 +56,7 @@ You can also explicitly specify the output path:
 """
 
 import argparse
+import copy
 import importlib
 import json
 import os
@@ -139,6 +141,14 @@ def parse_arguments():
         default=32768,
         help="Maximum number of tokens per generation (default: 32768, set large to collect complete data)",
     )
+    sampling_params_group.add_argument(
+        "--max-input-tokens",
+        type=int,
+        default=None,
+        help="If a request exceeds the server context length, retry it after "
+        "head-tail truncation to this many prompt tokens. This leaves room for "
+        "generation while preserving both the instruction and the end of long inputs.",
+    )
 
     # optimization
     optimization_group = parser.add_argument_group("optimization")
@@ -169,6 +179,14 @@ def parse_arguments():
         type=int,
         default=None,
         help="The number of samples to regenerate, if not provided, all samples will be regenerated",
+    )
+    data_group.add_argument(
+        "--num-generations-per-sample",
+        type=int,
+        default=1,
+        help="Number of independent generation requests submitted for each input "
+        "sample. The input is read once; generated rows receive a stable sample_idx "
+        "and unique id so --resume can skip individual generations.",
     )
     data_group.add_argument(
         "--resume",
@@ -468,6 +486,41 @@ def record_id_key(record: Dict[str, Any]) -> Optional[str]:
     return json.dumps(record["id"], ensure_ascii=False, sort_keys=True)
 
 
+def build_generation_record(
+    record: Dict[str, Any],
+    record_index: int,
+    generation_index: int,
+    num_generations: int,
+) -> Dict[str, Any]:
+    """Build one independently mutable request for an input record."""
+    if num_generations == 1:
+        return record
+
+    generation_record = copy.deepcopy(record)
+    generation_record["source_id"] = record.get("id", record_index)
+    generation_record["sample_idx"] = generation_index
+    generation_record["id"] = f"record_{record_index}_sample_{generation_index}"
+    return generation_record
+
+
+def iter_generation_records(
+    input_records: Iterator[Dict[str, Any]],
+    num_samples: Optional[int],
+    num_generations: int,
+) -> Iterator[Dict[str, Any]]:
+    """Read each source record once and yield its independent generations."""
+    for record_index, record in enumerate(input_records):
+        if num_samples is not None and record_index >= num_samples:
+            break
+        for generation_index in range(num_generations):
+            yield build_generation_record(
+                record,
+                record_index,
+                generation_index,
+                num_generations,
+            )
+
+
 def build_query_kwargs(args, messages, max_tokens=None):
     effective_max_tokens = max_tokens if max_tokens is not None else args.max_tokens
 
@@ -498,6 +551,62 @@ def build_query_kwargs(args, messages, max_tokens=None):
         query_kwargs["reasoning_effort"] = effort
         query_kwargs["extra_body"]["chat_template_kwargs"]["reasoning_effort"] = effort
     return query_kwargs
+
+
+def is_context_length_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "input" in message and "context length" in message and "longer" in message
+
+
+def chat_prompt_token_count(args, messages: List[Dict[str, Any]]) -> int:
+    return len(
+        args.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            enable_thinking=args.enable_thinking,
+        )
+    )
+
+
+def truncate_chat_messages(
+    args, messages: List[Dict[str, Any]]
+) -> tuple[List[Dict[str, Any]], int, int]:
+    """Head-tail truncate the longest text fields until the prompt fits."""
+    truncated_messages = copy.deepcopy(messages)
+    original_tokens = chat_prompt_token_count(args, truncated_messages)
+    current_tokens = original_tokens
+    marker = "\n\n[... input truncated to fit model context ...]\n\n"
+
+    for _ in range(32):
+        if current_tokens <= args.max_input_tokens:
+            return truncated_messages, original_tokens, current_tokens
+
+        candidates = []
+        for message_index, message in enumerate(truncated_messages):
+            content = message.get("content")
+            if isinstance(content, str) and content:
+                content_ids = args.tokenizer.encode(content, add_special_tokens=False)
+                candidates.append((len(content_ids), message_index, content_ids))
+        if not candidates:
+            break
+
+        content_tokens, message_index, content_ids = max(candidates)
+        excess = current_tokens - args.max_input_tokens
+        keep_tokens = max(1, content_tokens - excess - 64)
+        if keep_tokens >= content_tokens:
+            keep_tokens = content_tokens - 1
+        head_tokens = (keep_tokens + 1) // 2
+        tail_tokens = keep_tokens // 2
+        head = args.tokenizer.decode(content_ids[:head_tokens])
+        tail = args.tokenizer.decode(content_ids[-tail_tokens:]) if tail_tokens else ""
+        truncated_messages[message_index]["content"] = head + marker + tail
+        current_tokens = chat_prompt_token_count(args, truncated_messages)
+
+    raise ValueError(
+        f"Unable to truncate prompt from {original_tokens} to "
+        f"{args.max_input_tokens} tokens"
+    )
 
 
 def _append_assistant_turn(args, regenerated_messages, api_messages, message_obj) -> None:
@@ -570,8 +679,29 @@ def call_sglang(
             try:
                 resp = client.chat.completions.create(**query_kwargs)
             except Exception as e:
+                if args.max_input_tokens is None or not is_context_length_error(e):
+                    data["status"] = "error"
+                    data["error"] = str(e)
+                    return data
+                try:
+                    truncated_messages, original_tokens, used_tokens = (
+                        truncate_chat_messages(args, api_messages)
+                    )
+                    retry_query_kwargs = build_query_kwargs(
+                        args, truncated_messages, max_tokens
+                    )
+                    resp = client.chat.completions.create(**retry_query_kwargs)
+                except Exception as retry_error:
+                    data["status"] = "error"
+                    data["error"] = str(retry_error)
+                    return data
+                data["prompt_truncated"] = True
+                data["prompt_original_tokens"] = original_tokens
+                data["prompt_used_tokens"] = used_tokens
+
+            if not (resp.choices and resp.choices[0].message.content):
                 data["status"] = "error"
-                data["error"] = str(e)
+                data["error"] = "Model returned an empty response"
                 return data
             _append_assistant_turn(
                 args, regenerated_messages, api_messages, resp.choices[0].message
@@ -621,20 +751,43 @@ def main():
     if args.max_tokens <= 0:
         raise ValueError("Max tokens must be greater than 0")
 
+    if args.max_input_tokens is not None and args.max_input_tokens <= 0:
+        raise ValueError("--max-input-tokens must be greater than 0")
+
+    if args.num_generations_per_sample <= 0:
+        raise ValueError("--num-generations-per-sample must be a positive integer")
+
+    if args.num_samples is not None and args.num_samples <= 0:
+        raise ValueError("--num-samples must be a positive integer")
+
     print(f"Configuration:")
     print(f"  Model path: {args.model}")
     print(f"  Model type: {args.model_type}")
     print(f"  Max tokens: {args.max_tokens}")
+    print(f"  Max input tokens on context retry: {args.max_input_tokens}")
     print(f"  Concurrency: {args.concurrency}")
     print(f"  Temperature: {args.temperature}")
+    print(f"  Generations per input sample: {args.num_generations_per_sample}")
     print(f"  API URL: {args.server_address}")
     print(f"  Input file: {args.input_file_path}")
     print(f"  Output file: {output_file_path}")
     print(f"  Resume mode: {args.resume}")
     print("-" * 50)
+    args.tokenizer = None
+    if args.max_input_tokens is not None:
+        transformers = importlib.import_module("transformers")
+        args.tokenizer = transformers.AutoTokenizer.from_pretrained(
+            args.model, trust_remote_code=True
+        )
     total_records = count_input_records(
         args.input_file_path, args.parquet_presample_size
     )
+    selected_records = (
+        total_records
+        if args.num_samples is None
+        else min(total_records, args.num_samples)
+    )
+    total_generation_requests = selected_records * args.num_generations_per_sample
 
     skip_lines = 0
     processed_record_ids = set()
@@ -667,14 +820,22 @@ def main():
         if args.retry_errors and existing_error:
             print("  Error samples will be retried and the error file replaced")
         if len(processed_record_ids) == skip_lines:
-            print(f"  Skipping {skip_lines} input samples by stable record ID")
+            print(
+                f"  Skipping {skip_lines} generation requests by stable record ID"
+            )
         else:
             processed_record_ids.clear()
-            print(f"  Stable IDs unavailable; skipping first {skip_lines} input samples")
+            print(
+                f"  Stable IDs unavailable; skipping first {skip_lines} "
+                "generation requests"
+            )
         print("-" * 50)
 
-        if skip_lines >= total_records:
-            print(f"All {total_records} samples already processed. Nothing to do.")
+        if skip_lines >= total_generation_requests:
+            print(
+                f"All {total_generation_requests} generation requests already "
+                "processed. Nothing to do."
+            )
             return
 
     # test all server addresses
@@ -733,29 +894,30 @@ def main():
             args.parquet_presample_size,
             args.parquet_presample_seed,
         )
+        generation_records = iter_generation_records(
+            input_records,
+            args.num_samples,
+            args.num_generations_per_sample,
+        )
         pbar = tqdm(
-            total=total_records,
+            total=total_generation_requests,
             desc="Processing",
             initial=skip_lines if not processed_record_ids else 0,
         )
         start_server_index = 0
 
         if skip_lines > 0 and not processed_record_ids:
-            print(f"Skipping {skip_lines} already processed samples...")
+            print(f"Skipping {skip_lines} already processed generation requests...")
             for _ in range(skip_lines):
-                next(input_records, None)
-            print(f"Resuming from sample {skip_lines + 1}")
+                next(generation_records, None)
+            print(f"Resuming from generation request {skip_lines + 1}")
 
-        submitted_samples = 0
-        for data in input_records:
+        for data in generation_records:
             if processed_record_ids:
                 key = record_id_key(data)
                 if key is not None and key in processed_record_ids:
                     pbar.update(1)
                     continue
-
-            if args.num_samples is not None and submitted_samples >= args.num_samples:
-                break
 
             # find server address with the least waiting requests
             server_address = valid_server_addresses[start_server_index]
@@ -804,7 +966,6 @@ def main():
                 data,
             )
             waiting_queue[server_address].append(req_future)
-            submitted_samples += 1
             pbar.update(1)
 
         # deal with all the remaining requests

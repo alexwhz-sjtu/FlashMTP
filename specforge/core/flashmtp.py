@@ -4,6 +4,7 @@
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
@@ -50,6 +51,30 @@ HiddenStatesInput = Union[
     list[torch.Tensor],
     Dict[int, torch.Tensor],
 ]
+
+
+def _fsdp_global_weighted_scale(local_denominator: torch.Tensor) -> torch.Tensor:
+    """Build the local scale whose FSDP-averaged result is a global mean."""
+    denominator = local_denominator.detach().float().clone()
+    world_size = 1
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(denominator, op=dist.ReduceOp.SUM)
+        world_size = dist.get_world_size()
+    denominator = denominator.clamp_min(1e-6)
+    return world_size / denominator
+
+
+def fsdp_global_weighted_mean(
+    local_numerator: torch.Tensor,
+    local_denominator: torch.Tensor,
+) -> torch.Tensor:
+    """Return a gradient-correct global weighted mean for FSDP.
+
+    FSDP averages parameter gradients across ranks. Multiplying each rank's
+    local numerator by ``world_size / global_denominator`` therefore makes the
+    reduced gradient equal to ``sum(numerator) / sum(denominator)``.
+    """
+    return local_numerator * _fsdp_global_weighted_scale(local_denominator)
 
 
 def prepare_target_hidden(
@@ -292,8 +317,10 @@ class OnlineFlashMTPModel(nn.Module):
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
         final_ce_weight: float = 1.0,
+        final_forward_kl_weight: float = 0.0,
         tv_loss_weight: float = 1.0,
         base_lm_ce_weight: float = 0.0,
+        base_lm_forward_kl_weight: float = 0.0,
         base_lm_ce_decay_gamma: Optional[float] = None,
         chs_concat_mode: str = "feature",
         add_noise: bool = False,
@@ -301,7 +328,7 @@ class OnlineFlashMTPModel(nn.Module):
         ce_chunk_size: int = 2048,
         left_shift: Optional[bool] = None,
         temp_rollout_enabled: bool = False,
-        temp_rollout_projection_chunk_size: int = 64,
+        temp_rollout_projection_chunk_size: int = 0,
         target_vocab_size: Optional[int] = None,
         eos_token_id: Optional[int] = None,
     ):
@@ -319,18 +346,29 @@ class OnlineFlashMTPModel(nn.Module):
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
         self.final_ce_weight = float(final_ce_weight)
+        self.final_forward_kl_weight = float(final_forward_kl_weight)
         self.tv_loss_weight = float(tv_loss_weight)
         self.base_lm_ce_weight = float(base_lm_ce_weight)
+        self.base_lm_forward_kl_weight = float(base_lm_forward_kl_weight)
         for name, value in (
             ("final_ce_weight", self.final_ce_weight),
+            ("final_forward_kl_weight", self.final_forward_kl_weight),
             ("tv_loss_weight", self.tv_loss_weight),
             ("base_lm_ce_weight", self.base_lm_ce_weight),
+            ("base_lm_forward_kl_weight", self.base_lm_forward_kl_weight),
         ):
             if value < 0:
                 raise ValueError(
                     f"{name} must be non-negative, got {value}."
                 )
-        if self.final_ce_weight + self.tv_loss_weight + self.base_lm_ce_weight == 0:
+        if (
+            self.final_ce_weight
+            + self.final_forward_kl_weight
+            + self.tv_loss_weight
+            + self.base_lm_ce_weight
+            + self.base_lm_forward_kl_weight
+            == 0
+        ):
             raise ValueError("At least one FlashMTP loss weight must be positive.")
         self.base_lm_ce_decay_gamma = base_lm_ce_decay_gamma
         self.add_noise = add_noise
@@ -342,9 +380,14 @@ class OnlineFlashMTPModel(nn.Module):
             )
         self.ce_chunk_size = max(int(ce_chunk_size), 1)
         self.temp_rollout_enabled = bool(temp_rollout_enabled)
-        self.temp_rollout_projection_chunk_size = max(
-            int(temp_rollout_projection_chunk_size), 1
+        self.temp_rollout_projection_chunk_size = int(
+            temp_rollout_projection_chunk_size
         )
+        if self.temp_rollout_projection_chunk_size < 0:
+            raise ValueError(
+                "temp_rollout_projection_chunk_size must be non-negative; "
+                "use 0 to disable chunking."
+            )
         lm_head_vocab_size = int(self.lm_head.weight.shape[0])
         self.target_vocab_size = (
             lm_head_vocab_size
@@ -542,7 +585,7 @@ class OnlineFlashMTPModel(nn.Module):
                 noise_ratio=self.target_hidden_noise_ratio,
             )
         target_prediction_hidden = None
-        if self.tv_loss_weight != 0.0 and self.draft_model.markov_head is not None:
+        if self._needs_target_distribution_hidden():
             target_prediction_hidden = prepare_target_prediction_hidden(
                 hidden_states,
                 anchor_positions,
@@ -622,7 +665,7 @@ class OnlineFlashMTPModel(nn.Module):
         valid_positions = torch.zeros_like(generated, dtype=torch.bool)
         alive = block_keep_mask.bool().clone()
         current_hidden = target_anchor_hidden.detach()
-        predecessor_hidden = [] if self.tv_loss_weight != 0.0 else None
+        predecessor_hidden = [] if self._needs_target_distribution_hidden() else None
 
         for position in range(prediction_length):
             if predecessor_hidden is not None:
@@ -635,11 +678,14 @@ class OnlineFlashMTPModel(nn.Module):
                 flat_hidden.size(0), dtype=torch.long, device=flat_hidden.device
             )
             active_indices = flat_alive.nonzero(as_tuple=False).flatten()
-            for start in range(
-                0, active_indices.numel(), self.temp_rollout_projection_chunk_size
-            ):
+            projection_chunk_size = (
+                max(active_indices.numel(), 1)
+                if self.temp_rollout_projection_chunk_size == 0
+                else self.temp_rollout_projection_chunk_size
+            )
+            for start in range(0, active_indices.numel(), projection_chunk_size):
                 selected = active_indices[
-                    start : start + self.temp_rollout_projection_chunk_size
+                    start : start + projection_chunk_size
                 ]
                 logits = self._lm_head_module(current_hidden)(
                     flat_hidden.index_select(0, selected)
@@ -670,6 +716,16 @@ class OnlineFlashMTPModel(nn.Module):
     def _lm_head_module(self, output_hidden: torch.Tensor) -> nn.Module:
         return self.lm_head
 
+    def _needs_target_distribution_hidden(self) -> bool:
+        return (
+            (
+                self.tv_loss_weight != 0.0
+                and self.draft_model.markov_head is not None
+            )
+            or self.final_forward_kl_weight > 0.0
+            or self.base_lm_forward_kl_weight > 0.0
+        )
+
     def _chunked_weighted_ce_and_metrics(
         self,
         prediction_hidden: torch.Tensor,
@@ -687,8 +743,10 @@ class OnlineFlashMTPModel(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
     ]:
-        """Teacher-forced serial head + chunked CE/TV projection.
+        """Teacher-forced serial head + chunked CE/distribution projection.
 
         Low-rank Markov/RNN states are materialized for all prediction
         positions, while full-vocabulary logits exist only for one loss chunk.
@@ -721,21 +779,32 @@ class OnlineFlashMTPModel(nn.Module):
         flat_targets = labels.reshape(-1)
         flat_weights = weight_mask.reshape(-1)
         flat_eval_mask = binary_eval_mask.reshape(-1)
-        valid_token_count = flat_weights.sum() + 1e-6
+        valid_token_count = flat_weights.sum()
         markov_head = self.draft_model.markov_head
         output_mode = self.draft_model.markov_output_mode
         use_base_lm_ce = self.base_lm_ce_weight > 0.0 and base_weight_mask is not None
+        use_base_forward_kl = (
+            self.base_lm_forward_kl_weight > 0.0
+            and base_weight_mask is not None
+        )
+        use_base_loss = use_base_lm_ce or use_base_forward_kl
         use_tv_loss = self.tv_loss_weight != 0.0 and markov_head is not None
-        if use_tv_loss and target_prediction_hidden is None:
+        use_final_forward_kl = self.final_forward_kl_weight > 0.0
+        use_target_distribution = (
+            use_tv_loss or use_final_forward_kl or use_base_forward_kl
+        )
+        if use_target_distribution and target_prediction_hidden is None:
             raise ValueError(
-                "target_prediction_hidden is required when serial-head TV loss "
-                "is enabled."
+                "target_prediction_hidden is required when TV or forward-KL "
+                "distribution loss is enabled."
             )
         base_lm_head = (
-            self._lm_head_module(prediction_hidden) if use_base_lm_ce else None
+            self._lm_head_module(prediction_hidden) if use_base_loss else None
         )
         target_lm_head = (
-            self._lm_head_module(prediction_hidden) if use_tv_loss else None
+            self._lm_head_module(prediction_hidden)
+            if use_target_distribution
+            else None
         )
         lm_head = (
             self._lm_head_module(prediction_hidden)
@@ -765,7 +834,7 @@ class OnlineFlashMTPModel(nn.Module):
             assert lm_head is not None
             return self.draft_model.project_base_logits(lm_head, oh).float() + head_logits
 
-        def _chunk_ce_and_tv(
+        def _chunk_final_losses(
             oh: torch.Tensor,
             latent: torch.Tensor,
             target_oh: torch.Tensor,
@@ -775,7 +844,7 @@ class OnlineFlashMTPModel(nn.Module):
             active_chunk = weights_chunk > 0
             if not active_chunk.any():
                 zero = weights_chunk.new_zeros(())
-                return zero, zero
+                return zero, zero, zero
 
             oh = oh[active_chunk]
             latent = latent[active_chunk]
@@ -796,31 +865,50 @@ class OnlineFlashMTPModel(nn.Module):
                 logits_chunk.float(), targets_chunk, reduction="none"
             )
             ce_sum = (loss_chunk * weights_chunk).sum()
-            if not use_tv_loss:
-                return ce_sum, ce_sum.new_zeros(())
+            if not (use_tv_loss or use_final_forward_kl):
+                zero = ce_sum.new_zeros(())
+                return ce_sum, zero, zero
 
             assert target_lm_head is not None
             target_logits_chunk = self.draft_model.project_base_logits(
                 target_lm_head, target_oh
             ).float()
-            draft_probs = F.softmax(logits_chunk.float(), dim=-1)
-            target_probs = F.softmax(target_logits_chunk, dim=-1)
-            tv_per_position = (draft_probs - target_probs).abs().sum(dim=-1)
-            tv_sum = (tv_per_position * weights_chunk).sum()
-            return ce_sum, tv_sum
+            draft_log_probs = F.log_softmax(logits_chunk.float(), dim=-1)
+            target_log_probs = F.log_softmax(target_logits_chunk, dim=-1)
+            draft_probs = draft_log_probs.exp()
+            target_probs = target_log_probs.exp()
+            zero = ce_sum.new_zeros(())
+            tv_sum = zero
+            if use_tv_loss:
+                tv_per_position = (draft_probs - target_probs).abs().sum(dim=-1)
+                tv_sum = (tv_per_position * weights_chunk).sum()
+            forward_kl_sum = zero
+            if use_final_forward_kl:
+                teacher_log_probs = target_log_probs.detach()
+                teacher_probs = teacher_log_probs.exp()
+                forward_kl_per_position = (
+                    teacher_probs * (teacher_log_probs - draft_log_probs)
+                ).sum(dim=-1)
+                forward_kl_sum = (
+                    forward_kl_per_position * weights_chunk
+                ).sum()
+            return ce_sum, tv_sum, forward_kl_sum
 
-        def _base_chunk_ce(
+        def _base_chunk_losses(
             oh: torch.Tensor,
+            target_oh: torch.Tensor,
             targets_chunk: torch.Tensor,
             weights_chunk: torch.Tensor,
         ):
             assert base_lm_head is not None
             active_chunk = weights_chunk > 0
             if not active_chunk.any():
-                return weights_chunk.new_zeros(())
+                zero = weights_chunk.new_zeros(())
+                return zero, zero
             logits_chunk = self.draft_model.project_base_logits(
                 base_lm_head, oh[active_chunk]
             ).float()
+            target_oh = target_oh[active_chunk]
             targets_chunk = targets_chunk[active_chunk]
             weights_chunk = weights_chunk[active_chunk].float()
             if (targets_chunk < 0).any() or (
@@ -829,20 +917,45 @@ class OnlineFlashMTPModel(nn.Module):
                 raise ValueError(
                     "Supervised base-LM labels must be within the output vocabulary."
                 )
-            loss_chunk = F.cross_entropy(logits_chunk, targets_chunk, reduction="none")
-            return (loss_chunk * weights_chunk).sum()
+            zero = weights_chunk.new_zeros(())
+            ce_sum = zero
+            if use_base_lm_ce:
+                loss_chunk = F.cross_entropy(
+                    logits_chunk, targets_chunk, reduction="none"
+                )
+                ce_sum = (loss_chunk * weights_chunk).sum()
+            forward_kl_sum = zero
+            if use_base_forward_kl:
+                assert target_lm_head is not None
+                target_logits_chunk = self.draft_model.project_base_logits(
+                    target_lm_head, target_oh
+                ).float()
+                base_log_probs = F.log_softmax(logits_chunk, dim=-1)
+                target_log_probs = F.log_softmax(
+                    target_logits_chunk, dim=-1
+                ).detach()
+                target_probs = target_log_probs.exp()
+                forward_kl_per_position = (
+                    target_probs * (target_log_probs - base_log_probs)
+                ).sum(dim=-1)
+                forward_kl_sum = (
+                    forward_kl_per_position * weights_chunk
+                ).sum()
+            return ce_sum, forward_kl_sum
 
         loss_num = prediction_hidden.new_zeros(())
         tv_loss_num = prediction_hidden.new_zeros(())
+        final_forward_kl_num = prediction_hidden.new_zeros(())
         base_loss_num = prediction_hidden.new_zeros(())
+        base_forward_kl_num = prediction_hidden.new_zeros(())
         flat_target_prediction_hidden = (
             target_prediction_hidden.reshape(-1, target_prediction_hidden.size(-1))
-            if use_tv_loss and target_prediction_hidden is not None
+            if use_target_distribution and target_prediction_hidden is not None
             else None
         )
-        flat_base_weights = base_weight_mask.reshape(-1) if use_base_lm_ce else None
+        flat_base_weights = base_weight_mask.reshape(-1) if use_base_loss else None
         base_valid_token_count = (
-            flat_base_weights.sum() + 1e-6 if use_base_lm_ce else None
+            flat_base_weights.sum() if use_base_loss else None
         )
         correct_sum = prediction_hidden.new_zeros((), dtype=torch.float32)
         pred_chunks: list[torch.Tensor] = []
@@ -865,8 +978,8 @@ class OnlineFlashMTPModel(nn.Module):
                 else oh.new_empty(oh.size(0), 0)
             )
 
-            chunk_ce_sum, chunk_tv_sum = checkpoint(
-                _chunk_ce_and_tv,
+            chunk_ce_sum, chunk_tv_sum, chunk_final_forward_kl_sum = checkpoint(
+                _chunk_final_losses,
                 oh,
                 latent_chunk,
                 target_oh_chunk,
@@ -876,18 +989,25 @@ class OnlineFlashMTPModel(nn.Module):
             )
             loss_num = loss_num + chunk_ce_sum
             tv_loss_num = tv_loss_num + chunk_tv_sum
+            final_forward_kl_num = (
+                final_forward_kl_num + chunk_final_forward_kl_sum
+            )
 
-            if use_base_lm_ce:
+            if use_base_loss:
                 assert flat_base_weights is not None
                 base_weights_chunk = flat_base_weights[start:end]
-                base_chunk_sum = checkpoint(
-                    _base_chunk_ce,
+                base_chunk_sum, base_forward_kl_chunk_sum = checkpoint(
+                    _base_chunk_losses,
                     oh,
+                    target_oh_chunk,
                     targets_chunk,
                     base_weights_chunk,
                     use_reentrant=False,
                 )
                 base_loss_num = base_loss_num + base_chunk_sum
+                base_forward_kl_num = (
+                    base_forward_kl_num + base_forward_kl_chunk_sum
+                )
 
             with torch.no_grad():
                 logits_chunk = _final_logits(
@@ -901,27 +1021,45 @@ class OnlineFlashMTPModel(nn.Module):
                     + ((pred_chunk == targets_chunk) & eval_mask_chunk).sum().float()
                 )
 
-        final_ce_loss = loss_num / valid_token_count
-        actual_token_count = binary_eval_mask.sum() + 1e-6
+        final_loss_scale = _fsdp_global_weighted_scale(valid_token_count)
+        final_ce_loss = loss_num * final_loss_scale
+        actual_token_count = binary_eval_mask.sum()
         tv_loss = (
             # Keep TV on the same position-weighted scale as its numerator.
             # Using the binary token count here would shrink TV under decay.
-            tv_loss_num / valid_token_count
+            tv_loss_num * final_loss_scale
             if use_tv_loss
             else prediction_hidden.new_zeros(())
         )
+        final_forward_kl_loss = (
+            final_forward_kl_num * final_loss_scale
+            if use_final_forward_kl
+            else prediction_hidden.new_zeros(())
+        )
+        base_loss_scale = (
+            _fsdp_global_weighted_scale(base_valid_token_count)
+            if use_base_loss and base_valid_token_count is not None
+            else None
+        )
         base_ce_loss = (
-            base_loss_num / base_valid_token_count
-            if use_base_lm_ce and base_valid_token_count is not None
+            base_loss_num * base_loss_scale
+            if use_base_lm_ce and base_loss_scale is not None
+            else prediction_hidden.new_zeros(())
+        )
+        base_forward_kl_loss = (
+            base_forward_kl_num * base_loss_scale
+            if use_base_forward_kl and base_loss_scale is not None
             else prediction_hidden.new_zeros(())
         )
         loss = (
             self.final_ce_weight * final_ce_loss
+            + self.final_forward_kl_weight * final_forward_kl_loss
             + self.tv_loss_weight * tv_loss
             + self.base_lm_ce_weight * base_ce_loss
+            + self.base_lm_forward_kl_weight * base_forward_kl_loss
         )
         pred_ids = torch.cat(pred_chunks, dim=0)
-        accuracy = correct_sum / actual_token_count
+        accuracy = fsdp_global_weighted_mean(correct_sum, actual_token_count)
 
         with torch.no_grad():
             pred_ids_by_block = pred_ids.view_as(labels)
@@ -936,9 +1074,18 @@ class OnlineFlashMTPModel(nn.Module):
                 if valid_blocks.any()
                 else torch.zeros((), device=device, dtype=torch.float32)
             )
-            prefix_acc = prefix_sum / prefix_count.clamp(min=1.0)
+            prefix_acc = fsdp_global_weighted_mean(prefix_sum, prefix_count)
 
-        return loss, accuracy, prefix_acc, final_ce_loss, base_ce_loss, tv_loss
+        return (
+            loss,
+            accuracy,
+            prefix_acc,
+            final_ce_loss,
+            base_ce_loss,
+            tv_loss,
+            final_forward_kl_loss,
+            base_forward_kl_loss,
+        )
 
     def forward(
         self,
@@ -952,6 +1099,8 @@ class OnlineFlashMTPModel(nn.Module):
         target_anchor_hidden: Optional[torch.Tensor] = None,
         temp_rollout_context: Any = None,
     ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -988,8 +1137,7 @@ class OnlineFlashMTPModel(nn.Module):
             if (
                 target_prediction_hidden is None
                 and not self.temp_rollout_enabled
-                and self.tv_loss_weight != 0.0
-                and self.draft_model.markov_head is not None
+                and self._needs_target_distribution_hidden()
             ):
                 target_prediction_hidden = prepare_target_prediction_hidden(
                     hidden_states,
@@ -1154,7 +1302,7 @@ class OnlineFlashMTPModel(nn.Module):
         binary_eval_mask = prediction_weight_mask > 0
 
         base_prediction_weight_mask = None
-        if self.base_lm_ce_weight > 0.0:
+        if self.base_lm_ce_weight > 0.0 or self.base_lm_forward_kl_weight > 0.0:
             base_prediction_weight_mask = prediction_weight_mask.clone()
             if (
                 self.base_lm_ce_decay_gamma is not None
@@ -1178,7 +1326,16 @@ class OnlineFlashMTPModel(nn.Module):
             decay_weights = torch.exp(-(k - 1).float() / self.loss_decay_gamma)
             prediction_weight_mask = prediction_weight_mask * decay_weights
 
-        loss, accuracy, prefix_acc, final_ce_loss, base_ce_loss, tv_loss = (
+        (
+            loss,
+            accuracy,
+            prefix_acc,
+            final_ce_loss,
+            base_ce_loss,
+            tv_loss,
+            final_forward_kl_loss,
+            base_forward_kl_loss,
+        ) = (
             self._chunked_weighted_ce_and_metrics(
                 prediction_hidden=prediction_hidden,
                 prev_token_ids=prev_token_ids,
@@ -1198,4 +1355,6 @@ class OnlineFlashMTPModel(nn.Module):
             final_ce_loss,
             base_ce_loss,
             tv_loss,
+            final_forward_kl_loss,
+            base_forward_kl_loss,
         )
