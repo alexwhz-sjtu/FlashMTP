@@ -93,7 +93,7 @@ loss = STAGE1_TV_WEIGHT * weighted_mean(sum(abs(p_student - p_teacher)))
 Teacher 在 `eval/no_grad` 下运行。两者共享 anchors、target hidden、真实 Q embedding、
 labels 和有效位置 mask；student 串行头不参与优化。
 
-Stage 1 与 Stage 2 之间固定加入 1 个 transition epoch，使用 Stage 2 数据。
+Stage 1 与 Stage 2 之间固定加入 1 个 transition epoch，使用 Stage 1 数据。
 Transition 开始时解冻 student 串行头，并在每个 batch 上同时计算两套目标：
 
 ```text

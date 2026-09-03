@@ -625,7 +625,10 @@ def main():
     target, tokenizer, components, mask_token_id = build_target_and_components(
         args, drafts_for_target
     )
-    if resume_stage in (None, "stage1"):
+    needs_stage1_dataloader = resume_stage in (None, "stage1") or (
+        resume_stage == "transition" and not resume_transition_complete
+    )
+    if needs_stage1_dataloader:
         stage1_dataloader, stage2_dataloader = build_two_stage_dataloaders(
             args, tokenizer
         )
@@ -686,10 +689,14 @@ def main():
         args.stage2_epochs,
         args.accumulation_steps,
     )
-    transition_schedule_steps = stage_total_steps(
-        stage2_dataloader,
-        TRANSITION_EPOCHS,
-        args.accumulation_steps,
+    transition_schedule_steps = (
+        stage_total_steps(
+            stage1_dataloader,
+            TRANSITION_EPOCHS,
+            args.accumulation_steps,
+        )
+        if stage1_dataloader is not None
+        else 0
     )
     if stage1_dataloader is not None:
         stage1_schedule_steps = stage_total_steps(
@@ -1069,15 +1076,15 @@ def main():
     ):
         if teacher is None or teacher_online is None:
             raise ValueError("The transition epoch requires the teacher model")
-        stage2_dataloader.sampler.set_epoch(args.stage1_epochs + epoch)
+        stage1_dataloader.sampler.set_epoch(args.stage1_epochs + epoch)
         student.train()
         teacher.eval()
         iterator = (
-            tqdm(stage2_dataloader, desc=f"Transition epoch {epoch}")
+            tqdm(stage1_dataloader, desc=f"Transition epoch {epoch}")
             if dist.get_rank() == 0
-            else stage2_dataloader
+            else stage1_dataloader
         )
-        num_transition_batches = len(stage2_dataloader)
+        num_transition_batches = len(stage1_dataloader)
         for batch_idx, data in enumerate(iterator):
             if epoch == transition_start_epoch and batch_idx < transition_start_batch:
                 continue
