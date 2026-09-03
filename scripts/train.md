@@ -60,7 +60,7 @@ bash scripts/run_training_flashmtp_teacher.sh --dt h100
 
 
 
-## Student 两阶段
+## Student 两阶段与余弦过渡
 
 入口：`run_training_flashmtp_two_stage.sh` → `train_flashmtp_two_stage.py`。
 Teacher checkpoint 是 G、CHS、block、draft depth 和串行头结构的权威来源。
@@ -92,6 +92,23 @@ loss = STAGE1_TV_WEIGHT * weighted_mean(sum(abs(p_student - p_teacher)))
 
 Teacher 在 `eval/no_grad` 下运行。两者共享 anchors、target hidden、真实 Q embedding、
 labels 和有效位置 mask；student 串行头不参与优化。
+
+Stage 1 与 Stage 2 之间固定加入 1 个 transition epoch，使用 Stage 2 数据。
+Transition 开始时解冻 student 串行头，并在每个 batch 上同时计算两套目标：
+
+```text
+progress = batch_idx / (num_batches - 1)
+stage2_scale = 0.5 * (1 - cos(pi * progress))
+stage1_scale = 1 - stage2_scale
+
+transition_loss = stage1_scale * stage1_loss
+                + stage2_scale * stage2_loss
+```
+
+首个 batch 的权重为 Stage1/Stage2=`1/0`，最后一个 batch 为 `0/1`。如果
+transition dataloader 只有一个 batch，则两者各为 `0.5`。Teacher 在 transition
+结束后才释放；transition optimizer steps 计入两阶段共享的连续 LR scheduler。
+Checkpoint `transition/start` 是过渡开始状态，`transition` 是过渡完成状态。
 
 ```bash
 cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2.3
@@ -135,8 +152,9 @@ bash scripts/run_training_flashmtp_two_stage.sh --dt qz > "whz_mtp_logs/train_fl
 /inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/stop_keeper.sh
 ```
 
-Stage 2 只复制 teacher 串行头，然后释放 teacher 和 Stage 1 optimizer。训练 loss
-与 teacher 的三项监督 loss 相同，并创建新的 optimizer/scheduler。
+Stage 2 在 transition 已解冻的串行头基础上继续训练。Teacher 在 transition 后
+释放；训练 loss 与 teacher 的三项监督 loss 相同，并沿用同一个 optimizer 和
+连续 scheduler。
 
 
 | 变量                                              | 含义                   |

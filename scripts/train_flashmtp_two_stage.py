@@ -5,6 +5,7 @@ import argparse
 import copy
 import gc
 import logging
+import math
 import os
 
 import torch
@@ -53,6 +54,7 @@ SHARED_BACKBONE_MODULES = (
     "context_norm",
 )
 SHARED_BACKBONE_NON_LAYER_MODULES = SHARED_BACKBONE_MODULES[1:]
+TRANSITION_EPOCHS = 1
 
 
 def parse_args():
@@ -350,6 +352,23 @@ def _set_student_stage2_trainable(student: FlashMTPDraftModel) -> None:
     student.history_norm.requires_grad_(False)
 
 
+def _cosine_transition_scales(
+    batch_idx: int, num_batches: int
+) -> tuple[float, float]:
+    """Fade Stage 1 out and Stage 2 in over one transition epoch."""
+    if num_batches <= 0:
+        raise ValueError(f"Transition dataloader must be non-empty, got {num_batches}")
+    if not 0 <= int(batch_idx) < int(num_batches):
+        raise ValueError(
+            f"Transition batch index must be in [0, {num_batches}), got {batch_idx}"
+        )
+    if num_batches == 1:
+        return 0.5, 0.5
+    progress = float(batch_idx) / float(num_batches - 1)
+    stage2_scale = 0.5 * (1.0 - math.cos(math.pi * progress))
+    return 1.0 - stage2_scale, stage2_scale
+
+
 def _copy_serial_head(teacher: FlashMTPDraftModel, student: FlashMTPDraftModel) -> None:
     teacher_signature = (
         teacher.markov_head_type,
@@ -387,6 +406,10 @@ def main():
     resume_stage = None if resume_state is None else resume_state.get("training_stage")
     if resume_stage not in (None, "stage1", "transition", "stage2"):
         raise ValueError(f"Unsupported two-stage checkpoint stage: {resume_stage!r}")
+    resume_transition_complete = (
+        resume_stage == "transition"
+        and int(resume_state.get("stage_epoch", 0)) >= TRANSITION_EPOCHS
+    )
     if (
         resume_state is not None
         and "shard_draft_by_tp" in resume_state
@@ -457,12 +480,15 @@ def main():
         else resume_state.get("teacher_checkpoint_identity")
     )
     if (
-        resume_stage == "stage1"
+        (
+            resume_stage == "stage1"
+            or (resume_stage == "transition" and not resume_transition_complete)
+        )
         and saved_teacher_identity is not None
         and saved_teacher_identity != provided_teacher_identity
     ):
         raise ValueError(
-            "Stage 1 must resume with the same teacher checkpoint: "
+            "Stage 1/transition must resume with the same teacher checkpoint: "
             f"saved={saved_teacher_identity!r}, provided={provided_teacher_identity!r}."
         )
     teacher_identity = saved_teacher_identity or provided_teacher_identity
@@ -568,6 +594,29 @@ def main():
             raise ValueError("Transition/Stage 2 checkpoint has no inherited serial head")
         _sync_args_from_model(args, student)
 
+        if resume_stage == "transition" and not resume_transition_complete:
+            if not args.teacher_draft_path:
+                raise ValueError(
+                    "--teacher-draft-path is required to resume the transition epoch"
+                )
+            teacher = FlashMTPDraftModel.from_pretrained(
+                args.teacher_draft_path,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="flex_attention",
+            ).cuda().eval()
+            if not teacher.is_teacher:
+                raise ValueError(
+                    "--teacher-draft-path must contain an swa_teacher checkpoint"
+                )
+            teacher.requires_grad_(False)
+            if _non_depth_structure_signature(student) != _non_depth_structure_signature(
+                teacher
+            ):
+                raise ValueError(
+                    "Transition student structure except draft depth must match "
+                    "the teacher"
+                )
+
     # Wrap FSDP and construct the optimizer with every parameter that may be
     # trained in either stage. Stage 1 freezes the serial head only after this
     # complete parameter set has been registered with both.
@@ -637,13 +686,22 @@ def main():
         args.stage2_epochs,
         args.accumulation_steps,
     )
+    transition_schedule_steps = stage_total_steps(
+        stage2_dataloader,
+        TRANSITION_EPOCHS,
+        args.accumulation_steps,
+    )
     if stage1_dataloader is not None:
         stage1_schedule_steps = stage_total_steps(
             stage1_dataloader,
             args.stage1_epochs,
             args.accumulation_steps,
         )
-        computed_schedule_steps = stage1_schedule_steps + stage2_schedule_steps
+        computed_schedule_steps = (
+            stage1_schedule_steps
+            + transition_schedule_steps
+            + stage2_schedule_steps
+        )
     else:
         stage1_schedule_steps = 0
         completed_legacy_steps = (
@@ -658,6 +716,15 @@ def main():
         resume_state is not None
         and resume_state.get("continuous_two_stage_scheduler")
     )
+    if (
+        continuous_checkpoint
+        and resume_stage in ("stage1", "transition")
+        and int(resume_state.get("transition_epochs", 0)) != TRANSITION_EPOCHS
+    ):
+        raise ValueError(
+            "The resumed checkpoint predates the cosine transition epoch. "
+            "Resume from Stage 2 or start a fresh run with this training version."
+        )
     if continuous_checkpoint:
         for key, requested in (
             ("scheduler_learning_rate", args.learning_rate),
@@ -884,6 +951,7 @@ def main():
                         "global_step": global_step,
                         "serial_head_inherited": True,
                         "continuous_two_stage_scheduler": True,
+                        "transition_epochs": TRANSITION_EPOCHS,
                         "scheduler_total_steps": scheduler_total_steps,
                         "scheduler_learning_rate": args.learning_rate,
                         "scheduler_warmup_ratio": args.warmup_ratio,
@@ -922,6 +990,7 @@ def main():
                 "global_step": global_step,
                 "serial_head_inherited": True,
                 "continuous_two_stage_scheduler": True,
+                "transition_epochs": TRANSITION_EPOCHS,
                 "scheduler_total_steps": scheduler_total_steps,
                 "scheduler_learning_rate": args.learning_rate,
                 "scheduler_warmup_ratio": args.warmup_ratio,
@@ -950,7 +1019,7 @@ def main():
         _set_student_stage2_trainable(student)
         save_checkpoint(
             output_dir=args.output_dir,
-            name="transition",
+            name="transition/start",
             fsdp_model=fsdp,
             draft_model=student,
             optimizer=optimizer,
@@ -962,6 +1031,7 @@ def main():
                 "global_step": global_step,
                 "serial_head_inherited": True,
                 "continuous_two_stage_scheduler": True,
+                "transition_epochs": TRANSITION_EPOCHS,
                 "scheduler_total_steps": scheduler_total_steps,
                 "scheduler_learning_rate": args.learning_rate,
                 "scheduler_warmup_ratio": args.warmup_ratio,
@@ -978,6 +1048,269 @@ def main():
                 "stage2_train_data_identity": stage2_data_identity,
             },
         )
+
+    if resume_stage == "transition":
+        (
+            transition_start_epoch,
+            transition_start_batch,
+            transition_step,
+            restored_global,
+        ) = resume_cursor(resume_state, "transition")
+        global_step = restored_global
+    else:
+        transition_start_epoch = transition_start_batch = transition_step = 0
+
+    if resume_stage in (None, "stage1", "transition"):
+        _set_student_stage2_trainable(student)
+    for epoch in (
+        range(transition_start_epoch, TRANSITION_EPOCHS)
+        if resume_stage in (None, "stage1", "transition")
+        else ()
+    ):
+        if teacher is None or teacher_online is None:
+            raise ValueError("The transition epoch requires the teacher model")
+        stage2_dataloader.sampler.set_epoch(args.stage1_epochs + epoch)
+        student.train()
+        teacher.eval()
+        iterator = (
+            tqdm(stage2_dataloader, desc=f"Transition epoch {epoch}")
+            if dist.get_rank() == 0
+            else stage2_dataloader
+        )
+        num_transition_batches = len(stage2_dataloader)
+        for batch_idx, data in enumerate(iterator):
+            if epoch == transition_start_epoch and batch_idx < transition_start_batch:
+                continue
+            stage1_scale, stage2_scale = _cosine_transition_scales(
+                batch_idx, num_transition_batches
+            )
+            global_step += 1
+            transition_step += 1
+            input_ids = data["input_ids"].cuda()
+            attention_mask = data["attention_mask"].cuda()
+            loss_mask = data["loss_mask"].cuda()
+            anchors, block_keep = student_online.sample_anchor_positions(
+                input_ids.size(1), loss_mask
+            )
+            target_output = target.generate_flashmtp_data(
+                input_ids, attention_mask, loss_mask
+            )
+            hidden_states = hidden_states_to_cuda(target_output.hidden_states)
+            target_prefill_logits = target_output.logits.cuda()
+            if tp_draft_rank is not None:
+                input_ids = select_tp_rank_batch(input_ids, tp_draft_rank)
+                loss_mask = select_tp_rank_batch(loss_mask, tp_draft_rank)
+                anchors = select_tp_rank_batch(anchors, tp_draft_rank)
+                block_keep = select_tp_rank_batch(block_keep, tp_draft_rank)
+                hidden_states = select_tp_rank_batch(hidden_states, tp_draft_rank)
+                target_prefill_logits = select_tp_rank_batch(
+                    target_prefill_logits, tp_draft_rank
+                )
+            target_logits = gather_target_prefill_logits(
+                target_prefill_logits, anchors, student.block_size
+            )
+            del target_output, target_prefill_logits
+            student_batch = student_online.prepare_batch(
+                input_ids,
+                hidden_states,
+                loss_mask,
+                anchor_positions=anchors,
+                block_keep_mask=block_keep,
+            )
+            with torch.no_grad():
+                teacher_batch = teacher_online.prepare_batch(
+                    input_ids,
+                    hidden_states,
+                    loss_mask,
+                    anchor_positions=anchors,
+                    block_keep_mask=block_keep,
+                    shared_query_embeddings=student_batch.query_embeddings,
+                )
+                teacher_hidden = teacher_online.forward_backbone(
+                    teacher_batch, seq_len=input_ids.size(1)
+                )
+                teacher_serial_logits = teacher_online.compute_serial_logits(
+                    teacher_hidden, teacher_batch
+                )
+            (
+                student_hidden,
+                student_serial_logits,
+                stage2_outputs,
+            ) = fsdp(
+                prepared_batch=student_batch,
+                seq_len=input_ids.size(1),
+                target_prefill_logits=target_logits,
+                target_logits_are_gathered=True,
+                return_transition_outputs=True,
+            )
+            (
+                stage2_loss,
+                accuracy,
+                stage2_prefix_acc,
+                final_ce,
+                base_ce,
+                tv_loss,
+            ) = stage2_outputs
+            (
+                stage1_loss,
+                kl_loss,
+                hidden_loss,
+                stage1_prefix_acc,
+            ) = compute_stage1_distillation_loss(
+                student_hidden=student_hidden,
+                teacher_hidden=teacher_hidden,
+                student_serial_logits=student_serial_logits,
+                teacher_serial_logits=teacher_serial_logits,
+                raw_weight_mask=student_batch.raw_weight_mask,
+                labels=student_batch.labels,
+                kl_weight=args.stage1_kl_weight,
+                hidden_weight=args.stage1_hidden_weight,
+                smooth_l1_beta=args.stage1_smooth_l1_beta,
+                loss_decay_gamma=args.stage1_loss_decay_gamma,
+            )
+            loss = stage1_scale * stage1_loss + stage2_scale * stage2_loss
+            del (
+                hidden_states,
+                target_logits,
+                teacher_hidden,
+                teacher_serial_logits,
+                student_hidden,
+                student_serial_logits,
+                teacher_batch,
+                student_batch,
+                stage2_outputs,
+            )
+            (loss / args.accumulation_steps).backward()
+            micro_steps += 1
+            grad_norm = None
+            if micro_steps == args.accumulation_steps:
+                grad_norm = optimizer.step()
+                optimizer_step += 1
+                micro_steps = 0
+            if global_step % args.log_interval == 0:
+                metrics = torch.stack(
+                    [
+                        loss.detach(),
+                        stage1_loss.detach(),
+                        stage2_loss.detach(),
+                        kl_loss.detach(),
+                        hidden_loss.detach(),
+                        tv_loss.detach(),
+                        final_ce.detach(),
+                        base_ce.detach(),
+                        accuracy.detach(),
+                        stage1_prefix_acc.detach(),
+                        stage2_prefix_acc.detach(),
+                        loss.new_tensor(stage1_scale),
+                        loss.new_tensor(stage2_scale),
+                    ]
+                )
+                dist.all_reduce(metrics)
+                metrics /= dist.get_world_size()
+                payload = {
+                    "train/loss": metrics[0].item(),
+                    "train/stage1_loss": metrics[1].item(),
+                    "train/stage2_loss": metrics[2].item(),
+                    "train/kl": metrics[3].item(),
+                    "train/hidden": metrics[4].item(),
+                    "train/tv": metrics[5].item(),
+                    "train/final_ce": metrics[6].item(),
+                    "train/base_ce": metrics[7].item(),
+                    "train/accuracy": metrics[8].item(),
+                    "train/stage1_prefix_acc": metrics[9].item(),
+                    "train/stage2_prefix_acc": metrics[10].item(),
+                    "train/stage1_weight_scale": metrics[11].item(),
+                    "train/stage2_weight_scale": metrics[12].item(),
+                    "train/lr": optimizer.get_learning_rate(),
+                }
+                if grad_norm is not None:
+                    payload["train/grad_norm"] = grad_norm
+                tracker.log(payload, step=global_step)
+                print_on_rank0(
+                    f"transition step={global_step} loss={metrics[0]:.4f} "
+                    f"stage1_scale={metrics[11]:.4f} "
+                    f"stage2_scale={metrics[12]:.4f}"
+                )
+            if global_step % args.save_interval == 0 and micro_steps == 0:
+                save_checkpoint(
+                    output_dir=args.output_dir,
+                    name=f"transition/epoch_{epoch}_step_{transition_step}",
+                    fsdp_model=fsdp,
+                    draft_model=student,
+                    optimizer=optimizer,
+                    metadata={
+                        "training_stage": "transition",
+                        "stage_epoch": epoch,
+                        "next_batch_in_epoch": batch_idx + 1,
+                        "stage_step": transition_step,
+                        "global_step": global_step,
+                        "serial_head_inherited": True,
+                        "continuous_two_stage_scheduler": True,
+                        "transition_epochs": TRANSITION_EPOCHS,
+                        "scheduler_total_steps": scheduler_total_steps,
+                        "scheduler_learning_rate": args.learning_rate,
+                        "scheduler_warmup_ratio": args.warmup_ratio,
+                        "optimizer_step": optimizer_step,
+                        "optimizer_parameter_order": optimizer_parameter_order,
+                        "student_init_mode": student_init_mode,
+                        "shared_backbone_inherited": _shared_backbone_inherited(
+                            student_init_mode
+                        ),
+                        "teacher_checkpoint_identity": teacher_identity,
+                        "shard_draft_by_tp": bool(args.shard_draft_by_tp),
+                        "tp_size": int(args.tp_size),
+                        "stage1_train_data_identity": stage1_data_identity,
+                        "stage2_train_data_identity": stage2_data_identity,
+                    },
+                )
+        transition_start_batch = 0
+
+    if resume_stage in (None, "stage1", "transition"):
+        if micro_steps:
+            optimizer.scale_model_gradients(args.accumulation_steps / micro_steps)
+            optimizer.step()
+            optimizer_step += 1
+            micro_steps = 0
+        save_checkpoint(
+            output_dir=args.output_dir,
+            name="transition",
+            fsdp_model=fsdp,
+            draft_model=student,
+            optimizer=optimizer,
+            metadata={
+                "training_stage": "transition",
+                "stage_epoch": TRANSITION_EPOCHS,
+                "next_batch_in_epoch": 0,
+                "stage_step": transition_step,
+                "global_step": global_step,
+                "serial_head_inherited": True,
+                "continuous_two_stage_scheduler": True,
+                "transition_epochs": TRANSITION_EPOCHS,
+                "scheduler_total_steps": scheduler_total_steps,
+                "scheduler_learning_rate": args.learning_rate,
+                "scheduler_warmup_ratio": args.warmup_ratio,
+                "optimizer_step": optimizer_step,
+                "optimizer_parameter_order": optimizer_parameter_order,
+                "student_init_mode": student_init_mode,
+                "shared_backbone_inherited": _shared_backbone_inherited(
+                    student_init_mode
+                ),
+                "teacher_checkpoint_identity": teacher_identity,
+                "shard_draft_by_tp": bool(args.shard_draft_by_tp),
+                "tp_size": int(args.tp_size),
+                "stage1_train_data_identity": stage1_data_identity,
+                "stage2_train_data_identity": stage2_data_identity,
+            },
+        )
+        memory = log_cuda_peak("transition")
+        tracker.log(
+            {
+                "train/cuda_peak_allocated_gib": memory["allocated_gib"],
+                "train/cuda_peak_reserved_gib": memory["reserved_gib"],
+            },
+            step=global_step,
+        )
+
     # drafts_for_target also owns the teacher.  Keeping that list alive would
     # silently retain the full teacher on every rank throughout Stage 2.
     del teacher_online, teacher, drafts_for_target
@@ -1098,6 +1431,7 @@ def main():
                         "global_step": global_step,
                         "serial_head_inherited": True,
                         "continuous_two_stage_scheduler": True,
+                        "transition_epochs": TRANSITION_EPOCHS,
                         "scheduler_total_steps": scheduler_total_steps,
                         "scheduler_learning_rate": args.learning_rate,
                         "scheduler_warmup_ratio": args.warmup_ratio,
@@ -1134,6 +1468,7 @@ def main():
             "global_step": global_step,
             "serial_head_inherited": True,
             "continuous_two_stage_scheduler": True,
+            "transition_epochs": TRANSITION_EPOCHS,
             "scheduler_total_steps": scheduler_total_steps,
             "scheduler_learning_rate": args.learning_rate,
             "scheduler_warmup_ratio": args.warmup_ratio,

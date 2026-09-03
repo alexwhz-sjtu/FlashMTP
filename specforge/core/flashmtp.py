@@ -725,6 +725,7 @@ class OnlineFlashMTPModel(nn.Module):
         seq_len: Optional[int] = None,
         return_backbone: bool = False,
         return_backbone_and_serial_logits: bool = False,
+        return_transition_outputs: bool = False,
         target_logits_are_gathered: bool = False,
     ):
         if prepared_batch is None:
@@ -741,6 +742,31 @@ class OnlineFlashMTPModel(nn.Module):
         if seq_len is None:
             raise ValueError("seq_len is required with prepared_batch")
         prediction_hidden = self.forward_backbone(prepared_batch, seq_len=seq_len)
+        if return_transition_outputs:
+            if target_prefill_logits is None:
+                raise ValueError(
+                    "target_prefill_logits are required for transition loss"
+                )
+            gathered_target_logits = (
+                target_prefill_logits
+                if target_logits_are_gathered
+                else gather_target_prefill_logits(
+                    target_prefill_logits,
+                    prepared_batch.anchor_positions,
+                    self.block_size,
+                )
+            )
+            student_serial_logits = self.compute_serial_logits(
+                prediction_hidden, prepared_batch
+            )
+            supervised = self.compute_supervised_loss(
+                prediction_hidden, prepared_batch, gathered_target_logits
+            )
+            return (
+                prediction_hidden,
+                student_serial_logits,
+                supervised.as_tuple(),
+            )
         if return_backbone_and_serial_logits:
             return prediction_hidden, self.compute_serial_logits(
                 prediction_hidden, prepared_batch

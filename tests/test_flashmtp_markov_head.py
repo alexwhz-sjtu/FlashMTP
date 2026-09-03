@@ -13,6 +13,7 @@ from scripts.train_flashmtp_two_stage import (
     _copy_partial_shared_backbone,
     _copy_serial_head,
     _copy_shared_backbone,
+    _cosine_transition_scales,
     _evenly_spaced_teacher_layer_ids,
     _resolve_student_init_mode,
     _set_student_stage1_trainable,
@@ -805,6 +806,76 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
         self.assertTrue(
             all(
                 parameter.requires_grad
+                for parameter in student.markov_head.parameters()
+            )
+        )
+
+    def test_transition_cosine_scales_cover_both_endpoints(self):
+        self.assertEqual(_cosine_transition_scales(0, 5), (1.0, 0.0))
+        stage1_scale, stage2_scale = _cosine_transition_scales(2, 5)
+        self.assertAlmostEqual(stage1_scale, 0.5)
+        self.assertAlmostEqual(stage2_scale, 0.5)
+        self.assertEqual(_cosine_transition_scales(4, 5), (0.0, 1.0))
+        self.assertEqual(_cosine_transition_scales(0, 1), (0.5, 0.5))
+
+        stage1_scales = [
+            _cosine_transition_scales(index, 5)[0] for index in range(5)
+        ]
+        self.assertTrue(
+            all(
+                left >= right
+                for left, right in zip(stage1_scales, stage1_scales[1:])
+            )
+        )
+
+    def test_transition_stage1_kl_trains_serial_head(self):
+        student = make_model(
+            "pivot_q_student",
+            markov_head_type="rnn_easy",
+            markov_output_mode="direct",
+        )
+        _set_student_stage2_trainable(student)
+        wrapper = OnlineFlashMTPModel(
+            draft_model=student,
+            target_lm_head=nn.Linear(16, 31, bias=False),
+            target_embed_tokens=nn.Embedding(31, 16),
+            mask_token_id=30,
+            block_size=4,
+        )
+        hidden = torch.randn(1, 1, 3, 16, requires_grad=True)
+        weights = torch.ones(1, 1, 3)
+        batch = PreparedFlashMTPBatch(
+            anchor_positions=torch.tensor([[2]]),
+            block_keep_mask=torch.ones(1, 1, dtype=torch.bool),
+            target_hidden=torch.empty(1, 1, 2, 16),
+            shared_fused_history=None,
+            query_embeddings=torch.empty(1, 1, 6, 16),
+            token_keep_mask=torch.ones(1, 1, 3, dtype=torch.bool),
+            token_position_ids=torch.zeros(1, 1, 3, dtype=torch.long),
+            labels=torch.zeros(1, 1, 3, dtype=torch.long),
+            prev_token_ids=torch.tensor([[[1, 2, 3]]]),
+            raw_weight_mask=weights,
+            binary_eval_mask=weights.bool(),
+            initial_prev_token_ids=torch.tensor([[1]]),
+        )
+        student_logits = wrapper.compute_serial_logits(hidden, batch)
+        loss, _, _, _ = compute_stage1_distillation_loss(
+            student_hidden=hidden,
+            teacher_hidden=torch.randn_like(hidden),
+            student_serial_logits=student_logits,
+            teacher_serial_logits=torch.randn_like(student_logits),
+            raw_weight_mask=weights,
+            labels=batch.labels,
+            kl_weight=1.0,
+            hidden_weight=0.0,
+            smooth_l1_beta=1.0,
+            loss_decay_gamma=None,
+        )
+        loss.backward()
+
+        self.assertTrue(
+            any(
+                parameter.grad is not None and parameter.grad.abs().sum() > 0
                 for parameter in student.markov_head.parameters()
             )
         )
