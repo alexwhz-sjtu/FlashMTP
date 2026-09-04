@@ -86,12 +86,14 @@ teacher depth 严格大于 student depth。Student 层从 teacher 层按首尾�
 Stage 1：
 
 ```text
-loss = STAGE1_TV_WEIGHT * weighted_mean(sum(abs(p_student - p_teacher)))
+loss = STAGE1_KL_WEIGHT * weighted_mean(KL(p_teacher || p_student))
      + STAGE1_HIDDEN_WEIGHT * weighted_mean(SmoothL1(h_student, h_teacher))
+     + STAGE1_CE_WEIGHT * weighted_mean(CE(student_logits, true_labels))
 ```
 
 Teacher 在 `eval/no_grad` 下运行。两者共享 anchors、target hidden、真实 Q embedding、
-labels 和有效位置 mask；student 串行头不参与优化。
+labels 和有效位置 mask；Stage 1 CE 的 label 直接来自训练数据，不使用 teacher draft
+的 top-1。student 串行头在纯 Stage 1 中不参与优化。
 
 Stage 1 与 Stage 2 之间固定加入 1 个 transition epoch，使用 Stage 1 数据。
 Transition 开始时解冻 student 串行头，并在每个 batch 上同时计算两套目标：
@@ -132,8 +134,9 @@ ACCUMULATION_STEPS=1 \
 STAGE1_EPOCHS=2 \
 STAGE1_LEARNING_RATE=2e-4 \
 STAGE1_WARMUP_RATIO=0.02 \
-STAGE1_TV_WEIGHT=1.0 \
+STAGE1_KL_WEIGHT=1.0 \
 STAGE1_HIDDEN_WEIGHT=0.0 \
+STAGE1_CE_WEIGHT=0.1 \
 STAGE1_SMOOTH_L1_BETA=1.0 \
 STAGE1_LOSS_DECAY_GAMMA=12 \
 STAGE2_EPOCHS=4 \
@@ -154,7 +157,9 @@ bash scripts/run_training_flashmtp_two_stage.sh --dt qz > "whz_mtp_logs/train_fl
 
 Stage 2 在 transition 已解冻的串行头基础上继续训练。Teacher 在 transition 后
 释放；训练 loss 与 teacher 的三项监督 loss 相同，并沿用同一个 optimizer 和
-连续 scheduler。
+连续 scheduler。final CE 和 base CE 的 label 都取 target prefill 对应位置 logits
+的 greedy top-1；串行 head 的 teacher forcing 输入仍取训练数据原始序列中的前一
+个 token，不使用这些 greedy label 回填。
 
 
 | 变量                                              | 含义                   |
@@ -162,7 +167,8 @@ Stage 2 在 transition 已解冻的串行头基础上继续训练。Teacher 在 
 | `STAGE1_EPOCHS` / `STAGE2_EPOCHS`               | 两阶段独立 epoch 数        |
 | `STAGE1_LEARNING_RATE` / `STAGE2_LEARNING_RATE` | 两阶段独立学习率             |
 | `STAGE1_WARMUP_RATIO` / `STAGE2_WARMUP_RATIO`   | 两阶段独立 warmup 比例      |
-| `STAGE1_TV_WEIGHT` / `STAGE1_HIDDEN_WEIGHT`     | Stage 1 两项 loss 权重   |
+| `STAGE1_KL_WEIGHT` / `STAGE1_HIDDEN_WEIGHT`     | Stage 1 蒸馏 loss 权重   |
+| `STAGE1_CE_WEIGHT`                              | Stage 1 true-label CE 权重（默认 0.1） |
 | `STAGE1_SMOOTH_L1_BETA`                         | SmoothL1 beta        |
 | `STAGE1_LOSS_DECAY_GAMMA`                       | Stage 1 共用位置衰减       |
 | `STAGE2_FINAL_CE_WEIGHT`                        | Stage 2 final CE 权重  |

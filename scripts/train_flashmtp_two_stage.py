@@ -112,6 +112,12 @@ def parse_args():
         help="Deprecated alias for --stage1-kl-weight.",
     )
     parser.add_argument("--stage1-hidden-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--stage1-ce-weight",
+        type=float,
+        default=0.1,
+        help="Cross-entropy weight on training-data true labels in Stage 1.",
+    )
     parser.add_argument("--stage1-smooth-l1-beta", type=float, default=1.0)
     parser.add_argument("--stage1-loss-decay-gamma", type=float)
     parser.add_argument("--stage2-epochs", type=int, required=True)
@@ -190,9 +196,18 @@ def parse_args():
         and args.student_num_draft_layers <= 0
     ):
         parser.error("--student-num-draft-layers must be positive")
-    if args.stage1_kl_weight < 0 or args.stage1_hidden_weight < 0:
+    if (
+        args.stage1_kl_weight < 0
+        or args.stage1_hidden_weight < 0
+        or args.stage1_ce_weight < 0
+    ):
         parser.error("Stage 1 loss weights must be non-negative")
-    if args.stage1_kl_weight + args.stage1_hidden_weight == 0:
+    if (
+        args.stage1_kl_weight
+        + args.stage1_hidden_weight
+        + args.stage1_ce_weight
+        == 0
+    ):
         parser.error("At least one Stage 1 loss weight must be positive")
     stage2_weights = (
         args.stage2_final_ce_weight,
@@ -664,6 +679,7 @@ def main():
         tv_loss_weight=args.stage2_tv_weight,
         base_lm_ce_weight=args.stage2_base_ce_weight,
         base_lm_ce_decay_gamma=args.stage2_base_ce_decay_gamma,
+        use_target_greedy_ce_labels=True,
     )
     fsdp = FSDP(
         student_online,
@@ -890,7 +906,13 @@ def main():
                 seq_len=input_ids.size(1),
                 return_backbone_and_serial_logits=True,
             )
-            loss, kl_loss, hidden_loss, prefix_acc = compute_stage1_distillation_loss(
+            (
+                loss,
+                kl_loss,
+                hidden_loss,
+                ce_loss,
+                prefix_acc,
+            ) = compute_stage1_distillation_loss(
                 student_hidden=student_hidden,
                 teacher_hidden=teacher_hidden,
                 student_serial_logits=student_serial_logits,
@@ -899,6 +921,7 @@ def main():
                 labels=student_batch.labels,
                 kl_weight=args.stage1_kl_weight,
                 hidden_weight=args.stage1_hidden_weight,
+                ce_weight=args.stage1_ce_weight,
                 smooth_l1_beta=args.stage1_smooth_l1_beta,
                 loss_decay_gamma=args.stage1_loss_decay_gamma,
             )
@@ -924,6 +947,7 @@ def main():
                         loss.detach(),
                         kl_loss.detach(),
                         hidden_loss.detach(),
+                        ce_loss.detach(),
                         prefix_acc.detach(),
                     ]
                 )
@@ -933,7 +957,8 @@ def main():
                     "train/loss": metrics[0].item(),
                     "train/kl": metrics[1].item(),
                     "train/hidden": metrics[2].item(),
-                    "train/prefix_acc": metrics[3].item(),
+                    "train/stage1_ce": metrics[3].item(),
+                    "train/prefix_acc": metrics[4].item(),
                     "train/lr": optimizer.get_learning_rate(),
                 }
                 if grad_norm is not None:
@@ -941,7 +966,7 @@ def main():
                 tracker.log(payload, step=global_step)
                 print_on_rank0(
                     f"stage1 step={global_step} loss={metrics[0]:.4f} "
-                    f"prefix_acc={metrics[3]:.4f}"
+                    f"prefix_acc={metrics[4]:.4f}"
                 )
             if global_step % args.save_interval == 0 and micro_steps == 0:
                 save_checkpoint(
@@ -1162,6 +1187,7 @@ def main():
                 stage1_loss,
                 kl_loss,
                 hidden_loss,
+                stage1_ce_loss,
                 stage1_prefix_acc,
             ) = compute_stage1_distillation_loss(
                 student_hidden=student_hidden,
@@ -1172,6 +1198,7 @@ def main():
                 labels=student_batch.labels,
                 kl_weight=args.stage1_kl_weight,
                 hidden_weight=args.stage1_hidden_weight,
+                ce_weight=args.stage1_ce_weight,
                 smooth_l1_beta=args.stage1_smooth_l1_beta,
                 loss_decay_gamma=args.stage1_loss_decay_gamma,
             )
@@ -1202,6 +1229,7 @@ def main():
                         stage2_loss.detach(),
                         kl_loss.detach(),
                         hidden_loss.detach(),
+                        stage1_ce_loss.detach(),
                         tv_loss.detach(),
                         final_ce.detach(),
                         base_ce.detach(),
@@ -1220,14 +1248,15 @@ def main():
                     "train/stage2_loss": metrics[2].item(),
                     "train/kl": metrics[3].item(),
                     "train/hidden": metrics[4].item(),
-                    "train/tv": metrics[5].item(),
-                    "train/final_ce": metrics[6].item(),
-                    "train/base_ce": metrics[7].item(),
-                    "train/accuracy": metrics[8].item(),
-                    "train/stage1_prefix_acc": metrics[9].item(),
-                    "train/stage2_prefix_acc": metrics[10].item(),
-                    "train/stage1_weight_scale": metrics[11].item(),
-                    "train/stage2_weight_scale": metrics[12].item(),
+                    "train/stage1_ce": metrics[5].item(),
+                    "train/tv": metrics[6].item(),
+                    "train/final_ce": metrics[7].item(),
+                    "train/base_ce": metrics[8].item(),
+                    "train/accuracy": metrics[9].item(),
+                    "train/stage1_prefix_acc": metrics[10].item(),
+                    "train/stage2_prefix_acc": metrics[11].item(),
+                    "train/stage1_weight_scale": metrics[12].item(),
+                    "train/stage2_weight_scale": metrics[13].item(),
                     "train/lr": optimizer.get_learning_rate(),
                 }
                 if grad_norm is not None:
@@ -1235,8 +1264,8 @@ def main():
                 tracker.log(payload, step=global_step)
                 print_on_rank0(
                     f"transition step={global_step} loss={metrics[0]:.4f} "
-                    f"stage1_scale={metrics[11]:.4f} "
-                    f"stage2_scale={metrics[12]:.4f}"
+                    f"stage1_scale={metrics[12]:.4f} "
+                    f"stage2_scale={metrics[13]:.4f}"
                 )
             if global_step % args.save_interval == 0 and micro_steps == 0:
                 save_checkpoint(

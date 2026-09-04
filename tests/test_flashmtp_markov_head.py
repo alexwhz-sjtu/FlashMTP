@@ -518,6 +518,134 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
         output.loss.backward()
         self.assertIsNotNone(hidden.grad)
 
+    def test_stage2_ce_uses_target_top1_but_teacher_forcing_uses_data_tokens(self):
+        model = make_model(markov_output_mode="direct")
+        wrapper = OnlineFlashMTPModel(
+            draft_model=model,
+            target_lm_head=nn.Linear(16, 31, bias=False),
+            target_embed_tokens=nn.Embedding(31, 16),
+            mask_token_id=30,
+            block_size=4,
+            final_ce_weight=1.0,
+            tv_loss_weight=0.0,
+            base_lm_ce_weight=1.0,
+            use_target_greedy_ce_labels=True,
+        )
+        hidden = torch.zeros(1, 1, 3, 16)
+        hidden[..., 0] = 1.0
+        data_labels = torch.tensor([[[3, 4, 5]]])
+        data_prev_tokens = torch.tensor([[[2, 3, 4]]])
+        batch = PreparedFlashMTPBatch(
+            anchor_positions=torch.tensor([[2]]),
+            block_keep_mask=torch.tensor([[True]]),
+            target_hidden=torch.empty(1, 1, 2, 16),
+            shared_fused_history=None,
+            query_embeddings=torch.empty(1, 1, 6, 16),
+            token_keep_mask=torch.ones(1, 1, 3, dtype=torch.bool),
+            token_position_ids=torch.tensor([[[0, 1, 2]]]),
+            labels=data_labels,
+            prev_token_ids=data_prev_tokens,
+            raw_weight_mask=torch.ones(1, 1, 3),
+            binary_eval_mask=torch.ones(1, 1, 3, dtype=torch.bool),
+            initial_prev_token_ids=None,
+        )
+        target_top1 = torch.tensor([6, 7, 8])
+        target_logits = torch.zeros(1, 1, 3, 31)
+        target_logits[0, 0, torch.arange(3), target_top1] = 10.0
+        student_logits = torch.zeros(3, 31, requires_grad=True)
+        student_logits.data[torch.arange(3), target_top1] = torch.tensor(
+            [2.0, 3.0, 4.0]
+        )
+        with torch.no_grad():
+            wrapper.lm_head.weight.zero_()
+            wrapper.lm_head.weight[target_top1, 0] = torch.tensor([1.0, 2.0, 3.0])
+        captured = {}
+
+        def capture_teacher_forcing(**kwargs):
+            captured["prev_token_ids"] = kwargs["prev_token_ids"].clone()
+            return torch.zeros(1, 1, 3, model.markov_head.markov_rank)
+
+        with (
+            mock.patch.object(
+                model.markov_head,
+                "forward_teacher_forcing",
+                side_effect=capture_teacher_forcing,
+            ),
+            mock.patch.object(
+                model.markov_head,
+                "project_logits",
+                return_value=student_logits,
+            ),
+        ):
+            output = wrapper.compute_supervised_loss(hidden, batch, target_logits)
+
+        expected_ce = torch.nn.functional.cross_entropy(student_logits, target_top1)
+        expected_base_ce = torch.nn.functional.cross_entropy(
+            wrapper.lm_head(hidden.reshape(-1, hidden.size(-1))), target_top1
+        )
+        true_label_ce = torch.nn.functional.cross_entropy(
+            student_logits, data_labels.reshape(-1)
+        )
+        self.assertTrue(torch.allclose(output.final_ce_loss, expected_ce))
+        self.assertTrue(torch.allclose(output.base_ce_loss, expected_base_ce))
+        self.assertFalse(torch.allclose(output.final_ce_loss, true_label_ce))
+        self.assertTrue(torch.equal(captured["prev_token_ids"], data_prev_tokens))
+        self.assertEqual(output.accuracy.item(), 1.0)
+        self.assertEqual(output.prefix_acc.item(), 4.0)
+
+    def test_supervised_ce_defaults_to_data_labels_for_teacher_training(self):
+        model = make_model(markov_output_mode="direct")
+        wrapper = OnlineFlashMTPModel(
+            draft_model=model,
+            target_lm_head=nn.Linear(16, 31, bias=False),
+            target_embed_tokens=nn.Embedding(31, 16),
+            mask_token_id=30,
+            block_size=4,
+            final_ce_weight=1.0,
+            tv_loss_weight=0.0,
+        )
+        data_labels = torch.tensor([[[3, 4, 5]]])
+        batch = PreparedFlashMTPBatch(
+            anchor_positions=torch.tensor([[2]]),
+            block_keep_mask=torch.tensor([[True]]),
+            target_hidden=torch.empty(1, 1, 2, 16),
+            shared_fused_history=None,
+            query_embeddings=torch.empty(1, 1, 6, 16),
+            token_keep_mask=torch.ones(1, 1, 3, dtype=torch.bool),
+            token_position_ids=torch.tensor([[[0, 1, 2]]]),
+            labels=data_labels,
+            prev_token_ids=torch.tensor([[[2, 3, 4]]]),
+            raw_weight_mask=torch.ones(1, 1, 3),
+            binary_eval_mask=torch.ones(1, 1, 3, dtype=torch.bool),
+            initial_prev_token_ids=None,
+        )
+        target_logits = torch.zeros(1, 1, 3, 31)
+        target_logits[0, 0, torch.arange(3), torch.tensor([6, 7, 8])] = 10.0
+        student_logits = torch.zeros(3, 31)
+        student_logits[torch.arange(3), data_labels.reshape(-1)] = 2.0
+
+        with (
+            mock.patch.object(
+                model.markov_head,
+                "forward_teacher_forcing",
+                return_value=torch.zeros(1, 1, 3, model.markov_head.markov_rank),
+            ),
+            mock.patch.object(
+                model.markov_head,
+                "project_logits",
+                return_value=student_logits,
+            ),
+        ):
+            output = wrapper.compute_supervised_loss(
+                torch.zeros(1, 1, 3, 16), batch, target_logits
+            )
+
+        expected = torch.nn.functional.cross_entropy(
+            student_logits, data_labels.reshape(-1)
+        )
+        self.assertTrue(torch.allclose(output.final_ce_loss, expected))
+        self.assertEqual(output.accuracy.item(), 1.0)
+
     def test_masked_nan_block_does_not_contaminate_supervised_loss(self):
         model = make_model()
         head = nn.Linear(16, 31, bias=False)
@@ -564,7 +692,7 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
             if parameter.grad is not None:
                 self.assertTrue(torch.isfinite(parameter.grad).all())
 
-    def test_illegal_supervised_label_is_rejected(self):
+    def test_target_top1_outside_draft_vocabulary_is_rejected(self):
         model = make_model()
         wrapper = OnlineFlashMTPModel(
             draft_model=model,
@@ -572,6 +700,9 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
             target_embed_tokens=nn.Embedding(31, 16),
             mask_token_id=30,
             block_size=4,
+            final_ce_weight=1.0,
+            tv_loss_weight=0.0,
+            use_target_greedy_ce_labels=True,
         )
         weights = torch.ones(1, 1, 3)
         batch = PreparedFlashMTPBatch(
@@ -582,16 +713,20 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
             query_embeddings=torch.empty(1, 1, 6, 16),
             token_keep_mask=torch.ones(1, 1, 3, dtype=torch.bool),
             token_position_ids=torch.zeros(1, 1, 3, dtype=torch.long),
-            labels=torch.tensor([[[31, 1, 2]]]),
+            labels=torch.tensor([[[1, 2, 3]]]),
             prev_token_ids=torch.zeros(1, 1, 3, dtype=torch.long),
             raw_weight_mask=weights,
             binary_eval_mask=weights.bool(),
             initial_prev_token_ids=None,
         )
 
-        with self.assertRaisesRegex(ValueError, "within the output vocabulary"):
+        target_logits = torch.zeros(1, 1, 3, 32)
+        target_logits[..., 31] = 1.0
+        with self.assertRaisesRegex(
+            ValueError, "Target-prefill greedy labels must be within"
+        ):
             wrapper.compute_supervised_loss(
-                torch.randn(1, 1, 3, 16), batch, torch.randn(1, 1, 3, 31)
+                torch.randn(1, 1, 3, 16), batch, target_logits
             )
 
     def test_empty_supervision_is_rejected(self):
@@ -629,7 +764,7 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
         teacher = torch.randn(1, 2, 3, 16, requires_grad=True)
         student_logits = torch.randn(6, 31, requires_grad=True)
         teacher_logits = torch.randn(6, 31, requires_grad=True)
-        loss, _, _, _ = compute_stage1_distillation_loss(
+        loss, _, _, _, _ = compute_stage1_distillation_loss(
             student_hidden=student,
             teacher_hidden=teacher,
             student_serial_logits=student_logits,
@@ -638,6 +773,7 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
             labels=torch.zeros(1, 2, 3, dtype=torch.long),
             kl_weight=1.0,
             hidden_weight=1.0,
+            ce_weight=0.0,
             smooth_l1_beta=1.0,
             loss_decay_gamma=2.0,
         )
@@ -652,7 +788,7 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
         teacher = torch.randn_like(student)
         logits = torch.randn(3, 31)
 
-        loss, kl_loss, hidden_loss, _ = compute_stage1_distillation_loss(
+        loss, kl_loss, hidden_loss, ce_loss, _ = compute_stage1_distillation_loss(
             student_hidden=student,
             teacher_hidden=teacher,
             student_serial_logits=logits.clone().requires_grad_(),
@@ -661,6 +797,7 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
             labels=torch.zeros(1, 1, 3, dtype=torch.long),
             kl_weight=2.0,
             hidden_weight=0.0,
+            ce_weight=0.0,
             smooth_l1_beta=1.0,
             loss_decay_gamma=None,
         )
@@ -668,6 +805,38 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
         self.assertAlmostEqual(kl_loss.item(), 0.0, places=6)
         self.assertAlmostEqual(loss.item(), 0.0, places=6)
         self.assertEqual(hidden_loss.item(), 0.0)
+        self.assertEqual(ce_loss.item(), 0.0)
+
+    def test_stage1_ce_uses_true_label_instead_of_teacher_top1(self):
+        student_logits = torch.tensor([[3.0, 0.0, 0.0]], requires_grad=True)
+        teacher_logits = torch.tensor([[4.0, 0.0, 0.0]])
+        labels = torch.tensor([[[1]]])
+        loss, kl_loss, hidden_loss, ce_loss, prefix_acc = (
+            compute_stage1_distillation_loss(
+                student_hidden=torch.zeros(1, 1, 1, 2),
+                teacher_hidden=torch.zeros(1, 1, 1, 2),
+                student_serial_logits=student_logits,
+                teacher_serial_logits=teacher_logits,
+                raw_weight_mask=torch.ones(1, 1, 1),
+                labels=labels,
+                kl_weight=0.0,
+                hidden_weight=0.0,
+                ce_weight=1.0,
+                smooth_l1_beta=1.0,
+                loss_decay_gamma=None,
+            )
+        )
+
+        expected = torch.nn.functional.cross_entropy(
+            student_logits, labels.reshape(-1)
+        )
+        self.assertTrue(torch.allclose(loss, expected))
+        self.assertTrue(torch.allclose(ce_loss, expected))
+        self.assertGreater(kl_loss.item(), 0.0)
+        self.assertEqual(hidden_loss.item(), 0.0)
+        self.assertEqual(prefix_acc.item(), 1.0)
+        loss.backward()
+        self.assertIsNotNone(student_logits.grad)
 
     def test_frozen_direct_serial_head_backpropagates_only_to_hidden(self):
         model = make_model(
@@ -717,7 +886,7 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
         student_logits = torch.randn(3, 31, requires_grad=True)
         teacher_logits = torch.randn(3, 31, requires_grad=True)
 
-        loss, kl_loss, hidden_loss, _ = compute_stage1_distillation_loss(
+        loss, kl_loss, hidden_loss, ce_loss, _ = compute_stage1_distillation_loss(
             student_hidden=student,
             teacher_hidden=teacher,
             student_serial_logits=student_logits,
@@ -726,6 +895,7 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
             labels=torch.zeros(1, 2, 3, dtype=torch.long),
             kl_weight=1.0,
             hidden_weight=1.0,
+            ce_weight=1.0,
             smooth_l1_beta=1.0,
             loss_decay_gamma=2.0,
         )
@@ -733,6 +903,7 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertTrue(torch.isfinite(kl_loss))
         self.assertTrue(torch.isfinite(hidden_loss))
+        self.assertTrue(torch.isfinite(ce_loss))
         loss.backward()
         self.assertTrue(torch.isfinite(student.grad).all())
         self.assertTrue(torch.isfinite(student_logits.grad).all())
@@ -754,7 +925,7 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
             "specforge.core.flashmtp.F.smooth_l1_loss",
             side_effect=AssertionError("SmoothL1 should be skipped"),
         ):
-            loss, kl_loss, hidden_loss, prefix_acc = (
+            loss, kl_loss, hidden_loss, ce_loss, prefix_acc = (
                 compute_stage1_distillation_loss(
                     student_hidden=student,
                     teacher_hidden=teacher,
@@ -764,6 +935,7 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
                     labels=labels,
                     kl_weight=1.0,
                     hidden_weight=0.0,
+                    ce_weight=0.0,
                     smooth_l1_beta=1.0,
                     loss_decay_gamma=None,
                 )
@@ -771,6 +943,7 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(loss, kl_loss))
         self.assertEqual(hidden_loss.item(), 0.0)
+        self.assertEqual(ce_loss.item(), 0.0)
         self.assertEqual(prefix_acc.item(), 2.5)
         loss.backward()
         self.assertIsNone(student.grad)
@@ -859,7 +1032,7 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
             initial_prev_token_ids=torch.tensor([[1]]),
         )
         student_logits = wrapper.compute_serial_logits(hidden, batch)
-        loss, _, _, _ = compute_stage1_distillation_loss(
+        loss, _, _, _, _ = compute_stage1_distillation_loss(
             student_hidden=hidden,
             teacher_hidden=torch.randn_like(hidden),
             student_serial_logits=student_logits,
@@ -868,6 +1041,7 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
             labels=batch.labels,
             kl_weight=1.0,
             hidden_weight=0.0,
+            ce_weight=0.0,
             smooth_l1_beta=1.0,
             loss_decay_gamma=None,
         )

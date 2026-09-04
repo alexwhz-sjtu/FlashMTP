@@ -266,6 +266,7 @@ class OnlineFlashMTPModel(nn.Module):
         base_lm_ce_weight: float = 0.0,
         base_lm_ce_decay_gamma: Optional[float] = None,
         markov_teacher_forcing_ratio: float = 1.0,
+        use_target_greedy_ce_labels: bool = False,
     ) -> None:
         super().__init__()
         if attention_backend != "flex_attention":
@@ -298,6 +299,7 @@ class OnlineFlashMTPModel(nn.Module):
         self.markov_teacher_forcing_ratio = float(markov_teacher_forcing_ratio)
         if not 0.0 <= self.markov_teacher_forcing_ratio <= 1.0:
             raise ValueError("markov_teacher_forcing_ratio must be in [0, 1].")
+        self.use_target_greedy_ce_labels = bool(use_target_greedy_ce_labels)
 
     def sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor
@@ -532,7 +534,12 @@ class OnlineFlashMTPModel(nn.Module):
         batch: PreparedFlashMTPBatch,
         target_prefill_logits: torch.Tensor,
     ) -> FlashMTPLossOutput:
-        """Compute each active full-vocabulary tensor exactly once in FP32."""
+        """Compute supervised loss and its full-vocabulary projections.
+
+        With ``use_target_greedy_ce_labels``, CE uses the target model's greedy
+        prefill tokens while the serial head remains teacher-forced with tokens
+        from the training sequence (``batch.prev_token_ids``).
+        """
         active_positions = batch.binary_eval_mask.bool()
         if not active_positions.any():
             raise ValueError("FlashMTP loss has no supervised label positions.")
@@ -565,7 +572,12 @@ class OnlineFlashMTPModel(nn.Module):
             batch.raw_weight_mask, self.base_lm_ce_decay_gamma
         )
         active_hidden = prediction_hidden[active_positions]
-        active_labels = batch.labels[active_positions]
+        active_target_logits = target_prefill_logits[active_positions]
+        active_ce_labels = (
+            active_target_logits.argmax(dim=-1)
+            if self.use_target_greedy_ce_labels
+            else batch.labels[active_positions]
+        )
         active_final_weights = final_weights[active_positions].float()
         active_base_weights = base_weights[active_positions].float()
         markov_head = self.draft_model.markov_head
@@ -601,29 +613,33 @@ class OnlineFlashMTPModel(nn.Module):
                 if markov_output_uses_base_lm_head(output_mode)
                 else head_logits
             )
-        if (active_labels < 0).any() or (
-            active_labels >= final_logits.size(-1)
+        if (active_ce_labels < 0).any() or (
+            active_ce_labels >= final_logits.size(-1)
         ).any():
+            label_source = (
+                "Target-prefill greedy labels"
+                if self.use_target_greedy_ce_labels
+                else "Supervised labels"
+            )
             raise ValueError(
-                "Supervised labels must be within the output vocabulary: "
-                f"min={int(active_labels.min().item())}, "
-                f"max={int(active_labels.max().item())}, "
+                f"{label_source} must be within the output vocabulary: "
+                f"min={int(active_ce_labels.min().item())}, "
+                f"max={int(active_ce_labels.max().item())}, "
                 f"vocab_size={final_logits.size(-1)}."
             )
         final_ce_values = F.cross_entropy(
-            final_logits.float(), active_labels, reduction="none"
+            final_logits.float(), active_ce_labels, reduction="none"
         )
         final_ce = self._weighted_mean(final_ce_values, active_final_weights)
         if self.base_lm_ce_weight > 0:
             assert base_logits is not None
             base_ce_values = F.cross_entropy(
-                base_logits.float(), active_labels, reduction="none"
+                base_logits.float(), active_ce_labels, reduction="none"
             )
             base_ce = self._weighted_mean(base_ce_values, active_base_weights)
         else:
             base_ce = prediction_hidden.new_zeros((), dtype=torch.float32)
         if self.tv_loss_weight > 0:
-            active_target_logits = target_prefill_logits[active_positions]
             if active_target_logits.size(-1) < final_logits.size(-1):
                 active_target_logits = F.pad(
                     active_target_logits,
@@ -646,11 +662,13 @@ class OnlineFlashMTPModel(nn.Module):
         with torch.no_grad():
             predictions = torch.zeros_like(batch.labels)
             predictions[active_positions] = final_logits.argmax(dim=-1)
+            ce_labels = torch.zeros_like(batch.labels)
+            ce_labels[active_positions] = active_ce_labels
             valid = batch.binary_eval_mask
             accuracy = fsdp_global_weighted_mean(
-                ((predictions == batch.labels) & valid).sum().float(), valid.sum()
+                ((predictions == ce_labels) & valid).sum().float(), valid.sum()
             )
-            correct = (predictions == batch.labels) & valid
+            correct = (predictions == ce_labels) & valid
             prefix = correct.cumprod(dim=-1).sum(dim=-1).float() + 1.0
             valid_blocks = batch.block_keep_mask & valid.any(dim=-1)
             prefix_acc = fsdp_global_weighted_mean(
@@ -799,10 +817,11 @@ def compute_stage1_distillation_loss(
     labels: torch.Tensor,
     kl_weight: float,
     hidden_weight: float,
+    ce_weight: float,
     smooth_l1_beta: float,
     loss_decay_gamma: Optional[float],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return forward-KL, hidden loss, and serial-head prefix accuracy."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return Stage-1 loss terms and serial-head true-label prefix accuracy."""
     offsets = torch.arange(raw_weight_mask.size(-1), device=raw_weight_mask.device)
     decay = (
         torch.ones_like(offsets, dtype=torch.float32)
@@ -852,6 +871,23 @@ def compute_stage1_distillation_loss(
         hidden_loss = (hidden_values * active_weights).sum() * global_scale
     else:
         hidden_loss = student_hidden.new_zeros((), dtype=torch.float32)
+    if float(ce_weight) > 0:
+        active_labels = labels[active_positions]
+        if (active_labels < 0).any() or (
+            active_labels >= student_serial_logits.size(-1)
+        ).any():
+            raise ValueError(
+                "Stage-1 true labels must be within the student vocabulary: "
+                f"min={int(active_labels.min().item())}, "
+                f"max={int(active_labels.max().item())}, "
+                f"vocab_size={student_serial_logits.size(-1)}."
+            )
+        ce_values = F.cross_entropy(
+            student_serial_logits.float(), active_labels, reduction="none"
+        )
+        ce_loss = (ce_values * active_weights).sum() * global_scale
+    else:
+        ce_loss = student_serial_logits.new_zeros((), dtype=torch.float32)
     with torch.no_grad():
         predictions = torch.zeros_like(labels)
         predictions[active_positions] = student_serial_logits.argmax(dim=-1)
@@ -863,9 +899,12 @@ def compute_stage1_distillation_loss(
             prefix[valid_blocks].sum(), valid_blocks.sum()
         )
     return (
-        float(kl_weight) * kl_loss + float(hidden_weight) * hidden_loss,
+        float(kl_weight) * kl_loss
+        + float(hidden_weight) * hidden_loss
+        + float(ce_weight) * ce_loss,
         kl_loss,
         hidden_loss,
+        ce_loss,
         prefix_acc,
     )
 

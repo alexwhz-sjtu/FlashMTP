@@ -56,8 +56,9 @@ Python 入口默认 `STUDENT_INIT_MODE=scratch`，两阶段 shell 启动器默�
 teacher 复制并行 backbone、CHS 编码和相关 norm，但不复制历史融合模块
 或串行 head。Stage 1 只更新 student 并行 backbone、CHS 编码和相关 norm，以 teacher hidden
 的 LM-head TV 距离及 SmoothL1 蒸馏。Stage 2 在 full-param 上下文中只继承 teacher
-串行 head，随后释放 teacher，用 label 的 final CE、target TV 和 base CE 训练完整
-student。两阶段分别创建 optimizer 和 cosine/warmup scheduler。
+串行 head，随后释放 teacher，用 target prefill greedy top-1 作为 final CE/base CE
+的 label，并结合 target TV 训练完整 student；串行 head 的 teacher forcing 仍使用
+训练数据中的原始 token。两阶段分别创建 optimizer 和 cosine/warmup scheduler。
 
 若 student draft 比 teacher 浅，可设置 `STUDENT_INIT_MODE=shared_partial` 和
 `STUDENT_NUM_DRAFT_LAYERS=N`。该模式要求 teacher 层数严格大于 student，按首尾
@@ -102,8 +103,9 @@ bash scripts/run_training_flashmtp_two_stage.sh
 ## Logits 数据流
 
 Target 对每批数据只 prefill 一次。监督训练直接从完整 prefill logits gather
-`a...a+B-2`，随后释放完整 logits；不会从 final hidden 再调用 LM head，也没有
-logits chunk 或 gradient checkpoint 分支。Stage 1 不保留 target logits。
+`a...a+B-2`，取 greedy top-1 作为 Stage 2 CE label，随后释放完整 logits；不会从
+final hidden 再调用 LM head，也没有 logits chunk 或 gradient checkpoint 分支。
+Stage 1 不保留 target logits。
 
 ## 测试与安装
 
