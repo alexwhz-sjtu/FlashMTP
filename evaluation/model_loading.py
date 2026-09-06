@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 from loguru import logger
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
 
@@ -147,6 +147,52 @@ def has_flash_attention() -> bool:
         return False
 
 
+def load_decode_config(model_path: str, args: argparse.Namespace):
+    """Load a model config with an optional runtime long-context RoPE override."""
+    rope_type = getattr(args, "rope_scaling", None)
+    if not rope_type or rope_type == "none":
+        config = AutoConfig.from_pretrained(
+            model_path,
+            trust_remote_code=getattr(args, "trust_remote_code", False),
+        )
+        context_limit = getattr(args, "context_limit", None)
+        if context_limit is not None:
+            config.max_position_embeddings = int(context_limit)
+            logger.info(
+                "Using default RoPE with runtime context capacity {} for {}",
+                context_limit,
+                model_path,
+            )
+        return config
+
+    factor = float(getattr(args, "rope_factor", 1.0))
+    original_max = int(
+        getattr(args, "original_max_position_embeddings", None) or 40960
+    )
+    if factor < 1.0:
+        raise ValueError(f"rope_factor must be >= 1, got {factor}")
+    extended_max = int(original_max * factor)
+    rope_scaling = {
+        "rope_type": str(rope_type),
+        "factor": factor,
+        "original_max_position_embeddings": original_max,
+    }
+    logger.info(
+        "Applying runtime RoPE scaling to {}: type={} factor={} original_max={} extended_max={}",
+        model_path,
+        rope_type,
+        factor,
+        original_max,
+        extended_max,
+    )
+    return AutoConfig.from_pretrained(
+        model_path,
+        max_position_embeddings=extended_max,
+        rope_scaling=rope_scaling,
+        trust_remote_code=getattr(args, "trust_remote_code", False),
+    )
+
+
 def load_flashmtp_benchmark_models(
     args: argparse.Namespace,
     device: torch.device,
@@ -154,8 +200,12 @@ def load_flashmtp_benchmark_models(
     installed_flash_attn = has_flash_attention()
     attn_impl = "flash_attention_2" if installed_flash_attn else "sdpa"
 
+    target_config = load_decode_config(args.model_name_or_path, args)
+    draft_config = load_decode_config(args.draft_name_or_path, args)
+
     target = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
+        config=target_config,
         attn_implementation=attn_impl,
         dtype=torch.bfloat16,
         trust_remote_code=getattr(args, "trust_remote_code", False),
@@ -163,6 +213,7 @@ def load_flashmtp_benchmark_models(
 
     draft_model = FlashMTPDraftModel.from_pretrained(
         args.draft_name_or_path,
+        config=draft_config,
         attn_implementation=attn_impl,
         dtype=torch.bfloat16,
         trust_remote_code=getattr(args, "trust_remote_code", False),

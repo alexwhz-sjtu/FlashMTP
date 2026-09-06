@@ -422,6 +422,24 @@ def load_benchmark_dataset(
                     continue
 
                 data = json.loads(line)
+                if isinstance(data.get("raw_prompt"), str):
+                    if not data["raw_prompt"]:
+                        raise ValueError(
+                            f"Empty 'raw_prompt' in {dataset_path} at line {line_number}"
+                        )
+                    raw_instance = dict(data)
+                    raw_instance.setdefault(
+                        "turns", ["raw_prompt is encoded directly"]
+                    )
+                    instances.append(raw_instance)
+                    continue
+                if isinstance(data.get("text"), str) and (
+                    dataset_path.stem.lower().startswith("swe_bench")
+                    or Path(original_dataset_name).stem.lower().startswith("swe_bench")
+                    or "instance_id" in data
+                ):
+                    instances.append({"turns": [data["text"]]})
+                    continue
                 if "input" not in data:
                     raise ValueError(
                         f"Missing 'input' field in {dataset_path} at line {line_number}"
@@ -935,9 +953,27 @@ def main() -> None:
                 user_content = turn_q if turn_index == 0 else f"{prev_assistant}\n\n{turn_q}"
             else:
                 user_content = turn_q
-            messages.append({"role": "user", "content": user_content})
-            input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-            input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
+            raw_prompt = instance.get("raw_prompt")
+            if raw_prompt is not None:
+                if turn_index != 0:
+                    raise ValueError("raw_prompt datasets must contain exactly one turn")
+                input_text = raw_prompt
+                input_ids = tokenizer.encode(
+                    input_text,
+                    return_tensors="pt",
+                    add_special_tokens=False,
+                ).to(target.device)
+            else:
+                messages.append({"role": "user", "content": user_content})
+                input_text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+                input_ids = tokenizer.encode(
+                    input_text, return_tensors="pt", add_special_tokens=False
+                ).to(target.device)
             if args.batch_size > 1:
                 input_ids = input_ids.expand(args.batch_size, -1).contiguous()
             category_suffix = f" | category={sample_category}" if sample_category else ""

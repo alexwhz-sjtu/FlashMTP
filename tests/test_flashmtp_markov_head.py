@@ -12,6 +12,7 @@ from specforge.core.flashmtp import (
     OnlineFlashMTPModel,
     create_flashmtp_block_mask,
     gather_sliding_history,
+    prepare_target_prediction_labels,
     prepare_target_prediction_logits,
 )
 from specforge.modeling.draft.flashmtp import (
@@ -339,6 +340,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         self.assertEqual(tuple(packed.shape), (1, 8, 16))
 
         output_hidden = torch.arange(7 * 16, dtype=torch.float32).view(1, 7, 16)
+        target_prediction_labels = torch.tensor([[[20, 21, 22]]])
         fake_result = tuple(torch.zeros(()) for _ in range(6))
         with (
             mock.patch.object(
@@ -363,6 +365,7 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
                 history_hidden_states=packed,
                 history_start_positions=starts,
                 history_source_lengths=lengths,
+                target_prediction_labels=target_prediction_labels,
             )
 
         draft_call = draft_forward_mock.call_args.kwargs
@@ -391,6 +394,10 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
                 call["prediction_hidden"], output_hidden[:, 4:].view(1, 1, 3, 16)
             )
         )
+        self.assertTrue(
+            torch.equal(call["prev_token_ids"], torch.tensor([[[3, 4, 5]]]))
+        )
+        self.assertTrue(torch.equal(call["labels"], target_prediction_labels))
 
     def test_pivot_q_masks_padded_window_queries_as_kv(self) -> None:
         with mock.patch(
@@ -632,6 +639,28 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
             expected_positions.unsqueeze(-1).expand(-1, -1, -1, 3),
         )
         self.assertTrue(torch.equal(gathered, expected))
+
+    def test_target_prediction_labels_are_greedy_at_causal_positions(self) -> None:
+        target_logits = torch.full((2, 8, 11), -10.0)
+        greedy_tokens = torch.tensor(
+            [[0, 1, 2, 3, 4, 5, 6, 7], [8, 7, 6, 5, 4, 3, 2, 1]]
+        )
+        target_logits.scatter_(2, greedy_tokens.unsqueeze(-1), 10.0)
+        anchors = torch.tensor([[1, 3], [2, 4]])
+
+        labels = prepare_target_prediction_labels(
+            target_logits=target_logits,
+            anchor_positions=anchors,
+            block_size=4,
+        )
+
+        expected_positions = anchors.unsqueeze(-1) + torch.arange(3)
+        expected = torch.gather(
+            greedy_tokens.unsqueeze(1).expand(-1, 2, -1),
+            2,
+            expected_positions,
+        )
+        self.assertTrue(torch.equal(labels, expected))
 
     def _assert_teacher_forcing_matches_serial(
         self, head_type: str, output_mode: str

@@ -120,6 +120,50 @@ def prepare_target_prediction_logits(
     )
 
 
+def prepare_target_prediction_labels(
+    target_logits: torch.Tensor,
+    anchor_positions: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Gather target-greedy token labels for prediction slots 1..block_size-1.
+
+    A logit at sequence position ``p`` predicts the token at ``p + 1``.  For
+    an anchor at ``a``, the draft prediction slots therefore use target logits
+    at ``a .. a + block_size - 2``.  Reduce the vocabulary dimension before
+    gathering so CE-only training does not materialize an ``(B, N, K, V)``
+    tensor.
+    """
+    if block_size <= 1:
+        raise ValueError(f"block_size must be greater than 1, got {block_size}")
+    if target_logits.ndim != 3:
+        raise ValueError(
+            "target_logits must have shape (B,T,V), got "
+            f"{tuple(target_logits.shape)}."
+        )
+    if (
+        anchor_positions.ndim != 2
+        or anchor_positions.size(0) != target_logits.size(0)
+    ):
+        raise ValueError(
+            "anchor_positions must have shape (B,N) with the same batch size "
+            f"as target_logits, got {tuple(anchor_positions.shape)} and "
+            f"{tuple(target_logits.shape)}."
+        )
+
+    prediction_length = block_size - 1
+    offsets = torch.arange(prediction_length, device=anchor_positions.device).view(
+        1, 1, -1
+    )
+    target_positions = anchor_positions.unsqueeze(-1) + offsets
+    safe_positions = target_positions.clamp(max=target_logits.size(1) - 1)
+    target_greedy_ids = target_logits.argmax(dim=-1)
+    return torch.gather(
+        target_greedy_ids.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
+        dim=2,
+        index=safe_positions,
+    )
+
+
 def pack_history_token_embeddings(
     input_ids: torch.Tensor,
     loss_mask: torch.Tensor,
@@ -494,9 +538,10 @@ class OnlineFlashMTPModel(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
         Optional[torch.Tensor],
     ]:
-        """Sample anchors and gather teacher pivots/distribution states."""
+        """Sample anchors and gather teacher pivots, greedy labels, and distributions."""
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
@@ -516,10 +561,15 @@ class OnlineFlashMTPModel(nn.Module):
             input_ids,
             loss_mask,
         )
+        if target_logits is None:
+            raise ValueError("target_logits is required to build target-greedy CE labels.")
+        target_prediction_labels = prepare_target_prediction_labels(
+            target_logits,
+            anchor_positions,
+            self.block_size,
+        )
         target_prediction_logits = None
         if self.tv_loss_weight != 0.0 and self.draft_model.markov_head is not None:
-            if target_logits is None:
-                raise ValueError("target_logits is required when TV loss is enabled.")
             target_prediction_logits = prepare_target_prediction_logits(
                 target_logits,
                 anchor_positions,
@@ -532,6 +582,7 @@ class OnlineFlashMTPModel(nn.Module):
             history_hidden_states,
             history_start_positions,
             history_source_lengths,
+            target_prediction_labels,
             target_prediction_logits,
         )
 
@@ -886,6 +937,7 @@ class OnlineFlashMTPModel(nn.Module):
         history_hidden_states: Optional[torch.Tensor] = None,
         history_start_positions: Optional[torch.Tensor] = None,
         history_source_lengths: Optional[torch.Tensor] = None,
+        target_prediction_labels: Optional[torch.Tensor] = None,
         target_prediction_logits: Optional[torch.Tensor] = None,
         target_logits: Optional[torch.Tensor] = None,
     ) -> Tuple[
@@ -922,15 +974,21 @@ class OnlineFlashMTPModel(nn.Module):
                 input_ids,
                 loss_mask,
             )
+            if target_logits is None:
+                raise ValueError(
+                    "target_logits is required to build target-greedy CE labels."
+                )
+            if target_prediction_labels is None:
+                target_prediction_labels = prepare_target_prediction_labels(
+                    target_logits,
+                    anchor_positions,
+                    self.block_size,
+                )
             if (
                 target_prediction_logits is None
                 and self.tv_loss_weight != 0.0
                 and self.draft_model.markov_head is not None
             ):
-                if target_logits is None:
-                    raise ValueError(
-                        "target_logits is required when TV loss is enabled."
-                    )
                 target_prediction_logits = prepare_target_prediction_logits(
                     target_logits,
                     anchor_positions,
@@ -945,6 +1003,20 @@ class OnlineFlashMTPModel(nn.Module):
         if history_start_positions is None or history_source_lengths is None:
             raise ValueError(
                 "history_start_positions and history_source_lengths are required."
+            )
+        if target_prediction_labels is None:
+            raise ValueError(
+                "target_prediction_labels is required when target tensors are precomputed."
+            )
+        expected_label_shape = (
+            bsz,
+            anchor_positions.size(1),
+            self.block_size - 1,
+        )
+        if tuple(target_prediction_labels.shape) != expected_label_shape:
+            raise ValueError(
+                "target_prediction_labels must have shape "
+                f"{expected_label_shape}, got {tuple(target_prediction_labels.shape)}."
             )
         target_hidden = self._prepend_token_embedding_chs(
             target_hidden, input_ids, anchor_positions
@@ -986,6 +1058,7 @@ class OnlineFlashMTPModel(nn.Module):
                     if target_prediction_logits is not None
                     else None
                 )
+                chunk_target_labels = target_prediction_labels[:, start:end]
                 result = self.forward(
                     input_ids=input_ids,
                     loss_mask=loss_mask,
@@ -995,6 +1068,7 @@ class OnlineFlashMTPModel(nn.Module):
                     history_hidden_states=history_hidden_states,
                     history_start_positions=history_start_positions,
                     history_source_lengths=history_source_lengths,
+                    target_prediction_labels=chunk_target_labels,
                     target_prediction_logits=chunk_target_prediction,
                 )
 
@@ -1113,8 +1187,11 @@ class OnlineFlashMTPModel(nn.Module):
         prediction_hidden = output_hidden_4d[
             :, :, self.draft_model.unsupervised_query_count :, :
         ]
-        prev_token_ids = target_ids[:, :, :-1]
-        labels = target_ids[:, :, 1:]
+        # Keep these sources intentionally separate: the serial head is
+        # teacher-forced with dataset tokens, while CE follows target-greedy
+        # predictions at the corresponding causal positions.
+        teacher_forcing_prev_token_ids = target_ids[:, :, :-1]
+        ce_labels = target_prediction_labels
         prediction_weight_mask = weight_mask[:, :, 1:]
         binary_eval_mask = prediction_weight_mask > 0
         initial_prev_token_ids = None
@@ -1152,8 +1229,8 @@ class OnlineFlashMTPModel(nn.Module):
         loss, accuracy, prefix_acc, final_ce_loss, base_ce_loss, tv_loss = (
             self._chunked_weighted_ce_and_metrics(
                 prediction_hidden=prediction_hidden,
-                prev_token_ids=prev_token_ids,
-                labels=labels,
+                prev_token_ids=teacher_forcing_prev_token_ids,
+                labels=ce_labels,
                 weight_mask=prediction_weight_mask,
                 binary_eval_mask=binary_eval_mask,
                 block_keep_mask=block_keep_mask,

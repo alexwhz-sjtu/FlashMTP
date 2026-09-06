@@ -1532,25 +1532,50 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
 
         past_key_values_target = DynamicCache()
 
-        # Prefill stage (not included in decode wall time)
-        output = target(
-            input_ids,
-            position_ids=position_ids[:, :num_input_tokens],
-            past_key_values=past_key_values_target,
-            use_cache=True,
-            logits_to_keep=1,
-            output_hidden_states=True,
-        )
+        # Prefill stage (not included in decode wall time). FlashMTP only needs
+        # the final token from selected target layers. Requesting all hidden
+        # states retains O(layers * sequence_length * hidden_size) memory and
+        # makes long-context YaRN prefill unnecessarily expensive. Clone the
+        # selected last-token slices in hooks so intermediate full-sequence
+        # tensors can be released as the target advances through its layers.
+        captured_pivot_hidden: dict[int, torch.Tensor] = {}
+        hook_handles = []
+        for layer_id in self.target_layer_ids:
+            def capture_last_token(_module, _inputs, layer_output, *, _layer_id=layer_id):
+                captured_pivot_hidden[_layer_id] = layer_output[:, -1:, :].clone()
+
+            hook_handles.append(
+                target.model.layers[layer_id].register_forward_hook(capture_last_token)
+            )
+        try:
+            output = target(
+                input_ids,
+                position_ids=position_ids[:, :num_input_tokens],
+                past_key_values=past_key_values_target,
+                use_cache=True,
+                logits_to_keep=1,
+                output_hidden_states=False,
+            )
+        finally:
+            for handle in hook_handles:
+                handle.remove()
 
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
             output.logits, temperature
         )
-        target_hidden = gather_pivot_multilayer_inference(
-            output.hidden_states,
-            self.target_layer_ids,
-            -1,
-            self.config.num_target_layers,
+        missing_layer_ids = [
+            layer_id
+            for layer_id in self.target_layer_ids
+            if layer_id not in captured_pivot_hidden
+        ]
+        if missing_layer_ids:
+            raise RuntimeError(
+                f"Failed to capture prefill pivot hidden states for layers {missing_layer_ids}"
+            )
+        target_hidden = torch.stack(
+            [captured_pivot_hidden[layer_id] for layer_id in self.target_layer_ids],
+            dim=2,
         )
         recent_condition_hidden = self.initialize_inference_condition(
             token_embeddings=target.model.embed_tokens(input_ids),

@@ -1038,6 +1038,7 @@ def main():
                     history_hidden_states,
                     history_start_positions,
                     history_source_lengths,
+                    target_prediction_labels,
                     target_prediction_logits,
                 ) = flashmtp_model.prepare_training_tensors(
                     input_ids, hidden_states, loss_mask, target_logits
@@ -1060,6 +1061,9 @@ def main():
                 history_source_lengths = get_tp_data_shard(
                     history_source_lengths
                 )
+                target_prediction_labels = get_tp_data_shard(
+                    target_prediction_labels
+                )
                 if target_prediction_logits is not None:
                     target_prediction_logits = get_tp_data_shard(
                         target_prediction_logits
@@ -1081,6 +1085,7 @@ def main():
                 history_hidden_states=history_hidden_states,
                 history_start_positions=history_start_positions,
                 history_source_lengths=history_source_lengths,
+                target_prediction_labels=target_prediction_labels,
                 target_prediction_logits=target_prediction_logits,
             )
             del (
@@ -1088,6 +1093,7 @@ def main():
                 history_hidden_states,
                 history_start_positions,
                 history_source_lengths,
+                target_prediction_labels,
                 target_prediction_logits,
                 anchor_positions,
                 block_keep_mask,
