@@ -76,8 +76,9 @@ def parse_args():
         choices=STUDENT_INIT_MODES,
         help=(
             "Fresh Stage 1 backbone initialization. 'scratch' randomly initializes "
-            "the parallel backbone; 'shared_init' copies the teacher's shared "
-            "parallel backbone; "
+            "the parallel backbone (optionally at --student-num-draft-layers); "
+            "'shared_init' copies the teacher's shared parallel backbone at the "
+            "same depth; "
             "'shared_partial' initializes a shallower student from evenly spaced "
             "teacher backbone layers. The serial head is inherited from the teacher "
             "in every mode. "
@@ -88,8 +89,10 @@ def parse_args():
         "--student-num-draft-layers",
         type=int,
         help=(
-            "Student backbone depth for a fresh shared_partial run. The teacher "
-            "must have more draft layers. Resume uses the checkpoint depth."
+            "Student backbone depth for a fresh scratch or shared_partial run. "
+            "scratch randomly initializes that many draft layers; shared_partial "
+            "requires a strictly deeper teacher and copies evenly spaced layers. "
+            "shared_init cannot change depth. Resume uses the checkpoint depth."
         ),
     )
     parser.add_argument("--stage1-epochs", type=int, required=True)
@@ -288,6 +291,34 @@ def _shared_backbone_inherited(student_init_mode: str) -> bool:
 def _non_depth_structure_signature(draft: FlashMTPDraftModel) -> tuple:
     signature = _structure_signature(draft)
     return signature[:4] + signature[5:]
+
+
+def _apply_requested_student_draft_depth(
+    student_config,
+    *,
+    teacher: FlashMTPDraftModel,
+    student_init_mode: str,
+    student_num_draft_layers: int | None,
+) -> None:
+    """Set student draft depth from --student-num-draft-layers when allowed."""
+    if student_num_draft_layers is None:
+        return
+    student_depth = int(student_num_draft_layers)
+    teacher_depth = len(teacher.layers)
+    if student_init_mode == "shared_init" and student_depth != teacher_depth:
+        raise ValueError(
+            "shared_init cannot change draft depth; omit "
+            "--student-num-draft-layers or set it equal to the teacher "
+            f"({teacher_depth}), got {student_depth}."
+        )
+    if student_init_mode == "shared_partial":
+        _evenly_spaced_teacher_layer_ids(teacher_depth, student_depth)
+    if student_init_mode in ("scratch", "shared_partial"):
+        student_config.num_hidden_layers = student_depth
+        print_on_rank0(
+            f"Using student draft depth {student_depth} "
+            f"(teacher has {teacher_depth}) with init mode {student_init_mode}"
+        )
 
 
 def _evenly_spaced_teacher_layer_ids(
@@ -529,7 +560,12 @@ def main():
             ).cuda()
             if not student.is_student:
                 raise ValueError("Stage 1 checkpoint must contain a pivot_q_student")
-            if student_init_mode == "shared_partial":
+            if student_init_mode == "shared_init":
+                if _structure_signature(student) != _structure_signature(teacher):
+                    raise ValueError(
+                        "Stage 1 student structure no longer matches the teacher"
+                    )
+            else:
                 if _non_depth_structure_signature(
                     student
                 ) != _non_depth_structure_signature(teacher):
@@ -537,13 +573,10 @@ def main():
                         "Stage 1 student structure except draft depth no longer "
                         "matches the teacher"
                     )
-                _evenly_spaced_teacher_layer_ids(
-                    len(teacher.layers), len(student.layers)
-                )
-            elif _structure_signature(student) != _structure_signature(teacher):
-                raise ValueError(
-                    "Stage 1 student structure no longer matches the teacher"
-                )
+                if student_init_mode == "shared_partial":
+                    _evenly_spaced_teacher_layer_ids(
+                        len(teacher.layers), len(student.layers)
+                    )
             if (
                 args.student_num_draft_layers is not None
                 and int(args.student_num_draft_layers) != len(student.layers)
@@ -556,13 +589,12 @@ def main():
             args.num_draft_layers = student.config.num_hidden_layers
         else:
             student_config = copy.deepcopy(teacher.config)
-            if student_init_mode == "shared_partial":
-                _evenly_spaced_teacher_layer_ids(
-                    len(teacher.layers), int(args.student_num_draft_layers)
-                )
-                student_config.num_hidden_layers = int(
-                    args.student_num_draft_layers
-                )
+            _apply_requested_student_draft_depth(
+                student_config,
+                teacher=teacher,
+                student_init_mode=student_init_mode,
+                student_num_draft_layers=args.student_num_draft_layers,
+            )
             student = build_draft_model(
                 args,
                 model_role="pivot_q_student",
@@ -1255,6 +1287,10 @@ def main():
                     "train/accuracy": metrics[9].item(),
                     "train/stage1_prefix_acc": metrics[10].item(),
                     "train/stage2_prefix_acc": metrics[11].item(),
+                    # Keep the main prefix-accuracy curve continuous: Stage 1
+                    # logs its prefix accuracy under this key, while the
+                    # transition and Stage 2 use the Stage 2 definition.
+                    "train/prefix_acc": metrics[11].item(),
                     "train/stage1_weight_scale": metrics[12].item(),
                     "train/stage2_weight_scale": metrics[13].item(),
                     "train/lr": optimizer.get_learning_rate(),

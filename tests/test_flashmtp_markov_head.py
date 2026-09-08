@@ -10,6 +10,7 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from scripts.train_flashmtp_two_stage import (
     SHARED_BACKBONE_MODULES,
+    _apply_requested_student_draft_depth,
     _copy_partial_shared_backbone,
     _copy_serial_head,
     _copy_shared_backbone,
@@ -1114,6 +1115,37 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
                 self.assertTrue(torch.all(parameter == 0.25))
         for name, value in student.markov_head.state_dict().items():
             self.assertTrue(torch.equal(value, serial_before[name]))
+
+    def test_scratch_student_num_draft_layers_overrides_teacher_depth(self):
+        teacher = make_model("swa_teacher", num_draft_layers=5)
+        student_config = copy.deepcopy(teacher.config)
+        _apply_requested_student_draft_depth(
+            student_config,
+            teacher=teacher,
+            student_init_mode="scratch",
+            student_num_draft_layers=3,
+        )
+        self.assertEqual(student_config.num_hidden_layers, 3)
+
+        unchanged = copy.deepcopy(teacher.config)
+        _apply_requested_student_draft_depth(
+            unchanged,
+            teacher=teacher,
+            student_init_mode="scratch",
+            student_num_draft_layers=None,
+        )
+        self.assertEqual(unchanged.num_hidden_layers, 5)
+
+    def test_shared_init_rejects_student_depth_override(self):
+        teacher = make_model("swa_teacher", num_draft_layers=5)
+        student_config = copy.deepcopy(teacher.config)
+        with self.assertRaisesRegex(ValueError, "shared_init cannot change draft depth"):
+            _apply_requested_student_draft_depth(
+                student_config,
+                teacher=teacher,
+                student_init_mode="shared_init",
+                student_num_draft_layers=3,
+            )
 
     def test_shared_partial_requires_deeper_teacher(self):
         with self.assertRaisesRegex(ValueError, "teacher draft depth"):

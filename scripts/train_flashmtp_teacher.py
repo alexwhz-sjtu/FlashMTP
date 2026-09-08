@@ -146,6 +146,7 @@ def main():
         base_lm_ce_weight=args.base_lm_ce_weight,
         base_lm_ce_decay_gamma=args.base_lm_ce_decay_gamma,
         markov_teacher_forcing_ratio=args.markov_teacher_forcing_ratio,
+        use_target_greedy_ce_labels=True,
     )
     fsdp = FSDP(
         online,

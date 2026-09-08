@@ -11,7 +11,9 @@ teacher_loss = FINAL_CE_WEIGHT * final_ce
 ```
 
 位置权重为 `exp(-offset/gamma)`，第一个预测位置 offset 为 0。Target prefill
-logits 在 anchor 采样后一次 gather，完整序列张量随即释放。
+logits 在 anchor 采样后一次 gather，完整序列张量随即释放。`final_ce` 和
+`base_ce` 的 label 是对应 target prefill logits 的 greedy top-1；TV loss 使用
+完整 target 概率分布。串行 head 的 teacher forcing 输入仍来自训练数据 token。
 
 ```bash
 cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2.3
@@ -77,11 +79,12 @@ shell 启动器沿用 v2 的集群默认值，优先读取 `PET_NNODES`、`PET_N
 `layer_depth_embedding` 和 `context_norm`；teacher-only 历史融合参数与
 串行 head 不在此时复制。模式会写入 checkpoint，恢复时自动沿用。
 
-`shared_partial` 用于 teacher draft backbone 更深的情况。Fresh 训练必须设置
-`STUDENT_NUM_DRAFT_LAYERS`（Python 参数为 `--student-num-draft-layers`），并要求
-teacher depth 严格大于 student depth。Student 层从 teacher 层按首尾对齐均匀
-抽取，例如 5 层 teacher 到 3 层 student 的映射为 `[0, 2, 4]`；其余共享 norm
-照常复制。Stage 2 的串行 head 仍直接继承 teacher，与 backbone 深度无关。
+`STUDENT_NUM_DRAFT_LAYERS`（Python 参数为 `--student-num-draft-layers`）可改变
+student draft 深度。`scratch` 按该层数随机初始化并行 backbone，不必浅于 teacher。
+`shared_partial` 的 fresh 训练必须设置该变量，并要求 teacher depth 严格大于
+student depth；student 层从 teacher 层按首尾对齐均匀抽取，例如 5 层 teacher 到
+3 层 student 的映射为 `[0, 2, 4]`，其余共享 norm 照常复制。`shared_init` 不能改
+深度。Stage 2 的串行 head 仍直接继承 teacher，与 backbone 深度无关。
 
 Stage 1：
 

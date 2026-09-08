@@ -127,6 +127,36 @@ class TwoStageLauncherTest(unittest.TestCase):
         self.assertIn("--student-init-mode shared_partial", completed.stdout)
         self.assertIn("--student-num-draft-layers 3", completed.stdout)
 
+    def test_scratch_forwards_student_depth_and_tags_output(self):
+        env = _base_env()
+        env.update(
+            STUDENT_INIT_MODE="scratch",
+            STUDENT_NUM_DRAFT_LAYERS="5",
+        )
+        for name in (
+            "OUTPUT_DIR",
+            "CACHE_DIR",
+            "REPORT_TO",
+            "WANDB_PROJECT",
+            "WANDB_NAME",
+            "WANDB_RUN_ID",
+        ):
+            env.pop(name, None)
+
+        completed = subprocess.run(
+            ["bash", str(LAUNCHER), "--dt", "qz"],
+            cwd=PROJECT_DIR,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+
+        self.assertIn("--student-init-mode scratch", completed.stdout)
+        self.assertIn("--student-num-draft-layers 5", completed.stdout)
+        self.assertIn("_iscratch_sd5_", completed.stdout)
+
     def test_fresh_shared_partial_requires_student_depth(self):
         env = _base_env()
         env["STUDENT_INIT_MODE"] = "shared_partial"
