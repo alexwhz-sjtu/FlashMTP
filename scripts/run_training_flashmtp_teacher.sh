@@ -5,13 +5,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
 cd "${PROJECT_DIR}"
 export PYTHONPATH="${PROJECT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
-NNODES="${NNODES:-1}"
-NODE_RANK="${NODE_RANK:-0}"
-MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-MASTER_PORT="${MASTER_PORT:-29501}"
+NPROC_PER_NODE="${PET_NPROC_PER_NODE:-${NPROC_PER_NODE:-8}}"
+NNODES="${PET_NNODES:-${NNODES:-1}}"
+NODE_RANK="${PET_NODE_RANK:-${NODE_RANK:-0}}"
+MASTER_ADDR="${MASTER_ADDR:-${PET_MASTER_ADDR:-127.0.0.1}}"
+MASTER_PORT="${MASTER_PORT:-${PET_MASTER_PORT:-29501}}"
+
+if [[ "${NNODES}" -gt 1 ]] && { [[ "${MASTER_ADDR}" == "127.0.0.1" ]] || [[ "${MASTER_ADDR}" == "localhost" ]]; }; then
+  echo "Error: multi-node training (NNODES=${NNODES}) requires MASTER_ADDR or PET_MASTER_ADDR to point to the rank-0 node." >&2
+  exit 1
+fi
+
+export MASTER_ADDR MASTER_PORT
+
+echo "Distributed launch: host=$(hostname), nnodes=${NNODES}, node_rank=${NODE_RANK}, nproc_per_node=${NPROC_PER_NODE}, master=${MASTER_ADDR}:${MASTER_PORT}"
 
 OPTIONAL_ARGS=()
 [[ -n "${LOSS_DECAY_GAMMA:-}" ]] && OPTIONAL_ARGS+=(--loss-decay-gamma "${LOSS_DECAY_GAMMA}")
@@ -19,6 +30,7 @@ OPTIONAL_ARGS=()
 [[ -n "${RESUME_FROM:-}" ]] && OPTIONAL_ARGS+=(--resume-from "${RESUME_FROM}")
 [[ -n "${INIT_FROM:-}" ]] && OPTIONAL_ARGS+=(--init-from "${INIT_FROM}")
 [[ -n "${CHAT_TEMPLATE:-}" ]] && OPTIONAL_ARGS+=(--chat-template "${CHAT_TEMPLATE}")
+[[ -n "${BUILD_DATASET_NUM_PROC:-}" ]] && OPTIONAL_ARGS+=(--build-dataset-num-proc "${BUILD_DATASET_NUM_PROC}")
 if [[ "${SHARD_DRAFT_BY_TP:-0}" == "1" ]]; then
   OPTIONAL_ARGS+=(--shard-draft-by-tp)
 else
