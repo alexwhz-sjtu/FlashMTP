@@ -3,11 +3,34 @@
 
 import argparse
 import logging
+import os
 import time
+
+# SGLang and FlexAttention lazily compile CUDA kernels. Give every torchrun
+# worker separate persistent caches so concurrent multi-node builds and
+# autotuning cannot corrupt or reuse another rank's intermediate artifacts.
+_project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_global_rank = os.environ.get("RANK", "0")
+
+
+def _configure_rank_cache(dir_env: str, root_env: str, default_name: str) -> None:
+    root = os.environ.get(root_env) or os.environ.get(dir_env)
+    if not root:
+        root = os.path.join(_project_dir, "cache", default_name)
+    os.environ[dir_env] = os.path.join(root, f"rank_{_global_rank}")
+
+
+_configure_rank_cache("TVM_FFI_CACHE_DIR", "TVM_FFI_CACHE_ROOT", "tvm-ffi")
+_configure_rank_cache(
+    "TORCHINDUCTOR_CACHE_DIR", "TORCHINDUCTOR_CACHE_ROOT", "torchinductor"
+)
+_configure_rank_cache("TRITON_CACHE_DIR", "TRITON_CACHE_ROOT", "triton")
 
 import torch
 import torch.distributed as dist
+from torch._inductor import config as inductor_config
 from accelerate.utils import set_seed
+from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     MixedPrecision,
@@ -35,6 +58,10 @@ from scripts.flashmtp_training import (
     stage_total_steps,
     validate_common_args,
     validate_tp_draft_sharding,
+)
+
+inductor_config.triton.autotune_pointwise = (
+    os.environ.get("FLASHMTP_POINTWISE_AUTOTUNE", "0") == "1"
 )
 
 
@@ -101,11 +128,20 @@ def _sync_args_from_checkpoint(args, draft: FlashMTPDraftModel) -> None:
     draft.config._attn_implementation = "flex_attention"
 
 
+@record
 def main():
     logging.basicConfig(level=logging.INFO)
     args = parse_args()
     set_seed(args.seed)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+    print(
+        f"[rank {dist.get_rank()}] JIT caches: "
+        f"tvm={os.environ['TVM_FFI_CACHE_DIR']}, "
+        f"inductor={os.environ['TORCHINDUCTOR_CACHE_DIR']}, "
+        f"triton={os.environ['TRITON_CACHE_DIR']}; "
+        f"pointwise_autotune={inductor_config.triton.autotune_pointwise}",
+        flush=True,
+    )
     tp_draft_rank = validate_tp_draft_sharding(args)
 
     resume_state = load_training_state(args.resume_from)
