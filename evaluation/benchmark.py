@@ -28,6 +28,26 @@ from evaluation.utils import load_and_process_dataset
 
 DATASET_PATH_FILE = Path(__file__).resolve().with_name("dataset_path.json")
 
+# Standard short-text benchmark sample counts.  ``--max-samples`` remains an
+# explicit override; these values are used when the flag is omitted.
+SHORT_TEXT_SAMPLE_COUNTS = {
+    "gsm8k": 128,
+    "math500": 128,
+    "aime25": 30,
+    "humaneval": 164,
+    "mbpp": 128,
+    "livecodebench": 128,
+    "mt-bench": 80,
+    "alpaca": 128,
+}
+DEFAULT_MAX_SAMPLES = 10
+
+
+def default_max_samples_for_dataset(dataset_name: str) -> int:
+    """Return the standard sample count for a benchmark dataset alias."""
+    normalized = dataset_name.strip().lower().replace("_", "-")
+    return SHORT_TEXT_SAMPLE_COUNTS.get(normalized, DEFAULT_MAX_SAMPLES)
+
 INFINITEBENCH_PROMPTS = {
     "passkey": "There is an important info hidden inside a lot of irrelevant text. Find it and memorize it. I will quiz you about the important information.\n\n{context}\n\n{input}\n\nThe pass key is",
     "number_string": "There is an important info hidden inside a lot of irrelevant text. Find it. I will quiz you about the important information there.\n\n{context}\n\n{input}\n\nThe sequence of digits is",
@@ -775,8 +795,14 @@ def main() -> None:
         action="store_true",
         help="For SpecBench, evaluate only turns[0] from each question and ignore later turns.",
     )
-    parser.add_argument("--max-samples", type=int, default=10)
-    parser.add_argument("--max-new-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Maximum prompts to sample. Default: the standard per-dataset "
+        "short-text count, or 10 for other datasets.",
+    )
+    parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
         "--stochastic-verification-mode",
@@ -824,6 +850,13 @@ def main() -> None:
         help="Pass trust_remote_code=True when loading target/draft/tokenizer.",
     )
     args = parser.parse_args()
+
+    if args.max_samples is None:
+        args.max_samples = default_max_samples_for_dataset(args.dataset)
+    if args.max_samples < 1:
+        parser.error("--max-samples must be at least 1")
+    if args.max_new_tokens < 1:
+        parser.error("--max-new-tokens must be at least 1")
 
     random.seed(0)
     np.random.seed(0)

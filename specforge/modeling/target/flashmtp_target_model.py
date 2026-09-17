@@ -73,7 +73,10 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         from sglang.srt.configs.model_config import ModelConfig
         from sglang.srt.server_args import ServerArgs
 
-        from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
+        from .sglang_backend import (
+            SGLangRunner,
+            wrap_eagle3_logits_processors_in_module,
+        )
 
         tp_size = dist.get_world_size(get_tp_group())
         dtype_arg = torch_dtype if torch_dtype is not None else "auto"
@@ -118,17 +121,123 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         """Set which layers' hidden states to capture.
 
         If layer_ids is None or empty, capture ALL layers (for FlashMTP mode).
-        Note: SGLang's set_eagle3_layers_to_capture adds +1 offset to layer indices.
+        SGLang's capture APIs add a +1 offset to HF-style layer indices. The
+        final layer is returned separately as ``last_hidden_states``.
         """
+        num_layers = getattr(self.model_runner.model_config, "num_hidden_layers", 36)
         if layer_ids is None or len(layer_ids) == 0:
             # Capture all layers: range [0, num_hidden_layers)
-            # SGLang will add +1 offset internally
-            num_layers = getattr(self.model_runner.model_config, "num_hidden_layers", 36)
             layer_ids = list(range(num_layers))
 
         super().set_capture_layers(layer_ids)
-        if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
-            self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
+        model = self.model_runner.model
+        if hasattr(model, "set_eagle3_layers_to_capture"):
+            model.set_eagle3_layers_to_capture(layer_ids)
+            return
+        if hasattr(model, "set_dflash_layers_to_capture"):
+            # Qwen3.5 currently exposes only the DFlash hook. Its wrapper
+            # indexes layer k+1 directly, so asking it to capture the final
+            # layer would index one past the ModuleList. The final normalized
+            # hidden state is already returned by our logits-processor wrapper.
+            aux_layer_ids = [
+                layer_id for layer_id in layer_ids if layer_id < num_layers - 1
+            ]
+            model.set_dflash_layers_to_capture(aux_layer_ids)
+            return
+        self._set_communicator_capture(model, layer_ids, num_layers)
+
+    @staticmethod
+    def _set_communicator_capture(
+        model: nn.Module, layer_ids: List[int], num_layers: int
+    ) -> None:
+        """Install a Qwen3.5 capture fallback for stock SGLang 0.5.9.
+
+        Some SGLang builds support Qwen3.5 inference but do not expose the
+        DFlash/EAGLE hidden-state hook. Qwen3.5 decoder layers still use
+        ``LayerCommunicator``; wrapping its ``prepare_attn`` method lets us
+        capture the materialized residual before layer ``k + 1``, equivalent
+        to the built-in DFlash hook in newer builds.
+        """
+
+        language_model = getattr(model, "model", None)
+        layers = getattr(language_model, "layers", None)
+        if layers is None or len(layers) != num_layers:
+            raise RuntimeError(
+                f"SGLang model {type(model).__name__} does not expose a supported "
+                "hidden-state capture hook or compatible decoder layers."
+            )
+
+        state = getattr(model, "_flashmtp_communicator_capture", None)
+        if state is None:
+            state = {"selected_next_layer_ids": set(), "hidden_states": []}
+            model._flashmtp_communicator_capture = state
+
+            for next_layer_id, layer in enumerate(layers):
+                communicator = getattr(layer, "layer_communicator", None)
+                original_prepare_attn = getattr(communicator, "prepare_attn", None)
+                communicate_simple = getattr(
+                    communicator, "_communicate_simple_fn", None
+                )
+                if original_prepare_attn is None or communicate_simple is None:
+                    raise RuntimeError(
+                        "SGLang Qwen3.5 decoder layer does not expose the expected "
+                        "LayerCommunicator interface."
+                    )
+
+                def prepare_attn_and_capture(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    *args,
+                    _next_layer_id=next_layer_id,
+                    _communicator=communicator,
+                    _original_prepare_attn=original_prepare_attn,
+                    **kwargs,
+                ):
+                    hidden_states, residual = _original_prepare_attn(
+                        hidden_states,
+                        residual,
+                        forward_batch,
+                        *args,
+                        **kwargs,
+                    )
+                    if _next_layer_id in state["selected_next_layer_ids"]:
+                        captured = _communicator._communicate_simple_fn(
+                            hidden_states=residual,
+                            forward_batch=forward_batch,
+                            context=_communicator._context,
+                        )
+                        if captured is residual:
+                            captured = residual.clone()
+                        state["hidden_states"].append(captured)
+                    return hidden_states, residual
+
+                communicator.prepare_attn = prepare_attn_and_capture
+
+            from .sglang_backend.utils import LogitsProcessorForEAGLE3
+
+            processors = [
+                module
+                for module in model.modules()
+                if isinstance(module, LogitsProcessorForEAGLE3)
+            ]
+            if not processors:
+                raise RuntimeError(
+                    "Could not attach Qwen3.5 hidden-state capture to the SGLang "
+                    "logits processor."
+                )
+
+            def take_hidden_states(state=state):
+                hidden_states = state["hidden_states"]
+                state["hidden_states"] = []
+                return hidden_states
+
+            for processor in processors:
+                processor.aux_hidden_states_provider = take_hidden_states
+
+        state["selected_next_layer_ids"] = {
+            layer_id + 1 for layer_id in layer_ids if layer_id < num_layers - 1
+        }
 
     @staticmethod
     def _unpack_runner_output(runner_output):
@@ -347,9 +456,7 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         batched_aux = torch.cat([h.unsqueeze(0) for h in hidden_states_list], dim=0)
         batched_last = None
         if last_hidden_list is not None:
-            batched_last = torch.cat(
-                [h.unsqueeze(0) for h in last_hidden_list], dim=0
-            )
+            batched_last = torch.cat([h.unsqueeze(0) for h in last_hidden_list], dim=0)
 
         hidden_size = self.model_runner.model_config.hidden_size
         num_transformer_layers = getattr(
@@ -367,17 +474,14 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
                 last_hidden=None,
                 num_layers=num_aux_layers,
             )
-            aux_capture_ids, last_capture_ids = (
-                self._split_aux_and_last_capture_ids(
-                    captured_ids,
-                    num_aux_layers,
-                    num_transformer_layers,
-                    batched_last is not None,
-                )
+            aux_capture_ids, last_capture_ids = self._split_aux_and_last_capture_ids(
+                captured_ids,
+                num_aux_layers,
+                num_transformer_layers,
+                batched_last is not None,
             )
-            if (
-                num_transformer_layers is not None
-                and (not captured_ids or len(captured_ids) < num_transformer_layers)
+            if num_transformer_layers is not None and (
+                not captured_ids or len(captured_ids) < num_transformer_layers
             ):
                 # Partial capture: map absolute layer id -> hidden tensor.
                 hidden_states = {

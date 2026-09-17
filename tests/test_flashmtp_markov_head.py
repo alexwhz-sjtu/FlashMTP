@@ -80,6 +80,29 @@ class FlashMTPMarkovHeadTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only supports pivot-Q"):
             FlashMTPDraftModel(config)
 
+    def test_explicit_target_layer_ids_override_even_selection(self) -> None:
+        config = Qwen3Config(
+            vocab_size=29,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 8
+        config.block_size = 4
+        config.flashmtp_config = {
+            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
+            "sliding_window_size": 4,
+            "chs_num_layers": 2,
+            "target_layer_ids": [3, 7],
+        }
+
+        model = FlashMTPDraftModel(config)
+
+        self.assertEqual(model.target_layer_ids, [3, 7])
+
     def test_gather_sliding_history_left_pads_short_windows(self) -> None:
         fused = torch.arange(6, dtype=torch.float32).view(1, 6, 1)
         anchors = torch.tensor([[1, 3, 5]])

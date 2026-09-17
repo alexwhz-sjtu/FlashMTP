@@ -3,7 +3,7 @@ This file contains the wrapper for the SGL model.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -135,6 +135,9 @@ class LogitsProcessorForEAGLE3(torch.nn.Module):
         self.logits_processor = logits_processor
         self.return_last_hidden_states = return_last_hidden_states
         self.return_logits = return_logits
+        self.aux_hidden_states_provider: Optional[
+            Callable[[], Optional[List[torch.Tensor]]]
+        ] = None
 
     def forward(
         self,
@@ -146,6 +149,8 @@ class LogitsProcessorForEAGLE3(torch.nn.Module):
         hidden_states_before_norm: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
         logits_metadata.forward_mode = ForwardMode.DECODE
+        if aux_hidden_states is None and self.aux_hidden_states_provider is not None:
+            aux_hidden_states = self.aux_hidden_states_provider()
         ret = replaced_logits_processor_forward_for_eagle3(
             self.logits_processor,
             input_ids,

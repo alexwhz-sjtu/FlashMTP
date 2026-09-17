@@ -11,6 +11,50 @@ from specforge.modeling.target.flashmtp_target_model import (
 
 
 class FlashMTPTargetModelCaptureTest(unittest.TestCase):
+    def test_qwen35_dflash_capture_hook_excludes_final_layer(self):
+        class FakeModel:
+            def __init__(self):
+                self.requested_layers = None
+
+            def set_dflash_layers_to_capture(self, layer_ids):
+                self.requested_layers = layer_ids
+
+        model = FakeModel()
+        runner = SimpleNamespace(
+            model=model,
+            model_config=SimpleNamespace(num_hidden_layers=4),
+        )
+        target = SGLangFlashMTPTargetModel(runner)
+
+        target.set_capture_layers([0, 2, 3])
+
+        self.assertEqual(target.capture_layer_ids, [0, 2, 3])
+        self.assertEqual(model.requested_layers, [0, 2])
+
+    def test_eagle3_capture_hook_remains_preferred(self):
+        class FakeModel:
+            def __init__(self):
+                self.eagle_layers = None
+                self.dflash_layers = None
+
+            def set_eagle3_layers_to_capture(self, layer_ids):
+                self.eagle_layers = layer_ids
+
+            def set_dflash_layers_to_capture(self, layer_ids):
+                self.dflash_layers = layer_ids
+
+        model = FakeModel()
+        runner = SimpleNamespace(
+            model=model,
+            model_config=SimpleNamespace(num_hidden_layers=4),
+        )
+        target = SGLangFlashMTPTargetModel(runner)
+
+        target.set_capture_layers([0, 3])
+
+        self.assertEqual(model.eagle_layers, [0, 3])
+        self.assertIsNone(model.dflash_layers)
+
     def test_hf_target_output_keeps_prefill_logits(self):
         logits = torch.randn(1, 4, 11)
         layer_hidden = torch.randn(1, 4, 7)

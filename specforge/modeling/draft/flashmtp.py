@@ -445,20 +445,35 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 "supported; the backbone always uses an unsupervised anchor "
                 "query followed by MASK queries."
             )
-        selected_layer_ids = build_target_layer_ids(
-            config.num_target_layers, self.chs_num_layers
-        )
         configured_target_ids = flashmtp_config.get("target_layer_ids")
-        self.target_layer_ids = (
-            list(configured_target_ids)
-            if configured_target_ids is not None
-            else selected_layer_ids
-        )
-        if self.target_layer_ids != selected_layer_ids:
-            raise ValueError(
-                "target_layer_ids must match the fixed first/last plus evenly "
-                f"spaced selection {selected_layer_ids}, got {self.target_layer_ids}."
+        if configured_target_ids is None:
+            self.target_layer_ids = build_target_layer_ids(
+                config.num_target_layers, self.chs_num_layers
             )
+        else:
+            self.target_layer_ids = [
+                int(layer_id) for layer_id in configured_target_ids
+            ]
+            if len(self.target_layer_ids) != self.chs_num_layers:
+                raise ValueError(
+                    "target_layer_ids length must equal chs_num_layers: "
+                    f"{len(self.target_layer_ids)} != {self.chs_num_layers}."
+                )
+            if self.target_layer_ids != sorted(set(self.target_layer_ids)):
+                raise ValueError(
+                    "target_layer_ids must be unique and strictly increasing, got "
+                    f"{self.target_layer_ids}."
+                )
+            invalid_ids = [
+                layer_id
+                for layer_id in self.target_layer_ids
+                if not 0 <= layer_id < config.num_target_layers
+            ]
+            if invalid_ids:
+                raise ValueError(
+                    "target_layer_ids must be 0-based indices in "
+                    f"[0, {config.num_target_layers - 1}], got {invalid_ids}."
+                )
         flashmtp_config.pop("history_layer_ids", None)
 
         self.chs_first_context = (

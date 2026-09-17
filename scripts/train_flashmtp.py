@@ -3,6 +3,7 @@
 """FlashMTP Training Script."""
 
 import argparse
+import copy
 import logging
 import math
 import os
@@ -18,7 +19,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoTokenizer
 
 from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
@@ -35,6 +36,7 @@ from specforge.distributed import (
     get_tp_data_shard,
     init_distributed,
 )
+from specforge.modeling.config_utils import is_qwen35_model_type, load_text_model_config
 from specforge.modeling.draft.flashmtp import (
     FLASHMTP_ARCHITECTURE_VERSION,
     FlashMTPDraftModel,
@@ -133,6 +135,13 @@ def parse_args():
         default=7,
         help="Target hidden layers retained at the current CHS position. "
         "CHS contains hidden states only; the explicit token window follows it.",
+    )
+    model_group.add_argument(
+        "--chs-layer-ids",
+        type=str,
+        default=None,
+        help="Optional comma-separated, 0-based target layer IDs. When set, "
+        "this overrides --chs-num-layers and disables even layer sampling.",
     )
     model_group.add_argument(
         "--local-position",
@@ -331,8 +340,26 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
             "--markov-head-type gated only supports --markov-output-mode additive."
         )
 
+    target_config = load_text_model_config(
+        args.target_model_path,
+        trust_remote_code=args.trust_remote_code,
+    )
+    source_model_type = getattr(
+        target_config, "flashmtp_source_model_type", target_config.model_type
+    )
+    if (
+        is_qwen35_model_type(source_model_type)
+        and args.target_model_backend != "sglang"
+    ):
+        raise ValueError(
+            "Qwen3.5 targets require --target-model-backend sglang with the "
+            "currently pinned Transformers version. The FlashMTP draft remains "
+            "a dense Qwen3-style model."
+        )
+
     print_on_rank0(
-        f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
+        f"Loading target model from {args.target_model_path} using "
+        f"{args.target_model_backend} backend (source_model_type={source_model_type})"
     )
 
     target_model_kwargs = {}
@@ -349,11 +376,13 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     )
 
     if args.draft_config_path:
-        draft_config = AutoConfig.from_pretrained(args.draft_config_path)
+        draft_config = load_text_model_config(
+            args.draft_config_path,
+            trust_remote_code=args.trust_remote_code,
+        )
         print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
     else:
-        target_config = AutoConfig.from_pretrained(args.target_model_path)
-        draft_config = AutoConfig.from_pretrained(args.target_model_path)
+        draft_config = copy.deepcopy(target_config)
         draft_config.num_hidden_layers = args.num_draft_layers
         draft_config.block_size = args.block_size
         draft_config.num_target_layers = target_config.num_hidden_layers
@@ -365,22 +394,43 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     ):
         draft_config.flashmtp_config = {}
 
-    draft_config.flashmtp_config["architecture_version"] = (
-        FLASHMTP_ARCHITECTURE_VERSION
-    )
-    draft_config.flashmtp_config["sliding_window_size"] = int(
-        args.sliding_window_size
-    )
+    draft_config.flashmtp_config["architecture_version"] = FLASHMTP_ARCHITECTURE_VERSION
+    draft_config.flashmtp_config["sliding_window_size"] = int(args.sliding_window_size)
     draft_config.flashmtp_config.pop("history_mode", None)
     draft_config.flashmtp_config.pop("bwa_stride", None)
-    draft_config.flashmtp_config["chs_num_layers"] = int(args.chs_num_layers)
+    if args.chs_layer_ids is None:
+        target_layer_ids = None
+        chs_num_layers = int(args.chs_num_layers)
+    else:
+        try:
+            target_layer_ids = [
+                int(item.strip())
+                for item in args.chs_layer_ids.split(",")
+                if item.strip()
+            ]
+        except ValueError as exc:
+            raise ValueError(
+                "--chs-layer-ids must be a comma-separated list of integers, got "
+                f"{args.chs_layer_ids!r}."
+            ) from exc
+        if not target_layer_ids:
+            raise ValueError("--chs-layer-ids must contain at least one layer ID.")
+        chs_num_layers = len(target_layer_ids)
+        print_on_rank0(
+            "Using explicit CHS target layers (0-based): "
+            f"{target_layer_ids}; overriding chs_num_layers={chs_num_layers}"
+        )
+    draft_config.flashmtp_config["chs_num_layers"] = chs_num_layers
     draft_config.flashmtp_config["include_token_embedding_chs"] = False
     draft_config.flashmtp_config["pivot_query_embedding"] = False
     draft_config.flashmtp_config.pop("add_noise", None)
     draft_config.flashmtp_config.pop("target_hidden_noise_ratio", None)
     draft_config.flashmtp_config["local_position"] = bool(args.local_position)
     draft_config.flashmtp_config.pop("draft_input_mode", None)
-    draft_config.flashmtp_config.pop("target_layer_ids", None)
+    if target_layer_ids is None:
+        draft_config.flashmtp_config.pop("target_layer_ids", None)
+    else:
+        draft_config.flashmtp_config["target_layer_ids"] = target_layer_ids
     draft_config.flashmtp_config.pop("history_layer_ids", None)
     draft_config.flashmtp_config["markov_head_type"] = args.markov_head_type
     draft_config.flashmtp_config["markov_output_mode"] = args.markov_output_mode
@@ -617,7 +667,9 @@ def save_checkpoint(
             if os.path.exists(markov_src):
                 shutil.copy(markov_src, markov_dst)
 
-            suffix = "" if save_optimizer_state else " (weights only, no optimizer state)"
+            suffix = (
+                "" if save_optimizer_state else " (weights only, no optimizer state)"
+            )
             print_on_rank0(f"Saved checkpoint to {save_dir}{suffix}")
 
     dist.barrier()
@@ -736,9 +788,7 @@ def main():
     # An explicit checkpoint is authoritative. Without --ckpt-dir, --resume
     # discovers the latest epoch_*_step_* directory under output_dir.
     if args.resume and args.ckpt_dir is None and os.path.isdir(args.output_dir):
-        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(
-            args.output_dir
-        )
+        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
         print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
 
     resume_state = None
@@ -832,14 +882,10 @@ def main():
         draft_model.sliding_window_size
     )
     draft_model.config.flashmtp_config.pop("history_mode", None)
-    draft_model.config.flashmtp_config["chs_num_layers"] = (
-        draft_model.chs_num_layers
-    )
+    draft_model.config.flashmtp_config["chs_num_layers"] = draft_model.chs_num_layers
     draft_model.config.flashmtp_config["include_token_embedding_chs"] = False
     draft_model.config.flashmtp_config["pivot_query_embedding"] = False
-    draft_model.config.flashmtp_config["local_position"] = (
-        draft_model.local_position
-    )
+    draft_model.config.flashmtp_config["local_position"] = draft_model.local_position
     draft_model.config.flashmtp_config.pop("draft_input_mode", None)
     draft_model.config.flashmtp_config["target_layer_ids"] = (
         draft_model.target_layer_ids
@@ -870,8 +916,6 @@ def main():
     print_on_rank0("Loading target embeddings and head...")
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         args.target_model_path,
-        embed_key="model.embed_tokens.weight",  # Adjust if Qwen/Llama differs
-        lm_head_key="lm_head.weight",
         device="cuda",
         trust_remote_code=args.trust_remote_code,
     )
@@ -1052,18 +1096,10 @@ def main():
                 block_keep_mask = get_tp_data_shard(block_keep_mask)
                 target_hidden = get_tp_data_shard(target_hidden)
                 if history_hidden_states is not None:
-                    history_hidden_states = get_tp_data_shard(
-                        history_hidden_states
-                    )
-                history_start_positions = get_tp_data_shard(
-                    history_start_positions
-                )
-                history_source_lengths = get_tp_data_shard(
-                    history_source_lengths
-                )
-                target_prediction_labels = get_tp_data_shard(
-                    target_prediction_labels
-                )
+                    history_hidden_states = get_tp_data_shard(history_hidden_states)
+                history_start_positions = get_tp_data_shard(history_start_positions)
+                history_source_lengths = get_tp_data_shard(history_source_lengths)
+                target_prediction_labels = get_tp_data_shard(target_prediction_labels)
                 if target_prediction_logits is not None:
                     target_prediction_logits = get_tp_data_shard(
                         target_prediction_logits

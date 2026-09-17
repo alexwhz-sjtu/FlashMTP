@@ -48,6 +48,11 @@ NUM_EPOCHS="${NUM_EPOCHS:-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 SLIDING_WINDOW_SIZE="${SLIDING_WINDOW_SIZE:-64}"
 CHS_NUM_LAYERS="${CHS_NUM_LAYERS:-7}"
+CHS_LAYER_IDS="${CHS_LAYER_IDS:-}"
+if [[ -n "${CHS_LAYER_IDS}" ]]; then
+    IFS=',' read -r -a CHS_LAYER_ID_ARRAY <<< "${CHS_LAYER_IDS}"
+    CHS_NUM_LAYERS="${#CHS_LAYER_ID_ARRAY[@]}"
+fi
 CHS_LAYOUT_TAG="chsfirst_tokenwindow"
 if [[ -n "${DRAFT_INPUT_MODE:-}" && "${DRAFT_INPUT_MODE}" != "legacy" ]]; then
     echo "错误: DRAFT_INPUT_MODE 已移除，backbone 固定为 anchor+MASK query"
@@ -134,7 +139,22 @@ else
 fi
 
 
-TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
+if [ -z "${TARGET_MODEL_BACKEND:-}" ]; then
+    case "$(basename "${TARGET_MODEL}")" in
+        Qwen3.5-*) TARGET_MODEL_BACKEND="sglang" ;;
+        *) TARGET_MODEL_BACKEND="hf" ;;
+    esac
+fi
+if [[ "$(basename "${TARGET_MODEL}")" == Qwen3.5-* && "${TARGET_MODEL_BACKEND}" != "sglang" ]]; then
+    echo "错误: Qwen3.5 target 当前须使用 TARGET_MODEL_BACKEND=sglang" >&2
+    exit 1
+fi
+if [ -z "${SGLANG_ATTENTION_BACKEND:-}" ]; then
+    case "$(basename "${TARGET_MODEL}")" in
+        Qwen3.5-*) SGLANG_ATTENTION_BACKEND="fa3" ;;
+        *) SGLANG_ATTENTION_BACKEND="flashinfer" ;;
+    esac
+fi
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.25}"
 SGLANG_MAX_TOTAL_TOKENS="${SGLANG_MAX_TOTAL_TOKENS:-}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-}"
@@ -218,6 +238,9 @@ echo "  位置与对齐: draft ${POSITION_TAG}，target 全局位置，anchor qu
 echo "------------------------------------------"
 echo "目标模型: ${TARGET_MODEL}"
 echo "目标模型后端: ${TARGET_MODEL_BACKEND}"
+if [ "${TARGET_MODEL_BACKEND}" = "sglang" ]; then
+    echo "SGLang Attention后端: ${SGLANG_ATTENTION_BACKEND}"
+fi
 echo "训练数据: ${TRAIN_DATA_PATH}"
 echo "评估数据: ${EVAL_DATA_PATH:-无}"
 echo "输出目录: ${OUTPUT_DIR}"
@@ -228,6 +251,9 @@ echo "  草稿模型层数: ${NUM_DRAFT_LAYERS}"
 echo "  块大小: ${BLOCK_SIZE}"
 echo "  滑动窗口大小: ${SLIDING_WINDOW_SIZE}"
 echo "  CHS hidden 层数: ${CHS_NUM_LAYERS}"
+if [[ -n "${CHS_LAYER_IDS}" ]]; then
+    echo "  CHS target 层号 (0-based): ${CHS_LAYER_IDS}"
+fi
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  锚点执行分块: ${ANCHOR_CHUNK_SIZE} (0=关闭)"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
@@ -320,6 +346,10 @@ if [ -n "${LOSS_DECAY_GAMMA}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --loss-decay-gamma ${LOSS_DECAY_GAMMA}"
 fi
 
+if [ -n "${CHS_LAYER_IDS}" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --chs-layer-ids ${CHS_LAYER_IDS}"
+fi
+
 if [[ "${LOCAL_POSITION}" == "1" || "${LOCAL_POSITION}" == "true" ]]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --local-position"
 fi
@@ -374,6 +404,7 @@ if [ "${TARGET_MODEL_BACKEND}" = "sglang" ]; then
         echo "  SGLang KV profiling (need >=0.22 for MAX_LENGTH=${MAX_LENGTH})."
         echo "  Override with SGLANG_MEM_FRACTION_STATIC=0.25 (script default)."
     fi
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --sglang-attention-backend ${SGLANG_ATTENTION_BACKEND}"
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION_STATIC}"
     if [ -z "${SGLANG_MAX_TOTAL_TOKENS}" ]; then
         SGLANG_MAX_TOTAL_TOKENS=$((TRAIN_BATCH_SIZE * MAX_LENGTH))
