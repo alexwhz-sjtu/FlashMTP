@@ -3,32 +3,32 @@
 训练入口：`scripts/run_training_flashmtp.sh` → `scripts/train_flashmtp.py`。
 
 ```bash
-cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2swa
+cd /data/wanghanzhen/FlashMTP_v2swa
 source .venv/bin/activate
-SLIDING_WINDOW_SIZE=9 \
+SLIDING_WINDOW_SIZE=512 \
 CHS_NUM_LAYERS=12 \
-LOCAL_POSITION=true \
-CE_CHUNK_SIZE=4096 \
+LOCAL_POSITION=false \
+HEADPOS=false \
+HISTORY_MODE=fuse \
 BLOCK_SIZE=8 \
 NUM_DRAFT_LAYERS=5 \
-NUM_EPOCHS=8 \
+NUM_EPOCHS=6 \
 NUM_ANCHORS=512 \
 MAX_LENGTH=4096 \
 BATCH_SIZE=1 \
 LOSS_DECAY_GAMMA=4 \
 DATA_NUM_SAMPLES=pb_80k \
 BASE_LM_CE_DECAY_GAMMA=12 \
-LEARNING_RATE=5e-4 \
-MARKOV_LR_MULTIPLIER=0.5 \
+LEARNING_RATE=4e-4 \
 FINAL_CE_WEIGHT=0.1 \
 TV_LOSS_WEIGHT=1.0 \
 BASE_LM_CE_WEIGHT=0.06 \
-MARKOV_HEAD_TYPE=vanilla \
-MARKOV_OUTPUT_MODE=additive \
-MARKOV_RANK=256 \
-TRAIN_DATA_PATH='/share/dai-sys/wanghanzhen/projects/MTP/training_data/open_perfectblend_80k_qwen3_8b.jsonl' \
-MODEL_TAG='Qwen3_8B' \
-TARGET_MODEL=/share/dai-sys/wanghanzhen/models/Qwen/Qwen3-8B \
+MARKOV_HEAD_TYPE=rnn_easy \
+MARKOV_OUTPUT_MODE=direct \
+MARKOV_RANK=320 \
+TRAIN_DATA_PATH='/data/wanghanzhen/training_data/generated/qwen3-4b/open_perfectblend_80k_qwen3_4b.jsonl' \
+MODEL_TAG='Qwen3_4B' \
+TARGET_MODEL='/data/wanghanzhen/models/Qwen3-4B' \
 bash scripts/run_training_flashmtp.sh --dt h100
 ```
 
@@ -40,78 +40,33 @@ bash scripts/run_training_flashmtp.sh --dt h100
 | 环境变量                  | 默认值   | 说明                                                                           |
 | --------------------- | ----- | ---------------------------------------------------------------------------- |
 | `SLIDING_WINDOW_SIZE` | 64    | dense 窗口 W，使用 anchor 前 W-1 个连续位置                                             |
-| `CHS_NUM_LAYERS`      | 7     | pivot 保留的 target hidden 层数；CHS 不含 token embedding，排在 window 前                |
+| `HISTORY_MODE`        | fuse  | `fuse` 使用融合 hidden；`token` 使用 token embedding                                |
+| `CHS_NUM_LAYERS`      | 7     | pivot 保留的 target hidden 层数；pivot token embedding 作为 query                    |
 | `LOCAL_POSITION`      | false | draft 使用局部或全局 RoPE                                                           |
 | `BLOCK_SIZE`          | 16    | draft Q 为已知 anchor + B-1 个 MASK；pivot embedding 位于 CHS 首位，实际 proposal 数为 B-1 |
 | `NUM_DRAFT_LAYERS`    | 5     | 草稿 Transformer 层数                                                            |
 | `NUM_ANCHORS`         | 512   | 每条训练序列最多采样的 anchor 数                                                         |
 
 
-窗口布局固定为 pivot-Q dense SWA：context 只保留 CHS，window embedding 拼到 draft Q 前面：`[embed(a-W+1)..embed(a-1), embed(a), MASK...]`。最后一个 window token 与 CHS hidden 共用 `anchor-1` 的 RoPE position id；local 模式中第一个有效 window token 的 position id 为 0。
+窗口布局固定为 dense；历史表示由 `HISTORY_MODE=fuse|token` 控制。`token` 模式下最后一个历史 token 与 pivot 共用 `anchor-1` 的 RoPE position id。
 
 ## 串行 head 与 loss
 
 
-| 环境变量                   | 可选值/含义                                             |
-| ---------------------- | -------------------------------------------------- |
-| `MARKOV_HEAD_TYPE`     | `none` / `vanilla` / `gated` / `rnn` / `rnn_easy`  |
-| `MARKOV_OUTPUT_MODE`   | `additive` / `direct`                              |
-| `MARKOV_RANK`          | 低秩 state/embedding 维度                              |
-| `MARKOV_LR_MULTIPLIER` | Markov head 相对 backbone 的学习率倍率；默认 `1.0`，推荐先试 `0.5` |
-| `FINAL_CE_WEIGHT`      | 最终预测 CE 权重                                         |
-| `TV_LOSS_WEIGHT`       | target/draft 分布 L1 权重                              |
-| `BASE_LM_CE_WEIGHT`    | 可选 base LM-head CE 权重                              |
+| 环境变量                 | 可选值/含义                                            |
+| -------------------- | ------------------------------------------------- |
+| `MARKOV_HEAD_TYPE`   | `none` / `vanilla` / `gated` / `rnn` / `rnn_easy` |
+| `MARKOV_OUTPUT_MODE` | `additive` / `direct`                             |
+| `MARKOV_RANK`        | 低秩 state/embedding 维度                             |
+| `HEADPOS`            | `true` 启用相对位置 embedding；默认 `false`                |
+| `FINAL_CE_WEIGHT`    | 最终预测 CE 权重                                        |
+| `TV_LOSS_WEIGHT`     | target/draft 分布 L1 权重                             |
+| `BASE_LM_CE_WEIGHT`  | 可选 base LM-head CE 权重                             |
 
 
-`rnn_easy` 的 recurrent state 在每个 block 开始时置零；第一次预测只输入 `embed(anchor)`，不会再用 `embed(anchor-1)` 预热 state。旧版 checkpoint 的参数结构和调用参数保持兼容。完整 `rnn` head 仍保留原有的 predecessor state 初始化行为。
+`HEADPOS=true` 时串行 head 使用 block 内相对位置 embedding。`vanilla` / `gated + additive` 在
+previous-token embedding 处注入，`rnn/rnn_easy + direct` 在降维后的 hidden
+latent 处注入；训练与推理均使用相同的 `0..block_size-2` slot 编号。设为
+`false` 时保持原始无位置 embedding 的行为。
 
-`LEARNING_RATE` 是 backbone 的峰值学习率；Markov head 的峰值学习率为 `LEARNING_RATE * MARKOV_LR_MULTIPLIER`。两组参数共用同一个 warmup + cosine 进度，因此训练全程保持该倍率。恢复旧版单参数组 checkpoint 时会继承 Adam 动量和当时的 backbone LR，并按当前倍率建立 Markov head LR。
-
-如果只想继承 checkpoint 权重，并使用全新的 Adam、学习率调度、epoch 和 global step，设置 `CKPT_DIR=/path/to/checkpoint` 与 `LOAD_WEIGHTS_ONLY=1`。这时无需设置 `RESUME=1` 或 `RESUME_OPTIMIZER=0`。
-
-训练时 target 冻结，只捕获当前 CHS 所需层；TV loss 直接复用 target prefill logits。draft 不使用 KV cache。
-
-## Qwen3.5-4B
-
-Qwen3.5 使用复合配置和 hybrid GatedDeltaNet target；训练时 target 走 SGLang，
-FlashMTP draft 仍为匹配其 hidden/vocab/head 维度的 dense Qwen3-style Transformer。
-启动脚本识别到 `Qwen3.5-*` 模型目录时会默认选择 SGLang backend。
-
-```bash
-cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2swa
-source .venv/bin/activate
-SLIDING_WINDOW_SIZE=9 \
-CHS_NUM_LAYERS=12 \
-CHS_LAYER_IDS=3,7,11,15,19,23,27,31 \
-LOCAL_POSITION=true \
-CE_CHUNK_SIZE=4096 \
-BLOCK_SIZE=8 \
-NUM_DRAFT_LAYERS=5 \
-NUM_EPOCHS=10 \
-NUM_ANCHORS=512 \
-MAX_LENGTH=10240 \
-BATCH_SIZE=1 \
-LOSS_DECAY_GAMMA=4 \
-DATA_NUM_SAMPLES=qwen3.5_4b_aug_temp_1 \
-BASE_LM_CE_DECAY_GAMMA=12 \
-LEARNING_RATE=4e-4 \
-MARKOV_LR_MULTIPLIER=1.0 \
-FINAL_CE_WEIGHT=0.1 \
-TV_LOSS_WEIGHT=1.0 \
-BASE_LM_CE_WEIGHT=0.06 \
-MARKOV_HEAD_TYPE=vanilla \
-MARKOV_OUTPUT_MODE=additive \
-MARKOV_RANK=340 \
-MODEL_TAG='Qwen3.5_4B' \
-TARGET_MODEL=/share/dai-sys/wanghanzhen/models/Qwen/Qwen3.5-4B \
-TARGET_MODEL_BACKEND=sglang \
-SGLANG_ATTENTION_BACKEND=fa3 \
-CHAT_TEMPLATE=qwen \
-TRAIN_DATA_PATH=/share/dai-sys/wanghanzhen/projects/MTP/training_data/generated/qwen3.5-4b/qwen_3.5_4b_math_code_aug_think_off_math_code_chat_aug1_temp1_maxnew4096.jsonl \
-TP_SIZE=1 \
-bash scripts/run_training_flashmtp.sh --dt h100
-```
-
-当前固定的 `transformers==4.57.1` 不包含 Qwen3.5 HF model class，因此 Qwen3.5
-target 不支持 `TARGET_MODEL_BACKEND=hf`。`think_off` 数据继续使用 `CHAT_TEMPLATE=qwen`；
-只有样本确实包含 `<think>` 内容时才选择 `CHAT_TEMPLATE=qwen3.5`。
+训练时 target 冻结，只捕获 dense 历史所需的首层、中层、末层，以及当前 CHS 和 TV loss 所需层。draft 不使用 KV cache。

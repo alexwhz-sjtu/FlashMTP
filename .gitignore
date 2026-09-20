@@ -129,6 +129,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv*
 env/
 venv/
 ENV/
@@ -194,6 +195,10 @@ cython_debug/
 .cursorindexingignore
 outputs/
 wandb/
+logs/
+benchmark_results/
+evaluation_runs/
+sglang_bench_*/
 .idea
 .vscode/
 
