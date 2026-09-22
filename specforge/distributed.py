@@ -1,4 +1,3 @@
-import os
 from datetime import timedelta
 from typing import Any, Optional
 
@@ -73,21 +72,9 @@ def init_distributed(
         timeout(int): Timeout for collective communication in minutes
         tp_size(int): The degree of tensor parallelism
     """
-    device_count = torch.cuda.device_count()
-    if device_count <= 0:
-        raise RuntimeError("Distributed NCCL training requires at least one CUDA device")
-    fallback_rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", fallback_rank % device_count))
-    if not 0 <= local_rank < device_count:
-        raise RuntimeError(
-            f"LOCAL_RANK={local_rank} is invalid for {device_count} visible CUDA devices"
-        )
+    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
+    local_rank = dist.get_rank() % torch.cuda.device_count()
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(
-        backend="nccl",
-        timeout=timedelta(minutes=timeout),
-        device_id=torch.device("cuda", local_rank),
-    )
     print_with_rank(f"bind to device {local_rank}")
 
     world_size = dist.get_world_size()

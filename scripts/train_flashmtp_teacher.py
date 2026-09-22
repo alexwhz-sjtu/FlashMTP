@@ -84,6 +84,10 @@ def parse_args():
     parser.add_argument("--loss-decay-gamma", type=float)
     parser.add_argument("--base-lm-ce-decay-gamma", type=float)
     parser.add_argument("--markov-teacher-forcing-ratio", type=float, default=1.0)
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="Optional short-run limit, primarily for reproducible benchmarks.")
+    parser.add_argument("--no-final-save", action="store_true",
+                        help="Skip the final checkpoint (useful for throughput benchmarks).")
     args = parser.parse_args()
     validate_common_args(parser, args)
     if not args.train_data_path:
@@ -291,6 +295,16 @@ def main():
                 torch.cuda.synchronize()
                 print(f"[timing] step={global_step} complete={time.perf_counter()-debug_t0:.2f}s", flush=True)
 
+            if args.max_steps is not None:
+                torch.cuda.synchronize()
+                if dist.get_rank() == 0:
+                    print(
+                        f"[benchmark] step={global_step} dt={time.perf_counter()-debug_t0:.4f}s "
+                        f"seq={input_ids.size(1)} "
+                        f"peak_alloc_gib={torch.cuda.max_memory_allocated()/1024**3:.3f}",
+                        flush=True,
+                    )
+
             if global_step % args.log_interval == 0:
                 metrics = torch.stack(
                     [loss.detach(), accuracy, prefix_acc, final_ce.detach(), base_ce.detach(), tv_loss.detach()]
@@ -328,26 +342,31 @@ def main():
                         "serial_head_inherited": False,
                     },
                 )
+            if args.max_steps is not None and global_step >= args.max_steps:
+                break
         start_batch = 0
+        if args.max_steps is not None and global_step >= args.max_steps:
+            break
 
     if micro_steps:
         optimizer.scale_model_gradients(args.accumulation_steps / micro_steps)
         optimizer.step()
-    save_checkpoint(
-        output_dir=args.output_dir,
-        name="final",
-        fsdp_model=fsdp,
-        draft_model=draft,
-        optimizer=optimizer,
-        metadata={
-            "training_stage": "teacher",
-            "stage_epoch": args.num_epochs,
-            "next_batch_in_epoch": 0,
-            "stage_step": stage_step,
-            "global_step": global_step,
-            "serial_head_inherited": False,
-        },
-    )
+    if not args.no_final_save:
+        save_checkpoint(
+            output_dir=args.output_dir,
+            name="final",
+            fsdp_model=fsdp,
+            draft_model=draft,
+            optimizer=optimizer,
+            metadata={
+                "training_stage": "teacher",
+                "stage_epoch": args.num_epochs,
+                "next_batch_in_epoch": 0,
+                "stage_step": stage_step,
+                "global_step": global_step,
+                "serial_head_inherited": False,
+            },
+        )
     memory = log_cuda_peak("teacher")
     tracker.log(
         {

@@ -65,6 +65,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     )
     data.add_argument("--chat-template", default="qwen")
     data.add_argument("--is-preformatted", action="store_true")
+    data.add_argument(
+        "--pad-to-max-length",
+        action="store_true",
+        help="Pad every microbatch to --max-length (benchmark/control mode).",
+    )
     data.add_argument("--max-length", type=int, default=4096)
     data.add_argument("--batch-size", type=int, default=1)
     data.add_argument("--dataloader-num-workers", type=int, default=8)
@@ -318,6 +323,7 @@ def _prepare_dataloader(args, dataset, *, train_data_path: str):
         num_workers=args.dataloader_num_workers,
         shuffle=True,
         process_group=get_dp_group(),
+        pad_to_length=args.max_length if args.pad_to_max_length else None,
     )
     if len(dataloader) == 0:
         raise ValueError(

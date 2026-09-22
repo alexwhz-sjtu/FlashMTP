@@ -156,8 +156,6 @@ fi
 STUDENT_DEPTH_TAG=""
 if [[ "${STUDENT_INIT_MODE}" == "shared_partial" ]]; then
   STUDENT_DEPTH_TAG="_sd${STUDENT_NUM_DRAFT_LAYERS:-checkpoint}"
-elif [[ "${STUDENT_INIT_MODE}" == "scratch" && -n "${STUDENT_NUM_DRAFT_LAYERS}" ]]; then
-  STUDENT_DEPTH_TAG="_sd${STUDENT_NUM_DRAFT_LAYERS}"
 fi
 
 slug() {

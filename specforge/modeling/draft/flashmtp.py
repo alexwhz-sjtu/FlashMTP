@@ -324,12 +324,6 @@ class Qwen3FlashMTPAttention(nn.Module):
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        # Keep canonical layouts for compiled FlexAttention. This avoids
-        # illegal-memory-access failures seen with non-contiguous Q/K/V during
-        # Triton compilation and autotuning.
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
 
         attn_fn: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":

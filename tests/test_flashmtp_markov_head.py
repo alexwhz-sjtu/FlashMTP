@@ -10,7 +10,6 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from scripts.train_flashmtp_two_stage import (
     SHARED_BACKBONE_MODULES,
-    _apply_requested_student_draft_depth,
     _copy_partial_shared_backbone,
     _copy_serial_head,
     _copy_shared_backbone,
@@ -23,8 +22,11 @@ from scripts.train_flashmtp_two_stage import (
 from scripts import flashmtp_training
 from scripts.flashmtp_training import resume_cursor
 from specforge.core.flashmtp import (
+    FLEX_SPARSE_BLOCK_SIZE,
     OnlineFlashMTPModel,
     PreparedFlashMTPBatch,
+    _flex_block_alignment,
+    _flex_kv_pad,
     _make_flex_mask,
     compute_stage1_distillation_loss,
     gather_target_prefill_logits,
@@ -346,6 +348,23 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
             selected = anchors[row, keep[row]]
             self.assertTrue((loss_mask[row, selected] > 0.5).all())
             self.assertTrue((loss_mask[row, selected + 1] > 0.5).all())
+
+    def test_flex_kv_padding_aligns_teacher_history_and_student_blocks(self):
+        self.assertEqual(_flex_kv_pad(128), 0)
+        self.assertEqual(_flex_kv_pad(129), 127)
+        query_len = 8
+        chs_slots = 12
+        alignment = _flex_block_alignment(query_len, query_len + chs_slots)
+        self.assertEqual(alignment % 16, 0)
+        for num_blocks in (alignment, 2 * alignment):
+            student_kv = num_blocks * (chs_slots + query_len)
+            self.assertEqual(student_kv % FLEX_SPARSE_BLOCK_SIZE, 0)
+            for seq_len in (100, 4096, 123):
+                teacher_kv = seq_len + student_kv
+                self.assertEqual(
+                    (teacher_kv + _flex_kv_pad(teacher_kv)) % FLEX_SPARSE_BLOCK_SIZE,
+                    0,
+                )
 
     def test_inference_mask_embedding_does_not_expand_output_vocab(self):
         model = make_model()
@@ -1115,37 +1134,6 @@ class CurrentFlashMTPArchitectureTest(unittest.TestCase):
                 self.assertTrue(torch.all(parameter == 0.25))
         for name, value in student.markov_head.state_dict().items():
             self.assertTrue(torch.equal(value, serial_before[name]))
-
-    def test_scratch_student_num_draft_layers_overrides_teacher_depth(self):
-        teacher = make_model("swa_teacher", num_draft_layers=5)
-        student_config = copy.deepcopy(teacher.config)
-        _apply_requested_student_draft_depth(
-            student_config,
-            teacher=teacher,
-            student_init_mode="scratch",
-            student_num_draft_layers=3,
-        )
-        self.assertEqual(student_config.num_hidden_layers, 3)
-
-        unchanged = copy.deepcopy(teacher.config)
-        _apply_requested_student_draft_depth(
-            unchanged,
-            teacher=teacher,
-            student_init_mode="scratch",
-            student_num_draft_layers=None,
-        )
-        self.assertEqual(unchanged.num_hidden_layers, 5)
-
-    def test_shared_init_rejects_student_depth_override(self):
-        teacher = make_model("swa_teacher", num_draft_layers=5)
-        student_config = copy.deepcopy(teacher.config)
-        with self.assertRaisesRegex(ValueError, "shared_init cannot change draft depth"):
-            _apply_requested_student_draft_depth(
-                student_config,
-                teacher=teacher,
-                student_init_mode="shared_init",
-                student_num_draft_layers=3,
-            )
 
     def test_shared_partial_requires_deeper_teacher(self):
         with self.assertRaisesRegex(ValueError, "teacher draft depth"):

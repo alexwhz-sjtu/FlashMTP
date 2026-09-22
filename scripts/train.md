@@ -16,35 +16,64 @@ logits 在 anchor 采样后一次 gather，完整序列张量随即释放。`fin
 完整 target 概率分布。串行 head 的 teacher forcing 输入仍来自训练数据 token。
 
 ```bash
-cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2.3
+cd /data/wanghanzhen/FlashMTP_v2.3
 source .venv/bin/activate
-SWA_WINDOW_SIZE=128 \
-ANCHOR_GROUP_SIZE=6 \
+SWA_WINDOW_SIZE=2 \
+ANCHOR_GROUP_SIZE=1 \
 CHS_NUM_LAYERS=12 \
-LOCAL_POSITION=true \
-CE_CHUNK_SIZE=6144 \
+LOCAL_POSITION=false \
+CE_CHUNK_SIZE=4096 \
 BLOCK_SIZE=8 \
 NUM_DRAFT_LAYERS=5 \
-NUM_EPOCHS=8 \
-NUM_ANCHORS=768 \
-MAX_LENGTH=20480 \
+NUM_EPOCHS=6 \
+NUM_ANCHORS=512 \
+MAX_LENGTH=4096 \
 BATCH_SIZE=1 \
 LOSS_DECAY_GAMMA=4 \
-DATA_NUM_SAMPLES=2360K_aug1_qwen3_8b \
+DATA_NUM_SAMPLES=pb_80k_qwen3_4b \
 BASE_LM_CE_DECAY_GAMMA=12 \
-ACCUMULATION_STEPS=2 \
-LEARNING_RATE=5e-4 \
+ACCUMULATION_STEPS=1 \
+LEARNING_RATE=4e-4 \
 FINAL_CE_WEIGHT=0.1 \
 TV_LOSS_WEIGHT=1.0 \
 BASE_LM_CE_WEIGHT=0.06 \
 MARKOV_HEAD_TYPE=rnn_easy \
 MARKOV_OUTPUT_MODE=direct \
-MARKOV_RANK=512 \
-TRAIN_DATA_PATH='dataset_path' \
-MODEL_TAG='Qwen3_8B' \
-TARGET_MODEL=/share/dai-sys/wanghanzhen/models/Qwen/Qwen3-8B \
-bash scripts/run_training_flashmtp_teacher.sh --dt h100
+MARKOV_RANK=320 \
+TRAIN_DATA_PATH='/data/wanghanzhen/training_data/generated/qwen3-4b/open_perfectblend_80k_qwen3_4b.jsonl' \
+MODEL_TAG='Qwen3_4B' \
+TARGET_MODEL='/data/wanghanzhen/models/Qwen3-4B' \
+bash scripts/run_training_flashmtp_teacher.sh
+```
 
+```bash
+cd /data/wanghanzhen/FlashMTP_v2swa
+source .venv/bin/activate
+SLIDING_WINDOW_SIZE=512 \
+CHS_NUM_LAYERS=12 \
+LOCAL_POSITION=false \
+HEADPOS=false \
+HISTORY_MODE=fuse \
+BLOCK_SIZE=8 \
+NUM_DRAFT_LAYERS=5 \
+NUM_EPOCHS=6 \
+NUM_ANCHORS=512 \
+MAX_LENGTH=4096 \
+BATCH_SIZE=1 \
+LOSS_DECAY_GAMMA=4 \
+DATA_NUM_SAMPLES=pb_80k \
+BASE_LM_CE_DECAY_GAMMA=12 \
+LEARNING_RATE=4e-4 \
+FINAL_CE_WEIGHT=0.1 \
+TV_LOSS_WEIGHT=1.0 \
+BASE_LM_CE_WEIGHT=0.06 \
+MARKOV_HEAD_TYPE=rnn_easy \
+MARKOV_OUTPUT_MODE=direct \
+MARKOV_RANK=320 \
+TRAIN_DATA_PATH='/data/wanghanzhen/training_data/generated/qwen3-4b/open_perfectblend_80k_qwen3_4b.jsonl' \
+MODEL_TAG='Qwen3_4B' \
+TARGET_MODEL='/data/wanghanzhen/models/Qwen3-4B' \
+bash scripts/run_training_flashmtp.sh --dt h100
 ```
 
 
@@ -79,12 +108,11 @@ shell 启动器沿用 v2 的集群默认值，优先读取 `PET_NNODES`、`PET_N
 `layer_depth_embedding` 和 `context_norm`；teacher-only 历史融合参数与
 串行 head 不在此时复制。模式会写入 checkpoint，恢复时自动沿用。
 
-`STUDENT_NUM_DRAFT_LAYERS`（Python 参数为 `--student-num-draft-layers`）可改变
-student draft 深度。`scratch` 按该层数随机初始化并行 backbone，不必浅于 teacher。
-`shared_partial` 的 fresh 训练必须设置该变量，并要求 teacher depth 严格大于
-student depth；student 层从 teacher 层按首尾对齐均匀抽取，例如 5 层 teacher 到
-3 层 student 的映射为 `[0, 2, 4]`，其余共享 norm 照常复制。`shared_init` 不能改
-深度。Stage 2 的串行 head 仍直接继承 teacher，与 backbone 深度无关。
+`shared_partial` 用于 teacher draft backbone 更深的情况。Fresh 训练必须设置
+`STUDENT_NUM_DRAFT_LAYERS`（Python 参数为 `--student-num-draft-layers`），并要求
+teacher depth 严格大于 student depth。Student 层从 teacher 层按首尾对齐均匀
+抽取，例如 5 层 teacher 到 3 层 student 的映射为 `[0, 2, 4]`；其余共享 norm
+照常复制。Stage 2 的串行 head 仍直接继承 teacher，与 backbone 深度无关。
 
 Stage 1：
 
@@ -165,20 +193,20 @@ Stage 2 在 transition 已解冻的串行头基础上继续训练。Teacher 在 
 个 token，不使用这些 greedy label 回填。
 
 
-| 变量                                              | 含义                   |
-| ----------------------------------------------- | -------------------- |
-| `STAGE1_EPOCHS` / `STAGE2_EPOCHS`               | 两阶段独立 epoch 数        |
-| `STAGE1_LEARNING_RATE` / `STAGE2_LEARNING_RATE` | 两阶段独立学习率             |
-| `STAGE1_WARMUP_RATIO` / `STAGE2_WARMUP_RATIO`   | 两阶段独立 warmup 比例      |
-| `STAGE1_KL_WEIGHT` / `STAGE1_HIDDEN_WEIGHT`     | Stage 1 蒸馏 loss 权重   |
+| 变量                                              | 含义                               |
+| ----------------------------------------------- | -------------------------------- |
+| `STAGE1_EPOCHS` / `STAGE2_EPOCHS`               | 两阶段独立 epoch 数                    |
+| `STAGE1_LEARNING_RATE` / `STAGE2_LEARNING_RATE` | 两阶段独立学习率                         |
+| `STAGE1_WARMUP_RATIO` / `STAGE2_WARMUP_RATIO`   | 两阶段独立 warmup 比例                  |
+| `STAGE1_KL_WEIGHT` / `STAGE1_HIDDEN_WEIGHT`     | Stage 1 蒸馏 loss 权重               |
 | `STAGE1_CE_WEIGHT`                              | Stage 1 true-label CE 权重（默认 0.1） |
-| `STAGE1_SMOOTH_L1_BETA`                         | SmoothL1 beta        |
-| `STAGE1_LOSS_DECAY_GAMMA`                       | Stage 1 共用位置衰减       |
-| `STAGE2_FINAL_CE_WEIGHT`                        | Stage 2 final CE 权重  |
-| `STAGE2_TV_WEIGHT`                              | Stage 2 target TV 权重 |
-| `STAGE2_BASE_CE_WEIGHT`                         | Stage 2 base CE 权重   |
-| `STAGE2_LOSS_DECAY_GAMMA`                       | final CE/TV 位置衰减     |
-| `STAGE2_BASE_CE_DECAY_GAMMA`                    | base CE 独立位置衰减       |
+| `STAGE1_SMOOTH_L1_BETA`                         | SmoothL1 beta                    |
+| `STAGE1_LOSS_DECAY_GAMMA`                       | Stage 1 共用位置衰减                   |
+| `STAGE2_FINAL_CE_WEIGHT`                        | Stage 2 final CE 权重              |
+| `STAGE2_TV_WEIGHT`                              | Stage 2 target TV 权重             |
+| `STAGE2_BASE_CE_WEIGHT`                         | Stage 2 base CE 权重               |
+| `STAGE2_LOSS_DECAY_GAMMA`                       | final CE/TV 位置衰减                 |
+| `STAGE2_BASE_CE_DECAY_GAMMA`                    | base CE 独立位置衰减                   |
 
 
 通用变量包括 `ACCUMULATION_STEPS`、`NUM_ANCHORS`、`MAX_LENGTH`、

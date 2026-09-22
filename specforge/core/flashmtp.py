@@ -24,6 +24,27 @@ except ImportError:
     compile_friendly_create_block_mask = None
     FLEX_ATTENTION_AVAILABLE = False
 
+# FlexAttention Triton kernels tile Q/KV in 128-token blocks. A trailing
+# partial tile can illegal-access in backward; errors then surface on a later
+# CUDA call, often far from the attention kernel.
+FLEX_SPARSE_BLOCK_SIZE = 128
+
+
+def _flex_block_alignment(*dims: int) -> int:
+    alignment = 1
+    for dim in dims:
+        dim = int(dim)
+        if dim <= 0:
+            continue
+        part = FLEX_SPARSE_BLOCK_SIZE // math.gcd(FLEX_SPARSE_BLOCK_SIZE, dim)
+        alignment = math.lcm(alignment, part)
+    return alignment
+
+
+def _flex_kv_pad(kv_len: int) -> int:
+    kv_len = int(kv_len)
+    return (FLEX_SPARSE_BLOCK_SIZE - (kv_len % FLEX_SPARSE_BLOCK_SIZE)) % FLEX_SPARSE_BLOCK_SIZE
+
 
 HiddenStatesInput = Union[
     tuple[torch.Tensor, ...], list[torch.Tensor], Dict[int, torch.Tensor]
@@ -313,14 +334,16 @@ class OnlineFlashMTPModel(nn.Module):
         num_valid = min(self.num_anchors, int(counts.max().item()))
         if num_valid <= 0:
             raise ValueError("No valid anchor positions in this batch.")
-        # FlexAttention's generated kernels tile the query dimension in chunks
-        # of 128.  Dynamic per-batch padding can otherwise produce a final
-        # partial tile (for example, 78 blocks * 13 query tokens) that triggers
-        # an illegal access in the Triton backward kernel.  Pad only the block
-        # dimension to the next safe tile; these extra blocks are marked
+        # FlexAttention's generated kernels tile the query and KV dimensions in
+        # chunks of 128.  Dynamic per-batch padding can otherwise produce a
+        # final partial tile (for example, 78 blocks * 13 query tokens) that
+        # triggers an illegal access in the Triton backward kernel.  Pad the
+        # block dimension so both Q_LEN = N*query_len and the student KV length
+        # N*(CHS+query_len) land on a tile boundary.  Extra blocks are marked
         # invalid below and therefore contribute neither labels nor loss.
         query_len = int(self.draft_model.draft_query_length)
-        block_alignment = 128 // math.gcd(128, query_len)
+        chs_slots = int(self.draft_model.chs_num_layers)
+        block_alignment = _flex_block_alignment(query_len, query_len + chs_slots)
         num = (
             (num_valid + block_alignment - 1) // block_alignment
         ) * block_alignment
@@ -466,21 +489,32 @@ class OnlineFlashMTPModel(nn.Module):
         context_pos, draft_pos = self.draft_model.build_block_position_ids(
             batch.anchor_positions, batch.token_position_ids, batch.token_keep_mask
         )
-        attention_mask = _make_flex_mask(
-            model_role=self.draft_model.model_role,
-            anchor_positions=batch.anchor_positions,
-            block_keep_mask=batch.block_keep_mask,
-            token_keep_mask=batch.token_keep_mask,
-            seq_len=seq_len,
-            swa_window_size=self.draft_model.swa_window_size,
-            chs_slots=self.draft_model.chs_num_layers,
-            query_len=query_len,
-            device=query_embeddings.device,
-        )
         if self.draft_model.is_teacher:
             if batch.shared_fused_history is None:
                 raise ValueError("Teacher requires shared fused history.")
-            shared_pos = torch.arange(seq_len, device=query_embeddings.device).view(
+            history = batch.shared_fused_history
+            mask_seq_len = int(seq_len)
+            natural_kv = (
+                mask_seq_len
+                + num_blocks * self.draft_model.chs_num_layers
+                + num_blocks * query_len
+            )
+            history_pad = _flex_kv_pad(natural_kv)
+            if history_pad:
+                history = F.pad(history, (0, 0, 0, history_pad))
+                mask_seq_len += history_pad
+            attention_mask = _make_flex_mask(
+                model_role=self.draft_model.model_role,
+                anchor_positions=batch.anchor_positions,
+                block_keep_mask=batch.block_keep_mask,
+                token_keep_mask=batch.token_keep_mask,
+                seq_len=mask_seq_len,
+                swa_window_size=self.draft_model.swa_window_size,
+                chs_slots=self.draft_model.chs_num_layers,
+                query_len=query_len,
+                device=query_embeddings.device,
+            )
+            shared_pos = torch.arange(mask_seq_len, device=query_embeddings.device).view(
                 1, -1
             ).expand(bsz, -1)
             # The logical per-block context is [W-1 fuse, S CHS], but the fuse
@@ -497,11 +531,22 @@ class OnlineFlashMTPModel(nn.Module):
                 position_ids=draft_pos,
                 noise_embedding=query_embeddings,
                 target_hidden=batch.target_hidden,
-                shared_history=batch.shared_fused_history,
+                shared_history=history,
                 attention_mask=attention_mask,
                 rotary_position_ids=rotary,
             )
         else:
+            attention_mask = _make_flex_mask(
+                model_role=self.draft_model.model_role,
+                anchor_positions=batch.anchor_positions,
+                block_keep_mask=batch.block_keep_mask,
+                token_keep_mask=batch.token_keep_mask,
+                seq_len=seq_len,
+                swa_window_size=self.draft_model.swa_window_size,
+                chs_slots=self.draft_model.chs_num_layers,
+                query_len=query_len,
+                device=query_embeddings.device,
+            )
             empty_history = query_embeddings.new_empty(
                 bsz, num_blocks, 0, query_embeddings.size(-1)
             )
