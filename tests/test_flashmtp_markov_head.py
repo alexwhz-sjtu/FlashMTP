@@ -19,6 +19,7 @@ from specforge.modeling.draft.flashmtp import (
     FLASHMTP_ARCHITECTURE_VERSION,
     FlashMTPDraftModel,
     FlashMTPGroupedConv,
+    Qwen3FlashMTPAttention,
     build_target_layer_ids,
     rejection_sample_verify,
 )
@@ -29,6 +30,59 @@ from specforge.modeling.draft.flashmtp_markov_head import (
 
 
 class FlashMTPMarkovHeadTest(unittest.TestCase):
+    def test_flex_attention_forces_regular_kernel(self) -> None:
+        config = Qwen3Config(
+            vocab_size=29,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            attention_dropout=0.0,
+        )
+        config._attn_implementation = "flex_attention"
+        attention = Qwen3FlashMTPAttention(config, layer_idx=0)
+        captured = {}
+
+        def fake_flex_attention(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            **kwargs,
+        ):
+            captured.update(kwargs)
+            return query.transpose(1, 2), None
+
+        query_len = 2
+        context_len = 3
+        position_embeddings = (
+            torch.ones(1, context_len + query_len, 8),
+            torch.zeros(1, context_len + query_len, 8),
+        )
+        with mock.patch(
+            "specforge.modeling.draft.flashmtp.ALL_ATTENTION_FUNCTIONS",
+            {"flex_attention": fake_flex_attention},
+        ):
+            output, _ = attention(
+                hidden_states=torch.randn(1, query_len, 16),
+                target_hidden=torch.randn(1, context_len, 16),
+                position_embeddings=position_embeddings,
+                attention_mask=None,
+                kernel_options={
+                    "BLOCK_M": 64,
+                    "FORCE_USE_FLEX_ATTENTION": False,
+                },
+            )
+
+        self.assertEqual(output.shape, (1, query_len, 16))
+        self.assertEqual(captured["kernel_options"]["BLOCK_M"], 64)
+        self.assertTrue(
+            captured["kernel_options"]["FORCE_USE_FLEX_ATTENTION"]
+        )
+
     def test_grouped_conv_identity_and_block_boundary(self) -> None:
         conv = FlashMTPGroupedConv(
             hidden_size=2,

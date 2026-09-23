@@ -334,6 +334,17 @@ class Qwen3FlashMTPAttention(nn.Module):
         attn_fn: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        attn_kwargs = dict(kwargs)
+        if self.config._attn_implementation == "flex_attention":
+            # Packed FlashMTP queries have data-dependent lengths.  PyTorch may
+            # otherwise route short batches through the split-KV FlexDecoding
+            # kernel, which is an inference-oriented path and introduces a
+            # large float32 reduction workspace.  Keep training and inference
+            # on the regular FlexAttention kernel for every query length.
+            kernel_options = dict(attn_kwargs.pop("kernel_options", {}) or {})
+            kernel_options["FORCE_USE_FLEX_ATTENTION"] = True
+            attn_kwargs["kernel_options"] = kernel_options
         attn_output, attn_weights = attn_fn(
             self,
             q,
@@ -343,7 +354,7 @@ class Qwen3FlashMTPAttention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
-            **kwargs,
+            **attn_kwargs,
         )
         attn_output = attn_output.reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
