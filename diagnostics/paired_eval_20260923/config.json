@@ -1,0 +1,61 @@
+{
+  "seed": 20260923,
+  "training_file": "/data/wanghanzhen/training_data/generated/qwen3-8b/open_perfectblend_80k_qwen3_8b.jsonl",
+  "training_rows": 80000,
+  "train_samples": 128,
+  "benchmark_samples": 128,
+  "benchmark_categories": {
+    "coding": 10,
+    "extraction": 10,
+    "humanities": 10,
+    "math": 10,
+    "math_reasoning": 10,
+    "qa": 10,
+    "rag": 10,
+    "reasoning": 10,
+    "roleplay": 10,
+    "stem": 10,
+    "summarization": 10,
+    "translation": 9,
+    "writing": 9
+  },
+  "benchmark_exact_prompt_overlap_excluded": 0,
+  "checkpoints": {
+    "noconv": "/data/wanghanzhen/FlashMTP_v2swa/cache/models/flashmtp_h100_swa_w1_chs12_chsfirst_tokenwindow_globalpos_noconv_sample_q3_8b_pb_80k_wb_0.0_nlayers5_block_8_mhrnn_easy_direct_r512_ce0.1_tv1.0_maxlen4096_epochs6_Qwen3_8B/epoch_6_step_59730",
+    "convk2g16": "/data/wanghanzhen/FlashMTP_v2swa/cache/models/flashmtp_h100_swa_w1_chs12_chsfirst_tokenwindow_globalpos_convk2g16_sample_q3_8b_pb_80k_wb_0.0_nlayers5_block_8_mhrnn_easy_direct_r512_ce0.1_tv1.0_maxlen4096_epochs6_Qwen3_8B/epoch_6_step_59730"
+  },
+  "anchors_per_sample": 16,
+  "block_size": 8,
+  "max_length": 4096,
+  "generation_max_new_tokens": 256,
+  "loss_decay_gamma": 4,
+  "ce_weight": 0.1,
+  "l1_weight": 1.0,
+  "heldout_available": false,
+  "train_greedy_prefix": "training parser prefix plus fixed empty-thinking header when present",
+  "train_empty_thinking_header_preserved": 109,
+  "benchmark_template": "one user, enable_thinking=False, same as benchmark.py",
+  "note": "train_original/train_greedy are seen prompts, not heldout; benchmark dedup only exact normalized user text",
+  "length_control": "128 same train originals truncated at generation prefix length + 256 tokens",
+  "primary_benchmarks": {
+    "alpaca": {
+      "cache_rows": 52002,
+      "selected": 64,
+      "exact_train_prompt_overlaps_excluded": 0,
+      "split": "train (used only for evaluation here)"
+    },
+    "gsm8k": {
+      "cache_rows": 1319,
+      "selected": 64,
+      "exact_train_prompt_overlaps_excluded": 0,
+      "split": "test"
+    },
+    "mbpp": {
+      "cache_rows": 257,
+      "selected": 64,
+      "exact_train_prompt_overlaps_excluded": 0,
+      "split": "test"
+    }
+  },
+  "specbench_role": "supplementary only, superseded by user-selected primary datasets"
+}

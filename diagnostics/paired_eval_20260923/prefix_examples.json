@@ -1,0 +1,10 @@
+[
+  {
+    "cohort": "train_original",
+    "prefix_tail": "You are a helpful assistant.<|im_end|>\n<|im_start|>user\nLizzy had $30. She loaned out $15 to her friend. How much will Lizzy have if her friend returned the money with an interest of x%?\nIf we know the answer to the above question is 33, what is the value of unknown variable x?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+    "cohort": "benchmark_greedy",
+    "prefix_tail": " his fight with Floyd Mayweather. The 36-year-old looked extremely focused as he worked on his core strength during the training session. Spectators watch on as a fitness coach puts Pacquiao through his paces at LA's Griffith Park. Pacquiao has revealed the colourful mouthpiece he will wear during the May 2 bout in Las Vegas.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+]

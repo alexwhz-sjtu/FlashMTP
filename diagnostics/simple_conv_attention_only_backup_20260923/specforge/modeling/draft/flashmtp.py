@@ -1,4 +1,3 @@
-import os
 import time
 from typing import Callable, Optional
 
@@ -507,6 +506,12 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         self.post_attention_layernorm = Qwen3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.output_conv = (
+            FlashMTPGroupedConv(
+                config.hidden_size, block_size=query_block_size,
+                taps=conv_kernel_size, group_size=conv_group_size, sides=1,
+            ) if simple_conv_enabled else None
+        )
         self.attention_conv = (
             FlashMTPGroupedConv(
                 config.hidden_size,
@@ -514,7 +519,7 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
                 taps=conv_kernel_size,
                 group_size=conv_group_size,
             )
-            if backbone_conv_enabled or simple_conv_enabled
+            if backbone_conv_enabled
             else None
         )
         self.mlp_conv = (
@@ -572,34 +577,14 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         if self.mlp_conv is not None:
             hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
         hidden_states = residual + hidden_states
+        if self.output_conv is not None:
+            hidden_states = self.output_conv(hidden_states)
         return hidden_states
 
 
 class FlashMTPDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3FlashMTPDecoderLayer"]
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        # The previous simple_conv used inter-layer output_conv weights, which
-        # cannot initialize the new attention input/output wrappers.
-        config = kwargs.get("config")
-        if config is None or isinstance(config, (str, os.PathLike)):
-            config = cls.config_class.from_pretrained(
-                config if config is not None else pretrained_model_name_or_path,
-                **{k: kwargs[k] for k in (
-                    "cache_dir", "force_download", "local_files_only", "token",
-                    "revision", "subfolder",
-                ) if k in kwargs},
-            )
-        fcfg = getattr(config, "flashmtp_config", {}) or {}
-        if (fcfg.get("backbone_conv_mode") == "simple_conv"
-                and fcfg.get("simple_conv_layout") != "attention_pre_post"):
-            raise ValueError(
-                "Legacy simple_conv checkpoint uses output_conv and is incompatible "
-                "with attention_pre_post simple_conv; retrain or explicitly convert weights."
-            )
-        return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
 
     @torch.no_grad()
     def _init_weights(self, module: nn.Module) -> None:
@@ -758,11 +743,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             raise ValueError(f"Unknown backbone_conv_mode={self.backbone_conv_mode!r}")
         self.backbone_conv_enabled = self.backbone_conv_mode != "none"
         flashmtp_config["backbone_conv_mode"] = self.backbone_conv_mode
-        if self.backbone_conv_mode == "simple_conv":
-            layout = flashmtp_config.get("simple_conv_layout", "attention_pre_post")
-            if layout != "attention_pre_post":
-                raise ValueError(f"Unsupported simple_conv_layout={layout!r}")
-            flashmtp_config["simple_conv_layout"] = layout
         self.conv_kernel_size = int(flashmtp_config.get("conv_kernel_size", 2))
         self.conv_group_size = int(flashmtp_config.get("conv_group_size", 16))
         flashmtp_config["backbone_conv_enabled"] = self.backbone_conv_enabled
@@ -793,7 +773,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                     conv_kernel_size=self.conv_kernel_size,
                     conv_group_size=self.conv_group_size,
                     backbone_conv_enabled=self.backbone_conv_mode == "full",
-                    simple_conv_enabled=self.backbone_conv_mode == "simple_conv",
+                    simple_conv_enabled=(self.backbone_conv_mode == "simple_conv"
+                                         and layer_idx < config.num_hidden_layers - 1),
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
@@ -1022,7 +1003,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.config.block_size = int(block_size)
         if self.backbone_conv_enabled:
             for layer in self.layers:
-                for conv in (layer.attention_conv, layer.mlp_conv):
+                for conv in (layer.attention_conv, layer.mlp_conv, layer.output_conv):
                     if conv is not None:
                         conv.set_block_size(self.draft_query_length)
 
