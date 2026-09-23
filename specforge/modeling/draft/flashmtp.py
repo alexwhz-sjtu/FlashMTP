@@ -3,6 +3,7 @@ from typing import Callable, Optional
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from transformers import DynamicCache
 from ...utils import print_on_rank0
 from transformers.models.qwen3.modeling_qwen3 import (
@@ -348,11 +349,151 @@ class Qwen3FlashMTPAttention(nn.Module):
         return attn_output, attn_weights
 
 
+class FlashMTPGroupedConv(nn.Module):
+    """DFlash2-style grouped dynamic depthwise convolution per query block.
+
+    The dynamic delta is shared by ``group_size`` adjacent hidden channels,
+    while the learned base kernel remains channel-wise.  One projection of the
+    sublayer input produces kernels for both the input and output wrappers.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        block_size: int,
+        taps: int = 2,
+        group_size: int = 16,
+        sides: int = 2,
+    ) -> None:
+        super().__init__()
+        if taps < 1:
+            raise ValueError("FlashMTP conv_kernel_size must be >= 1")
+        if taps > block_size:
+            raise ValueError(
+                "FlashMTP conv_kernel_size must not exceed the full query block "
+                f"length, got conv_kernel_size={taps}, block_size={block_size}"
+            )
+        if group_size < 1 or hidden_size % group_size:
+            raise ValueError(
+                f"FlashMTP conv_group_size={group_size} must divide "
+                f"hidden_size={hidden_size}"
+            )
+
+        self.sides = sides
+        self.block_size = int(block_size)
+        self.taps = int(taps)
+        self.group_size = int(group_size)
+        self.num_groups = int(hidden_size) // self.group_size
+
+        # [input/output side, tap, channel].  [1, 0, ...] is identity.
+        base_kernel = torch.zeros(sides, self.taps, int(hidden_size))
+        base_kernel[:, 0] = 1.0
+        self.base_kernel = nn.Parameter(base_kernel)
+        self.kernel_projection = nn.Linear(
+            int(hidden_size),
+            sides * self.taps * self.num_groups,
+            bias=False,
+        )
+        nn.init.zeros_(self.kernel_projection.weight)
+
+    def set_block_size(self, block_size: int) -> None:
+        block_size = int(block_size)
+        if block_size < self.taps:
+            raise ValueError(
+                f"FlashMTP convolution block_size={block_size} must be >= "
+                f"conv_kernel_size={self.taps}"
+            )
+        self.block_size = block_size
+
+    def _convolve(
+        self,
+        hidden_states: torch.Tensor,
+        delta: torch.Tensor,
+        *,
+        side: int,
+    ) -> torch.Tensor:
+        batch_size, sequence_length, hidden_size = hidden_states.shape
+        if sequence_length % self.block_size:
+            raise ValueError(
+                "FlashMTP convolution sequence length must be divisible by the "
+                f"full query block length {self.block_size}, got {sequence_length}"
+            )
+
+        num_blocks = sequence_length // self.block_size
+        blocks = hidden_states.reshape(
+            batch_size,
+            num_blocks,
+            self.block_size,
+            self.num_groups,
+            self.group_size,
+        )
+        dynamic = delta.reshape(
+            batch_size,
+            num_blocks,
+            self.block_size,
+            self.taps,
+            self.num_groups,
+        )
+        base = self.base_kernel[side].reshape(
+            1,
+            1,
+            1,
+            self.taps,
+            self.num_groups,
+            self.group_size,
+        )
+        coefficients = base + dynamic.unsqueeze(-1)
+
+        output = coefficients[:, :, :, 0] * blocks
+        for tap in range(1, self.taps):
+            shifted = F.pad(
+                blocks[:, :, : self.block_size - tap],
+                (0, 0, 0, 0, tap, 0),
+            )
+            output = output + coefficients[:, :, :, tap] * shifted
+        return output.reshape(batch_size, sequence_length, hidden_size)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.sides != 1:
+            raise ValueError("Direct forward requires a single-sided convolution")
+        coefficients = self.kernel_projection(hidden_states).reshape(
+            *hidden_states.shape[:-1], self.taps, self.num_groups
+        )
+        return self._convolve(hidden_states, coefficients, side=0)
+
+    def prepare(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        coefficients = self.kernel_projection(hidden_states).reshape(
+            *hidden_states.shape[:-1],
+            2,
+            self.taps,
+            self.num_groups,
+        )
+        return (
+            self._convolve(hidden_states, coefficients[..., 0, :, :], side=0),
+            coefficients[..., 1, :, :],
+        )
+
+    def finish(
+        self,
+        hidden_states: torch.Tensor,
+        coefficients: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._convolve(hidden_states, coefficients, side=1)
+
+
 class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
     def __init__(
         self,
         config: Qwen3Config,
         layer_idx: int,
+        *,
+        query_block_size: int,
+        conv_kernel_size: int,
+        conv_group_size: int,
+        backbone_conv_enabled: bool,
+        simple_conv_enabled: bool = False,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -364,6 +505,32 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.output_conv = (
+            FlashMTPGroupedConv(
+                config.hidden_size, block_size=query_block_size,
+                taps=conv_kernel_size, group_size=conv_group_size, sides=1,
+            ) if simple_conv_enabled else None
+        )
+        self.attention_conv = (
+            FlashMTPGroupedConv(
+                config.hidden_size,
+                block_size=query_block_size,
+                taps=conv_kernel_size,
+                group_size=conv_group_size,
+            )
+            if backbone_conv_enabled
+            else None
+        )
+        self.mlp_conv = (
+            FlashMTPGroupedConv(
+                config.hidden_size,
+                block_size=query_block_size,
+                taps=conv_kernel_size,
+                group_size=conv_group_size,
+            )
+            if backbone_conv_enabled
+            else None
         )
 
     def forward(
@@ -382,6 +549,11 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
     ]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        attention_kernel = None
+        if self.attention_conv is not None:
+            hidden_states, attention_kernel = self.attention_conv.prepare(
+                hidden_states
+            )
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             target_hidden=target_hidden,
@@ -391,17 +563,36 @@ class Qwen3FlashMTPDecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )[0]
+        if self.attention_conv is not None:
+            hidden_states = self.attention_conv.finish(
+                hidden_states, attention_kernel
+            )
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        mlp_kernel = None
+        if self.mlp_conv is not None:
+            hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if self.mlp_conv is not None:
+            hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
         hidden_states = residual + hidden_states
+        if self.output_conv is not None:
+            hidden_states = self.output_conv(hidden_states)
         return hidden_states
 
 
 class FlashMTPDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3FlashMTPDecoderLayer"]
+
+    @torch.no_grad()
+    def _init_weights(self, module: nn.Module) -> None:
+        super()._init_weights(module)
+        if isinstance(module, FlashMTPGroupedConv):
+            # Qwen3PreTrainedModel.post_init() reinitializes child Linear
+            # modules.  Restore the dynamic branch to an exact identity start.
+            nn.init.zeros_(module.kernel_projection.weight)
 
     def __init__(self, config) -> None:
         super().__init__(config)
@@ -543,6 +734,20 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         flashmtp_config["markov_head_type"] = self.markov_head_type
         flashmtp_config["markov_output_mode"] = self.markov_output_mode
         flashmtp_config["markov_rank"] = self.markov_rank
+        self.backbone_conv_mode = flashmtp_config.get("backbone_conv_mode")
+        if self.backbone_conv_mode is None:
+            self.backbone_conv_mode = (
+                "full" if flashmtp_config.get("backbone_conv_enabled", False) else "none"
+            )
+        if self.backbone_conv_mode not in ("none", "full", "simple_conv"):
+            raise ValueError(f"Unknown backbone_conv_mode={self.backbone_conv_mode!r}")
+        self.backbone_conv_enabled = self.backbone_conv_mode != "none"
+        flashmtp_config["backbone_conv_mode"] = self.backbone_conv_mode
+        self.conv_kernel_size = int(flashmtp_config.get("conv_kernel_size", 2))
+        self.conv_group_size = int(flashmtp_config.get("conv_group_size", 16))
+        flashmtp_config["backbone_conv_enabled"] = self.backbone_conv_enabled
+        flashmtp_config["conv_kernel_size"] = self.conv_kernel_size
+        flashmtp_config["conv_group_size"] = self.conv_group_size
         self.markov_head = (
             None
             if self.markov_head_type == "none"
@@ -557,19 +762,25 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         )
         self._compiled_serial_sampler_cache: dict[tuple[str, float], Callable] = {}
         config.flashmtp_config = flashmtp_config
+        self.block_size = int(config.block_size)
 
         self.layers = nn.ModuleList(
             [
                 Qwen3FlashMTPDecoderLayer(
                     config,
                     layer_idx,
+                    query_block_size=self.draft_query_length,
+                    conv_kernel_size=self.conv_kernel_size,
+                    conv_group_size=self.conv_group_size,
+                    backbone_conv_enabled=self.backbone_conv_mode == "full",
+                    simple_conv_enabled=(self.backbone_conv_mode == "simple_conv"
+                                         and layer_idx < config.num_hidden_layers - 1),
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
-        self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
         self._last_decode_stats = {}
 
@@ -589,7 +800,11 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             f"target_layer_ids={self.target_layer_ids}, "
             f"markov_head_type={self.markov_head_type}, "
             f"markov_output_mode={self.markov_output_mode}, "
-            f"markov_rank={self.markov_rank}"
+            f"markov_rank={self.markov_rank}, "
+            f"backbone_conv_mode={self.backbone_conv_mode}, "
+            f"backbone_conv_enabled={self.backbone_conv_enabled}, "
+            f"conv_kernel_size={self.conv_kernel_size}, "
+            f"conv_group_size={self.conv_group_size}"
         )
 
         self.post_init()
@@ -786,6 +1001,11 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             )
         self.block_size = int(block_size)
         self.config.block_size = int(block_size)
+        if self.backbone_conv_enabled:
+            for layer in self.layers:
+                for conv in (layer.attention_conv, layer.mlp_conv, layer.output_conv):
+                    if conv is not None:
+                        conv.set_block_size(self.draft_query_length)
 
     def _prediction_hidden(self, block_hidden: torch.Tensor) -> torch.Tensor:
         """Return one hidden state for each proposed token."""
@@ -1557,7 +1777,13 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         hook_handles = []
         for layer_id in self.target_layer_ids:
             def capture_last_token(_module, _inputs, layer_output, *, _layer_id=layer_id):
-                captured_pivot_hidden[_layer_id] = layer_output[:, -1:, :].clone()
+                last_token_hidden = layer_output[:, -1:, :]
+                if _layer_id == len(target.model.layers) - 1:
+                    # HF hidden_states[-1] includes the final model RMSNorm,
+                    # unlike the raw final decoder-layer output from this hook.
+                    # Match both training CHS and subsequent verification CHS.
+                    last_token_hidden = target.model.norm(last_token_hidden)
+                captured_pivot_hidden[_layer_id] = last_token_hidden.clone()
 
             hook_handles.append(
                 target.model.layers[layer_id].register_forward_hook(capture_last_token)

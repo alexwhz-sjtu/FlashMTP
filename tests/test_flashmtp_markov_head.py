@@ -18,6 +18,7 @@ from specforge.core.flashmtp import (
 from specforge.modeling.draft.flashmtp import (
     FLASHMTP_ARCHITECTURE_VERSION,
     FlashMTPDraftModel,
+    FlashMTPGroupedConv,
     build_target_layer_ids,
     rejection_sample_verify,
 )
@@ -28,6 +29,153 @@ from specforge.modeling.draft.flashmtp_markov_head import (
 
 
 class FlashMTPMarkovHeadTest(unittest.TestCase):
+    def test_grouped_conv_identity_and_block_boundary(self) -> None:
+        conv = FlashMTPGroupedConv(
+            hidden_size=2,
+            block_size=3,
+            taps=2,
+            group_size=1,
+        )
+        inputs = torch.tensor(
+            [
+                [
+                    [1.0, 2.0],
+                    [3.0, 4.0],
+                    [5.0, 6.0],
+                    [7.0, 8.0],
+                    [9.0, 10.0],
+                    [11.0, 12.0],
+                ]
+            ]
+        )
+
+        prepared, output_kernel = conv.prepare(inputs)
+        torch.testing.assert_close(prepared, inputs)
+        torch.testing.assert_close(conv.finish(inputs, output_kernel), inputs)
+
+        with torch.no_grad():
+            conv.base_kernel.zero_()
+            conv.base_kernel[:, 1].fill_(1.0)
+        shifted, _ = conv.prepare(inputs)
+        expected = torch.tensor(
+            [
+                [
+                    [0.0, 0.0],
+                    [1.0, 2.0],
+                    [3.0, 4.0],
+                    [0.0, 0.0],
+                    [7.0, 8.0],
+                    [9.0, 10.0],
+                ]
+            ]
+        )
+        torch.testing.assert_close(shifted, expected)
+
+    def test_backbone_conv_switch_builds_identity_wrappers(self) -> None:
+        config = Qwen3Config(
+            vocab_size=29,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 4
+        config.block_size = 4
+        config.flashmtp_config = {
+            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
+            "sliding_window_size": 4,
+            "chs_num_layers": 2,
+            "target_layer_ids": [0, 3],
+            "backbone_conv_enabled": True,
+            "conv_kernel_size": 2,
+            "conv_group_size": 4,
+        }
+
+        model = FlashMTPDraftModel(config)
+        layer = model.layers[0]
+        self.assertTrue(model.backbone_conv_enabled)
+        self.assertEqual(layer.attention_conv.block_size, model.draft_query_length)
+        self.assertEqual(layer.mlp_conv.block_size, model.draft_query_length)
+        torch.testing.assert_close(
+            layer.attention_conv.kernel_projection.weight,
+            torch.zeros_like(layer.attention_conv.kernel_projection.weight),
+        )
+        self.assertEqual(model.config.flashmtp_config["conv_kernel_size"], 2)
+        self.assertEqual(model.config.flashmtp_config["conv_group_size"], 4)
+
+        model.set_config_block_size(6)
+        self.assertEqual(layer.attention_conv.block_size, model.draft_query_length)
+        self.assertEqual(layer.mlp_conv.block_size, model.draft_query_length)
+
+    def test_backbone_conv_defaults_off_for_legacy_configs(self) -> None:
+        config = Qwen3Config(
+            vocab_size=29,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+        config.num_target_layers = 4
+        config.block_size = 4
+        config.flashmtp_config = {
+            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
+            "sliding_window_size": 4,
+            "chs_num_layers": 2,
+            "target_layer_ids": [0, 3],
+        }
+
+        model = FlashMTPDraftModel(config)
+        self.assertFalse(model.backbone_conv_enabled)
+        self.assertIsNone(model.layers[0].attention_conv)
+        self.assertIsNone(model.layers[0].mlp_conv)
+
+    def test_backbone_conv_forward_backward_reaches_dynamic_kernel(self) -> None:
+        config = Qwen3Config(
+            vocab_size=29,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            attention_dropout=0.0,
+        )
+        config._attn_implementation = "eager"
+        config.num_target_layers = 4
+        config.block_size = 4
+        config.flashmtp_config = {
+            "architecture_version": FLASHMTP_ARCHITECTURE_VERSION,
+            "sliding_window_size": 4,
+            "chs_num_layers": 2,
+            "target_layer_ids": [0, 3],
+            "backbone_conv_enabled": True,
+            "conv_kernel_size": 2,
+            "conv_group_size": 4,
+        }
+        model = FlashMTPDraftModel(config)
+        query_len = model.draft_query_length
+        context_len = model.condition_slot_count
+        output = model(
+            position_ids=torch.arange(query_len).repeat(2, 1),
+            rotary_position_ids=torch.arange(context_len + query_len).repeat(
+                2, 1
+            ),
+            noise_embedding=torch.randn(2, query_len, 16),
+            target_hidden=torch.randn(2, 1, context_len, 16),
+            attention_mask=torch.zeros(2, 1, query_len, context_len + query_len),
+        )
+        output.square().mean().backward()
+
+        grad = model.layers[0].attention_conv.kernel_projection.weight.grad
+        self.assertEqual(output.shape, (2, query_len, 16))
+        self.assertIsNotNone(grad)
+        self.assertTrue(torch.isfinite(grad).all().item())
+        self.assertGreater(grad.abs().sum().item(), 0.0)
+
     def test_sliding_layer_selection_and_architecture_validation(self) -> None:
         self.assertEqual(build_target_layer_ids(8, 5), [0, 1, 3, 6, 7])
         with self.assertRaises(ValueError):

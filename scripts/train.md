@@ -5,11 +5,10 @@
 ```bash
 cd /data/wanghanzhen/FlashMTP_v2swa
 source .venv/bin/activate
-SLIDING_WINDOW_SIZE=512 \
+SLIDING_WINDOW_SIZE=1 \
 CHS_NUM_LAYERS=12 \
-LOCAL_POSITION=false \
+LOCAL_POSITION=true \
 HEADPOS=false \
-HISTORY_MODE=fuse \
 BLOCK_SIZE=8 \
 NUM_DRAFT_LAYERS=5 \
 NUM_EPOCHS=6 \
@@ -17,18 +16,22 @@ NUM_ANCHORS=512 \
 MAX_LENGTH=4096 \
 BATCH_SIZE=1 \
 LOSS_DECAY_GAMMA=4 \
-DATA_NUM_SAMPLES=pb_80k \
+DATA_NUM_SAMPLES=q3_8b_pb_80k \
 BASE_LM_CE_DECAY_GAMMA=12 \
 LEARNING_RATE=4e-4 \
 FINAL_CE_WEIGHT=0.1 \
 TV_LOSS_WEIGHT=1.0 \
-BASE_LM_CE_WEIGHT=0.06 \
+BASE_LM_CE_WEIGHT=0.0 \
 MARKOV_HEAD_TYPE=rnn_easy \
 MARKOV_OUTPUT_MODE=direct \
-MARKOV_RANK=320 \
-TRAIN_DATA_PATH='/data/wanghanzhen/training_data/generated/qwen3-4b/open_perfectblend_80k_qwen3_4b.jsonl' \
-MODEL_TAG='Qwen3_4B' \
-TARGET_MODEL='/data/wanghanzhen/models/Qwen3-4B' \
+ENABLE_BACKBONE_CONV=true \
+export BACKBONE_CONV_MODE=simple_conv \
+BACKBONE_CONV_KERNEL_SIZE=2 \
+BACKBONE_CONV_GROUP_SIZE=16 \
+MARKOV_RANK=512 \
+TRAIN_DATA_PATH='/data/wanghanzhen/training_data/generated/qwen3-8b/open_perfectblend_80k_qwen3_8b.jsonl' \
+MODEL_TAG='Qwen3_8B' \
+TARGET_MODEL='/data/wanghanzhen/models/Qwen3-8B' \
 bash scripts/run_training_flashmtp.sh --dt h100
 ```
 
@@ -70,3 +73,36 @@ latent 处注入；训练与推理均使用相同的 `0..block_size-2` slot 编�
 `false` 时保持原始无位置 embedding 的行为。
 
 训练时 target 冻结，只捕获 dense 历史所需的首层、中层、末层，以及当前 CHS 和 TV loss 所需层。draft 不使用 KV cache。
+
+### 层间卷积 simple_conv
+
+保留原有训练命令的其它参数，设置 `BACKBONE_CONV_MODE=simple_conv`。
+可选模式为 `none`、`full`、`simple_conv`；显式模式优先于旧的
+`ENABLE_BACKBONE_CONV`。未设置模式时，旧开关行为保持不变。
+
+```bash
+BACKBONE_CONV_MODE=simple_conv \
+BACKBONE_CONV_KERNEL_SIZE=2 \
+BACKBONE_CONV_GROUP_SIZE=16 \
+bash scripts/run_training_flashmtp.sh --dt h100
+```
+
+直接调用 `scripts/train_flashmtp.py` 时，添加：
+`--backbone-conv-mode simple_conv --conv-kernel-size 2 --conv-group-size 16`。
+这里的 `--dt` 沿用原有环境配置选择，不根据 GPU 型号自动切换；数据、模型和输出路径
+需沿用自己的训练配置。
+
+`simple_conv` 在每个非末层的 MLP 残差相加之后执行一次单侧动态因果卷积，
+最后一层不加。5 层时共 4 次卷积，基础核恒等初始化、动态投影零初始化。
+模式保存到 checkpoint 的 `flashmtp_config.backbone_conv_mode`，推理自动读取。
+旧 checkpoint 未记录模式时，根据 `backbone_conv_enabled` 恢复 none/full。
+恢复训练要求卷积模式相同，不能将已有 full checkpoint 直接作为 simple_conv resume。
+
+可复现的合成 backbone forward 测速（不含 target、LM head 和串行 head）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. .venv/bin/python \
+  scripts/benchmark_simple_conv_forward.py \
+  --config /path/to/checkpoint/config.json \
+  --output benchmark_results/simple_conv_forward.json
+```

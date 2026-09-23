@@ -122,19 +122,47 @@ DIST_TIMEOUT="${DIST_TIMEOUT:-1200}"
 # 模型参数（OUTPUT_DIR 依赖 BLOCK_SIZE，须早于 dt 分支）
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 MODEL_TAG="${MODEL_TAG:-Qwen3_8B}"
+ENABLE_BACKBONE_CONV="${ENABLE_BACKBONE_CONV:-true}"
+BACKBONE_CONV_KERNEL_SIZE="${BACKBONE_CONV_KERNEL_SIZE:-2}"
+BACKBONE_CONV_GROUP_SIZE="${BACKBONE_CONV_GROUP_SIZE:-16}"
+case "${ENABLE_BACKBONE_CONV,,}" in
+    1|true|yes|on)
+        ENABLE_BACKBONE_CONV="true"
+        BACKBONE_CONV_TAG="convk${BACKBONE_CONV_KERNEL_SIZE}g${BACKBONE_CONV_GROUP_SIZE}"
+        ;;
+    0|false|no|off)
+        ENABLE_BACKBONE_CONV="false"
+        BACKBONE_CONV_TAG="noconv"
+        ;;
+    *)
+        echo "错误: ENABLE_BACKBONE_CONV 须为 true/false（也接受 1/0、yes/no、on/off）" >&2
+        exit 1
+        ;;
+esac
+
+# Explicit mode takes precedence over the legacy boolean switch.
+BACKBONE_CONV_MODE="${BACKBONE_CONV_MODE:-}"
+if [[ -n "${BACKBONE_CONV_MODE}" ]]; then
+    case "${BACKBONE_CONV_MODE}" in
+        none) ENABLE_BACKBONE_CONV="false"; BACKBONE_CONV_TAG="noconv" ;;
+        full) ENABLE_BACKBONE_CONV="true"; BACKBONE_CONV_TAG="convk${BACKBONE_CONV_KERNEL_SIZE}g${BACKBONE_CONV_GROUP_SIZE}" ;;
+        simple_conv) ENABLE_BACKBONE_CONV="true"; BACKBONE_CONV_TAG="simple_convk${BACKBONE_CONV_KERNEL_SIZE}g${BACKBONE_CONV_GROUP_SIZE}" ;;
+        *) echo "Invalid BACKBONE_CONV_MODE: ${BACKBONE_CONV_MODE}" >&2; exit 1 ;;
+    esac
+fi
 
 if [ "$DT" = "qz" ]; then
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_swa_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_sample_${DATA_NUM_SAMPLES}_wb_${BASE_LM_CE_WEIGHT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_qz_swa_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_${BACKBONE_CONV_TAG}_sample_${DATA_NUM_SAMPLES}_wb_${BASE_LM_CE_WEIGHT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 elif [ "$DT" = "h100" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/share/dai-sys/wanghanzhen/projects/MTP/training_data/nemotron_think_off_samples_40000_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_swa_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_sample_${DATA_NUM_SAMPLES}_wb_${BASE_LM_CE_WEIGHT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_h100_swa_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_${BACKBONE_CONV_TAG}_sample_${DATA_NUM_SAMPLES}_wb_${BASE_LM_CE_WEIGHT}_nlayers${NUM_DRAFT_LAYERS}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_HOME/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_swa_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_a800_swa_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_${BACKBONE_CONV_TAG}_nemotron_40000_think_on_nlayers${NUM_DRAFT_LAYERS}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
@@ -191,7 +219,7 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-1000}"
 
 # Tracker 参数
 REPORT_TO="${REPORT_TO:-wandb}"
-WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training-v2new}"
+WANDB_PROJECT="${WANDB_PROJECT:-flashmtp_v3}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
 # 含 dt / 草稿层数 / 样本量 / 拼接方式；run id 与默认 OUTPUT_DIR 中 nlayers* 可对照
 # WandB Name/Id 上限 128 字符；超长时保留前缀并追加 8 位哈希，避免训练在 wandb.init 处失败
@@ -207,8 +235,8 @@ clip_wandb_id() {
     local keep=$((max_len - 9))
     printf '%s_%s' "${value:0:${keep}}" "${digest}"
 }
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_swa_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_wb_${BASE_LM_CE_WEIGHT}_block_${BLOCK_SIZE}_${MARKOV_TAG}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
-WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_swa_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_wb_${BASE_LM_CE_WEIGHT}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${MODEL_TAG}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_swa_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_${BACKBONE_CONV_TAG}_wb_${BASE_LM_CE_WEIGHT}_block_${BLOCK_SIZE}_${MARKOV_TAG}_n${DATA_NUM_SAMPLES}_epochs${NUM_EPOCHS}_${MODEL_TAG}}"
+WANDB_NAME="${WANDB_RUN_NAME:-flashmtp_swa_w${SLIDING_WINDOW_SIZE}_chs${CHS_NUM_LAYERS}_${CHS_LAYOUT_TAG}_${POSITION_TAG}_${BACKBONE_CONV_TAG}_wb_${BASE_LM_CE_WEIGHT}_block_${BLOCK_SIZE}_${MARKOV_TAG}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_${MODEL_TAG}}"
 WANDB_RUN_ID="$(clip_wandb_id "${WANDB_RUN_ID}")"
 WANDB_NAME="$(clip_wandb_id "${WANDB_NAME}")"
 if [ -n "${WANDB_RUN_NAME}" ]; then
@@ -257,6 +285,8 @@ fi
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  锚点执行分块: ${ANCHOR_CHUNK_SIZE} (0=关闭)"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
+echo "  Backbone两点卷积: ${ENABLE_BACKBONE_CONV}"
+echo "  卷积kernel/group: ${BACKBONE_CONV_KERNEL_SIZE}/${BACKBONE_CONV_GROUP_SIZE}"
 echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
 echo "  最终CE权重: ${FINAL_CE_WEIGHT}"
 echo "  串行Head TV权重: ${TV_LOSS_WEIGHT}"
@@ -352,6 +382,16 @@ fi
 
 if [[ "${LOCAL_POSITION}" == "1" || "${LOCAL_POSITION}" == "true" ]]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --local-position"
+fi
+
+if [[ -n "${BACKBONE_CONV_MODE}" ]]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --backbone-conv-mode ${BACKBONE_CONV_MODE}"
+fi
+
+if [ "${ENABLE_BACKBONE_CONV}" = "true" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --backbone-conv"
+else
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --no-backbone-conv"
 fi
 
 if awk "BEGIN {exit !(${BASE_LM_CE_WEIGHT} > 0)}"; then
@@ -458,6 +498,8 @@ EXIT_CODE=0
     --markov-head-type ${MARKOV_HEAD_TYPE} \
     --markov-output-mode ${MARKOV_OUTPUT_MODE} \
     --markov-rank ${MARKOV_RANK} \
+    --conv-kernel-size ${BACKBONE_CONV_KERNEL_SIZE} \
+    --conv-group-size ${BACKBONE_CONV_GROUP_SIZE} \
     --final-ce-weight ${FINAL_CE_WEIGHT} \
     --tv-loss-weight ${TV_LOSS_WEIGHT} \
     --seed 42 \

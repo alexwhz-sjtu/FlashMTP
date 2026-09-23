@@ -150,6 +150,29 @@ def parse_args():
         "attention window. Target positions and target KV cache remain global.",
     )
     model_group.add_argument(
+        "--backbone-conv",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable DFlash2-style grouped dynamic convolution around every "
+        "attention and MLP sublayer. Disabled by default for legacy CLI compatibility.",
+    )
+    model_group.add_argument(
+        "--backbone-conv-mode", choices=("none", "full", "simple_conv"),
+        default=None, help="Explicit convolution mode; overrides --[no-]backbone-conv.",
+    )
+    model_group.add_argument(
+        "--conv-kernel-size",
+        type=int,
+        default=2,
+        help="Number of causal convolution taps in the FlashMTP backbone.",
+    )
+    model_group.add_argument(
+        "--conv-group-size",
+        type=int,
+        default=16,
+        help="Number of adjacent hidden channels sharing each dynamic kernel delta.",
+    )
+    model_group.add_argument(
         "--loss-decay-gamma",
         type=float,
         default=None,
@@ -322,6 +345,14 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     """Build target model (backend wrapper) and draft model."""
     if args.markov_rank <= 0:
         raise ValueError(f"--markov-rank must be positive, got {args.markov_rank}.")
+    if args.conv_kernel_size < 1:
+        raise ValueError(
+            f"--conv-kernel-size must be positive, got {args.conv_kernel_size}."
+        )
+    if args.conv_group_size < 1:
+        raise ValueError(
+            f"--conv-group-size must be positive, got {args.conv_group_size}."
+        )
     if args.final_ce_weight < 0:
         raise ValueError(
             f"--final-ce-weight must be non-negative, got {args.final_ce_weight}."
@@ -435,6 +466,14 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     draft_config.flashmtp_config["markov_head_type"] = args.markov_head_type
     draft_config.flashmtp_config["markov_output_mode"] = args.markov_output_mode
     draft_config.flashmtp_config["markov_rank"] = int(args.markov_rank)
+    draft_config.flashmtp_config["backbone_conv_mode"] = (
+        args.backbone_conv_mode or ("full" if args.backbone_conv else "none")
+    )
+    draft_config.flashmtp_config["backbone_conv_enabled"] = (
+        draft_config.flashmtp_config["backbone_conv_mode"] != "none"
+    )
+    draft_config.flashmtp_config["conv_kernel_size"] = int(args.conv_kernel_size)
+    draft_config.flashmtp_config["conv_group_size"] = int(args.conv_group_size)
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
@@ -463,7 +502,10 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         f"local_position={draft_model.local_position}, "
         f"markov_head_type={draft_model.markov_head_type}, "
         f"markov_output_mode={draft_model.markov_output_mode}, "
-        f"markov_rank={draft_model.markov_rank}"
+        f"markov_rank={draft_model.markov_rank}, "
+        f"backbone_conv_enabled={draft_model.backbone_conv_enabled}, "
+        f"conv_kernel_size={draft_model.conv_kernel_size}, "
+        f"conv_group_size={draft_model.conv_group_size}"
     )
 
     return target_model, draft_model
@@ -813,6 +855,22 @@ def main():
                 "current training arguments: "
                 f"requested={requested_markov}, checkpoint={checkpoint_markov}."
             )
+        requested_conv = (
+            draft_model.backbone_conv_mode,
+            draft_model.conv_kernel_size,
+            draft_model.conv_group_size,
+        )
+        checkpoint_conv = (
+            loaded_model.backbone_conv_mode,
+            loaded_model.conv_kernel_size,
+            loaded_model.conv_group_size,
+        )
+        if requested_conv != checkpoint_conv:
+            raise ValueError(
+                "Checkpoint backbone-convolution configuration does not match "
+                "the current training arguments: "
+                f"requested={requested_conv}, checkpoint={checkpoint_conv}."
+            )
         requested_sliding = (
             draft_model.architecture_version,
             draft_model.sliding_window_size,
@@ -898,6 +956,16 @@ def main():
         draft_model.markov_output_mode
     )
     draft_model.config.flashmtp_config["markov_rank"] = int(draft_model.markov_rank)
+    draft_model.config.flashmtp_config["backbone_conv_mode"] = draft_model.backbone_conv_mode
+    draft_model.config.flashmtp_config["backbone_conv_enabled"] = (
+        draft_model.backbone_conv_enabled
+    )
+    draft_model.config.flashmtp_config["conv_kernel_size"] = int(
+        draft_model.conv_kernel_size
+    )
+    draft_model.config.flashmtp_config["conv_group_size"] = int(
+        draft_model.conv_group_size
+    )
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
