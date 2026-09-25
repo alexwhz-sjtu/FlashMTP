@@ -1459,7 +1459,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         position_ids = torch.arange(
             output_ids.shape[1], device=target.device
         ).unsqueeze(0)
-        past_key_values_target = DynamicCache()
+        past_key_values_target = (target.make_inference_cache() if hasattr(target, "make_inference_cache") else DynamicCache())
 
         if target.device.type == "cuda":
             torch.cuda.synchronize(target.device)
@@ -1795,7 +1795,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             .expand(bsz, -1)
         )
 
-        past_key_values_target = DynamicCache()
+        past_key_values_target = (target.make_inference_cache() if hasattr(target, "make_inference_cache") else DynamicCache())
 
         # Prefill stage (not included in decode wall time). FlashMTP only needs
         # the final token from selected target layers. Requesting all hidden

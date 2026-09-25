@@ -72,6 +72,14 @@ RESUME="${RESUME:-}"
 CKPT_DIR="${CKPT_DIR:-}"
 RESUME_OPTIMIZER="${RESUME_OPTIMIZER:-1}"
 LOAD_WEIGHTS_ONLY="${LOAD_WEIGHTS_ONLY:-0}"
+DRAFT_CONFIG_PATH="${DRAFT_CONFIG_PATH:-}"
+if [ "${LOAD_WEIGHTS_ONLY}" = "1" ]; then
+    if [ -z "${CKPT_DIR}" ]; then
+        echo "错误: LOAD_WEIGHTS_ONLY=1 须设置 CKPT_DIR" >&2
+        exit 1
+    fi
+    DRAFT_CONFIG_PATH="${DRAFT_CONFIG_PATH:-${CKPT_DIR}}"
+fi
 
 # ========================================
 # 主要数据集参数
@@ -411,6 +419,10 @@ fi
 
 if [ -n "${CKPT_DIR}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --ckpt-dir ${CKPT_DIR}"
+fi
+
+if [ -n "${DRAFT_CONFIG_PATH}" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --draft-config-path ${DRAFT_CONFIG_PATH}"
 fi
 
 if [ "${RESUME_OPTIMIZER}" = "0" ]; then

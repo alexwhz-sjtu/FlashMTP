@@ -415,9 +415,12 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     else:
         draft_config = copy.deepcopy(target_config)
         draft_config.num_hidden_layers = args.num_draft_layers
-        draft_config.block_size = args.block_size
         draft_config.num_target_layers = target_config.num_hidden_layers
         print_on_rank0("Auto-generated draft config from target model")
+
+    # A checkpoint config supplies the architecture, while the requested block
+    # size controls this new run. The serial head has no block-sized weights.
+    draft_config.block_size = args.block_size
 
     if (
         not hasattr(draft_config, "flashmtp_config")
@@ -787,6 +790,8 @@ def main():
     )
 
     args = parse_args()
+    if args.load_weights_only and not args.ckpt_dir:
+        raise ValueError("--load-weights-only requires an explicit --ckpt-dir.")
     set_seed(args.seed)
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
@@ -895,6 +900,13 @@ def main():
                 "current training arguments: "
                 f"requested={requested_sliding}, checkpoint={checkpoint_sliding}."
             )
+        checkpoint_block_size = loaded_model.block_size
+        if not args.load_weights_only and draft_model.block_size != checkpoint_block_size:
+            raise ValueError(
+                "Changing block_size when restoring optimizer/scheduler state is "
+                "unsupported. Use --load-weights-only to start a new run from "
+                f"checkpoint weights ({checkpoint_block_size} -> {draft_model.block_size})."
+            )
         draft_model.load_state_dict(loaded_model.state_dict())
         del loaded_model
         draft_weights_from_checkpoint = True
@@ -905,6 +917,10 @@ def main():
             print_on_rank0(
                 "Weights-only initialization requested: ignoring checkpoint "
                 "epoch, global step, optimizer, and scheduler state."
+            )
+            print_on_rank0(
+                f"Draft block_size: checkpoint={checkpoint_block_size}, "
+                f"new run={draft_model.block_size}"
             )
         elif training_state_dir is not None:
             resume_state = load_distributed_training_state(

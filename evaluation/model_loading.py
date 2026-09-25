@@ -203,13 +203,25 @@ def load_flashmtp_benchmark_models(
     target_config = load_decode_config(args.model_name_or_path, args)
     draft_config = load_decode_config(args.draft_name_or_path, args)
 
-    target = AutoModelForCausalLM.from_pretrained(
+    is_qwen35 = target_config.model_type in ("qwen3_5", "qwen3_5_text")
+    target_class = AutoModelForCausalLM
+    if is_qwen35:
+        from transformers import Qwen3_5ForCausalLM
+        target_class = Qwen3_5ForCausalLM
+        target_config = getattr(target_config, "text_config", target_config)
+
+    target = target_class.from_pretrained(
         args.model_name_or_path,
         config=target_config,
         attn_implementation=attn_impl,
         dtype=torch.bfloat16,
         trust_remote_code=getattr(args, "trust_remote_code", False),
     ).to(device).eval()
+
+    if is_qwen35:
+        from evaluation.qwen35_target import install_qwen35_rollback
+        install_qwen35_rollback(target)
+        logger.info("Qwen3.5 target: hybrid cache with accepted-prefix recurrence replay")
 
     draft_model = FlashMTPDraftModel.from_pretrained(
         args.draft_name_or_path,

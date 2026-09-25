@@ -650,7 +650,7 @@ def target_generate(
     position_ids = torch.arange(max_length, device=input_ids.device).unsqueeze(0).expand(
         batch_size_dim, -1
     )
-    past_key_values_target = DynamicCache()
+    past_key_values_target = (target.make_inference_cache() if hasattr(target, "make_inference_cache") else DynamicCache())
     stop_tensor = (
         torch.tensor(stop_token_ids, device=input_ids.device, dtype=torch.long)
         if stop_token_ids
@@ -790,6 +790,7 @@ def main() -> None:
         "Default: verify the full block (proposal_length + 1).",
     )
     parser.add_argument("--dataset", type=str, required=True)
+    parser.add_argument("--output-json", type=str, default=None, help="Save aggregate metrics and per-turn timing records.")
     parser.add_argument(
         "--specbench-first-turn-only",
         action="store_true",
@@ -1069,6 +1070,9 @@ def main() -> None:
                 response["category"] = sample_category
             if instance.get("question_id") is not None:
                 response["question_id"] = instance["question_id"]
+            response["sample_index"] = idx
+            response["turn_index"] = turn_index
+            response["greedy_equal"] = (bool(torch.equal(response[1].output_ids, spec_response.output_ids)) if args.temperature < 1e-5 else None)
             responses.append(response)
 
     if dist.size() > 1:
@@ -1099,6 +1103,31 @@ def main() -> None:
 
     total_elapsed_time = cuda_time() - benchmark_start
     print(f"Total elapsed time: {total_elapsed_time:.2f}s")
+    if args.output_json:
+        import transformers
+        records = []
+        for r in responses:
+            record = {k: r.get(k) for k in ("sample_index", "turn_index", "greedy_equal")}
+            for label, key in (("baseline", 1), ("flashmtp", config_block_size)):
+                result = r[key]
+                record[label] = {
+                    "num_output_tokens": result.num_output_tokens,
+                    "num_input_tokens": result.num_input_tokens,
+                    "num_tokens_for_decode_rate": result.num_tokens_for_decode_rate,
+                    "decode_wall_time": result.decode_wall_time,
+                    "acceptance_lengths": result.acceptance_lengths if label == "flashmtp" else None,
+                }
+            records.append(record)
+        payload = {
+            "args": vars(args), "torch_version": torch.__version__,
+            "transformers_version": transformers.__version__,
+            "overall": overall_stats, "elapsed_seconds": total_elapsed_time,
+            "greedy_equal_turns": sum(r["greedy_equal"] is True for r in records),
+            "records": records,
+        }
+        output_path = Path(args.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
 if __name__ == "__main__":
     main()
