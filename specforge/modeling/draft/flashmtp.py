@@ -178,6 +178,10 @@ SUPPORTED_FLASHMTP_ARCHITECTURE_VERSIONS = (
     FLASHMTP_ARCHITECTURE_VERSION_V4,
     FLASHMTP_ARCHITECTURE_VERSION_V3,
 )
+# Pivot-q student checkpoints keep pre-anchor tokens in ``anchor_group_size``.
+# Their history fusion weights are unused once that token window is removed.
+LEGACY_PIVOTQ_STUDENT_ARCHITECTURE = "swa_teacher_pivotq_student_v1"
+LEGACY_UNUSED_STATE_PREFIXES = ("history_fuse.", "history_norm.")
 def _infer_hs_embedding_offset(
     hidden_states: tuple | list, num_transformer_layers: int
 ) -> int:
@@ -223,6 +227,253 @@ def build_target_layer_ids(
             f"Failed to select exactly {S} CHS layers from target depth {L}: {result}"
         )
     return result
+
+
+def _checkpoint_markov(flashmtp_config: dict) -> tuple[str, str, int]:
+    head_type = str(flashmtp_config.get("markov_head_type", "none")).lower()
+    output_mode = str(flashmtp_config.get("markov_output_mode", "additive")).lower()
+    rank = int(flashmtp_config.get("markov_rank", 0))
+    if head_type == "none":
+        rank = 0
+    return head_type, output_mode, rank
+
+
+def _checkpoint_conv(flashmtp_config: dict) -> tuple[str, int, int]:
+    mode = flashmtp_config.get("backbone_conv_mode")
+    if mode is None:
+        mode = (
+            "full"
+            if flashmtp_config.get("backbone_conv_enabled", False)
+            else "none"
+        )
+    return (
+        str(mode),
+        int(flashmtp_config.get("conv_kernel_size", 2)),
+        int(flashmtp_config.get("conv_group_size", 16)),
+    )
+
+
+def read_checkpoint_flashmtp_config(
+    checkpoint_dir: str,
+) -> tuple[Qwen3Config, dict]:
+    """Load a draft checkpoint config without constructing its architecture."""
+    config = Qwen3Config.from_pretrained(checkpoint_dir)
+    flashmtp_config = getattr(config, "flashmtp_config", None) or {}
+    if not isinstance(flashmtp_config, dict) or not flashmtp_config.get(
+        "architecture_version"
+    ):
+        raise ValueError(
+            f"Checkpoint {checkpoint_dir} has no flashmtp_config.architecture_version."
+        )
+    return config, flashmtp_config
+
+
+def load_checkpoint_state_dict(checkpoint_dir: str) -> dict[str, torch.Tensor]:
+    """Read draft weights saved by ``save_pretrained``."""
+    single = os.path.join(checkpoint_dir, "model.safetensors")
+    if os.path.isfile(single):
+        from safetensors.torch import load_file
+
+        return load_file(single, device="cpu")
+
+    index_path = os.path.join(checkpoint_dir, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        import json
+
+        from safetensors.torch import load_file
+
+        with open(index_path, encoding="utf-8") as index_file:
+            index = json.load(index_file)
+        state_dict: dict[str, torch.Tensor] = {}
+        for shard_name in sorted(set(index["weight_map"].values())):
+            state_dict.update(
+                load_file(os.path.join(checkpoint_dir, shard_name), device="cpu")
+            )
+        return state_dict
+
+    bin_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
+    if os.path.isfile(bin_path):
+        return torch.load(bin_path, map_location="cpu", weights_only=True)
+
+    incomplete = [
+        name
+        for name in os.listdir(checkpoint_dir)
+        if "incomplete" in name
+    ]
+    hint = ""
+    if incomplete:
+        hint = f" Found incomplete weight files: {incomplete}."
+    raise FileNotFoundError(
+        f"No model.safetensors or pytorch_model.bin in {checkpoint_dir}.{hint}"
+    )
+
+
+def plan_checkpoint_weight_init(
+    model: "FlashMTPDraftModel",
+    flashmtp_config: dict,
+    *,
+    load_weights_only: bool,
+) -> dict:
+    """Check that a wider-window checkpoint can initialize ``model``.
+
+    Sliding-window weights do not depend on how many pre-anchor tokens are
+    concatenated. A new ``sliding_window_size`` is therefore a data-layout
+    change. Legacy pivot-q students store those tokens as ``anchor_group_size``
+    and also carry unused history-fusion parameters.
+    """
+    source_architecture = str(flashmtp_config.get("architecture_version"))
+    supported = source_architecture in SUPPORTED_FLASHMTP_ARCHITECTURE_VERSIONS
+    legacy = source_architecture == LEGACY_PIVOTQ_STUDENT_ARCHITECTURE
+    if not supported and not legacy:
+        raise ValueError(
+            "Cannot initialize from checkpoint architecture "
+            f"{source_architecture!r}. Expected one of "
+            f"{SUPPORTED_FLASHMTP_ARCHITECTURE_VERSIONS} or "
+            f"{LEGACY_PIVOTQ_STUDENT_ARCHITECTURE!r}."
+        )
+
+    requested_markov = (
+        model.markov_head_type,
+        model.markov_output_mode,
+        model.markov_rank,
+    )
+    checkpoint_markov = _checkpoint_markov(flashmtp_config)
+    if requested_markov != checkpoint_markov:
+        raise ValueError(
+            "Checkpoint serial-head configuration does not match the current "
+            f"training arguments: requested={requested_markov}, "
+            f"checkpoint={checkpoint_markov}."
+        )
+
+    requested_conv = (
+        model.backbone_conv_mode,
+        model.conv_kernel_size,
+        model.conv_group_size,
+    )
+    checkpoint_conv = _checkpoint_conv(flashmtp_config)
+    if requested_conv != checkpoint_conv:
+        raise ValueError(
+            "Checkpoint backbone-convolution configuration does not match the "
+            "current training arguments: "
+            f"requested={requested_conv}, checkpoint={checkpoint_conv}."
+        )
+
+    checkpoint_layers = [
+        int(layer_id) for layer_id in flashmtp_config.get("target_layer_ids") or []
+    ]
+    if (
+        checkpoint_layers != list(model.target_layer_ids)
+        or int(flashmtp_config.get("chs_num_layers", -1)) != model.chs_num_layers
+    ):
+        raise ValueError(
+            "Checkpoint CHS layers do not match the current training arguments: "
+            f"requested=({model.chs_num_layers}, {list(model.target_layer_ids)}), "
+            f"checkpoint=({flashmtp_config.get('chs_num_layers')}, {checkpoint_layers})."
+        )
+
+    if supported:
+        if source_architecture != model.architecture_version:
+            raise ValueError(
+                "Checkpoint architecture_version does not match the current model: "
+                f"requested={model.architecture_version!r}, "
+                f"checkpoint={source_architecture!r}."
+            )
+        mismatches = []
+        for name, checkpoint_value, requested_value in (
+            (
+                "local_position",
+                bool(flashmtp_config.get("local_position", False)),
+                bool(model.local_position),
+            ),
+            (
+                "include_token_embedding_chs",
+                bool(flashmtp_config.get("include_token_embedding_chs", False)),
+                bool(model.include_token_embedding_chs),
+            ),
+            (
+                "pivot_query_embedding",
+                bool(flashmtp_config.get("pivot_query_embedding", False)),
+                bool(model.pivot_query_embedding),
+            ),
+        ):
+            if checkpoint_value != requested_value:
+                mismatches.append(
+                    f"{name}: checkpoint={checkpoint_value}, requested={requested_value}"
+                )
+        if mismatches:
+            raise ValueError(
+                "Checkpoint sliding-CHS configuration does not match the current "
+                "training arguments: " + "; ".join(mismatches)
+            )
+        source_window_name = "sliding_window_size"
+        source_window = int(flashmtp_config["sliding_window_size"])
+    else:
+        if not load_weights_only:
+            raise ValueError(
+                "Loading a pivot-q student checkpoint into the sliding-window "
+                "model drops history_fuse/history_norm. Use --load-weights-only "
+                "so optimizer state from the old architecture is not restored."
+            )
+        source_window_name = "anchor_group_size"
+        source_window = int(flashmtp_config.get("anchor_group_size", 1))
+
+    window_changed = source_window != int(model.sliding_window_size)
+    if window_changed and not load_weights_only:
+        raise ValueError(
+            "Checkpoint window does not match the current run: "
+            f"checkpoint {source_window_name}={source_window}, requested "
+            f"sliding_window_size={model.sliding_window_size}. Use "
+            "--load-weights-only to fine-tune with the new window while "
+            "inheriting the existing weights."
+        )
+    return {
+        "source_architecture": source_architecture,
+        "source_window_name": source_window_name,
+        "source_window": source_window,
+        "window_changed": window_changed,
+        "anchor_group_size": flashmtp_config.get("anchor_group_size"),
+        "swa_window_size": flashmtp_config.get("swa_window_size"),
+    }
+
+
+def adapt_checkpoint_state_dict(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    *,
+    source_architecture: str,
+) -> tuple[dict[str, torch.Tensor], list[str]]:
+    """Keep tensors that match ``model`` and drop legacy fusion weights."""
+    target = model.state_dict()
+    drop_prefixes = (
+        LEGACY_UNUSED_STATE_PREFIXES
+        if source_architecture == LEGACY_PIVOTQ_STUDENT_ARCHITECTURE
+        else ()
+    )
+    adapted: dict[str, torch.Tensor] = {}
+    dropped: list[str] = []
+    unexpected: list[str] = []
+    shape_errors: list[str] = []
+    for key, value in state_dict.items():
+        if key in target:
+            if tuple(value.shape) != tuple(target[key].shape):
+                shape_errors.append(
+                    f"{key}: checkpoint={tuple(value.shape)}, "
+                    f"model={tuple(target[key].shape)}"
+                )
+            else:
+                adapted[key] = value
+        elif any(key.startswith(prefix) for prefix in drop_prefixes):
+            dropped.append(key)
+        else:
+            unexpected.append(key)
+    missing = [key for key in target if key not in adapted]
+    if shape_errors or unexpected or missing:
+        raise ValueError(
+            "Checkpoint weights cannot initialize this sliding-window model. "
+            f"shape_mismatch={shape_errors}, unexpected={unexpected}, "
+            f"missing={missing}."
+        )
+    return adapted, dropped
 
 
 def gather_pivot_multilayer_inference(
@@ -1893,11 +2144,18 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
             sampled_draft_tokens, draft_logits = self.sample_draft_tokens(
                 draft_hidden=draft_hidden,
                 lm_head=lm_head,
-                first_prev_token_ids=draft_input_ids[:, 0],
+                # Singleton views inherit the full generation-buffer stride.
+                # Canonicalize them so short/long warmups share one
+                # torch.compile graph during benchmark decode.
+                first_prev_token_ids=draft_input_ids[:, 0].clone(
+                    memory_format=torch.contiguous_format
+                ),
                 temperature=draft_temperature,
                 compile_serial_head=compile_serial_head,
                 initial_prev_token_ids=(
-                    pivot_token_ids.squeeze(1)
+                    pivot_token_ids.squeeze(1).clone(
+                        memory_format=torch.contiguous_format
+                    )
                     if self.seed_rnn_from_predecessor
                     else None
                 ),

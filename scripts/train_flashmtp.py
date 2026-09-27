@@ -40,6 +40,10 @@ from specforge.modeling.config_utils import is_qwen35_model_type, load_text_mode
 from specforge.modeling.draft.flashmtp import (
     FLASHMTP_ARCHITECTURE_VERSION,
     FlashMTPDraftModel,
+    adapt_checkpoint_state_dict,
+    load_checkpoint_state_dict,
+    plan_checkpoint_weight_init,
+    read_checkpoint_flashmtp_config,
 )
 from specforge.modeling.target.flashmtp_target_model import (
     FlashMTPTargetModel,
@@ -273,9 +277,12 @@ def parse_args():
     training_group.add_argument(
         "--load-weights-only",
         action="store_true",
-        help="Load draft weights/config from --ckpt-dir, but ignore its epoch, "
+        help="Load draft weights from --ckpt-dir, but ignore its epoch, "
         "global step, optimizer, and scheduler state. Training restarts from "
-        "epoch 0 with the newly configured optimizer and LR schedule.",
+        "epoch 0. This is required when changing sliding_window_size, including "
+        "fine-tuning a wider-window or legacy pivot-q student checkpoint at "
+        "sliding_window_size=1. Matching backbone and serial-head weights are "
+        "copied; history_fuse/history_norm from the legacy student are dropped.",
     )
     training_group.add_argument(
         "--resume-optimizer",
@@ -841,76 +848,41 @@ def main():
     resume_state = None
     draft_weights_from_checkpoint = False
     if draft_model_last_checkpoint:
-        loaded_model = FlashMTPDraftModel.from_pretrained(
-            draft_model_last_checkpoint, torch_dtype=torch.bfloat16
+        checkpoint_config, checkpoint_flashmtp = read_checkpoint_flashmtp_config(
+            draft_model_last_checkpoint
         )
-        requested_markov = (
-            draft_model.markov_head_type,
-            draft_model.markov_output_mode,
-            draft_model.markov_rank,
+        init_plan = plan_checkpoint_weight_init(
+            draft_model,
+            checkpoint_flashmtp,
+            load_weights_only=args.load_weights_only,
         )
-        checkpoint_markov = (
-            loaded_model.markov_head_type,
-            loaded_model.markov_output_mode,
-            loaded_model.markov_rank,
-        )
-        if requested_markov != checkpoint_markov:
-            raise ValueError(
-                "Checkpoint serial-head configuration does not match the "
-                "current training arguments: "
-                f"requested={requested_markov}, checkpoint={checkpoint_markov}."
-            )
-        requested_conv = (
-            draft_model.backbone_conv_mode,
-            draft_model.conv_kernel_size,
-            draft_model.conv_group_size,
-        )
-        checkpoint_conv = (
-            loaded_model.backbone_conv_mode,
-            loaded_model.conv_kernel_size,
-            loaded_model.conv_group_size,
-        )
-        if requested_conv != checkpoint_conv:
-            raise ValueError(
-                "Checkpoint backbone-convolution configuration does not match "
-                "the current training arguments: "
-                f"requested={requested_conv}, checkpoint={checkpoint_conv}."
-            )
-        requested_sliding = (
-            draft_model.architecture_version,
-            draft_model.sliding_window_size,
-            draft_model.chs_num_layers,
-            draft_model.include_token_embedding_chs,
-            draft_model.chs_first_context,
-            draft_model.local_position,
-            draft_model.target_layer_ids,
-        )
-        checkpoint_sliding = (
-            loaded_model.architecture_version,
-            loaded_model.sliding_window_size,
-            loaded_model.chs_num_layers,
-            loaded_model.include_token_embedding_chs,
-            loaded_model.chs_first_context,
-            loaded_model.local_position,
-            loaded_model.target_layer_ids,
-        )
-        if requested_sliding != checkpoint_sliding:
-            raise ValueError(
-                "Checkpoint sliding-CHS configuration does not match the "
-                "current training arguments: "
-                f"requested={requested_sliding}, checkpoint={checkpoint_sliding}."
-            )
-        checkpoint_block_size = loaded_model.block_size
+        checkpoint_block_size = int(checkpoint_config.block_size)
         if not args.load_weights_only and draft_model.block_size != checkpoint_block_size:
             raise ValueError(
                 "Changing block_size when restoring optimizer/scheduler state is "
                 "unsupported. Use --load-weights-only to start a new run from "
                 f"checkpoint weights ({checkpoint_block_size} -> {draft_model.block_size})."
             )
-        draft_model.load_state_dict(loaded_model.state_dict())
-        del loaded_model
+        checkpoint_state = load_checkpoint_state_dict(draft_model_last_checkpoint)
+        adapted_state, dropped_keys = adapt_checkpoint_state_dict(
+            draft_model,
+            checkpoint_state,
+            source_architecture=init_plan["source_architecture"],
+        )
+        draft_model.load_state_dict(adapted_state, strict=True)
+        del checkpoint_state, adapted_state
         draft_weights_from_checkpoint = True
         print_on_rank0("Loaded draft model weights from checkpoint")
+        if init_plan["window_changed"] or dropped_keys:
+            print_on_rank0(
+                "Initialized a new sliding window from checkpoint weights: "
+                f"{init_plan['source_architecture']} "
+                f"{init_plan['source_window_name']}={init_plan['source_window']} -> "
+                f"sliding_window_size={draft_model.sliding_window_size}. "
+                f"anchor_group_size={init_plan['anchor_group_size']}, "
+                f"swa_window_size={init_plan['swa_window_size']}. "
+                f"Dropped unused weights: {dropped_keys or 'none'}."
+            )
 
         training_state_dir = resolve_training_state_dir(draft_model_last_checkpoint)
         if args.load_weights_only:
