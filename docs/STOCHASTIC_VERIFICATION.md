@@ -1,7 +1,7 @@
-# Stochastic Verification in FlashMTP
+# Stochastic Verification in DLite
 
 Technical reference for `match` vs `rejection` verification modes in `spec_generate`.
-Code: `specforge/modeling/draft/flashmtp.py`.
+Code: `specforge/modeling/draft/dlite.py`.
 
 ---
 
@@ -9,7 +9,7 @@ Code: `specforge/modeling/draft/flashmtp.py`.
 
 Parallel block speculative decoding proposes $K{-}1$ draft tokens in one forward pass, then verifies them against the target model. At **temperature $T{=}0$** (greedy), verification reduces to prefix equality with the target's greedy continuation — exact and efficient.
 
-At **$T{>}0$**, the target defines a **stochastic** continuation. Prior parallel-block systems (including naive FlashMTP deployments) often:
+At **$T{>}0$**, the target defines a **stochastic** continuation. Prior parallel-block systems (including naive DLite deployments) often:
 
 1. Sample draft tokens with **greedy** decoding ($T_\text{draft}{=}0$), and
 2. Verify by checking whether draft tokens equal **independent target samples** (`match` mode).
@@ -25,7 +25,7 @@ This combination is **not** rejection sampling. It does not preserve the target 
 | $q_i(y)$ | Draft model probability of token $y$ at position $i$ |
 | $p_i(y)$ | Target model probability at position $i$ (after softmax at temperature $T$) |
 | $\tilde{y}_i$ | Draft-proposed token at position $i$ |
-| $K$ | `verify_block_size` (default 16) |
+| $K$ | `verify_block_size` (defaults to the checkpoint block size) |
 | Proposals | $\tilde{y}_1, \ldots, \tilde{y}_{K-1}$ (slot 0 is the known anchor) |
 
 ---
@@ -102,30 +102,21 @@ flowchart LR
 
 Consider a position where the draft's greedy token $\hat{y} = \arg\max q$ has high $q(\hat{y})$ but moderate $p(\hat{y})$ under stochastic target. The target sample will rarely equal $\hat{y}$, so **match** accepts ~0 tokens. **Rejection** accepts with probability $p(\hat{y})/q(\hat{y})$, which can be substantial when $q$ is calibrated.
 
-**Measured effect** (Model B, gsm8k, $T{=}1$, `compile_serial_head=true`):
-
-| Mode | Speedup | Accept length | Draft accept rate |
-|------|--------:|--------------:|------------------:|
-| match | 3.20× | 4.33 | 23.5% |
-| rejection | **3.58×** | **4.60** | **24.0%** |
-
-Similar gains on math500 (+8%), aime25 (+13%), mbpp (+10%).
-
 ---
 
 ## Code map
 
 | Function / flag | Location | Role |
 |-----------------|----------|------|
-| `STOCHASTIC_VERIFICATION_MODES` | `flashmtp.py:43` | `("match", "rejection")` |
-| `rejection_sample_verify()` | `flashmtp.py:87` | Core rejection math |
-| `spec_generate(..., stochastic_verification_mode=)` | `flashmtp.py:1064` | Main decode loop |
-| `draft_temperature` branch | `flashmtp.py:1188` | Greedy vs stochastic draft |
+| `STOCHASTIC_VERIFICATION_MODES` | `dlite.py` | `("match", "rejection")` |
+| `rejection_sample_verify()` | `dlite.py` | Core rejection math |
+| `spec_generate(..., stochastic_verification_mode=)` | `dlite.py` | Main decode loop |
+| `draft_temperature` branch | `dlite.py` | Greedy vs stochastic draft |
 | `--stochastic-verification-mode` | `evaluation/benchmark.py` | CLI flag |
 
 Key branch in `spec_generate`:
 
-```1188:1229:specforge/modeling/draft/flashmtp.py
+```python
             draft_temperature = temperature if use_rejection_sampling else 0.0
             sampled_draft_tokens, draft_logits = self.sample_draft_tokens(
                 ...
@@ -172,11 +163,3 @@ python evaluation/benchmark.py \
 ```
 
 **Caveat:** Parallel block drafting proposes tokens from a **block-conditional** distribution (bidirectional context within the block), not the true left-to-right autoregressive $p(y_i \mid y_{<i})$. Rejection sampling guarantees correctness **relative to the block proposal distribution**, not bitwise equivalence to naive AR sampling. For exact AR equivalence, use standard autoregressive speculative decoding (Eagle, Medusa) or accept the block approximation.
-
----
-
-## Related reading
-
-- `compare.md` — FlashMTP vs DSpARK Markov head architecture
-- `profile/compile_serial_head_profile.md` — compile does not change verification semantics
-- `benchmark_results/SUMMARY.md` — match vs rejection benchmark numbers

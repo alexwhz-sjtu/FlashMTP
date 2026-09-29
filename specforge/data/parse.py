@@ -10,6 +10,7 @@ from transformers import PreTrainedTokenizer
 from .template import ChatTemplate
 
 __all__ = ["GeneralParser", "HarmonyParser"]
+Conversation = List[Dict[str, str]]
 
 
 class Parser(ABC):
@@ -82,7 +83,7 @@ class GeneralParser(Parser):
 
             if conversation[0]["role"] == "system":
                 warnings.warn(
-                    f"The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template"
+                    "The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template"
                 )
                 messages.append(
                     {"role": "system", "content": conversation[0]["content"]}

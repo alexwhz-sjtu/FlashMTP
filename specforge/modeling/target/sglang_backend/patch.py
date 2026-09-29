@@ -347,7 +347,6 @@ def initialize_dp_attention(
     tp_size = server_args.tp_size
     dp_size = server_args.dp_size
     moe_dense_tp_size = server_args.moe_dense_tp_size
-    pp_size = server_args.pp_size
     # NOTE: attn_cp_size is new in sglang 0.5.9
     attn_cp_size = getattr(server_args, "attn_cp_size", 1)
 

@@ -4,40 +4,46 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "specforge"
-dynamic = ["version", "description"]
+dynamic = ["version"]
+description = "DLite speculative decoding training and evaluation"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "pre-commit",
     "torch==2.9.1",
-    "torchaudio==2.9.1",
-    "torchvision==0.24.1",
     "transformers==4.57.1",
-    "qwen-vl-utils==0.0.11",
-    "datasets",
-    "setuptools",
-    "tqdm",
-    "wandb",
-    "psutil",
     "numpy",
-    "accelerate",
-    "pydantic",
-    "sglang==0.5.9",
-    "openai-harmony",
-    "ninja",
     "packaging",
-    "yunchang",
+    "safetensors",
+    "tqdm",
+    "typing-extensions",
 ]
 
-[tool.setuptools]
-packages = ["specforge"]
-
 [project.optional-dependencies]
+train = [
+    "accelerate",
+    "datasets",
+    "ninja",
+    "openai-harmony",
+    "psutil",
+    "pydantic",
+    "qwen-vl-utils==0.0.11",
+    "sglang==0.5.9",
+    "wandb",
+    "yunchang",
+]
+benchmark = [
+    "datasets",
+    "huggingface-hub",
+    "loguru",
+    "rich",
+]
 dev = [
     "pre-commit",
 ]
 fa = ["flash-attn"]
 
+[tool.setuptools.packages.find]
+include = ["specforge*"]
+
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}
-description = {file = "README.md"}

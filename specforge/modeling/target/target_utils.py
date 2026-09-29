@@ -27,7 +27,7 @@ class SGLangTPEmbeddingAdapter(nn.Module):
         self.vocab_size = int(embedding.org_vocab_size)
         if not 0 <= self.mask_token_id < self.vocab_size:
             raise ValueError(
-                "FlashMTP vocab_row MASK mode requires an existing SGLang "
+                "DLite vocab_row MASK mode requires an existing SGLang "
                 f"embedding row, but mask_token_id={self.mask_token_id} and "
                 f"target vocab size={self.vocab_size}."
             )

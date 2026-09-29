@@ -10,21 +10,18 @@ from huggingface_hub import hf_hub_download
 
 
 NEMOTRON_LOCAL_DATA_DIR = Path(
-    "/share/wanghanzhen/.cache/huggingface/hub/datasets--nvidia--Nemotron-Post-Training-Dataset-v2/"
-    "snapshots/5c89e01dd720ae0f4058445ed49c5fb68a03c76e/data"
+    os.environ.get("NEMOTRON_LOCAL_DATA_DIR", "datasets/nemotron")
 )
 
 SWE_BENCH_LONG_TEST_FILE = Path(
-    "/data/wanghanzhen/datasets/SWE-bench/data/test-00000-of-00001.parquet"
+    os.environ.get("SWE_BENCH_LONG_TEST_FILE", "datasets/swe-bench/test.parquet")
 )
 
 LONGBENCH_V2_FILE = Path(
-    "/data/wanghanzhen/datasets/LongBench_v2/data.json"
+    os.environ.get("LONGBENCH_V2_FILE", "datasets/longbench-v2/data.json")
 )
 
-DATASET_CACHE_ROOT = Path(
-    "../../processed_dataset_cache"
-)
+DATASET_CACHE_ROOT = Path(os.environ.get("DLITE_DATASET_CACHE", ".cache/datasets"))
 DATASET_CACHE_VERSION = "v1"
 
 def _load_livecodebench_jsonl_dataset():

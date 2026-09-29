@@ -68,7 +68,6 @@ def replaced_logits_processor_forward_for_eagle3(
         else:
             aux_pruned_states = None
         sample_indices = None
-        input_logprob_indices = None
     else:
         raise RuntimeError(
             f"The modified logits processor is not supported for this forward mode: {logits_metadata.forward_mode}"

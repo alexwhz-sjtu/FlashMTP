@@ -1,13 +1,19 @@
-# Lazy package init — import submodules directly to avoid pulling sglang when unused.
+"""DLite target-model backends.
+
+SGLang is imported lazily by ``dlite_target_model`` so the HF backend remains
+usable without the optional training dependency.
+"""
+
+from .dlite_target_model import (
+    DLiteTargetModel,
+    HFDLiteTargetModel,
+    SGLangDLiteTargetModel,
+    get_dlite_target_model,
+)
 
 __all__ = [
-    "Eagle3TargetModel",
-    "SGLangEagle3TargetModel",
-    "HFEagle3TargetModel",
-    "CustomEagle3TargetModel",
-    "get_eagle3_target_model",
-    "FlashMTPTargetModel",
-    "HFFlashMTPTargetModel",
-    "get_flashmtp_target_model",
-    "TargetHead",
+    "DLiteTargetModel",
+    "HFDLiteTargetModel",
+    "SGLangDLiteTargetModel",
+    "get_dlite_target_model",
 ]

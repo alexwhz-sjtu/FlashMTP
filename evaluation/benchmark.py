@@ -19,11 +19,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
-from specforge.modeling.draft.flashmtp import sample
+from specforge.modeling.draft.dlite import DLiteDraftModel
+from specforge.modeling.draft.dlite import sample
 
 from evaluation import distributed as dist
-from evaluation.model_loading import load_flashmtp_benchmark_models
+from evaluation.model_loading import load_dlite_benchmark_models
 from evaluation.utils import load_and_process_dataset
 
 DATASET_PATH_FILE = Path(__file__).resolve().with_name("dataset_path.json")
@@ -36,7 +36,7 @@ INFINITEBENCH_PROMPTS = {
     "longbook_choice_eng": "Read the book and answer the question.\n\n{context}\n\nQuestion: {question}\nA. {OPTION_A}\nB. {OPTION_B}\nC. {OPTION_C}\nD. {OPTION_D}\n\nThe letter of the correct answer is",
     "longbook_qa_eng": "Read the book and answer the question. Be very concise in your answer.\n\n{context}\n\nQuestion: {question}\nAnswer:",
     "longbook_qa_chn": "阅读以下书籍然后回答问题。\n\n{context}\n\n问题：{question}\n答案：",
-    "longdialogue_qa_eng": "Below is a dialogue script where one random occurrence of a character name is replaced with \"$$MASK$$\", and you should try to guess who that character is.\n\n{context}\n\nThe name that has been replaced with $$MASK$$ is likely",
+    "longdialogue_qa_eng": 'Below is a dialogue script where one random occurrence of a character name is replaced with "$$MASK$$", and you should try to guess who that character is.\n\n{context}\n\nThe name that has been replaced with $$MASK$$ is likely',
     "math_find": "{prefix}\n\n{context}\n\n{input}",
     "math_calc": "Let us calculate the intermediate values of an expression.\n\nExpression: 1 + 3 + 4\nValues: [1, 4, 8]\n\nExpression: 8 - 3 + 2 - 4\nValues: [8, 5, 7, 3]\n\nExpression: {context}\nValues:",
     "code_run": "There is a function called {func} in the following Python code.\n\n{context}\n\nPlease compute the exact value of {func_call}. The value of {func_call} is",
@@ -78,14 +78,14 @@ def load_longbench_v2_shard_directory(
 ) -> list[dict]:
     json_files = sorted(p for p in shard_dir.glob("*.json") if p.is_file())
     if not json_files:
-        raise FileNotFoundError(f"No JSON files under LongBench v2 shard dir: {shard_dir}")
+        raise FileNotFoundError(
+            f"No JSON files under LongBench v2 shard dir: {shard_dir}"
+        )
     instances: list[dict] = []
     for json_file in json_files:
         with json_file.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        instances.extend(
-            load_longbench_v2_json_records(data, json_file, dataset_alias)
-        )
+        instances.extend(load_longbench_v2_json_records(data, json_file, dataset_alias))
     if not instances:
         raise ValueError(f"No LongBench v2 samples loaded from shard dir: {shard_dir}")
     return instances
@@ -129,7 +129,9 @@ def should_load_as_multifieldqa_en_mixup(
     if not data or not isinstance(data[0], dict):
         return False
     row0 = data[0]
-    if not isinstance(row0.get("input"), str) or not isinstance(row0.get("context"), str):
+    if not isinstance(row0.get("input"), str) or not isinstance(
+        row0.get("context"), str
+    ):
         return False
     alias = original_dataset_name.lower()
     aliases = (
@@ -148,7 +150,9 @@ def should_load_as_multifieldqa_en_mixup(
     return is_multifieldqa_en_mixup_dataset_path(dataset_path)
 
 
-def load_multifieldqa_en_mixup_json_records(data: list, dataset_path: Path) -> list[dict]:
+def load_multifieldqa_en_mixup_json_records(
+    data: list, dataset_path: Path
+) -> list[dict]:
     if not isinstance(data, list):
         raise ValueError(f"{dataset_path} must contain a JSON list")
     instances: list[dict] = []
@@ -161,7 +165,9 @@ def load_multifieldqa_en_mixup_json_records(data: list, dataset_path: Path) -> l
     return instances
 
 
-def is_swe_bench_style_json(data: list, dataset_path: Path, original_dataset_name: str) -> bool:
+def is_swe_bench_style_json(
+    data: list, dataset_path: Path, original_dataset_name: str
+) -> bool:
     """SWE-bench Parquet export: list of dicts with string ``text`` (and usually ``instance_id``)."""
     if not data or not isinstance(data[0], dict):
         return False
@@ -178,7 +184,9 @@ def load_swe_bench_json_instances(data: list, dataset_path: Path) -> list[dict]:
     instances: list[dict] = []
     for index, item in enumerate(data):
         if not isinstance(item, dict):
-            raise ValueError(f"{dataset_path} index {index}: expected object, got {type(item)}")
+            raise ValueError(
+                f"{dataset_path} index {index}: expected object, got {type(item)}"
+            )
         if "text" not in item or item["text"] is None:
             raise ValueError(f"Missing 'text' in {dataset_path} at index {index}")
         text = item["text"]
@@ -205,20 +213,28 @@ def format_infinitebench_prompt(data: dict, task_name: str) -> str:
     }
 
     options = data.get("options") or []
-    for option_index, option_name in enumerate(["OPTION_A", "OPTION_B", "OPTION_C", "OPTION_D"]):
+    for option_index, option_name in enumerate(
+        ["OPTION_A", "OPTION_B", "OPTION_C", "OPTION_D"]
+    ):
         if option_index < len(options):
             fields[option_name] = options[option_index]
 
     if task_name == "math_find":
         find_result = re.findall(r"The .+ of", data["input"])
         if not find_result:
-            raise ValueError(f"Cannot infer math_find target from input: {data['input']}")
-        fields["prefix"] = f"What is {find_result[0].lower()[:-3]} in the following list?"
+            raise ValueError(
+                f"Cannot infer math_find target from input: {data['input']}"
+            )
+        fields["prefix"] = (
+            f"What is {find_result[0].lower()[:-3]} in the following list?"
+        )
 
     if task_name == "code_run":
         find_result = re.findall(r"func_[0-9]+\(-?[0-9]+\)", data["input"])
         if not find_result:
-            raise ValueError(f"Cannot infer code_run function call from input: {data['input']}")
+            raise ValueError(
+                f"Cannot infer code_run function call from input: {data['input']}"
+            )
         fields["func_call"] = find_result[0]
         fields["func"] = fields["func_call"].split("(")[0]
 
@@ -240,7 +256,10 @@ def resolve_dataset_path(dataset_name: str) -> str:
 
 def default_specbench_question_jsonl() -> Path:
     """Repo-root ``Spec-Bench/data/spec_bench/question.jsonl``."""
-    return Path(__file__).resolve().parents[2] / "Spec-Bench/data/spec_bench/question.jsonl"
+    return (
+        Path(__file__).resolve().parents[2]
+        / "Spec-Bench/data/spec_bench/question.jsonl"
+    )
 
 
 def specbench_dataset_meta(dataset_alias: str) -> tuple[bool, str | None]:
@@ -282,10 +301,14 @@ def flatten_specbench_turns(turns: list) -> list[str]:
     return out
 
 
-def load_specbench_question_jsonl(dataset_path: Path, original_dataset_name: str) -> list[dict]:
+def load_specbench_question_jsonl(
+    dataset_path: Path, original_dataset_name: str
+) -> list[dict]:
     is_sb, category = specbench_dataset_meta(original_dataset_name)
     if not is_sb:
-        raise ValueError("internal: load_specbench_question_jsonl requires a specbench dataset name")
+        raise ValueError(
+            "internal: load_specbench_question_jsonl requires a specbench dataset name"
+        )
     if not dataset_path.is_file():
         raise FileNotFoundError(f"Spec-Bench file not found: {dataset_path}")
     instances: list[dict] = []
@@ -295,11 +318,16 @@ def load_specbench_question_jsonl(dataset_path: Path, original_dataset_name: str
             if not line:
                 continue
             obj = json.loads(line)
-            if category is not None and str(obj.get("category", "")).lower() != category.lower():
+            if (
+                category is not None
+                and str(obj.get("category", "")).lower() != category.lower()
+            ):
                 continue
             turns = obj.get("turns")
             if not isinstance(turns, list) or not turns:
-                raise ValueError(f"{dataset_path}:{line_number}: missing non-empty turns")
+                raise ValueError(
+                    f"{dataset_path}:{line_number}: missing non-empty turns"
+                )
             flat = flatten_specbench_turns(turns)
             if not flat:
                 continue
@@ -339,7 +367,9 @@ def load_benchmark_dataset(dataset_name: str):
             or is_longbench_v2_dataset_path(dataset_path)
             or original_dataset_name.lower().startswith("longbench_v2_")
         ):
-            return load_longbench_v2_shard_directory(dataset_path, original_dataset_name)
+            return load_longbench_v2_shard_directory(
+                dataset_path, original_dataset_name
+            )
         raise ValueError(f"Unsupported dataset directory: {dataset_path}")
 
     if dataset_path.is_file() and dataset_path.suffix == ".json":
@@ -357,7 +387,9 @@ def load_benchmark_dataset(dataset_name: str):
                 data, dataset_path, original_dataset_name
             )
 
-        if should_load_as_multifieldqa_en_mixup(data, dataset_path, original_dataset_name):
+        if should_load_as_multifieldqa_en_mixup(
+            data, dataset_path, original_dataset_name
+        ):
             return load_multifieldqa_en_mixup_json_records(data, dataset_path)
 
         if is_swe_bench_style_json(data, dataset_path, original_dataset_name):
@@ -384,7 +416,9 @@ def load_benchmark_dataset(dataset_name: str):
                     return load_longbench_v2_json_records(
                         data, dataset_path, original_dataset_name
                     )
-                if should_load_as_multifieldqa_en_mixup(data, dataset_path, original_dataset_name):
+                if should_load_as_multifieldqa_en_mixup(
+                    data, dataset_path, original_dataset_name
+                ):
                     return load_multifieldqa_en_mixup_json_records(data, dataset_path)
                 if is_swe_bench_style_json(data, dataset_path, original_dataset_name):
                     return load_swe_bench_json_instances(data, dataset_path)
@@ -435,7 +469,7 @@ def cuda_time() -> float:
 
 
 def decode_weight(run) -> int:
-    """Token count for amortized decode metrics (matches dflash benchmark)."""
+    """Token count used for amortized decode metrics."""
     n = int(getattr(run, "num_tokens_for_decode_rate", run.num_output_tokens))
     return int(run.batch_size) * max(n, 1)
 
@@ -454,7 +488,7 @@ def compute_benchmark_stats(
             "token_weighted_speedup": 0.0,
             "throughput_ratio": 0.0,
             "baseline_s_per_token": 0.0,
-            "flashmtp_s_per_token": 0.0,
+            "dlite_s_per_token": 0.0,
             "unweighted_speedup": 0.0,
             "avg_accept_length": 0.0,
             "histogram": [0.0] * (verify_block_size + 1),
@@ -469,9 +503,13 @@ def compute_benchmark_stats(
     throughput1 = w1 / max(d1, 1e-30)
     throughputb = wb / max(db, 1e-30)
     t1_unweighted = float(np.mean([r[1].time_per_output_token for r in responses]))
-    tb_unweighted = float(np.mean([r[block_size].time_per_output_token for r in responses]))
+    tb_unweighted = float(
+        np.mean([r[block_size].time_per_output_token for r in responses])
+    )
 
-    acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
+    acceptance_lengths = list(
+        chain(*[r[block_size].acceptance_lengths for r in responses])
+    )
     if acceptance_lengths:
         histogram = [
             acceptance_lengths.count(b) / len(acceptance_lengths)
@@ -487,7 +525,7 @@ def compute_benchmark_stats(
         "token_weighted_speedup": t1 / max(tb, 1e-30),
         "throughput_ratio": throughputb / max(throughput1, 1e-30),
         "baseline_s_per_token": t1,
-        "flashmtp_s_per_token": tb,
+        "dlite_s_per_token": tb,
         "unweighted_speedup": t1_unweighted / max(tb_unweighted, 1e-30),
         "avg_accept_length": avg_accept,
         "histogram": histogram,
@@ -511,7 +549,7 @@ def print_benchmark_stats(stats: dict, block_size: int, title: str) -> None:
     )
     print(
         f"  decode s/token baseline={stats['baseline_s_per_token']:.6f} "
-        f"flashmtp={stats['flashmtp_s_per_token']:.6f}"
+        f"dlite={stats['dlite_s_per_token']:.6f}"
     )
     histogram = stats["histogram"]
     hist_text = ", ".join(f"{x * 100:.1f}%" for x in histogram)
@@ -522,7 +560,7 @@ def print_benchmark_stats(stats: dict, block_size: int, title: str) -> None:
 @torch.inference_mode()
 def run_benchmark_warmup(
     target: AutoModelForCausalLM,
-    draft_model: FlashMTPDraftModel,
+    draft_model: DLiteDraftModel,
     tokenizer: AutoTokenizer,
     verify_block_size: int,
     device: torch.device,
@@ -550,7 +588,7 @@ def run_benchmark_warmup(
         temperature=temperature,
         decode_timing_after_first_token=False,
     )
-    flashmtp_generate(
+    dlite_generate(
         model=draft_model,
         target=target,
         input_ids=input_ids,
@@ -583,8 +621,10 @@ def target_generate(
         (batch_size_dim, max_length), dtype=torch.long, device=input_ids.device
     )
     output_ids[:, :num_input_tokens] = input_ids
-    position_ids = torch.arange(max_length, device=input_ids.device).unsqueeze(0).expand(
-        batch_size_dim, -1
+    position_ids = (
+        torch.arange(max_length, device=input_ids.device)
+        .unsqueeze(0)
+        .expand(batch_size_dim, -1)
     )
     past_key_values_target = DynamicCache()
     stop_tensor = (
@@ -605,7 +645,9 @@ def target_generate(
     next_token = sample(output.logits, temperature)
     time_to_first_token = (cuda_time() - prefill_start) / batch_size_dim
 
-    decode_start: float | None = None if decode_timing_after_first_token else cuda_time()
+    decode_start: float | None = (
+        None if decode_timing_after_first_token else cuda_time()
+    )
     start = input_ids.shape[1]
     while start < max_length:
         output_ids[:, start : start + 1] = next_token
@@ -638,9 +680,13 @@ def target_generate(
     if decode_start is None:
         decode_start = cuda_time()
     total_decode_time = cuda_time() - decode_start
-    rate_tokens = max(num_output_tokens - (1 if decode_timing_after_first_token else 0), 1)
+    rate_tokens = max(
+        num_output_tokens - (1 if decode_timing_after_first_token else 0), 1
+    )
     time_per_output_token = total_decode_time / (batch_size_dim * rate_tokens)
-    throughput_tokens_per_sec = (batch_size_dim * rate_tokens) / max(total_decode_time, 1e-9)
+    throughput_tokens_per_sec = (batch_size_dim * rate_tokens) / max(
+        total_decode_time, 1e-9
+    )
 
     return SimpleNamespace(
         output_ids=output_ids,
@@ -657,8 +703,8 @@ def target_generate(
 
 
 @torch.inference_mode()
-def flashmtp_generate(
-    model: FlashMTPDraftModel,
+def dlite_generate(
+    model: DLiteDraftModel,
     target: AutoModelForCausalLM,
     input_ids: torch.Tensor,
     max_new_tokens: int,
@@ -686,7 +732,9 @@ def flashmtp_generate(
     num_input_tokens = input_ids.shape[1]
     num_output_tokens = output_ids.shape[1] - num_input_tokens
     decode_wall_time = float(stats.get("decode_wall_time", 0.0))
-    rate_tokens = max(num_output_tokens - (1 if decode_timing_after_first_token else 0), 1)
+    rate_tokens = max(
+        num_output_tokens - (1 if decode_timing_after_first_token else 0), 1
+    )
     time_per_output_token = decode_wall_time / (bsz * max(rate_tokens, 1))
     throughput_tokens_per_sec = (bsz * rate_tokens) / max(decode_wall_time, 1e-9)
 
@@ -733,7 +781,7 @@ def main() -> None:
     parser.add_argument(
         "--compile-serial-head",
         action="store_true",
-        help="Compile the serial Markov-head block sampler with torch.compile. "
+        help="Compile the serial Sequential-head block sampler with torch.compile. "
         "Compilation happens during warmup.",
     )
     parser.add_argument(
@@ -741,13 +789,13 @@ def main() -> None:
         type=int,
         default=1,
         help="Replicate each prompt along the batch dimension (expand) for throughput runs. "
-        "Use temperature=0 so FlashMTP speculative steps stay aligned across the batch.",
+        "Use temperature=0 so DLite speculative steps stay aligned across the batch.",
     )
     parser.add_argument(
         "--mask-token-id",
         type=int,
         default=None,
-        help="Override mask token id (default: checkpoint flashmtp_config, then tokenizer).",
+        help="Override mask token id (default: checkpoint dlite_config, then tokenizer).",
     )
     parser.add_argument(
         "--trust-remote-code",
@@ -767,7 +815,7 @@ def main() -> None:
     torch.cuda.set_device(dist.local_rank())
     device = torch.device(f"cuda:{dist.local_rank()}")
 
-    target, draft_model, tokenizer, draft_summary = load_flashmtp_benchmark_models(
+    target, draft_model, tokenizer, draft_summary = load_dlite_benchmark_models(
         args, device
     )
 
@@ -775,9 +823,7 @@ def main() -> None:
     draft_block_len = draft_model.draft_block_len
     max_verify_block_size = draft_model.max_verify_block_size
     verify_block_size = (
-        args.verify_block
-        if args.verify_block is not None
-        else max_verify_block_size
+        args.verify_block if args.verify_block is not None else max_verify_block_size
     )
     if not 1 <= verify_block_size <= max_verify_block_size:
         raise ValueError(
@@ -785,21 +831,19 @@ def main() -> None:
             f"got {verify_block_size}"
         )
     logger.info(
-        "Decode config: markov_head_type={} markov_output_mode={} markov_rank={} "
-        "model_role={} swa_window_size={} anchor_group_size={} fuse_slots={} "
+        "Decode config: sequential_head={} sequential_rank={} "
+        "model_role={} swa_window_size={} fuse_slots={} "
         "chs_num_layers={} condition_slots={}",
-        draft_summary["markov_head_type"],
-        draft_summary["markov_output_mode"],
-        draft_summary["markov_rank"],
+        draft_summary["sequential_head"],
+        draft_summary["sequential_rank"],
         draft_summary["model_role"],
         draft_summary["swa_window_size"],
-        draft_summary["anchor_group_size"],
         draft_summary["fuse_slot_count"],
         draft_summary["chs_num_layers"],
         draft_summary["condition_slots"],
     )
     logger.info(
-        "FlashMTP decode: config_block_size={} draft_block_len={} "
+        "DLite decode: config_block_size={} draft_block_len={} "
         "verify_block_size={} verification_mode={} compile_serial_head={} "
         "(discarding {} draft proposals before target verification)",
         config_block_size,
@@ -819,17 +863,19 @@ def main() -> None:
                 "currently requires --batch-size 1."
             )
         logger.warning(
-            "batch_size>1 with temperature>0 can desynchronize FlashMTP across batch rows; "
+            "batch_size>1 with temperature>0 can desynchronize DLite across batch rows; "
             "prefer --temperature 0 for batched benchmarking."
         )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-    stop_token_ids = [token_id for token_id in [tokenizer.eos_token_id] if token_id is not None]
+    stop_token_ids = [
+        token_id for token_id in [tokenizer.eos_token_id] if token_id is not None
+    ]
     dataset = load_benchmark_dataset(args.dataset)
     dataset = select_max_samples(dataset, args.max_samples)
 
     if dist.is_main():
-        print("Running CUDA warmup (baseline + FlashMTP, short decode)...")
+        print("Running CUDA warmup (baseline + DLite, short decode)...")
     run_benchmark_warmup(
         target=target,
         draft_model=draft_model,
@@ -856,15 +902,26 @@ def main() -> None:
         prev_assistant = ""
         for turn_index, turn_q in enumerate(instance["turns"]):
             if chain_turns:
-                user_content = turn_q if turn_index == 0 else f"{prev_assistant}\n\n{turn_q}"
+                user_content = (
+                    turn_q if turn_index == 0 else f"{prev_assistant}\n\n{turn_q}"
+                )
             else:
                 user_content = turn_q
             messages.append({"role": "user", "content": user_content})
-            input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-            input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
+            input_text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            input_ids = tokenizer.encode(input_text, return_tensors="pt").to(
+                target.device
+            )
             if args.batch_size > 1:
                 input_ids = input_ids.expand(args.batch_size, -1).contiguous()
-            category_suffix = f" | category={sample_category}" if sample_category else ""
+            category_suffix = (
+                f" | category={sample_category}" if sample_category else ""
+            )
             print(
                 f"\n[Sample {idx} | Turn {turn_index}{category_suffix}] Input length: "
                 f"{input_ids.shape[1]} tokens ({len(user_content)} chars), "
@@ -880,7 +937,7 @@ def main() -> None:
                 temperature=args.temperature,
                 decode_timing_after_first_token=decode_after_first,
             )
-            response[config_block_size] = flashmtp_generate(
+            response[config_block_size] = dlite_generate(
                 model=draft_model,
                 target=target,
                 input_ids=input_ids,
@@ -892,13 +949,18 @@ def main() -> None:
                 stochastic_verification_mode=args.stochastic_verification_mode,
                 compile_serial_head=args.compile_serial_head,
             )
-            
+
             spec_response = response[config_block_size]
-            generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens:]
+            generated_ids = spec_response.output_ids[
+                0, spec_response.num_input_tokens :
+            ]
             output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
             acceptance_lengths_text = ", ".join(
-                [f"{position}:{length}" for position, length in enumerate(spec_response.acceptance_lengths)]
+                [
+                    f"{position}:{length}"
+                    for position, length in enumerate(spec_response.acceptance_lengths)
+                ]
             )
             avg_acceptance_length = np.mean(spec_response.acceptance_lengths)
             print(f"\n[Sample {idx} | Turn {turn_index}] Response:\n{output_text}")
@@ -906,15 +968,17 @@ def main() -> None:
                 f"[Sample {idx} | Turn {turn_index}] Decode timing "
                 f"(cuda wall after prefill, amortized s/token, batch={args.batch_size}): "
                 f"baseline={response[1].time_per_output_token:.6f}, "
-                f"flashmtp={spec_response.time_per_output_token:.6f} | "
+                f"dlite={spec_response.time_per_output_token:.6f} | "
                 f"tok/s (batch total): baseline={response[1].throughput_tokens_per_sec:.2f}, "
-                f"flashmtp={spec_response.throughput_tokens_per_sec:.2f}"
+                f"dlite={spec_response.throughput_tokens_per_sec:.2f}"
             )
             print(
                 f"[Sample {idx} | Turn {turn_index}] Acceptance lengths (position:length): "
                 f"{acceptance_lengths_text}"
             )
-            print(f"[Sample {idx} | Turn {turn_index}] Average acceptance length: {avg_acceptance_length:.2f}")
+            print(
+                f"[Sample {idx} | Turn {turn_index}] Average acceptance length: {avg_acceptance_length:.2f}"
+            )
 
             messages.append({"role": "assistant", "content": output_text})
             if chain_turns:
@@ -949,10 +1013,13 @@ def main() -> None:
             cat_stats = compute_benchmark_stats(
                 category_groups[category], config_block_size, verify_block_size
             )
-            print_benchmark_stats(cat_stats, config_block_size, title=f"category={category}")
+            print_benchmark_stats(
+                cat_stats, config_block_size, title=f"category={category}"
+            )
 
     total_elapsed_time = cuda_time() - benchmark_start
     print(f"Total elapsed time: {total_elapsed_time:.2f}s")
+
 
 if __name__ == "__main__":
     main()

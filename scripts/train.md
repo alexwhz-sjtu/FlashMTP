@@ -1,33 +1,17 @@
-# FlashMTP 当前训练接口
-
-## Teacher
-
-入口：`run_training_flashmtp_teacher.sh` → `train_flashmtp_teacher.py`。
-
-```text
-teacher_loss = FINAL_CE_WEIGHT * final_ce
-             + TV_LOSS_WEIGHT * sum(abs(p_final - p_target))
-             + BASE_LM_CE_WEIGHT * base_ce
-```
-
-位置权重为 `exp(-offset/gamma)`，第一个预测位置 offset 为 0。Target prefill
-logits 在 anchor 采样后一次 gather，完整序列张量随即释放。`final_ce` 和
-`base_ce` 的 label 是对应 target prefill logits 的 greedy top-1；TV loss 使用
-完整 target 概率分布。串行 head 的 teacher forcing 输入仍来自训练数据 token。
-
+## DLite training recipe
 ```bash
 cd /data/wanghanzhen/FlashMTP_v2.3
 source .venv/bin/activate
-SWA_WINDOW_SIZE=2 \
-ANCHOR_GROUP_SIZE=1 \
-CHS_NUM_LAYERS=12 \
-LOCAL_POSITION=false \
-CE_CHUNK_SIZE=4096 \
+SWA_WINDOW_SIZE=1 \
+CHS_NUM_LAYERS=14 \
+TARGET_MODEL_BACKEND=sglang \
+SGLANG_MEM_FRACTION_STATIC=0.3 \
+LOCAL_POSITION=true \
 BLOCK_SIZE=8 \
 NUM_DRAFT_LAYERS=5 \
-NUM_EPOCHS=6 \
-NUM_ANCHORS=512 \
-MAX_LENGTH=4096 \
+NUM_EPOCHS=10 \
+NUM_ANCHORS=768 \
+MAX_LENGTH=10240 \
 BATCH_SIZE=1 \
 LOSS_DECAY_GAMMA=4 \
 DATA_NUM_SAMPLES=pb_80k_qwen3_4b \
@@ -36,182 +20,13 @@ ACCUMULATION_STEPS=1 \
 LEARNING_RATE=4e-4 \
 FINAL_CE_WEIGHT=0.1 \
 TV_LOSS_WEIGHT=1.0 \
-BASE_LM_CE_WEIGHT=0.06 \
-MARKOV_HEAD_TYPE=rnn_easy \
-MARKOV_OUTPUT_MODE=direct \
-MARKOV_RANK=320 \
+BASE_LM_CE_WEIGHT=0.0 \
+SEQUENTIAL_HEAD=rnn \
+SEQUENTIAL_RANK=320 \
+SHARD_DRAFT_BY_TP=0 \
+TP_SIZE=1 \
 TRAIN_DATA_PATH='/data/wanghanzhen/training_data/generated/qwen3-4b/open_perfectblend_80k_qwen3_4b.jsonl' \
 MODEL_TAG='Qwen3_4B' \
 TARGET_MODEL='/data/wanghanzhen/models/Qwen3-4B' \
-bash scripts/run_training_flashmtp_teacher.sh
+bash scripts/run_training_dlite_teacher.sh 
 ```
-
-```bash
-cd /data/wanghanzhen/FlashMTP_v2swa
-source .venv/bin/activate
-SLIDING_WINDOW_SIZE=512 \
-CHS_NUM_LAYERS=12 \
-LOCAL_POSITION=false \
-HEADPOS=false \
-HISTORY_MODE=fuse \
-BLOCK_SIZE=8 \
-NUM_DRAFT_LAYERS=5 \
-NUM_EPOCHS=6 \
-NUM_ANCHORS=512 \
-MAX_LENGTH=4096 \
-BATCH_SIZE=1 \
-LOSS_DECAY_GAMMA=4 \
-DATA_NUM_SAMPLES=pb_80k \
-BASE_LM_CE_DECAY_GAMMA=12 \
-LEARNING_RATE=4e-4 \
-FINAL_CE_WEIGHT=0.1 \
-TV_LOSS_WEIGHT=1.0 \
-BASE_LM_CE_WEIGHT=0.06 \
-MARKOV_HEAD_TYPE=rnn_easy \
-MARKOV_OUTPUT_MODE=direct \
-MARKOV_RANK=320 \
-TRAIN_DATA_PATH='/data/wanghanzhen/training_data/generated/qwen3-4b/open_perfectblend_80k_qwen3_4b.jsonl' \
-MODEL_TAG='Qwen3_4B' \
-TARGET_MODEL='/data/wanghanzhen/models/Qwen3-4B' \
-bash scripts/run_training_flashmtp.sh --dt h100
-```
-
-
-| 变量                   | 含义                                          |
-| -------------------- | ------------------------------------------- |
-| `SWA_WINDOW_SIZE`    | Teacher 时间窗口 W，包含 W-1 个 fuse 位置和一个 CHS 时间位置 |
-| `ANCHOR_GROUP_SIZE`  | Draft Q 中包含 anchor 的真实 token 数 G            |
-| `BLOCK_SIZE`         | anchor-inclusive block 大小 B，预测 B-1 个 token  |
-| `CHS_NUM_LAYERS`     | `a-1` 处保留的 target hidden 层数                 |
-| `NUM_DRAFT_LAYERS`   | 并行 draft Transformer 深度                     |
-| `MARKOV_HEAD_TYPE`   | `none`、`vanilla`、`gated`、`rnn` 或 `rnn_easy` |
-| `MARKOV_OUTPUT_MODE` | `additive` 或 `direct`                       |
-| `MARKOV_RANK`        | 串行头低秩维度                                     |
-
-
-
-
-## Student 两阶段与余弦过渡
-
-入口：`run_training_flashmtp_two_stage.sh` → `train_flashmtp_two_stage.py`。
-Teacher checkpoint 是 G、CHS、block、draft depth 和串行头结构的权威来源。
-
-shell 启动器沿用 v2 的集群默认值，优先读取 `PET_NNODES`、`PET_NODE_RANK`、
-`PET_NPROC_PER_NODE`、`PET_MASTER_ADDR` 和 `PET_MASTER_PORT`。默认
-`MASK_TOKEN_ID=151669`、`STUDENT_INIT_MODE=shared_init`、`REPORT_TO=wandb`。
-它会根据 teacher 结构、数据、两阶段 loss/LR、长度、anchor 和并行配置确定性生成
-`OUTPUT_DIR` 及 W&B name/id；同一共享存储上的所有节点会得到相同值。设置
-`RUN_SUFFIX` 可区分同参数的新实验，所有自动值也都能用同名环境变量覆盖。
-
-`STUDENT_INIT_MODE` 支持 `scratch`（默认）、`shared_init` 和 `shared_partial`。`shared_init`
-在 fresh Stage 1 开始前复制 teacher 的 `layers`、`norm`、
-`layer_depth_embedding` 和 `context_norm`；teacher-only 历史融合参数与
-串行 head 不在此时复制。模式会写入 checkpoint，恢复时自动沿用。
-
-`shared_partial` 用于 teacher draft backbone 更深的情况。Fresh 训练必须设置
-`STUDENT_NUM_DRAFT_LAYERS`（Python 参数为 `--student-num-draft-layers`），并要求
-teacher depth 严格大于 student depth。Student 层从 teacher 层按首尾对齐均匀
-抽取，例如 5 层 teacher 到 3 层 student 的映射为 `[0, 2, 4]`；其余共享 norm
-照常复制。Stage 2 的串行 head 仍直接继承 teacher，与 backbone 深度无关。
-
-Stage 1：
-
-```text
-loss = STAGE1_KL_WEIGHT * weighted_mean(KL(p_teacher || p_student))
-     + STAGE1_HIDDEN_WEIGHT * weighted_mean(SmoothL1(h_student, h_teacher))
-     + STAGE1_CE_WEIGHT * weighted_mean(CE(student_logits, true_labels))
-```
-
-Teacher 在 `eval/no_grad` 下运行。两者共享 anchors、target hidden、真实 Q embedding、
-labels 和有效位置 mask；Stage 1 CE 的 label 直接来自训练数据，不使用 teacher draft
-的 top-1。student 串行头在纯 Stage 1 中不参与优化。
-
-Stage 1 与 Stage 2 之间固定加入 1 个 transition epoch，使用 Stage 1 数据。
-Transition 开始时解冻 student 串行头，并在每个 batch 上同时计算两套目标：
-
-```text
-progress = batch_idx / (num_batches - 1)
-stage2_scale = 0.5 * (1 - cos(pi * progress))
-stage1_scale = 1 - stage2_scale
-
-transition_loss = stage1_scale * stage1_loss
-                + stage2_scale * stage2_loss
-```
-
-首个 batch 的权重为 Stage1/Stage2=`1/0`，最后一个 batch 为 `0/1`。如果
-transition dataloader 只有一个 batch，则两者各为 `0.5`。Teacher 在 transition
-结束后才释放；transition optimizer steps 计入两阶段共享的连续 LR scheduler。
-Checkpoint `transition/start` 是过渡开始状态，`transition` 是过渡完成状态。
-
-```bash
-cd /share/dai-sys/wanghanzhen/projects/MTP/FlashMTP_v2.3
-source .venv/bin/activate
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
-export WANDB_MODE=offline
-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/stop_keeper.sh
-
-TARGET_MODEL='/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B' \
-STUDENT_INIT_MODE=shared_init \
-TARGET_MODEL_BACKEND=sglang \
-SGLANG_MEM_FRACTION_STATIC=0.25 \
-TEACHER_DRAFT_PATH='/data/wanghanzhen/FlashMTP_v2.3/cache/models/flashmtp_v2_3_teacher_maskrow_from1m_2n16g_targettp2_draftdp16_sglang025_swa128_ag6_chs12_a768_block8_d5_rnn_easy_direct_r512_aug1_qwen3_8b_maxlen10240_acc2_lr5e5_4ep/final' \
-STAGE1_TRAIN_DATA_PATH=/path/to/distillation.jsonl \
-STAGE2_TRAIN_DATA_PATH=/path/to/supervised.jsonl \
-STAGE1_BUILD_DATASET_NUM_PROC=32 \
-STAGE2_BUILD_DATASET_NUM_PROC=32 \
-TP_SIZE=2 \
-NNODES=3 \
-ACCUMULATION_STEPS=1 \
-STAGE1_EPOCHS=2 \
-STAGE1_LEARNING_RATE=2e-4 \
-STAGE1_WARMUP_RATIO=0.02 \
-STAGE1_KL_WEIGHT=1.0 \
-STAGE1_HIDDEN_WEIGHT=0.0 \
-STAGE1_CE_WEIGHT=0.1 \
-STAGE1_SMOOTH_L1_BETA=1.0 \
-STAGE1_LOSS_DECAY_GAMMA=12 \
-STAGE2_EPOCHS=4 \
-STAGE2_LEARNING_RATE=1e-4 \
-STAGE2_WARMUP_RATIO=0.02 \
-STAGE2_FINAL_CE_WEIGHT=0.1 \
-STAGE2_TV_WEIGHT=1.0 \
-STAGE2_BASE_CE_WEIGHT=0.06 \
-STAGE2_LOSS_DECAY_GAMMA=4 \
-STAGE2_BASE_CE_DECAY_GAMMA=12 \
-SHARD_DRAFT_BY_TP=1 \
-MAX_LENGTH=10240 \
-NUM_ANCHORS=768 \
-bash scripts/run_training_flashmtp_two_stage.sh --dt qz > "whz_mtp_logs/train_flashmtp_qz_dist_$(date +%Y%m%d_%H%M%S).log" 2>&1 &
-
-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/stop_keeper.sh
-```
-
-Stage 2 在 transition 已解冻的串行头基础上继续训练。Teacher 在 transition 后
-释放；训练 loss 与 teacher 的三项监督 loss 相同，并沿用同一个 optimizer 和
-连续 scheduler。final CE 和 base CE 的 label 都取 target prefill 对应位置 logits
-的 greedy top-1；串行 head 的 teacher forcing 输入仍取训练数据原始序列中的前一
-个 token，不使用这些 greedy label 回填。
-
-
-| 变量                                              | 含义                               |
-| ----------------------------------------------- | -------------------------------- |
-| `STAGE1_EPOCHS` / `STAGE2_EPOCHS`               | 两阶段独立 epoch 数                    |
-| `STAGE1_LEARNING_RATE` / `STAGE2_LEARNING_RATE` | 两阶段独立学习率                         |
-| `STAGE1_WARMUP_RATIO` / `STAGE2_WARMUP_RATIO`   | 两阶段独立 warmup 比例                  |
-| `STAGE1_KL_WEIGHT` / `STAGE1_HIDDEN_WEIGHT`     | Stage 1 蒸馏 loss 权重               |
-| `STAGE1_CE_WEIGHT`                              | Stage 1 true-label CE 权重（默认 0.1） |
-| `STAGE1_SMOOTH_L1_BETA`                         | SmoothL1 beta                    |
-| `STAGE1_LOSS_DECAY_GAMMA`                       | Stage 1 共用位置衰减                   |
-| `STAGE2_FINAL_CE_WEIGHT`                        | Stage 2 final CE 权重              |
-| `STAGE2_TV_WEIGHT`                              | Stage 2 target TV 权重             |
-| `STAGE2_BASE_CE_WEIGHT`                         | Stage 2 base CE 权重               |
-| `STAGE2_LOSS_DECAY_GAMMA`                       | final CE/TV 位置衰减                 |
-| `STAGE2_BASE_CE_DECAY_GAMMA`                    | base CE 独立位置衰减                   |
-
-
-通用变量包括 `ACCUMULATION_STEPS`、`NUM_ANCHORS`、`MAX_LENGTH`、
-`SAVE_INTERVAL`、`LOG_INTERVAL`、`TARGET_MODEL_BACKEND` 和 `RESUME_FROM`。
-
-当前 teacher/student 训练均使用 `mask_embedding_mode=vocab_row`：MASK ID 必须
-对应 target embedding 中已有的一行，不再用词表均值构造 MASK embedding。
-多机迁移和完整启动示例见 `docs/STUDENT_TWO_STAGE_PORTING.md`。

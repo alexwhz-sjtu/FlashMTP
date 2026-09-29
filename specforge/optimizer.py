@@ -21,7 +21,6 @@ class BF16Optimizer:
         # TODO: For now, we only support cosine annealing warmup lr scheduler and AdamW optimizer
         # TODO: We should make these parameters configurable
         #   These magic numbers: weight_decay=0.0, max_grad_norm=0.5, total_steps=800k, warmup_steps=12k are copied from
-        #   https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/ds_config.json
         self.model = model
         self.model_params = (
             [p for p in model.parameters() if p.requires_grad]

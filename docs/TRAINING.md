@@ -1,0 +1,61 @@
+# DLite training
+
+## Common model settings
+
+The launchers accept these environment variables and forward the corresponding
+CLI options:
+
+| Environment variable | CLI option | Default |
+| --- | --- | --- |
+| `TARGET_MODEL` | `--target-model-path` | required |
+| `TARGET_MODEL_BACKEND` | `--target-model-backend` | `hf` |
+| `TRAIN_DATA_PATH` | `--train-data-path` | required |
+| `BLOCK_SIZE` | `--block-size` | `8` |
+| `NUM_DRAFT_LAYERS` | `--num-draft-layers` | `5` |
+| `SWA_WINDOW_SIZE` | `--swa-window-size` | `32` |
+| `CHS_NUM_LAYERS` | `--chs-num-layers` | `7` |
+| `SEQUENTIAL_HEAD` | `--sequential-head` | `rnn` |
+| `SEQUENTIAL_RANK` | `--sequential-rank` | `256` |
+| `MASK_TOKEN_ID` | `--mask-token-id` | `151669` |
+
+`sglang` remains available for target prefill and exposes the existing SGLang
+memory, tensor-parallel, and draft-sharding options. The draft model uses
+FlexAttention during training; inference may use FlashAttention 2 or SDPA.
+
+## Teacher
+
+Run `scripts/run_training_dlite_teacher.sh`. Its loss can combine final-token CE,
+TV, and base-LM CE using `FINAL_CE_WEIGHT`, `TV_LOSS_WEIGHT`, and
+`BASE_LM_CE_WEIGHT`. CE labels use the target model's greedy prefill tokens,
+while the `rnn` sequential head updates its state with ground-truth previous
+tokens from the training sequence.
+
+Each draft block uses exactly `Q=[embed(anchor), MASK x (block_size-1)]`.
+Tokens before the anchor never enter Q, and the sequential RNN starts from a
+zero state before consuming the anchor token.
+
+Teacher, Stage 1, transition, and Stage 2 training backpropagate additive loss
+numerators. At each optimizer boundary, gradients are normalized by the sum of
+effective loss weights across the complete gradient-accumulation window and all
+ranks in the FSDP data-parallel process group. A final partial window uses its
+actual accumulated denominator rather than treating missing microbatches as
+zero-weight rank averages.
+
+## Student
+
+Run `scripts/run_training_dlite_two_stage.sh` and provide a trained teacher with
+`TEACHER_DRAFT_PATH`.
+
+- A new student backbone is always initialized from scratch.
+- Stage 1 uses only `STAGE1_KL_WEIGHT`; it has no auxiliary regression or
+  true-label CE term.
+- Stage 1 and Stage 2 share one processed dataloader built from
+  `TRAIN_DATA_PATH`.
+- The teacher sequential head is copied into the student, then frozen for
+  Stage 1. The student backbone learns to match the teacher logits.
+- Stage 2 unfreezes the student and uses `STAGE2_FINAL_CE_WEIGHT`,
+  `STAGE2_TV_WEIGHT`, and `STAGE2_BASE_CE_WEIGHT`.
+
+Resume with `RESUME_FROM`. For fresh two-stage training,
+`TEACHER_DRAFT_PATH`, `STAGE1_EPOCHS`, `STAGE2_EPOCHS`, and `LEARNING_RATE` are
+required.

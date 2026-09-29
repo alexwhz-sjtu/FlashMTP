@@ -12,7 +12,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
-    initialize_dp_attention,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import (
@@ -82,10 +81,6 @@ class SGLangRunner(ModelRunner):
         if not self.server_args.enable_p2p_check:
             monkey_patch_p2p_access_check()
 
-        if self.server_args.dist_init_addr:
-            dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
-        else:
-            dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
         set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
