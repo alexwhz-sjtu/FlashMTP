@@ -1,7 +1,9 @@
 ## DLite training recipe
+
 ```bash
-cd /data/wanghanzhen/FlashMTP_v2.3
-source .venv/bin/activate
+cd /data/wanghanzhen/projects/SpecDecoding/FlashMTP_v2.3
+uv sync --locked --extra train
+
 SWA_WINDOW_SIZE=1 \
 CHS_NUM_LAYERS=14 \
 TARGET_MODEL_BACKEND=sglang \
@@ -9,9 +11,9 @@ SGLANG_MEM_FRACTION_STATIC=0.3 \
 LOCAL_POSITION=true \
 BLOCK_SIZE=8 \
 NUM_DRAFT_LAYERS=5 \
-NUM_EPOCHS=10 \
-NUM_ANCHORS=768 \
-MAX_LENGTH=10240 \
+NUM_EPOCHS=6 \
+NUM_ANCHORS=512 \
+MAX_LENGTH=4096 \
 BATCH_SIZE=1 \
 LOSS_DECAY_GAMMA=4 \
 DATA_NUM_SAMPLES=pb_80k_qwen3_4b \
@@ -28,5 +30,5 @@ TP_SIZE=1 \
 TRAIN_DATA_PATH='/data/wanghanzhen/training_data/generated/qwen3-4b/open_perfectblend_80k_qwen3_4b.jsonl' \
 MODEL_TAG='Qwen3_4B' \
 TARGET_MODEL='/data/wanghanzhen/models/Qwen3-4B' \
-bash scripts/run_training_dlite_teacher.sh 
+uv run --locked --extra train bash scripts/run_training_dlite_teacher.sh
 ```
