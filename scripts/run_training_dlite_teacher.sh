@@ -132,12 +132,12 @@ else
   OPTIONAL_ARGS+=(--no-shard-draft-by-tp)
 fi
 
-REPORT_TO="${REPORT_TO:-}"
+REPORT_TO="${REPORT_TO:-wandb}"
 if [[ -n "${REPORT_TO}" ]]; then
   OPTIONAL_ARGS+=(--report-to "${REPORT_TO}")
   if [[ "${REPORT_TO}" == "wandb" ]]; then
     RUN_HASH="$("${PYTHON_BIN}" -c 'import hashlib, sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:8])' "${RUN_TAG}")"
-    WANDB_PROJECT="${WANDB_PROJECT:-dlite-training-v2.3-teacher}"
+    WANDB_PROJECT="${WANDB_PROJECT:-flashmtp_training_v2full}"
     WANDB_NAME="${WANDB_RUN_NAME:-${WANDB_NAME:-$(slug "v23t_${DT_TAG}${MODEL_TAG}_${DATA_TAG}_swa${SWA_WINDOW_SIZE}_d${NUM_DRAFT_LAYERS}_${SEQUENTIAL_HEAD}_r${SEQUENTIAL_RANK}" 110)_${RUN_HASH}}}"
     WANDB_RUN_ID="${WANDB_RUN_ID:-$(slug "v23t-${DT_TAG}${MODEL_TAG}-${DATA_TAG}-${RUN_HASH}" 64)}"
     OPTIONAL_ARGS+=(
