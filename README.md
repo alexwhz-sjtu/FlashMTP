@@ -8,38 +8,32 @@ dependence inside the block.
 The repository contains the complete training stack. The sibling `DLite/`
 repository is the smaller inference-only release.
 
-
-
-```
-uv python install 3.11
-uv venv --python 3.11 .venv
-
-# 严格按照 uv.lock 安装项目依赖
-uv sync --locked \
-  --extra train \
-  --extra benchmark \
-  --extra dev
+```bash
+uv venv -p 3.11
+source .venv/bin/activate
+uv pip install -v -e . --prerelease=allow
+uv pip install datasets==4.8.3 pyarrow==23.0.1
 ```
 
 ## Environment
 
-Python 3.11 or newer and [uv](https://docs.astral.sh/uv/) are required. Create
-the project environment from the committed lock file:
+Python 3.11 and [uv](https://docs.astral.sh/uv/) are required. Create the
+virtual environment, install this repository, then pin the dataset stack:
 
 ```bash
-uv sync --locked --extra train --extra benchmark
+uv venv -p 3.11
+source .venv/bin/activate
+uv pip install -v -e . --prerelease=allow
+uv pip install datasets==4.8.3 pyarrow==23.0.1
 ```
 
-This creates `.venv` and installs the repository as an editable package. Run
-project commands through `uv run`; activating the environment is not required.
+Activate `.venv` before running project commands.
 
 FlashAttention is optional. Install the regular dependencies first so PyTorch
 is available while FlashAttention is built:
 
 ```bash
-uv sync --locked --extra train --extra benchmark
-uv sync --locked --extra train --extra benchmark --extra fa \
-  --no-build-isolation-package flash-attn
+uv pip install flash-attn --no-build-isolation
 ```
 
 The supported target backends are `hf` and `sglang`. Attention backend options
@@ -54,7 +48,7 @@ Teacher training:
 TARGET_MODEL=/path/to/Qwen3-8B \
 TRAIN_DATA_PATH=/path/to/train.jsonl \
 OUTPUT_DIR=/path/to/teacher \
-uv run --locked --extra train bash scripts/run_training_dlite_teacher.sh --dt h100
+bash scripts/run_training_dlite_teacher.sh --dt h100
 ```
 
 Two-stage student training:
@@ -66,7 +60,7 @@ TRAIN_DATA_PATH=/path/to/train.jsonl \
 OUTPUT_DIR=/path/to/student \
 STAGE1_EPOCHS=1 STAGE2_EPOCHS=5 \
 LEARNING_RATE=5e-4 STAGE1_KL_WEIGHT=1.0 \
-uv run --locked --extra train bash scripts/run_training_dlite_two_stage.sh --dt h100
+bash scripts/run_training_dlite_two_stage.sh --dt h100
 ```
 
 Both stages consume the same `TRAIN_DATA_PATH`. The student backbone always
@@ -82,7 +76,7 @@ See [docs/TRAINING.md](docs/TRAINING.md) for configuration details.
 TARGET_MODEL=/path/to/Qwen3-8B \
 DRAFT_NAME_OR_PATH=/path/to/student/final \
 DATASET=gsm8k MAX_SAMPLES=100 \
-uv run --locked --extra benchmark bash evaluation/run_benchmark_dlite.sh
+bash evaluation/run_benchmark_dlite.sh
 ```
 
 Checkpoint model settings live under `dlite_config`. The public architecture is

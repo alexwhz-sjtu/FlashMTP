@@ -2,7 +2,7 @@
 
 ```bash
 cd /data/wanghanzhen/projects/SpecDecoding/FlashMTP_v2.3
-uv sync --locked --extra train
+source .venv/bin/activate
 
 SWA_WINDOW_SIZE=1 \
 CHS_NUM_LAYERS=14 \
@@ -30,5 +30,5 @@ TP_SIZE=1 \
 TRAIN_DATA_PATH='/data/wanghanzhen/training_data/generated/qwen3-4b/open_perfectblend_80k_qwen3_4b.jsonl' \
 MODEL_TAG='Qwen3_4B' \
 TARGET_MODEL='/data/wanghanzhen/models/Qwen3-4B' \
-uv run --locked --extra train bash scripts/run_training_dlite_teacher.sh
+bash scripts/run_training_dlite_teacher.sh
 ```
