@@ -53,15 +53,6 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Two-stage DLite distillation")
     add_common_args(parser)
     parser.add_argument("--teacher-draft-path")
-    parser.add_argument(
-        "--student-only",
-        action="store_true",
-        help=(
-            "Initialize a fresh pivot_q_student from the target config and train "
-            "it directly with the Stage 2 losses, skipping Stage 1 distillation "
-            "and the transition epoch."
-        ),
-    )
     parser.add_argument("--stage1-epochs", type=int, required=True)
     parser.add_argument(
         "--learning-rate",
@@ -88,16 +79,13 @@ def parse_args():
     for name in ("stage2_epochs", "accumulation_steps"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
-    if args.stage1_epochs < 0 or (not args.student_only and args.stage1_epochs == 0):
-        parser.error(
-            "--stage1-epochs must be non-negative in student-only mode and "
-            "positive otherwise"
-        )
+    if args.stage1_epochs <= 0:
+        parser.error("--stage1-epochs must be positive")
     if args.learning_rate is None or args.learning_rate <= 0:
         parser.error("--learning-rate must be positive")
     if args.warmup_ratio is None or not 0.0 <= args.warmup_ratio <= 1.0:
         parser.error("--warmup-ratio must be in [0, 1]")
-    if not args.student_only and args.stage1_kl_weight <= 0:
+    if args.stage1_kl_weight <= 0:
         parser.error("--stage1-kl-weight must be positive")
     stage2_weights = (
         args.stage2_final_ce_weight,
@@ -108,13 +96,7 @@ def parse_args():
         parser.error("Stage 2 loss weights must be non-negative")
     if sum(stage2_weights) == 0:
         parser.error("At least one Stage 2 loss weight must be positive")
-    if args.student_only and args.teacher_draft_path is not None:
-        parser.error("--student-only cannot be combined with --teacher-draft-path")
-    if (
-        args.resume_from is None
-        and args.teacher_draft_path is None
-        and not args.student_only
-    ):
+    if args.resume_from is None and args.teacher_draft_path is None:
         parser.error("--teacher-draft-path is required for fresh training")
     get_tracker_class(args.report_to).validate_args(parser, args)
     return args
@@ -209,15 +191,6 @@ def main():
     resume_stage = None if resume_state is None else resume_state.get("training_stage")
     if resume_stage not in (None, "stage1", "transition", "stage2"):
         raise ValueError(f"Unsupported two-stage checkpoint stage: {resume_stage!r}")
-    checkpoint_student_only = bool(
-        resume_state is not None and resume_state.get("student_only", False)
-    )
-    if args.student_only and resume_stage in ("stage1", "transition"):
-        raise ValueError(
-            "--student-only can only resume a student-only or Stage 2 checkpoint"
-        )
-    student_only = args.student_only or checkpoint_student_only
-    fresh_student_only = student_only and resume_state is None
     resume_transition_complete = (
         resume_stage == "transition"
         and int(resume_state.get("stage_epoch", 0)) >= TRANSITION_EPOCHS
@@ -252,10 +225,7 @@ def main():
             f"saved={resume_state['train_data_identity']!r}, "
             f"provided={train_data_identity!r}."
         )
-    print_on_rank0(
-        "Student init mode: "
-        + ("scratch, direct Stage 2" if fresh_student_only else "scratch")
-    )
+    print_on_rank0("Student init mode: scratch")
     print_on_rank0(
         "Continuous two-stage LR schedule: "
         f"lr={args.learning_rate:g}, warmup_ratio={args.warmup_ratio:g}"
@@ -283,14 +253,7 @@ def main():
     teacher_identity = saved_teacher_identity or provided_teacher_identity
 
     teacher = None
-    if fresh_student_only:
-        student = build_draft_model(args, model_role="pivot_q_student")
-        args.num_draft_layers = student.config.num_hidden_layers
-        print_on_rank0(
-            "Initialized student from target config; training directly with "
-            "Stage 2 losses"
-        )
-    elif resume_stage in (None, "stage1"):
+    if resume_stage in (None, "stage1"):
         if not args.teacher_draft_path:
             raise ValueError(
                 "--teacher-draft-path is required for fresh or Stage 1 training"
@@ -349,10 +312,7 @@ def main():
             raise ValueError(
                 "Transition/Stage 2 checkpoint must contain a pivot_q_student"
             )
-        if (
-            not bool(resume_state.get("serial_head_inherited"))
-            and not checkpoint_student_only
-        ):
+        if not bool(resume_state.get("serial_head_inherited")):
             raise ValueError(
                 "Transition/Stage 2 checkpoint has no initialized serial head"
             )
@@ -393,7 +353,7 @@ def main():
     target, tokenizer, components, mask_token_id = build_target_and_components(
         args, drafts_for_target
     )
-    needs_stage1_dataloader = not student_only and (
+    needs_stage1_dataloader = (
         resume_stage in (None, "stage1")
         or (resume_stage == "transition" and not resume_transition_complete)
     )
@@ -582,7 +542,7 @@ def main():
                 "two-stage schedule."
             )
             optimizer.advance_scheduler(optimizer_step)
-    if resume_stage in (None, "stage1") and not student_only:
+    if resume_stage in (None, "stage1"):
         _set_student_stage1_trainable(student)
     micro_steps = 0
     loss_denominator_sum = None
@@ -590,7 +550,7 @@ def main():
 
     for epoch in (
         range(stage1_start_epoch, args.stage1_epochs)
-        if resume_stage in (None, "stage1") and not student_only
+        if resume_stage in (None, "stage1")
         else ()
     ):
         stage1_dataloader.sampler.set_epoch(epoch)
@@ -731,7 +691,7 @@ def main():
                 )
         stage1_start_batch = 0
 
-    if resume_stage in (None, "stage1") and not student_only:
+    if resume_stage in (None, "stage1"):
         if micro_steps:
             normalize_accumulated_gradients(
                 optimizer,
@@ -817,11 +777,11 @@ def main():
     else:
         transition_start_epoch = transition_start_batch = transition_step = 0
 
-    if resume_stage in (None, "stage1", "transition") and not student_only:
+    if resume_stage in (None, "stage1", "transition"):
         _set_student_stage2_trainable(student)
     for epoch in (
         range(transition_start_epoch, TRANSITION_EPOCHS)
-        if resume_stage in (None, "stage1", "transition") and not student_only
+        if resume_stage in (None, "stage1", "transition")
         else ()
     ):
         if teacher is None or teacher_online is None:

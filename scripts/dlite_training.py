@@ -48,8 +48,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     model.add_argument(
         "--mask-token-id",
         type=int,
-        default=151669,
-        help="In-vocabulary v2 MASK row (default: Qwen3 token 151669).",
+        default=None,
+        help=(
+            "Optional in-vocabulary MASK embedding row. By default, preserve the "
+            "checkpoint value, use tokenizer.mask_token_id, or select the first "
+            "model vocabulary row unused by the tokenizer."
+        ),
     )
     model.add_argument("--num-anchors", type=int, default=512)
     model.add_argument("--sequential-head", default="rnn", choices=["rnn"])
@@ -216,17 +220,83 @@ def build_target_and_components(args, draft_models: list[DLiteDraftModel]):
     return target, tokenizer, components, mask_token_id
 
 
+def _select_mask_token_id(
+    *,
+    explicit_id: Optional[int],
+    configured_ids: list[Optional[int]],
+    tokenizer_mask_id: Optional[int],
+    used_token_ids: set[int],
+    vocab_size: int,
+) -> tuple[int, str]:
+    """Select a real embedding row without assuming a model-specific token ID."""
+    vocab_size = int(vocab_size)
+    if vocab_size <= 0:
+        raise ValueError(f"Target vocabulary size must be positive, got {vocab_size}.")
+
+    if explicit_id is not None:
+        candidate = int(explicit_id)
+        source = "explicit --mask-token-id"
+    else:
+        configured = {int(value) for value in configured_ids if value is not None}
+        if len(configured) > 1:
+            raise ValueError(
+                "Draft checkpoints disagree on mask_token_id: "
+                f"{sorted(configured)}. Pass --mask-token-id explicitly."
+            )
+        if configured:
+            candidate = configured.pop()
+            source = "draft checkpoint"
+        elif tokenizer_mask_id is not None:
+            candidate = int(tokenizer_mask_id)
+            source = "tokenizer.mask_token_id"
+        else:
+            candidate = next(
+                (
+                    token_id
+                    for token_id in range(vocab_size)
+                    if token_id not in used_token_ids
+                ),
+                -1,
+            )
+            source = "first tokenizer-unused model vocabulary row"
+
+    if not 0 <= candidate < vocab_size:
+        if candidate < 0 and explicit_id is None:
+            raise ValueError(
+                "No tokenizer-unused row exists inside the target embedding vocabulary. "
+                "Configure a model-provided mask token or pass --mask-token-id."
+            )
+        raise ValueError(
+            f"MASK token id {candidate} selected from {source} is outside target "
+            f"vocabulary [0, {vocab_size})."
+        )
+    return candidate, source
+
+
 def resolve_tokenizer_and_components(args, draft_models, target=None):
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
-    if args.mask_token_id is not None:
-        mask_token_id = int(args.mask_token_id)
-    elif tokenizer.mask_token_id is not None:
-        mask_token_id = int(tokenizer.mask_token_id)
-    else:
-        tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
-        mask_token_id = int(tokenizer.mask_token_id)
+    target_config = AutoConfig.from_pretrained(
+        args.target_model_path, trust_remote_code=args.trust_remote_code
+    )
+    configured_mask_ids = [
+        draft.config.dlite_config.get("mask_token_id")
+        for draft in draft_models
+        if getattr(draft.config, "dlite_config", None)
+    ]
+    mask_token_id, mask_source = _select_mask_token_id(
+        explicit_id=args.mask_token_id,
+        configured_ids=configured_mask_ids,
+        tokenizer_mask_id=tokenizer.mask_token_id,
+        used_token_ids={int(value) for value in tokenizer.get_vocab().values()},
+        vocab_size=int(target_config.vocab_size),
+    )
+    args.mask_token_id = mask_token_id
+    print_on_rank0(
+        f"Resolved MASK token id {mask_token_id} from {mask_source}; "
+        f"target vocab_size={int(target_config.vocab_size)}."
+    )
     if args.target_model_backend == "sglang":
         if target is None or not hasattr(target, "model_runner"):
             raise ValueError("SGLang target is required to reuse target components.")

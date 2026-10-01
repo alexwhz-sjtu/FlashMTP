@@ -107,7 +107,6 @@ if [[ -z "${RESUME_FROM:-}" && -z "${TEACHER_DRAFT_PATH:-}" ]]; then
 fi
 
 TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
-MASK_TOKEN_ID="${MASK_TOKEN_ID:-151669}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 STAGE1_KL_WEIGHT="${STAGE1_KL_WEIGHT:-1.0}"
 STAGE1_LOSS_DECAY_GAMMA="${STAGE1_LOSS_DECAY_GAMMA:-}"
@@ -178,7 +177,7 @@ print(full + "|" + short)
   TEACHER_WANDB_TAG="$(slug "${TEACHER_ARCH_META#*|}" 40)"
 fi
 
-RUN_TAG="v23s_${DT}_${TARGET_TAG}_${DATA_TAG}_ws${WORLD_SIZE}_tp${TP_SIZE}_sh${SHARD_DRAFT_BY_TP}_tb${NAME_TARGET_BATCH}_db${NAME_DRAFT_BATCH}_${TEACHER_TAG}_scratch_m${MASK_TOKEN_ID}_e${STAGE1_EPOCHS}+t1+${STAGE2_EPOCHS}_lr${LEARNING_RATE}_w${WARMUP_RATIO}_kl${STAGE1_KL_WEIGHT}_g${STAGE1_LOSS_DECAY_GAMMA:-none}_ce${STAGE2_FINAL_CE_WEIGHT}_tv${STAGE2_TV_WEIGHT}_b${STAGE2_BASE_CE_WEIGHT}_g${STAGE2_LOSS_DECAY_GAMMA:-none}_bg${STAGE2_BASE_CE_DECAY_GAMMA:-none}_L${MAX_LENGTH}_A${NUM_ANCHORS}_ac${ACCUMULATION_STEPS}"
+RUN_TAG="v23s_${DT}_${TARGET_TAG}_${DATA_TAG}_ws${WORLD_SIZE}_tp${TP_SIZE}_sh${SHARD_DRAFT_BY_TP}_tb${NAME_TARGET_BATCH}_db${NAME_DRAFT_BATCH}_${TEACHER_TAG}_scratch_m${MASK_TOKEN_ID:-auto}_e${STAGE1_EPOCHS}+t1+${STAGE2_EPOCHS}_lr${LEARNING_RATE}_w${WARMUP_RATIO}_kl${STAGE1_KL_WEIGHT}_g${STAGE1_LOSS_DECAY_GAMMA:-none}_ce${STAGE2_FINAL_CE_WEIGHT}_tv${STAGE2_TV_WEIGHT}_b${STAGE2_BASE_CE_WEIGHT}_g${STAGE2_LOSS_DECAY_GAMMA:-none}_bg${STAGE2_BASE_CE_DECAY_GAMMA:-none}_L${MAX_LENGTH}_A${NUM_ANCHORS}_ac${ACCUMULATION_STEPS}"
 if [[ -n "${RUN_SUFFIX:-}" ]]; then
   RUN_TAG="$(slug "${RUN_TAG}" 210)_$(slug "${RUN_SUFFIX}" 24)"
 else
@@ -187,7 +186,7 @@ fi
 
 OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_DIR}/cache/models}"
 OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_TAG}}"
-CACHE_DIR="${CACHE_DIR:-${PROJECT_DIR}/cache/train/${DATA_TAG}_l${MAX_LENGTH}_m${MASK_TOKEN_ID}}"
+CACHE_DIR="${CACHE_DIR:-${PROJECT_DIR}/cache/train/${DATA_TAG}_l${MAX_LENGTH}_m${MASK_TOKEN_ID:-auto}}"
 REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-dlite-training-v2.3-student}"
 RUN_HASH="$("${PYTHON_BIN}" -c 'import hashlib, sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:8])' "${RUN_TAG}")"
@@ -290,7 +289,7 @@ printf 'Output directory: %s\n' "${OUTPUT_DIR}"
 printf 'Training dataset: %s\n' "${TRAIN_DATA_PATH}"
 printf 'Transition: 1 epoch on the shared dataset with cosine Stage1->Stage2 loss blending\n'
 printf 'Dataset cache: %s\n' "${CACHE_DIR}"
-printf 'MASK token id: %s\n' "${MASK_TOKEN_ID}"
+printf 'MASK token id: %s\n' "${MASK_TOKEN_ID:-auto (model-adapted)}"
 if [[ "${REPORT_TO}" == "wandb" ]]; then
   printf 'W&B project: %s\nW&B name: %s\nW&B run id: %s\n' \
     "${WANDB_PROJECT}" "${WANDB_NAME}" "${WANDB_RUN_ID}"

@@ -16,11 +16,16 @@ CLI options:
 | `CHS_NUM_LAYERS` | `--chs-num-layers` | `7` |
 | `SEQUENTIAL_HEAD` | `--sequential-head` | `rnn` |
 | `SEQUENTIAL_RANK` | `--sequential-rank` | `256` |
-| `MASK_TOKEN_ID` | `--mask-token-id` | `151669` |
+| `MASK_TOKEN_ID` | `--mask-token-id` | automatically selected for the target model |
 
 `sglang` remains available for target prefill and exposes the existing SGLang
 memory, tensor-parallel, and draft-sharding options. The draft model uses
 FlexAttention during training; inference may use FlashAttention 2 or SDPA.
+
+When `MASK_TOKEN_ID` is omitted, training preserves a value stored in a loaded
+draft checkpoint, otherwise uses the tokenizer's native mask token, or selects
+the first target embedding row not occupied by the tokenizer. An explicit
+`MASK_TOKEN_ID` remains available as an override.
 
 ## Teacher
 
