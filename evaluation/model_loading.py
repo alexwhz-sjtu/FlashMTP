@@ -93,10 +93,22 @@ def validate_decode_config(draft_model: DLiteDraftModel) -> None:
     """Log serial-head inference settings from the loaded checkpoint."""
     summary = dlite_config_summary(draft_model)
     sequential_head = str(summary["sequential_head"])
+    query_layout = (
+        "Q=[embed(a-1), embed(a), MASK...]"
+        if draft_model.uses_predecessor_query
+        else "Q=[embed(a), MASK...]"
+    )
+    rnn_init = (
+        "RNN seeded from a-1"
+        if draft_model.seed_rnn_from_predecessor
+        else "RNN zero-initialized"
+    )
     if draft_model.is_student:
         logger.info(
-            "PivotQ student: Q=[embed(a), MASK...], local RoPE; "
-            "CHS is context KV. block_size={} proposals={} query_len={}",
+            "PivotQ student: {}, local RoPE; CHS is context KV; {}. "
+            "block_size={} proposals={} query_len={}",
+            query_layout,
+            rnn_init,
             summary["block_size"],
             draft_model.proposal_length,
             draft_model.draft_query_length,
@@ -104,8 +116,10 @@ def validate_decode_config(draft_model: DLiteDraftModel) -> None:
     else:
         logger.info(
             "SWA teacher: KV=[fuse(a-W)..fuse(a-2), CHS(a-1)], "
-            "Q=[embed(a), MASK...], global RoPE. "
+            "{}, global RoPE; {}. "
             "block_size={} proposals={} W={}",
+            query_layout,
+            rnn_init,
             summary["block_size"],
             draft_model.proposal_length,
             summary["swa_window_size"],

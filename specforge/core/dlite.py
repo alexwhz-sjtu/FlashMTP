@@ -223,6 +223,7 @@ class PreparedDLiteBatch:
     token_position_ids: torch.Tensor
     labels: torch.Tensor
     prev_token_ids: torch.Tensor
+    initial_prev_token_ids: Optional[torch.Tensor]
     raw_weight_mask: torch.Tensor
     binary_eval_mask: torch.Tensor
 
@@ -397,13 +398,21 @@ class OnlineDLiteModel(nn.Module):
             self.draft_model.target_layer_ids,
             self.draft_model.config.num_target_layers,
         )
-        token_positions = anchor_positions.unsqueeze(-1)
+        prefix_count = self.draft_model.token_prefix_count
+        prefix_offsets = torch.arange(
+            1 - prefix_count,
+            1,
+            device=anchor_positions.device,
+        ).view(1, 1, -1)
+        token_positions = (anchor_positions.unsqueeze(-1) + prefix_offsets).clamp(
+            min=0
+        )
         token_ids = torch.gather(
             input_ids.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
             2,
             token_positions,
         )
-        token_keep = block_keep_mask.unsqueeze(-1)
+        token_keep = block_keep_mask.unsqueeze(-1).expand(-1, -1, prefix_count)
         if shared_query_embeddings is None:
             token_embeddings = self.embed_tokens(token_ids)
             token_embeddings = token_embeddings * token_keep.unsqueeze(-1).to(
@@ -431,6 +440,15 @@ class OnlineDLiteModel(nn.Module):
         labels, prev_ids, weights, binary = self._build_labels_and_weights(
             input_ids, loss_mask, anchor_positions, block_keep_mask
         )
+        initial_prev_ids = (
+            torch.where(
+                block_keep_mask,
+                token_ids[..., 0],
+                torch.zeros_like(token_ids[..., 0]),
+            )
+            if self.draft_model.seed_rnn_from_predecessor
+            else None
+        )
         return PreparedDLiteBatch(
             anchor_positions,
             block_keep_mask,
@@ -441,6 +459,7 @@ class OnlineDLiteModel(nn.Module):
             token_positions,
             labels,
             prev_ids,
+            initial_prev_ids,
             weights,
             binary,
         )
@@ -589,6 +608,7 @@ class OnlineDLiteModel(nn.Module):
         latent = sequential_head.forward_teacher_forcing(
             hidden_states=prediction_hidden,
             prev_token_ids=prev_token_ids,
+            initial_prev_token_ids=batch.initial_prev_token_ids,
         )
         final_logits = sequential_head.project_logits(latent[active_positions]).float()
         if (active_ce_labels < 0).any() or (
@@ -713,6 +733,7 @@ class OnlineDLiteModel(nn.Module):
         latent = sequential_head.forward_teacher_forcing(
             hidden_states=prediction_hidden,
             prev_token_ids=prev_token_ids,
+            initial_prev_token_ids=batch.initial_prev_token_ids,
         )
         serial_logits = sequential_head.project_logits(latent[active_positions]).float()
         return serial_logits

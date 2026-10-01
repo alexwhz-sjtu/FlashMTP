@@ -80,7 +80,9 @@ bash evaluation/run_benchmark_dlite.sh
 ```
 
 Checkpoint model settings live under `dlite_config`. The public architecture is
-`DLiteDraftModel`; the only sequential-head type is `rnn`.
+`DLiteDraftModel`; the only sequential-head type is `rnn`. New training uses
+`dlite_v2`, while inference remains compatible with both `dlite_v1` and
+`dlite_v2` checkpoints.
 
 ## License
 

@@ -10,6 +10,7 @@ CLI options:
 | `TARGET_MODEL` | `--target-model-path` | required |
 | `TARGET_MODEL_BACKEND` | `--target-model-backend` | `hf` |
 | `TRAIN_DATA_PATH` | `--train-data-path` | required |
+| `DLITE_VERSION` | `--dlite-version` | `dlite_v2` |
 | `BLOCK_SIZE` | `--block-size` | `8` |
 | `NUM_DRAFT_LAYERS` | `--num-draft-layers` | `5` |
 | `SWA_WINDOW_SIZE` | `--swa-window-size` | `32` |
@@ -35,9 +36,18 @@ TV, and base-LM CE using `FINAL_CE_WEIGHT`, `TV_LOSS_WEIGHT`, and
 while the `rnn` sequential head updates its state with ground-truth previous
 tokens from the training sequence.
 
-Each draft block uses exactly `Q=[embed(anchor), MASK x (block_size-1)]`.
-Tokens before the anchor never enter Q, and the sequential RNN starts from a
-zero state before consuming the anchor token.
+`dlite_v2` uses
+`Q=[embed(anchor-1), embed(anchor), MASK x (block_size-1)]`. The added real
+token uses the target model's input embedding row. CHS remains the selected
+target-layer hidden states at `anchor-1`: for students both CHS and the new
+query use local position 0; for teachers both use absolute position
+`anchor-1`. Before predicting `anchor+1`, the sequential RNN state is primed
+with the `anchor-1` token and then updated with the anchor token.
+
+`dlite_v1` checkpoints remain loadable for inference and retain their original
+`Q=[embed(anchor), MASK x (block_size-1)]` layout and zero-initialized RNN
+state. Set `DLITE_VERSION=dlite_v1` only when intentionally training that
+legacy layout.
 
 Teacher, Stage 1, transition, and Stage 2 training backpropagate additive loss
 numerators. At each optimizer boundary, gradients are normalized by the sum of

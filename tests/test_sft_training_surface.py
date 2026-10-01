@@ -30,6 +30,7 @@ class SFTTrainingSurfaceTest(unittest.TestCase):
         ):
             self.assertIn(option, trainer)
             self.assertIn(option, launcher)
+        self.assertIn("--dlite-version", launcher)
 
 
 if __name__ == "__main__":

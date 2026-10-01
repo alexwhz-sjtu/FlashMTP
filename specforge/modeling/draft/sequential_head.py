@@ -86,11 +86,35 @@ class DLiteSequentialHead(nn.Module):
         fused_inputs = torch.cat([new_state, hidden_states], dim=-1)
         return self.state_hidden_mlp(fused_inputs), new_state
 
+    def _seed_rnn_state(
+        self,
+        initial_prev_token_ids: torch.Tensor,
+        *,
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prime recurrent state with the token immediately before the anchor."""
+        initial_prev_token_ids = initial_prev_token_ids.long()
+        if initial_prev_token_ids.ndim != 1:
+            raise ValueError(
+                "initial_prev_token_ids must be 1-D for state seeding, got "
+                f"{tuple(initial_prev_token_ids.shape)}."
+            )
+        dummy_hidden = reference.new_zeros(
+            initial_prev_token_ids.shape[0], self.hidden_size
+        )
+        _, state = self._compute_step_latent(
+            prev_token_ids=initial_prev_token_ids,
+            hidden_states=dummy_hidden,
+            state=None,
+        )
+        return state
+
     def forward_teacher_forcing(
         self,
         *,
         hidden_states: torch.Tensor,
         prev_token_ids: torch.Tensor,
+        initial_prev_token_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Return low-rank states for teacher-forced block predictions.
 
@@ -98,6 +122,9 @@ class DLiteSequentialHead(nn.Module):
             hidden_states: ``[..., prediction_length, hidden_size]``.
             prev_token_ids: ``[..., prediction_length]``; entry ``k`` is the
                 ground-truth token immediately preceding prediction ``k``.
+            initial_prev_token_ids: Optional ``[...]`` token ids at
+                ``anchor-1`` used to prime the recurrent state before the
+                first supervised prediction step.
         """
         if hidden_states.shape[:-1] != prev_token_ids.shape:
             raise ValueError(
@@ -118,12 +145,24 @@ class DLiteSequentialHead(nn.Module):
                 f"maximum {self.max_prediction_length}."
             )
         batch_shape = hidden_states.shape[:-2]
-        state = torch.zeros(
-            *batch_shape,
-            self.sequential_rank,
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
+        if initial_prev_token_ids is not None:
+            if initial_prev_token_ids.shape != batch_shape:
+                raise ValueError(
+                    "initial_prev_token_ids must match hidden_states batch "
+                    f"dimensions {batch_shape}, got "
+                    f"{tuple(initial_prev_token_ids.shape)}."
+                )
+            state = self._seed_rnn_state(
+                initial_prev_token_ids.reshape(-1),
+                reference=hidden_states.reshape(-1, hidden_states.size(-1)),
+            ).view(*batch_shape, self.sequential_rank)
+        else:
+            state = torch.zeros(
+                *batch_shape,
+                self.sequential_rank,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
         outputs: list[torch.Tensor] = []
         for position in range(prediction_length):
             latent, state = self._compute_step_latent(
@@ -144,6 +183,7 @@ class DLiteSequentialHead(nn.Module):
         hidden_states: torch.Tensor,
         first_prev_token_ids: torch.Tensor,
         temperature: float = 0.0,
+        initial_prev_token_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Serially sample one DLite prediction block.
 
@@ -162,7 +202,18 @@ class DLiteSequentialHead(nn.Module):
                 f"prediction_length={prediction_length} exceeds configured "
                 f"maximum {self.max_prediction_length}."
             )
-        state = hidden_states.new_zeros(batch_size, self.sequential_rank)
+        if initial_prev_token_ids is not None:
+            if initial_prev_token_ids.shape != (batch_size,):
+                raise ValueError(
+                    "initial_prev_token_ids must have shape "
+                    f"({batch_size},), got {tuple(initial_prev_token_ids.shape)}."
+                )
+            state = self._seed_rnn_state(
+                initial_prev_token_ids,
+                reference=hidden_states,
+            ).view(batch_size, self.sequential_rank)
+        else:
+            state = hidden_states.new_zeros(batch_size, self.sequential_rank)
         prev_token_ids = first_prev_token_ids.long()
         sampled_tokens: list[torch.Tensor] = []
         final_logits: list[torch.Tensor] = []

@@ -35,7 +35,6 @@ class TrainingSurfaceTest(unittest.TestCase):
             "anchor-group-size",
             "anchor_group_size",
             "ANCHOR_GROUP_SIZE",
-            "initial_prev_token_ids",
             "student-only",
             "student_only",
         ):

@@ -70,7 +70,119 @@ class PublicConfigTest(unittest.TestCase):
             embed_tokens(torch.tensor([31, 31, 31])),
         )
         self.assertEqual(prepared.token_position_ids.tolist(), [[[2]]])
-        self.assertFalse(hasattr(prepared, "initial_prev_token_ids"))
+        self.assertIsNone(prepared.initial_prev_token_ids)
+        inference_query = model.build_inference_query_embeddings(
+            embed_tokens,
+            torch.tensor([[6, 31, 31, 31]]),
+        )
+        self.assertEqual(inference_query.shape, (1, 4, 16))
+        torch.testing.assert_close(inference_query[0, 0], embed_tokens.weight[6])
+
+    def test_v2_adds_predecessor_query_and_rnn_seed(self):
+        config = Qwen3Config(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=4,
+        )
+        config.num_target_layers = 4
+        config.block_size = 4
+        config.dlite_config = {
+            "architecture_version": "dlite_v2",
+            "model_role": "pivot_q_student",
+            "chs_num_layers": 2,
+            "target_layer_ids": build_target_layer_ids(4, 2),
+            "sequential_head": "rnn",
+            "sequential_rank": 8,
+            "mask_token_id": 31,
+        }
+        model = DLiteDraftModel(config)
+        self.assertEqual(model.draft_query_length, config.block_size + 1)
+        self.assertTrue(model.uses_predecessor_query)
+        self.assertTrue(model.seed_rnn_from_predecessor)
+
+        embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        online = OnlineDLiteModel(
+            draft_model=model,
+            target_lm_head=nn.Linear(config.hidden_size, config.vocab_size),
+            target_embed_tokens=embed_tokens,
+            mask_token_id=31,
+            block_size=config.block_size,
+        )
+        input_ids = torch.tensor([[4, 5, 6, 7, 8, 9]])
+        hidden_states = {
+            layer_id: torch.randn(1, input_ids.size(1), config.hidden_size)
+            for layer_id in model.target_layer_ids
+        }
+        prepared = online.prepare_batch(
+            input_ids,
+            hidden_states,
+            torch.ones_like(input_ids),
+            anchor_positions=torch.tensor([[2]]),
+            block_keep_mask=torch.tensor([[True]]),
+        )
+        self.assertEqual(prepared.query_embeddings.shape, (1, 1, 5, 16))
+        torch.testing.assert_close(
+            prepared.query_embeddings[0, 0, :2],
+            embed_tokens(input_ids[0, 1:3]),
+        )
+        torch.testing.assert_close(
+            prepared.query_embeddings[0, 0, 2:],
+            embed_tokens(torch.tensor([31, 31, 31])),
+        )
+        self.assertEqual(prepared.token_position_ids.tolist(), [[[1, 2]]])
+        self.assertEqual(prepared.initial_prev_token_ids.tolist(), [[5]])
+        context_pos, draft_pos = model.build_block_position_ids(
+            prepared.anchor_positions,
+            prepared.token_position_ids,
+            prepared.token_keep_mask,
+        )
+        self.assertEqual(context_pos.tolist(), [[0, 0]])
+        self.assertEqual(draft_pos.tolist(), [[0, 1, 2, 3, 4]])
+        inference_query = model.build_inference_query_embeddings(
+            embed_tokens,
+            torch.tensor([[6, 31, 31, 31]]),
+            predecessor_token_ids=torch.tensor([[5]]),
+        )
+        self.assertEqual(inference_query.shape, (1, 5, 16))
+        torch.testing.assert_close(
+            inference_query[0, :2], embed_tokens(torch.tensor([5, 6]))
+        )
+
+    def test_v2_teacher_predecessor_and_chs_share_anchor_minus_one_position(self):
+        config = Qwen3Config(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=4,
+        )
+        config.num_target_layers = 4
+        config.block_size = 4
+        config.dlite_config = {
+            "architecture_version": "dlite_v2",
+            "model_role": "swa_teacher",
+            "swa_window_size": 1,
+            "chs_num_layers": 2,
+            "target_layer_ids": build_target_layer_ids(4, 2),
+            "history_layer_ids": [0, 2, 3],
+            "sequential_head": "rnn",
+            "sequential_rank": 8,
+            "mask_token_id": 31,
+        }
+        model = DLiteDraftModel(config)
+        context_pos, draft_pos = model.build_block_position_ids(
+            anchor_positions=torch.tensor([[5]]),
+            token_position_ids=torch.tensor([[[4, 5]]]),
+            token_keep_mask=torch.tensor([[[True, True]]]),
+        )
+        self.assertEqual(context_pos.tolist(), [[4, 4]])
+        self.assertEqual(draft_pos.tolist(), [[4, 5, 6, 7, 8]])
 
 
 if __name__ == "__main__":

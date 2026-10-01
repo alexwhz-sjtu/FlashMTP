@@ -103,6 +103,7 @@ def parse_args():
 
 
 def _sync_args_from_model(args, draft: DLiteDraftModel) -> None:
+    args.dlite_version = draft.architecture_version
     args.block_size = draft.block_size
     args.num_draft_layers = draft.config.num_hidden_layers
     args.swa_window_size = draft.swa_window_size
@@ -114,6 +115,7 @@ def _sync_args_from_model(args, draft: DLiteDraftModel) -> None:
 
 def _structure_signature(draft: DLiteDraftModel) -> tuple:
     return (
+        draft.architecture_version,
         draft.swa_window_size,
         draft.chs_num_layers,
         draft.block_size,
@@ -126,7 +128,7 @@ def _structure_signature(draft: DLiteDraftModel) -> tuple:
 
 def _non_depth_structure_signature(draft: DLiteDraftModel) -> tuple:
     signature = _structure_signature(draft)
-    return signature[:3] + signature[4:]
+    return signature[:4] + signature[5:]
 
 
 def _set_student_stage1_trainable(student: DLiteDraftModel) -> None:
@@ -156,12 +158,14 @@ def _cosine_transition_scales(batch_idx: int, num_batches: int) -> tuple[float, 
 
 def _copy_serial_head(teacher: DLiteDraftModel, student: DLiteDraftModel) -> None:
     teacher_signature = (
+        teacher.architecture_version,
         teacher.sequential_head_type,
         teacher.sequential_rank,
         teacher.block_size,
         teacher.config.vocab_size,
     )
     student_signature = (
+        student.architecture_version,
         student.sequential_head_type,
         student.sequential_rank,
         student.block_size,

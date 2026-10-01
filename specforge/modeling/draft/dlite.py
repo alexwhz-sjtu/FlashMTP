@@ -154,7 +154,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-DLITE_ARCHITECTURE_VERSION = "dlite_v1"
+DLITE_ARCHITECTURE_VERSIONS = ("dlite_v1", "dlite_v2")
+DLITE_ARCHITECTURE_VERSION = "dlite_v2"
 DLITE_MODEL_ROLES = ("swa_teacher", "pivot_q_student")
 
 
@@ -386,11 +387,11 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         self.config = config
         dlite_config = getattr(config, "dlite_config", {}) or {}
         architecture_version = dlite_config.get("architecture_version")
-        if architecture_version != DLITE_ARCHITECTURE_VERSION:
+        if architecture_version not in DLITE_ARCHITECTURE_VERSIONS:
             raise ValueError(
                 "Incompatible DLite checkpoint/config architecture_version: "
-                f"expected {DLITE_ARCHITECTURE_VERSION!r}, got "
-                f"{architecture_version!r}. Historical checkpoints are not supported."
+                f"expected one of {DLITE_ARCHITECTURE_VERSIONS}, got "
+                f"{architecture_version!r}."
             )
         self.architecture_version = str(architecture_version)
         self.model_role = str(dlite_config.get("model_role", "")).lower()
@@ -462,7 +463,7 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
             hidden_size=config.hidden_size,
             max_prediction_length=config.block_size - 1,
         )
-        self._compiled_serial_sampler_cache: dict[float, Callable] = {}
+        self._compiled_serial_sampler_cache: dict[tuple[float, bool], Callable] = {}
         config.dlite_config = dlite_config
 
         self.layers = nn.ModuleList(
@@ -524,6 +525,18 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
     @property
     def fuse_slot_count(self) -> int:
         return self.swa_window_size - 1
+
+    @property
+    def uses_predecessor_query(self) -> bool:
+        return self.architecture_version == "dlite_v2"
+
+    @property
+    def token_prefix_count(self) -> int:
+        return 2 if self.uses_predecessor_query else 1
+
+    @property
+    def seed_rnn_from_predecessor(self) -> bool:
+        return self.uses_predecessor_query and self.sequential_head_type == "rnn"
 
     def get_last_decode_stats(self) -> dict:
         return dict(self._last_decode_stats)
@@ -598,7 +611,7 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
 
     @property
     def draft_query_length(self) -> int:
-        return self.block_size
+        return self.token_prefix_count + self.proposal_length
 
     @property
     def proposal_length(self) -> int:
@@ -657,14 +670,30 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         self,
         embed_tokens: nn.Module,
         draft_input_ids: torch.Tensor,
+        predecessor_token_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Build one anchor-token query followed by ``B-1`` MASK queries."""
+        """Build versioned real-token queries followed by ``B-1`` MASK queries."""
         if draft_input_ids.ndim != 2 or draft_input_ids.shape[1] != self.block_size:
             raise ValueError(
                 "draft_input_ids must have shape "
                 f"(batch, {self.block_size}), got {tuple(draft_input_ids.shape)}."
-            )
-        anchor_embeddings = embed_tokens(draft_input_ids[:, :1])
+        )
+        anchor_ids = draft_input_ids[:, :1]
+        if self.uses_predecessor_query:
+            if (
+                predecessor_token_ids is None
+                or predecessor_token_ids.shape != anchor_ids.shape
+            ):
+                raise ValueError(
+                    "dlite_v2 requires predecessor_token_ids shaped "
+                    f"{tuple(anchor_ids.shape)}."
+                )
+            real_token_ids = torch.cat([predecessor_token_ids, anchor_ids], dim=1)
+        else:
+            if predecessor_token_ids is not None:
+                raise ValueError("dlite_v1 does not accept predecessor_token_ids.")
+            real_token_ids = anchor_ids
+        real_embeddings = embed_tokens(real_token_ids)
         mask_ids = draft_input_ids[:, 1:]
         weight = getattr(embed_tokens, "weight", None)
         if weight is not None and bool((mask_ids >= weight.shape[0]).any()):
@@ -697,7 +726,7 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
             )
         else:
             mask_embeddings = embed_tokens(mask_ids)
-        return torch.cat([anchor_embeddings, mask_embeddings], dim=1)
+        return torch.cat([real_embeddings, mask_embeddings], dim=1)
 
     def build_inference_current_chs(
         self,
@@ -793,16 +822,18 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         else:
             history_source = recent_condition_hidden[:, :0, :]
         history = history_source.unsqueeze(1)
-        token_pos = torch.full(
-            (recent_condition_hidden.shape[0], 1, 1),
-            anchor_position,
+        token_pos = torch.arange(
+            anchor_position - self.token_prefix_count + 1,
+            anchor_position + 1,
             device=recent_condition_hidden.device,
             dtype=torch.long,
+        ).view(1, 1, -1).expand(
+            recent_condition_hidden.shape[0], -1, -1
         )
         token_keep = torch.ones(
             recent_condition_hidden.shape[0],
             1,
-            1,
+            self.token_prefix_count,
             dtype=torch.bool,
             device=recent_condition_hidden.device,
         )
@@ -959,23 +990,33 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         first_prev_token_ids: torch.Tensor,
         temperature: float = 0.0,
         compile_serial_head: bool = False,
+        initial_prev_token_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample standard DLite draft positions using configured head semantics."""
+        if initial_prev_token_ids is not None and not self.seed_rnn_from_predecessor:
+            raise ValueError(
+                "initial_prev_token_ids are supported by dlite_v2 rnn checkpoints only."
+            )
         if compile_serial_head:
-            cache_key = float(temperature)
+            cache_key = (float(temperature), initial_prev_token_ids is not None)
             compiled_sampler = self._compiled_serial_sampler_cache.get(cache_key)
             if compiled_sampler is None:
                 sequential_head = self.sequential_head
                 fixed_temperature = float(temperature)
+                seed_from_predecessor = initial_prev_token_ids is not None
 
                 def serial_sampler(
                     hidden_states: torch.Tensor,
                     previous_ids: torch.Tensor,
+                    initial_previous_ids: Optional[torch.Tensor] = None,
                 ) -> tuple[torch.Tensor, torch.Tensor]:
                     return sequential_head.sample_block_tokens(
                         hidden_states=hidden_states,
                         first_prev_token_ids=previous_ids,
                         temperature=fixed_temperature,
+                        initial_prev_token_ids=(
+                            initial_previous_ids if seed_from_predecessor else None
+                        ),
                     )
 
                 compiled_sampler = torch.compile(
@@ -984,11 +1025,16 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
                     fullgraph=True,
                 )
                 self._compiled_serial_sampler_cache[cache_key] = compiled_sampler
+            if initial_prev_token_ids is not None:
+                return compiled_sampler(
+                    draft_hidden, first_prev_token_ids, initial_prev_token_ids
+                )
             return compiled_sampler(draft_hidden, first_prev_token_ids)
         return self.sequential_head.sample_block_tokens(
             hidden_states=draft_hidden,
             first_prev_token_ids=first_prev_token_ids,
             temperature=temperature,
+            initial_prev_token_ids=initial_prev_token_ids,
         )
 
     @torch.inference_mode()
@@ -1084,9 +1130,13 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         start = input_ids.shape[1]
         while start < max_length:
             draft_input_ids = output_ids[:, start : start + draft_block_len].clone()
+            predecessor_token_ids = output_ids[:, start - 1 : start]
             noise_embedding = self.build_inference_query_embeddings(
                 target.model.embed_tokens,
                 draft_input_ids,
+                predecessor_token_ids=(
+                    predecessor_token_ids if self.uses_predecessor_query else None
+                ),
             )
             current_target_hidden = self.build_inference_current_chs(
                 target_hidden,
@@ -1114,6 +1164,11 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
                 first_prev_token_ids=draft_input_ids[:, 0],
                 temperature=draft_temperature,
                 compile_serial_head=compile_serial_head,
+                initial_prev_token_ids=(
+                    predecessor_token_ids.squeeze(1)
+                    if self.seed_rnn_from_predecessor
+                    else None
+                ),
             )
             all_verify_output_ids = torch.cat(
                 [draft_input_ids[:, :1], sampled_draft_tokens], dim=1

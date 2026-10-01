@@ -43,6 +43,21 @@ class SequentialHeadTest(unittest.TestCase):
         self.assertEqual(latent.shape, (2, 3, 5))
         self.assertEqual(self.head.project_logits(latent).shape, (2, 3, 17))
 
+    def test_predecessor_seed_changes_teacher_forcing_state(self):
+        hidden = torch.randn(2, 3, 7)
+        previous = torch.randint(0, 17, (2, 3))
+        unseeded = self.head.forward_teacher_forcing(
+            hidden_states=hidden,
+            prev_token_ids=previous,
+        )
+        seeded = self.head.forward_teacher_forcing(
+            hidden_states=hidden,
+            prev_token_ids=previous,
+            initial_prev_token_ids=torch.tensor([3, 4]),
+        )
+        self.assertEqual(seeded.shape, unseeded.shape)
+        self.assertFalse(torch.equal(seeded, unseeded))
+
     def test_greedy_sampling_shapes(self):
         tokens, logits = self.head.sample_block_tokens(
             hidden_states=torch.randn(2, 4, 7),
@@ -50,6 +65,14 @@ class SequentialHeadTest(unittest.TestCase):
         )
         self.assertEqual(tokens.shape, (2, 4))
         self.assertEqual(logits.shape, (2, 4, 17))
+
+        seeded_tokens, seeded_logits = self.head.sample_block_tokens(
+            hidden_states=torch.randn(2, 4, 7),
+            first_prev_token_ids=torch.tensor([1, 2]),
+            initial_prev_token_ids=torch.tensor([3, 4]),
+        )
+        self.assertEqual(seeded_tokens.shape, (2, 4))
+        self.assertEqual(seeded_logits.shape, (2, 4, 17))
 
 
 if __name__ == "__main__":

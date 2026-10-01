@@ -24,6 +24,7 @@ from specforge.data import build_training_dataset, prepare_dp_dataloaders
 from specforge.distributed import get_dp_group, get_tp_group
 from specforge.modeling.draft.dlite import (
     DLITE_ARCHITECTURE_VERSION,
+    DLITE_ARCHITECTURE_VERSIONS,
     DLiteDraftModel,
     build_target_layer_ids,
 )
@@ -41,6 +42,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     model = parser.add_argument_group("model")
     model.add_argument("--target-model-path", required=True)
     model.add_argument("--target-model-backend", default="hf", choices=["hf", "sglang"])
+    model.add_argument(
+        "--dlite-version",
+        default=DLITE_ARCHITECTURE_VERSION,
+        choices=DLITE_ARCHITECTURE_VERSIONS,
+    )
     model.add_argument("--block-size", type=int, default=8)
     model.add_argument("--num-draft-layers", type=int, default=5)
     model.add_argument("--swa-window-size", type=int, default=32)
@@ -149,7 +155,7 @@ def build_draft_config(args, *, model_role: str, source_config=None):
         config.num_target_layers = target_depth
         config.block_size = int(args.block_size)
     dlite = dict(
-        architecture_version=DLITE_ARCHITECTURE_VERSION,
+        architecture_version=args.dlite_version,
         model_role=model_role,
         chs_num_layers=int(args.chs_num_layers),
         target_layer_ids=build_target_layer_ids(

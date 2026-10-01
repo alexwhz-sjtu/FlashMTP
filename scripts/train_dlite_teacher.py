@@ -124,6 +124,7 @@ def _sync_args_from_checkpoint(args, draft: DLiteDraftModel) -> None:
     if not draft.is_teacher:
         raise ValueError("Teacher training can only resume an swa_teacher checkpoint.")
     args.block_size = draft.block_size
+    args.dlite_version = draft.architecture_version
     args.num_draft_layers = draft.config.num_hidden_layers
     args.swa_window_size = draft.swa_window_size
     args.chs_num_layers = draft.chs_num_layers

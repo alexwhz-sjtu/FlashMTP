@@ -58,6 +58,8 @@ MASTER_PORT="${MASTER_PORT:-${PET_MASTER_PORT:-29503}}"
 export MASTER_ADDR MASTER_PORT
 
 TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
+DLITE_VERSION="${DLITE_VERSION:-dlite_v2}"
+LOCAL_POSITION="${LOCAL_POSITION:-true}"
 BLOCK_SIZE="${BLOCK_SIZE:-8}"
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 CHS_NUM_LAYERS="${CHS_NUM_LAYERS:-7}"
@@ -162,7 +164,7 @@ fi
 DT_TAG=""
 [[ -n "${DT}" ]] && DT_TAG="${DT}_"
 
-RUN_TAG="dlite_v23_sft_${DT_TAG}${MODEL_TAG}_${DATA_TAG}_${NNODES}n${WORLD_SIZE}g_tp${TP_SIZE}_sh${SHARD_DRAFT_BY_TP}_chs${CHS_NUM_LAYERS}_a${NUM_ANCHORS}_block${BLOCK_SIZE}_d${NUM_DRAFT_LAYERS}_${SEQUENTIAL_HEAD}_r${SEQUENTIAL_RANK}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_lr${LEARNING_RATE}_ce${FINAL_CE_WEIGHT}_tv${TV_LOSS_WEIGHT}_base${BASE_LM_CE_WEIGHT}"
+RUN_TAG="${DLITE_VERSION}_sft_${DT_TAG}${MODEL_TAG}_${DATA_TAG}_${NNODES}n${WORLD_SIZE}g_tp${TP_SIZE}_sh${SHARD_DRAFT_BY_TP}_chs${CHS_NUM_LAYERS}_a${NUM_ANCHORS}_block${BLOCK_SIZE}_d${NUM_DRAFT_LAYERS}_${SEQUENTIAL_HEAD}_r${SEQUENTIAL_RANK}_maxlen${MAX_LENGTH}_ep${NUM_EPOCHS}_lr${LEARNING_RATE}_ce${FINAL_CE_WEIGHT}_tv${TV_LOSS_WEIGHT}_base${BASE_LM_CE_WEIGHT}"
 if [[ -n "${RUN_SUFFIX:-}" ]]; then
   RUN_TAG="$(slug "${RUN_TAG}" 210)_$(slug "${RUN_SUFFIX}" 24)"
 else
@@ -173,10 +175,10 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_DIR}/cache/models}"
 OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_TAG}}"
 CACHE_DIR="${CACHE_DIR:-${PROJECT_DIR}/cache/train/${DATA_TAG}_l${MAX_LENGTH}_m${MASK_TOKEN_ID:-auto}}"
 REPORT_TO="${REPORT_TO:-wandb}"
-WANDB_PROJECT="${WANDB_PROJECT:-dlite-training-v2.3-sft}"
+WANDB_PROJECT="${WANDB_PROJECT:-dlite-training}"
 RUN_HASH="$("${PYTHON_BIN}" -c 'import hashlib, sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:8])' "${RUN_TAG}")"
-WANDB_NAME="${WANDB_RUN_NAME:-${WANDB_NAME:-$(slug "v23sft_${DT_TAG}${MODEL_TAG}_${DATA_TAG}_d${NUM_DRAFT_LAYERS}_${SEQUENTIAL_HEAD}_r${SEQUENTIAL_RANK}" 110)_${RUN_HASH}}}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-$(slug "v23sft-${DT_TAG}${MODEL_TAG}-${DATA_TAG}-${RUN_HASH}" 64)}"
+WANDB_NAME="${WANDB_RUN_NAME:-${WANDB_NAME:-$(slug "${DLITE_VERSION}_sft_${DT_TAG}${MODEL_TAG}_${DATA_TAG}_d${NUM_DRAFT_LAYERS}_${SEQUENTIAL_HEAD}_r${SEQUENTIAL_RANK}" 110)_${RUN_HASH}}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-$(slug "${DLITE_VERSION}-sft-${DT_TAG}${MODEL_TAG}-${DATA_TAG}-${RUN_HASH}" 64)}"
 
 OPTIONAL_ARGS=(--local-position)
 [[ -n "${LOSS_DECAY_GAMMA}" ]] && OPTIONAL_ARGS+=(--loss-decay-gamma "${LOSS_DECAY_GAMMA}")
@@ -211,6 +213,7 @@ CMD=(
   -m scripts.train_dlite_sft
   --target-model-path "${TARGET_MODEL}"
   --target-model-backend "${TARGET_MODEL_BACKEND}"
+  --dlite-version "${DLITE_VERSION}"
   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
   --train-data-path "${TRAIN_DATA_PATH}"
   --output-dir "${OUTPUT_DIR}"
