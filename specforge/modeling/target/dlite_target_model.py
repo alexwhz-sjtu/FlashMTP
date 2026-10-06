@@ -121,20 +121,112 @@ class SGLangDLiteTargetModel(DLiteTargetModel):
     def set_capture_layers(self, layer_ids: List[int]) -> None:
         """Set which layers' hidden states to capture.
 
-        If layer_ids is None or empty, capture ALL layers (for DLite mode).
-        Note: SGLang's set_eagle3_layers_to_capture adds +1 offset to layer indices.
+        If layer_ids is None or empty, capture all layers. SGLang's capture
+        APIs add a +1 offset to HF-style layer indices; the final layer is
+        returned separately as ``last_hidden_states``.
         """
+        num_layers = getattr(self.model_runner.model_config, "num_hidden_layers", 36)
         if layer_ids is None or len(layer_ids) == 0:
-            # Capture all layers: range [0, num_hidden_layers)
-            # SGLang will add +1 offset internally
-            num_layers = getattr(
-                self.model_runner.model_config, "num_hidden_layers", 36
-            )
             layer_ids = list(range(num_layers))
 
         super().set_capture_layers(layer_ids)
-        if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
-            self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
+        model = self.model_runner.model
+        if hasattr(model, "set_eagle3_layers_to_capture"):
+            model.set_eagle3_layers_to_capture(layer_ids)
+            return
+        if hasattr(model, "set_dflash_layers_to_capture"):
+            # Qwen3.5 exposes this hook in newer SGLang versions. The final
+            # normalized layer is already supplied by the logits processor.
+            model.set_dflash_layers_to_capture(
+                [layer_id for layer_id in layer_ids if layer_id < num_layers - 1]
+            )
+            return
+        self._set_communicator_capture(model, layer_ids, num_layers)
+
+    @staticmethod
+    def _set_communicator_capture(
+        model: nn.Module, layer_ids: List[int], num_layers: int
+    ) -> None:
+        """Install hidden-state capture for stock SGLang 0.5.9 Qwen3.5."""
+        language_model = getattr(model, "model", None)
+        layers = getattr(language_model, "layers", None)
+        if layers is None or len(layers) != num_layers:
+            raise RuntimeError(
+                f"SGLang model {type(model).__name__} does not expose a supported "
+                "hidden-state capture hook or compatible decoder layers."
+            )
+
+        state = getattr(model, "_dlite_communicator_capture", None)
+        if state is None:
+            state = {"selected_next_layer_ids": set(), "hidden_states": []}
+            model._dlite_communicator_capture = state
+
+            for next_layer_id, layer in enumerate(layers):
+                communicator = getattr(layer, "layer_communicator", None)
+                original_prepare_attn = getattr(communicator, "prepare_attn", None)
+                communicate_simple = getattr(
+                    communicator, "_communicate_simple_fn", None
+                )
+                if original_prepare_attn is None or communicate_simple is None:
+                    raise RuntimeError(
+                        "SGLang Qwen3.5 decoder layer does not expose the expected "
+                        "LayerCommunicator interface."
+                    )
+
+                def prepare_attn_and_capture(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    *args,
+                    _next_layer_id=next_layer_id,
+                    _communicator=communicator,
+                    _original_prepare_attn=original_prepare_attn,
+                    **kwargs,
+                ):
+                    hidden_states, residual = _original_prepare_attn(
+                        hidden_states,
+                        residual,
+                        forward_batch,
+                        *args,
+                        **kwargs,
+                    )
+                    if _next_layer_id in state["selected_next_layer_ids"]:
+                        captured = _communicator._communicate_simple_fn(
+                            hidden_states=residual,
+                            forward_batch=forward_batch,
+                            context=_communicator._context,
+                        )
+                        if captured is residual:
+                            captured = residual.clone()
+                        state["hidden_states"].append(captured)
+                    return hidden_states, residual
+
+                communicator.prepare_attn = prepare_attn_and_capture
+
+            from .sglang_backend.utils import LogitsProcessorForEAGLE3
+
+            processors = [
+                module
+                for module in model.modules()
+                if isinstance(module, LogitsProcessorForEAGLE3)
+            ]
+            if not processors:
+                raise RuntimeError(
+                    "Could not attach Qwen3.5 hidden-state capture to the SGLang "
+                    "logits processor."
+                )
+
+            def take_hidden_states(state=state):
+                hidden_states = state["hidden_states"]
+                state["hidden_states"] = []
+                return hidden_states
+
+            for processor in processors:
+                processor.aux_hidden_states_provider = take_hidden_states
+
+        state["selected_next_layer_ids"] = {
+            layer_id + 1 for layer_id in layer_ids if layer_id < num_layers - 1
+        }
 
     @staticmethod
     def _unpack_runner_output(runner_output):

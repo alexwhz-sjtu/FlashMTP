@@ -418,14 +418,25 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
                 f"swa_window_size must be >= 1, got {self.swa_window_size}."
             )
         self.chs_num_layers = int(dlite_config["chs_num_layers"])
-        selected_layer_ids = build_target_layer_ids(
-            config.num_target_layers, self.chs_num_layers
-        )
-        self.target_layer_ids = list(dlite_config["target_layer_ids"])
-        if self.target_layer_ids != selected_layer_ids:
+        self.target_layer_ids = [
+            int(value) for value in dlite_config["target_layer_ids"]
+        ]
+        if len(self.target_layer_ids) != self.chs_num_layers:
             raise ValueError(
-                "target_layer_ids must match the fixed first/last plus evenly "
-                f"spaced selection {selected_layer_ids}, got {self.target_layer_ids}."
+                "target_layer_ids length must equal chs_num_layers: "
+                f"{len(self.target_layer_ids)} != {self.chs_num_layers}."
+            )
+        if self.target_layer_ids != sorted(set(self.target_layer_ids)):
+            raise ValueError("target_layer_ids must be unique and strictly increasing.")
+        invalid_layer_ids = [
+            layer_id
+            for layer_id in self.target_layer_ids
+            if not 0 <= layer_id < int(config.num_target_layers)
+        ]
+        if invalid_layer_ids:
+            raise ValueError(
+                f"target_layer_ids {invalid_layer_ids} are outside [0, "
+                f"{int(config.num_target_layers) - 1}]."
             )
         default_history_ids = [
             0,

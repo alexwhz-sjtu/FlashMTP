@@ -13,6 +13,8 @@ dependencies = [
     "torchaudio==2.9.1",
     "torchvision==0.24.1",
     "transformers==4.57.1",
+    "causal-conv1d==1.7.0",
+    "flash-linear-attention[conv1d]==0.5.2",
     "qwen-vl-utils==0.0.11",
     "datasets",
     "setuptools",
@@ -41,3 +43,10 @@ fa = ["flash-attn"]
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}
 description = {file = "README.md"}
+
+[tool.uv]
+preview = true
+
+[tool.uv.extra-build-dependencies]
+# This CUDA extension must use the exact PyTorch C++ ABI selected by the lock.
+causal-conv1d = [{ requirement = "torch", match-runtime = true }]

@@ -15,6 +15,7 @@ CLI options:
 | `NUM_DRAFT_LAYERS` | `--num-draft-layers` | `5` |
 | `SWA_WINDOW_SIZE` | `--swa-window-size` | `32` |
 | `CHS_NUM_LAYERS` | `--chs-num-layers` | `7` |
+| `TARGET_LAYER_IDS` | `--target-layer-ids` | `0,1,3,7,11,15,19,23,27,29,30,31` |
 | `SEQUENTIAL_HEAD` | `--sequential-head` | `rnn` |
 | `SEQUENTIAL_RANK` | `--sequential-rank` | `256` |
 | `MASK_TOKEN_ID` | `--mask-token-id` | automatically selected for the target model |
@@ -22,6 +23,12 @@ CLI options:
 `sglang` remains available for target prefill and exposes the existing SGLang
 memory, tensor-parallel, and draft-sharding options. The draft model uses
 FlexAttention during training; inference may use FlashAttention 2 or SDPA.
+
+When `TARGET_LAYER_IDS` is non-empty, its unique, increasing, zero-based IDs
+are used directly and `CHS_NUM_LAYERS` is ignored. Set `TARGET_LAYER_IDS=` to
+restore automatic evenly spaced selection by count. Qwen3.5 targets are loaded
+through SGLang with FA3 while their DLite draft remains a dense Qwen3-style
+backbone with matching vocabulary and hidden dimensions.
 
 When `MASK_TOKEN_ID` is omitted, training preserves a value stored in a loaded
 draft checkpoint, otherwise uses the tokenizer's native mask token, or selects

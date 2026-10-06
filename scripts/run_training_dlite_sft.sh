@@ -37,6 +37,8 @@ if [[ -z "${PYTHON_BIN:-}" && -x "${PROJECT_DIR}/.venv/bin/python" ]]; then
 else
   PYTHON_BIN="${PYTHON_BIN:-python3}"
 fi
+PYTHON_EXECUTABLE="$(command -v "${PYTHON_BIN}" 2>/dev/null || printf '%s' "${PYTHON_BIN}")"
+export PATH="$(cd "$(dirname "${PYTHON_EXECUTABLE}")" && pwd):${PATH}"
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   echo "Python executable not found: ${PYTHON_BIN}" >&2
   exit 2
@@ -57,12 +59,28 @@ MASTER_ADDR="${MASTER_ADDR:-${PET_MASTER_ADDR:-127.0.0.1}}"
 MASTER_PORT="${MASTER_PORT:-${PET_MASTER_PORT:-29503}}"
 export MASTER_ADDR MASTER_PORT
 
-TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
+if [[ -z "${TARGET_MODEL_BACKEND:-}" ]]; then
+  case "${TARGET_MODEL%/}" in
+    *Qwen3.5-*) TARGET_MODEL_BACKEND="sglang" ;;
+    *) TARGET_MODEL_BACKEND="hf" ;;
+  esac
+fi
+if [[ -z "${SGLANG_ATTENTION_BACKEND:-}" && "${TARGET_MODEL%/}" == *Qwen3.5-* ]]; then
+  SGLANG_ATTENTION_BACKEND="fa3"
+fi
+if [[ -z "${CHAT_TEMPLATE:-}" && "${TARGET_MODEL%/}" == *Qwen3.5-* ]]; then
+  CHAT_TEMPLATE="qwen3.5"
+fi
 DLITE_VERSION="${DLITE_VERSION:-dlite_v2}"
 LOCAL_POSITION="${LOCAL_POSITION:-true}"
 BLOCK_SIZE="${BLOCK_SIZE:-8}"
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 CHS_NUM_LAYERS="${CHS_NUM_LAYERS:-7}"
+TARGET_LAYER_IDS="${TARGET_LAYER_IDS:-0,1,3,7,11,15,19,23,27,29,30,31}"
+if [[ -n "${TARGET_LAYER_IDS}" ]]; then
+  IFS=',' read -r -a _TARGET_LAYER_ID_ARRAY <<< "${TARGET_LAYER_IDS}"
+  CHS_NUM_LAYERS="${#_TARGET_LAYER_ID_ARRAY[@]}"
+fi
 SEQUENTIAL_HEAD="${SEQUENTIAL_HEAD:-rnn}"
 SEQUENTIAL_RANK="${SEQUENTIAL_RANK:-256}"
 NUM_EPOCHS="${NUM_EPOCHS:-10}"
@@ -187,6 +205,7 @@ OPTIONAL_ARGS=(--local-position)
 [[ -n "${INIT_FROM:-}" ]] && OPTIONAL_ARGS+=(--init-from "${INIT_FROM}")
 [[ -n "${MASK_TOKEN_ID:-}" ]] && OPTIONAL_ARGS+=(--mask-token-id "${MASK_TOKEN_ID}")
 [[ -n "${CHAT_TEMPLATE:-}" ]] && OPTIONAL_ARGS+=(--chat-template "${CHAT_TEMPLATE}")
+[[ -n "${TARGET_LAYER_IDS}" ]] && OPTIONAL_ARGS+=(--target-layer-ids "${TARGET_LAYER_IDS}")
 [[ -n "${SGLANG_ATTENTION_BACKEND:-}" ]] && OPTIONAL_ARGS+=(--sglang-attention-backend "${SGLANG_ATTENTION_BACKEND}")
 [[ -n "${SGLANG_CONTEXT_LENGTH:-}" ]] && OPTIONAL_ARGS+=(--sglang-context-length "${SGLANG_CONTEXT_LENGTH}")
 [[ -n "${SGLANG_MAX_RUNNING_REQUESTS:-}" ]] && OPTIONAL_ARGS+=(--sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}")

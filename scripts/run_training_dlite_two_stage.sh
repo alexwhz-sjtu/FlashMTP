@@ -37,6 +37,8 @@ if [[ -z "${PYTHON_BIN:-}" && -x "${PROJECT_DIR}/.venv/bin/python" ]]; then
 else
   PYTHON_BIN="${PYTHON_BIN:-python3}"
 fi
+PYTHON_EXECUTABLE="$(command -v "${PYTHON_BIN}" 2>/dev/null || printf '%s' "${PYTHON_BIN}")"
+export PATH="$(cd "$(dirname "${PYTHON_EXECUTABLE}")" && pwd):${PATH}"
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   echo "Python executable not found: ${PYTHON_BIN}" >&2
   exit 2
@@ -106,7 +108,18 @@ if [[ -z "${RESUME_FROM:-}" && -z "${TEACHER_DRAFT_PATH:-}" ]]; then
   exit 2
 fi
 
-TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
+if [[ -z "${TARGET_MODEL_BACKEND:-}" ]]; then
+  case "${TARGET_MODEL%/}" in
+    *Qwen3.5-*) TARGET_MODEL_BACKEND="sglang" ;;
+    *) TARGET_MODEL_BACKEND="hf" ;;
+  esac
+fi
+if [[ -z "${SGLANG_ATTENTION_BACKEND:-}" && "${TARGET_MODEL%/}" == *Qwen3.5-* ]]; then
+  SGLANG_ATTENTION_BACKEND="fa3"
+fi
+if [[ -z "${CHAT_TEMPLATE:-}" && "${TARGET_MODEL%/}" == *Qwen3.5-* ]]; then
+  CHAT_TEMPLATE="qwen3.5"
+fi
 DLITE_VERSION="${DLITE_VERSION:-dlite_v2}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 STAGE1_KL_WEIGHT="${STAGE1_KL_WEIGHT:-1.0}"

@@ -120,6 +120,7 @@ def _sync_args_from_checkpoint(args, draft: DLiteDraftModel) -> None:
     args.dlite_version = draft.architecture_version
     args.num_draft_layers = draft.config.num_hidden_layers
     args.chs_num_layers = draft.chs_num_layers
+    args.target_layer_ids = ",".join(str(value) for value in draft.target_layer_ids)
     args.sequential_head = draft.sequential_head_type
     args.sequential_rank = draft.sequential_rank
     draft.config._attn_implementation = "flex_attention"

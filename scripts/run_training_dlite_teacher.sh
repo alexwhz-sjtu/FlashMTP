@@ -39,6 +39,8 @@ if [[ -z "${PYTHON_BIN:-}" && -x "${PROJECT_DIR}/.venv/bin/python" ]]; then
 else
   PYTHON_BIN="${PYTHON_BIN:-python3}"
 fi
+PYTHON_EXECUTABLE="$(command -v "${PYTHON_BIN}" 2>/dev/null || printf '%s' "${PYTHON_BIN}")"
+export PATH="$(cd "$(dirname "${PYTHON_EXECUTABLE}")" && pwd):${PATH}"
 
 : "${TARGET_MODEL:?set TARGET_MODEL}"
 : "${TRAIN_DATA_PATH:?set TRAIN_DATA_PATH}"
@@ -50,12 +52,28 @@ MASTER_ADDR="${MASTER_ADDR:-${PET_MASTER_ADDR:-127.0.0.1}}"
 MASTER_PORT="${MASTER_PORT:-${PET_MASTER_PORT:-29501}}"
 export MASTER_ADDR MASTER_PORT
 
-TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
+if [[ -z "${TARGET_MODEL_BACKEND:-}" ]]; then
+  case "${TARGET_MODEL%/}" in
+    *Qwen3.5-*) TARGET_MODEL_BACKEND="sglang" ;;
+    *) TARGET_MODEL_BACKEND="hf" ;;
+  esac
+fi
+if [[ -z "${SGLANG_ATTENTION_BACKEND:-}" && "${TARGET_MODEL%/}" == *Qwen3.5-* ]]; then
+  SGLANG_ATTENTION_BACKEND="fa3"
+fi
+if [[ -z "${CHAT_TEMPLATE:-}" && "${TARGET_MODEL%/}" == *Qwen3.5-* ]]; then
+  CHAT_TEMPLATE="qwen3.5"
+fi
 DLITE_VERSION="${DLITE_VERSION:-dlite_v2}"
 BLOCK_SIZE="${BLOCK_SIZE:-8}"
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 SWA_WINDOW_SIZE="${SWA_WINDOW_SIZE:-512}"
 CHS_NUM_LAYERS="${CHS_NUM_LAYERS:-14}"
+TARGET_LAYER_IDS="${TARGET_LAYER_IDS:-0,1,3,7,11,15,19,23,27,29,30,31}"
+if [[ -n "${TARGET_LAYER_IDS}" ]]; then
+  IFS=',' read -r -a _TARGET_LAYER_ID_ARRAY <<< "${TARGET_LAYER_IDS}"
+  CHS_NUM_LAYERS="${#_TARGET_LAYER_ID_ARRAY[@]}"
+fi
 SEQUENTIAL_HEAD="${SEQUENTIAL_HEAD:-rnn}"
 SEQUENTIAL_RANK="${SEQUENTIAL_RANK:-512}"
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
@@ -127,6 +145,11 @@ OPTIONAL_ARGS=()
 [[ -n "${CHAT_TEMPLATE:-}" ]] && OPTIONAL_ARGS+=(--chat-template "${CHAT_TEMPLATE}")
 [[ -n "${MASK_TOKEN_ID:-}" ]] && OPTIONAL_ARGS+=(--mask-token-id "${MASK_TOKEN_ID}")
 [[ -n "${CACHE_DIR:-}" ]] && OPTIONAL_ARGS+=(--cache-dir "${CACHE_DIR}")
+[[ -n "${TARGET_LAYER_IDS}" ]] && OPTIONAL_ARGS+=(--target-layer-ids "${TARGET_LAYER_IDS}")
+[[ -n "${SGLANG_ATTENTION_BACKEND:-}" ]] && OPTIONAL_ARGS+=(--sglang-attention-backend "${SGLANG_ATTENTION_BACKEND}")
+[[ -n "${SGLANG_CONTEXT_LENGTH:-}" ]] && OPTIONAL_ARGS+=(--sglang-context-length "${SGLANG_CONTEXT_LENGTH}")
+[[ -n "${SGLANG_MAX_RUNNING_REQUESTS:-}" ]] && OPTIONAL_ARGS+=(--sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}")
+[[ -n "${SGLANG_MAX_TOTAL_TOKENS:-}" ]] && OPTIONAL_ARGS+=(--sglang-max-total-tokens "${SGLANG_MAX_TOTAL_TOKENS}")
 if [[ "${SHARD_DRAFT_BY_TP}" == "1" ]]; then
   OPTIONAL_ARGS+=(--shard-draft-by-tp)
 else

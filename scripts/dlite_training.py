@@ -12,7 +12,7 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoTokenizer
 
 from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
@@ -27,6 +27,10 @@ from specforge.modeling.draft.dlite import (
     DLITE_ARCHITECTURE_VERSIONS,
     DLiteDraftModel,
     build_target_layer_ids,
+)
+from specforge.modeling.config_utils import (
+    is_qwen35_model_type,
+    load_text_model_config,
 )
 from specforge.modeling.target.dlite_target_model import get_dlite_target_model
 from specforge.modeling.target.target_utils import (
@@ -51,6 +55,13 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     model.add_argument("--num-draft-layers", type=int, default=5)
     model.add_argument("--swa-window-size", type=int, default=32)
     model.add_argument("--chs-num-layers", type=int, default=7)
+    model.add_argument(
+        "--target-layer-ids",
+        help=(
+            "Comma-separated zero-based target layer IDs. When provided, this "
+            "takes precedence over --chs-num-layers."
+        ),
+    )
     model.add_argument(
         "--mask-token-id",
         type=int,
@@ -145,7 +156,9 @@ def validate_common_args(parser: argparse.ArgumentParser, args) -> None:
 
 def build_draft_config(args, *, model_role: str, source_config=None):
     config = (
-        AutoConfig.from_pretrained(args.target_model_path)
+        load_text_model_config(
+            args.target_model_path, trust_remote_code=args.trust_remote_code
+        )
         if source_config is None
         else source_config
     )
@@ -154,13 +167,40 @@ def build_draft_config(args, *, model_role: str, source_config=None):
         config.num_hidden_layers = int(args.num_draft_layers)
         config.num_target_layers = target_depth
         config.block_size = int(args.block_size)
+    if args.target_layer_ids:
+        target_layer_ids = [
+            int(value.strip())
+            for value in str(args.target_layer_ids).split(",")
+            if value.strip()
+        ]
+        if not target_layer_ids:
+            raise ValueError("--target-layer-ids must contain at least one layer ID.")
+        if target_layer_ids != sorted(set(target_layer_ids)):
+            raise ValueError(
+                "--target-layer-ids must be unique and in strictly increasing order."
+            )
+        invalid = [
+            layer_id
+            for layer_id in target_layer_ids
+            if not 0 <= layer_id < int(config.num_target_layers)
+        ]
+        if invalid:
+            raise ValueError(
+                f"Target layer IDs {invalid} are outside [0, "
+                f"{int(config.num_target_layers) - 1}]."
+            )
+        chs_num_layers = len(target_layer_ids)
+        args.chs_num_layers = chs_num_layers
+    else:
+        chs_num_layers = int(args.chs_num_layers)
+        target_layer_ids = build_target_layer_ids(
+            int(config.num_target_layers), chs_num_layers
+        )
     dlite = dict(
         architecture_version=args.dlite_version,
         model_role=model_role,
-        chs_num_layers=int(args.chs_num_layers),
-        target_layer_ids=build_target_layer_ids(
-            int(config.num_target_layers), int(args.chs_num_layers)
-        ),
+        chs_num_layers=chs_num_layers,
+        target_layer_ids=target_layer_ids,
         sequential_head=args.sequential_head,
         sequential_rank=int(args.sequential_rank),
         mask_token_id=(None if args.mask_token_id is None else int(args.mask_token_id)),
@@ -191,8 +231,27 @@ def build_draft_model(args, *, model_role: str, source_config=None):
 
 
 def build_target_model(args, draft_models: list[DLiteDraftModel]):
+    target_config = load_text_model_config(
+        args.target_model_path, trust_remote_code=args.trust_remote_code
+    )
+    source_model_type = getattr(
+        target_config, "dlite_source_model_type", target_config.model_type
+    )
+    if (
+        is_qwen35_model_type(source_model_type)
+        and args.target_model_backend != "sglang"
+    ):
+        raise ValueError(
+            "Qwen3.5 targets require --target-model-backend sglang with the "
+            "pinned Transformers version; the DLite draft remains a dense "
+            "Qwen3-style model."
+        )
     backend_kwargs = {}
     if args.target_model_backend == "sglang":
+        if is_qwen35_model_type(source_model_type):
+            # SGLang 0.5.9's Qwen3.5 hybrid GDN path is validated with FA3;
+            # FlashInfer attempts to JIT an incompatible fallback prefill path.
+            args.sglang_attention_backend = "fa3"
         backend_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
         if backend_kwargs["max_running_requests"] is None:
             backend_kwargs["max_running_requests"] = int(args.batch_size)
@@ -283,7 +342,7 @@ def resolve_tokenizer_and_components(args, draft_models, target=None):
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
-    target_config = AutoConfig.from_pretrained(
+    target_config = load_text_model_config(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
     configured_mask_ids = [

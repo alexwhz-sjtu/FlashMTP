@@ -128,6 +128,7 @@ def _sync_args_from_checkpoint(args, draft: DLiteDraftModel) -> None:
     args.num_draft_layers = draft.config.num_hidden_layers
     args.swa_window_size = draft.swa_window_size
     args.chs_num_layers = draft.chs_num_layers
+    args.target_layer_ids = ",".join(str(value) for value in draft.target_layer_ids)
     args.sequential_head = draft.sequential_head_type
     args.sequential_rank = draft.sequential_rank
     # Transformers does not serialize the private attention implementation
