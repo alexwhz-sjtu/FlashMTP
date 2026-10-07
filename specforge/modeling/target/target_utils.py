@@ -8,9 +8,9 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributed.nn import functional as dist_nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
+from torch.distributed.nn import functional as dist_nn
 from transformers import AutoConfig
 
 
@@ -75,10 +75,12 @@ class SGLangTPLMHeadAdapter(nn.Module):
         mapping = lm_head.get_sharded_to_full_mapping()
         self.register_buffer(
             "sharded_to_full",
-            None
-            if mapping is None
-            else torch.tensor(
-                mapping, dtype=torch.long, device=lm_head.weight.device
+            (
+                None
+                if mapping is None
+                else torch.tensor(
+                    mapping, dtype=torch.long, device=lm_head.weight.device
+                )
             ),
             persistent=False,
         )
@@ -116,9 +118,7 @@ class SGLangTPLMHeadAdapter(nn.Module):
             for owner_hidden in hidden_by_owner
         ]
         received = [torch.empty_like(local_logits[0]) for _ in range(self.tp_size)]
-        vocab_shards = dist_nn.all_to_all(
-            received, local_logits, group=self.tp_group
-        )
+        vocab_shards = dist_nn.all_to_all(received, local_logits, group=self.tp_group)
         if trace:
             print(f"[rank {dist.get_rank()}] TP LM head: shards gathered", flush=True)
         gathered_logits = torch.cat(vocab_shards, dim=-1)
@@ -266,8 +266,9 @@ class TargetEmbeddingsAndHead(nn.Module):
         if embed_key not in loaded_keys:
             raise RuntimeError("Failed to load embeddings.")
         if not tie_weights and lm_head_key not in loaded_keys:
-            print(
-                "Warning: LM Head weights were not found (and tie_weights is False). Head is random."
+            raise RuntimeError(
+                "LM head weights were not found and the target does not tie its "
+                "embedding weights; refusing to use a random target head."
             )
 
     def _load_file_content(

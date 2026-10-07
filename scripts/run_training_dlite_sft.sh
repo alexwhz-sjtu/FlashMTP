@@ -45,7 +45,12 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
 fi
 
 : "${TARGET_MODEL:?set TARGET_MODEL}"
-: "${TRAIN_DATA_PATH:?set TRAIN_DATA_PATH}"
+if [[ -n "${TRAIN_DATA_PATH:-}" && -n "${TRAIN_HIDDEN_STATES_PATH:-}" ]] || \
+   [[ -z "${TRAIN_DATA_PATH:-}" && -z "${TRAIN_HIDDEN_STATES_PATH:-}" ]]; then
+  echo "Set exactly one of TRAIN_DATA_PATH or TRAIN_HIDDEN_STATES_PATH" >&2
+  exit 2
+fi
+TRAIN_INPUT_PATH="${TRAIN_HIDDEN_STATES_PATH:-${TRAIN_DATA_PATH:-}}"
 
 NNODES="${PET_NNODES:-${NNODES:-1}}"
 NODE_RANK="${PET_NODE_RANK:-${NODE_RANK:-0}}"
@@ -96,6 +101,10 @@ NUM_ANCHORS="${NUM_ANCHORS:-512}"
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
 TP_SIZE="${TP_SIZE:-1}"
 SHARD_DRAFT_BY_TP="${SHARD_DRAFT_BY_TP:-0}"
+if [[ -n "${TRAIN_HIDDEN_STATES_PATH:-}" && ( "${TP_SIZE}" != "1" || "${SHARD_DRAFT_BY_TP}" != "0" ) ]]; then
+  echo "Offline regen_full training requires TP_SIZE=1 and SHARD_DRAFT_BY_TP=0" >&2
+  exit 2
+fi
 REQUESTED_BATCH_SIZE="${BATCH_SIZE:-1}"
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-20000}"
@@ -175,7 +184,7 @@ fi
 if [[ -n "${DATA_NUM_SAMPLES:-}" ]]; then
   DATA_TAG="$(slug "${DATA_NUM_SAMPLES}" 28)"
 else
-  DATA_BASENAME="${TRAIN_DATA_PATH%/}"
+  DATA_BASENAME="${TRAIN_INPUT_PATH%/}"
   DATA_BASENAME="${DATA_BASENAME##*/}"
   DATA_TAG="$(slug "${DATA_BASENAME%.jsonl}" 28)"
 fi
@@ -199,11 +208,18 @@ WANDB_NAME="${WANDB_RUN_NAME:-${WANDB_NAME:-$(slug "${DLITE_VERSION}_sft_${DT_TA
 WANDB_RUN_ID="${WANDB_RUN_ID:-$(slug "${DLITE_VERSION}-sft-${DT_TAG}${MODEL_TAG}-${DATA_TAG}-${RUN_HASH}" 64)}"
 
 OPTIONAL_ARGS=(--local-position)
+if [[ -n "${TRAIN_HIDDEN_STATES_PATH:-}" ]]; then
+  OPTIONAL_ARGS+=(--train-hidden-states-path "${TRAIN_HIDDEN_STATES_PATH}")
+else
+  OPTIONAL_ARGS+=(--train-data-path "${TRAIN_DATA_PATH}")
+fi
 [[ -n "${LOSS_DECAY_GAMMA}" ]] && OPTIONAL_ARGS+=(--loss-decay-gamma "${LOSS_DECAY_GAMMA}")
 [[ -n "${BASE_LM_CE_DECAY_GAMMA}" ]] && OPTIONAL_ARGS+=(--base-lm-ce-decay-gamma "${BASE_LM_CE_DECAY_GAMMA}")
 [[ -n "${RESUME_FROM:-}" ]] && OPTIONAL_ARGS+=(--resume-from "${RESUME_FROM}")
 [[ -n "${INIT_FROM:-}" ]] && OPTIONAL_ARGS+=(--init-from "${INIT_FROM}")
 [[ -n "${MASK_TOKEN_ID:-}" ]] && OPTIONAL_ARGS+=(--mask-token-id "${MASK_TOKEN_ID}")
+[[ -n "${EMBEDDING_KEY:-}" ]] && OPTIONAL_ARGS+=(--embedding-key "${EMBEDDING_KEY}")
+[[ -n "${LM_HEAD_KEY:-}" ]] && OPTIONAL_ARGS+=(--lm-head-key "${LM_HEAD_KEY}")
 [[ -n "${CHAT_TEMPLATE:-}" ]] && OPTIONAL_ARGS+=(--chat-template "${CHAT_TEMPLATE}")
 [[ -n "${TARGET_LAYER_IDS}" ]] && OPTIONAL_ARGS+=(--target-layer-ids "${TARGET_LAYER_IDS}")
 [[ -n "${SGLANG_ATTENTION_BACKEND:-}" ]] && OPTIONAL_ARGS+=(--sglang-attention-backend "${SGLANG_ATTENTION_BACKEND}")
@@ -234,7 +250,6 @@ CMD=(
   --target-model-backend "${TARGET_MODEL_BACKEND}"
   --dlite-version "${DLITE_VERSION}"
   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
-  --train-data-path "${TRAIN_DATA_PATH}"
   --output-dir "${OUTPUT_DIR}"
   --block-size "${BLOCK_SIZE}"
   --num-draft-layers "${NUM_DRAFT_LAYERS}"
@@ -267,7 +282,7 @@ CMD=(
 printf 'DLite v2.3 SFT config: nodes=%s rank=%s gpus/node=%s world=%s tp=%s local_position=true\n' \
   "${NNODES}" "${NODE_RANK}" "${NPROC_PER_NODE}" "${WORLD_SIZE}" "${TP_SIZE}"
 printf 'Output directory: %s\nTraining dataset: %s\nDataset cache: %s\n' \
-  "${OUTPUT_DIR}" "${TRAIN_DATA_PATH}" "${CACHE_DIR}"
+  "${OUTPUT_DIR}" "${TRAIN_INPUT_PATH}" "${CACHE_DIR}"
 if [[ "${REPORT_TO}" == "wandb" ]]; then
   printf 'W&B project: %s\nW&B name: %s\nW&B run id: %s\n' \
     "${WANDB_PROJECT}" "${WANDB_NAME}" "${WANDB_RUN_ID}"

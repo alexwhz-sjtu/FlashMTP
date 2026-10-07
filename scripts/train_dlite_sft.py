@@ -30,33 +30,38 @@ from accelerate.utils import set_seed
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
+)
+from torch.distributed.fsdp import (
     MixedPrecision,
     ShardingStrategy,
 )
 from tqdm import tqdm
 
-from specforge.core.dlite import OnlineDLiteModel, gather_target_prefill_logits
-from specforge.distributed import destroy_distributed, init_distributed
-from specforge.modeling.draft.dlite import DLiteDraftModel
-from specforge.optimizer import BF16Optimizer
-from specforge.tracker import create_tracker, get_tracker_class
-from specforge.utils import print_on_rank0
 from scripts.dlite_training import (
     add_common_args,
     build_draft_model,
     build_target_and_components,
     build_train_dataloader,
     hidden_states_to_cuda,
+    load_cached_target_data,
     load_training_state,
     log_cuda_peak,
     normalize_accumulated_gradients,
+    required_hidden_layer_ids,
     resume_cursor,
     save_checkpoint,
     select_tp_rank_batch,
     stage_total_steps,
+    training_data_identity,
     validate_common_args,
     validate_tp_draft_sharding,
 )
+from specforge.core.dlite import OnlineDLiteModel, gather_target_prefill_logits
+from specforge.distributed import destroy_distributed, init_distributed
+from specforge.modeling.draft.dlite import DLiteDraftModel
+from specforge.optimizer import BF16Optimizer
+from specforge.tracker import create_tracker, get_tracker_class
+from specforge.utils import print_on_rank0
 
 
 def parse_args():
@@ -88,8 +93,6 @@ def parse_args():
     args = parser.parse_args()
 
     validate_common_args(parser, args)
-    if not args.train_data_path:
-        parser.error("--train-data-path is required")
     if args.resume_from and args.init_from:
         parser.error("--resume-from and --init-from are mutually exclusive")
     if not args.local_position:
@@ -132,13 +135,16 @@ def _validate_resume_state(args, state: dict, total_steps: int) -> None:
             "SFT can only resume an SFT checkpoint; got "
             f"{state.get('training_stage')!r}. Use --init-from to import weights only."
         )
-    expected_data = os.path.realpath(args.train_data_path)
+    expected_data = training_data_identity(args)
     saved_data = state.get("train_data_identity")
     if saved_data is not None and saved_data != expected_data:
         raise ValueError(
             "Training dataset must match the resumed checkpoint: "
             f"saved={saved_data!r}, provided={expected_data!r}."
         )
+    expected_mode = "regen_full" if args.train_hidden_states_path else "online"
+    if state.get("train_data_mode", expected_mode) != expected_mode:
+        raise ValueError("Training data mode must match the resumed checkpoint.")
     for key, requested in (
         ("tp_size", int(args.tp_size)),
         ("scheduler_total_steps", int(total_steps)),
@@ -178,7 +184,10 @@ def _checkpoint_metadata(
         "scheduler_warmup_ratio": float(args.warmup_ratio),
         "shard_draft_by_tp": bool(args.shard_draft_by_tp),
         "tp_size": int(args.tp_size),
-        "train_data_identity": os.path.realpath(args.train_data_path),
+        "train_data_identity": training_data_identity(args),
+        "train_data_mode": (
+            "regen_full" if args.train_hidden_states_path else "online"
+        ),
         "local_position": True,
     }
 
@@ -224,6 +233,7 @@ def main():
         train_data_path=args.train_data_path,
         cache_namespace="sft",
         num_proc=args.build_dataset_num_proc,
+        required_layer_ids=required_hidden_layer_ids([student]),
     )
     scheduler_total_steps = stage_total_steps(
         dataloader, args.num_epochs, args.accumulation_steps
@@ -293,11 +303,20 @@ def main():
             anchors, block_keep = online.sample_anchor_positions(
                 input_ids.size(1), loss_mask
             )
-            target_output = target.generate_dlite_data(
-                input_ids, attention_mask, loss_mask
-            )
-            hidden_states = hidden_states_to_cuda(target_output.hidden_states)
-            target_prefill_logits = target_output.logits.cuda()
+            if args.train_hidden_states_path:
+                hidden_states, target_logits = load_cached_target_data(
+                    data,
+                    anchors=anchors,
+                    block_size=student.block_size,
+                    lm_head=components.lm_head,
+                    need_logits=True,
+                )
+            else:
+                target_output = target.generate_dlite_data(
+                    input_ids, attention_mask, loss_mask
+                )
+                hidden_states = hidden_states_to_cuda(target_output.hidden_states)
+                target_prefill_logits = target_output.logits.cuda()
             if tp_draft_rank is not None:
                 input_ids = select_tp_rank_batch(input_ids, tp_draft_rank)
                 loss_mask = select_tp_rank_batch(loss_mask, tp_draft_rank)
@@ -307,10 +326,11 @@ def main():
                 target_prefill_logits = select_tp_rank_batch(
                     target_prefill_logits, tp_draft_rank
                 )
-            target_logits = gather_target_prefill_logits(
-                target_prefill_logits, anchors, student.block_size
-            )
-            del target_output, target_prefill_logits
+            if not args.train_hidden_states_path:
+                target_logits = gather_target_prefill_logits(
+                    target_prefill_logits, anchors, student.block_size
+                )
+                del target_output, target_prefill_logits
             (
                 loss,
                 accuracy,

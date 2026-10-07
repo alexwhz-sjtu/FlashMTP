@@ -13,11 +13,32 @@ import torch.distributed as dist
 from accelerate.utils import set_seed
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
+)
+from torch.distributed.fsdp import (
     MixedPrecision,
     ShardingStrategy,
 )
 from tqdm import tqdm
 
+from scripts.dlite_training import (
+    add_common_args,
+    build_draft_model,
+    build_target_and_components,
+    build_train_dataloader,
+    hidden_states_to_cuda,
+    load_cached_target_data,
+    load_training_state,
+    log_cuda_peak,
+    normalize_accumulated_gradients,
+    required_hidden_layer_ids,
+    resume_cursor,
+    save_checkpoint,
+    select_tp_rank_batch,
+    stage_total_steps,
+    training_data_identity,
+    validate_common_args,
+    validate_tp_draft_sharding,
+)
 from specforge.core.dlite import (
     OnlineDLiteModel,
     compute_stage1_distillation_loss,
@@ -28,23 +49,6 @@ from specforge.modeling.draft.dlite import DLiteDraftModel
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker, get_tracker_class
 from specforge.utils import print_on_rank0
-from scripts.dlite_training import (
-    add_common_args,
-    build_draft_model,
-    build_target_and_components,
-    build_train_dataloader,
-    hidden_states_to_cuda,
-    load_training_state,
-    log_cuda_peak,
-    normalize_accumulated_gradients,
-    resume_cursor,
-    save_checkpoint,
-    select_tp_rank_batch,
-    stage_total_steps,
-    validate_common_args,
-    validate_tp_draft_sharding,
-)
-
 
 TRANSITION_EPOCHS = 1
 
@@ -74,8 +78,6 @@ def parse_args():
     parser.add_argument("--stage2-base-ce-decay-gamma", type=float)
     args = parser.parse_args()
     validate_common_args(parser, args)
-    if not args.train_data_path:
-        parser.error("--train-data-path is required")
     for name in ("stage2_epochs", "accumulation_steps"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -219,7 +221,8 @@ def main():
             "--tp-size must match the resumed checkpoint: "
             f"saved={int(resume_state['tp_size'])}, requested={int(args.tp_size)}."
         )
-    train_data_identity = os.path.realpath(args.train_data_path)
+    train_data_identity = training_data_identity(args)
+    train_data_mode = "regen_full" if args.train_hidden_states_path else "online"
     if (
         resume_state is not None
         and resume_state.get("train_data_identity") is not None
@@ -230,6 +233,11 @@ def main():
             f"saved={resume_state['train_data_identity']!r}, "
             f"provided={train_data_identity!r}."
         )
+    if (
+        resume_state is not None
+        and resume_state.get("train_data_mode", train_data_mode) != train_data_mode
+    ):
+        raise ValueError("Training data mode must match the resumed checkpoint.")
     print_on_rank0("Student init mode: scratch")
     print_on_rank0(
         "Continuous two-stage LR schedule: "
@@ -358,9 +366,8 @@ def main():
     target, tokenizer, components, mask_token_id = build_target_and_components(
         args, drafts_for_target
     )
-    needs_stage1_dataloader = (
-        resume_stage in (None, "stage1")
-        or (resume_stage == "transition" and not resume_transition_complete)
+    needs_stage1_dataloader = resume_stage in (None, "stage1") or (
+        resume_stage == "transition" and not resume_transition_complete
     )
     train_dataloader = build_train_dataloader(
         args,
@@ -368,6 +375,7 @@ def main():
         train_data_path=args.train_data_path,
         cache_namespace="train",
         num_proc=args.build_dataset_num_proc,
+        required_layer_ids=required_hidden_layer_ids(drafts_for_target),
     )
     stage1_dataloader = train_dataloader if needs_stage1_dataloader else None
     stage2_dataloader = train_dataloader
@@ -577,11 +585,20 @@ def main():
             anchors, block_keep = student_online.sample_anchor_positions(
                 input_ids.size(1), loss_mask
             )
-            target_output = target.generate_dlite_data(
-                input_ids, attention_mask, loss_mask, return_logits=False
-            )
-            hidden_states = hidden_states_to_cuda(target_output.hidden_states)
-            del target_output
+            if args.train_hidden_states_path:
+                hidden_states, _ = load_cached_target_data(
+                    data,
+                    anchors=anchors,
+                    block_size=student.block_size,
+                    lm_head=components.lm_head,
+                    need_logits=False,
+                )
+            else:
+                target_output = target.generate_dlite_data(
+                    input_ids, attention_mask, loss_mask, return_logits=False
+                )
+                hidden_states = hidden_states_to_cuda(target_output.hidden_states)
+                del target_output
             if tp_draft_rank is not None:
                 # The TP target sees the shared full batch.  From this point on,
                 # teacher and student on rank r both consume only sample r.
@@ -692,6 +709,7 @@ def main():
                         "shard_draft_by_tp": bool(args.shard_draft_by_tp),
                         "tp_size": int(args.tp_size),
                         "train_data_identity": train_data_identity,
+                        "train_data_mode": train_data_mode,
                     },
                 )
         stage1_start_batch = 0
@@ -732,6 +750,7 @@ def main():
                 "shard_draft_by_tp": bool(args.shard_draft_by_tp),
                 "tp_size": int(args.tp_size),
                 "train_data_identity": train_data_identity,
+                "train_data_mode": train_data_mode,
             },
         )
         memory = log_cuda_peak("stage1")
@@ -768,6 +787,7 @@ def main():
                 "shard_draft_by_tp": bool(args.shard_draft_by_tp),
                 "tp_size": int(args.tp_size),
                 "train_data_identity": train_data_identity,
+                "train_data_mode": train_data_mode,
             },
         )
 
@@ -814,11 +834,20 @@ def main():
             anchors, block_keep = student_online.sample_anchor_positions(
                 input_ids.size(1), loss_mask
             )
-            target_output = target.generate_dlite_data(
-                input_ids, attention_mask, loss_mask
-            )
-            hidden_states = hidden_states_to_cuda(target_output.hidden_states)
-            target_prefill_logits = target_output.logits.cuda()
+            if args.train_hidden_states_path:
+                hidden_states, target_logits = load_cached_target_data(
+                    data,
+                    anchors=anchors,
+                    block_size=student.block_size,
+                    lm_head=components.lm_head,
+                    need_logits=True,
+                )
+            else:
+                target_output = target.generate_dlite_data(
+                    input_ids, attention_mask, loss_mask
+                )
+                hidden_states = hidden_states_to_cuda(target_output.hidden_states)
+                target_prefill_logits = target_output.logits.cuda()
             if tp_draft_rank is not None:
                 input_ids = select_tp_rank_batch(input_ids, tp_draft_rank)
                 loss_mask = select_tp_rank_batch(loss_mask, tp_draft_rank)
@@ -828,10 +857,11 @@ def main():
                 target_prefill_logits = select_tp_rank_batch(
                     target_prefill_logits, tp_draft_rank
                 )
-            target_logits = gather_target_prefill_logits(
-                target_prefill_logits, anchors, student.block_size
-            )
-            del target_output, target_prefill_logits
+            if not args.train_hidden_states_path:
+                target_logits = gather_target_prefill_logits(
+                    target_prefill_logits, anchors, student.block_size
+                )
+                del target_output, target_prefill_logits
             student_batch = student_online.prepare_batch(
                 input_ids,
                 hidden_states,
@@ -995,6 +1025,7 @@ def main():
                         "shard_draft_by_tp": bool(args.shard_draft_by_tp),
                         "tp_size": int(args.tp_size),
                         "train_data_identity": train_data_identity,
+                        "train_data_mode": train_data_mode,
                     },
                 )
         transition_start_batch = 0
@@ -1035,6 +1066,7 @@ def main():
                 "shard_draft_by_tp": bool(args.shard_draft_by_tp),
                 "tp_size": int(args.tp_size),
                 "train_data_identity": train_data_identity,
+                "train_data_mode": train_data_mode,
             },
         )
         memory = log_cuda_peak("transition")
@@ -1049,7 +1081,8 @@ def main():
     # drafts_for_target also owns the teacher.  Keeping that list alive would
     # silently retain the full teacher on every rank throughout Stage 2.
     del teacher_online, teacher, drafts_for_target
-    target.set_capture_layers(student.target_layer_ids)
+    if target is not None:
+        target.set_capture_layers(student.target_layer_ids)
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -1095,11 +1128,20 @@ def main():
             anchors, block_keep = student_online.sample_anchor_positions(
                 input_ids.size(1), loss_mask
             )
-            target_output = target.generate_dlite_data(
-                input_ids, attention_mask, loss_mask
-            )
-            hidden_states = hidden_states_to_cuda(target_output.hidden_states)
-            target_prefill_logits = target_output.logits.cuda()
+            if args.train_hidden_states_path:
+                hidden_states, target_logits = load_cached_target_data(
+                    data,
+                    anchors=anchors,
+                    block_size=student.block_size,
+                    lm_head=components.lm_head,
+                    need_logits=True,
+                )
+            else:
+                target_output = target.generate_dlite_data(
+                    input_ids, attention_mask, loss_mask
+                )
+                hidden_states = hidden_states_to_cuda(target_output.hidden_states)
+                target_prefill_logits = target_output.logits.cuda()
             if tp_draft_rank is not None:
                 input_ids = select_tp_rank_batch(input_ids, tp_draft_rank)
                 loss_mask = select_tp_rank_batch(loss_mask, tp_draft_rank)
@@ -1109,10 +1151,11 @@ def main():
                 target_prefill_logits = select_tp_rank_batch(
                     target_prefill_logits, tp_draft_rank
                 )
-            target_logits = gather_target_prefill_logits(
-                target_prefill_logits, anchors, student.block_size
-            )
-            del target_output, target_prefill_logits
+            if not args.train_hidden_states_path:
+                target_logits = gather_target_prefill_logits(
+                    target_prefill_logits, anchors, student.block_size
+                )
+                del target_output, target_prefill_logits
             prepared = student_online.prepare_batch(
                 input_ids,
                 hidden_states,
@@ -1206,6 +1249,7 @@ def main():
                         "shard_draft_by_tp": bool(args.shard_draft_by_tp),
                         "tp_size": int(args.tp_size),
                         "train_data_identity": train_data_identity,
+                        "train_data_mode": train_data_mode,
                     },
                 )
         stage2_start_batch = 0
@@ -1243,6 +1287,7 @@ def main():
             "shard_draft_by_tp": bool(args.shard_draft_by_tp),
             "tp_size": int(args.tp_size),
             "train_data_identity": train_data_identity,
+            "train_data_mode": train_data_mode,
         },
     )
     memory = log_cuda_peak("stage2")

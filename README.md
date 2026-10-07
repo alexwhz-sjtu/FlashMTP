@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="DLite logo" width="480">
+</p>
+
 # DLite
 
 DLite is a Qwen3 speculative-decoding project with teacher training, two-stage
@@ -77,6 +81,12 @@ Both stages consume the same `TRAIN_DATA_PATH`. The student backbone always
 starts from random initialization. Stage 1 trains only with weighted KL
 distillation; Stage 2 uses the configured CE/TV objectives. The teacher's
 sequential head is copied to the student and frozen during Stage 1.
+
+All three launchers also support offline `regen_full` training. Replace
+`TRAIN_DATA_PATH` with `TRAIN_HIDDEN_STATES_PATH=/path/to/regen_full/cache`,
+and set `TP_SIZE=1` plus `SHARD_DRAFT_BY_TP=0`. The two data variables are
+mutually exclusive. Offline mode skips target-transformer prefill and computes
+target logits from cached final-norm hidden states with the frozen LM head.
 
 See [docs/TRAINING.md](docs/TRAINING.md) for configuration details.
 

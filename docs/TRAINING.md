@@ -9,7 +9,8 @@ CLI options:
 | --- | --- | --- |
 | `TARGET_MODEL` | `--target-model-path` | required |
 | `TARGET_MODEL_BACKEND` | `--target-model-backend` | `hf` |
-| `TRAIN_DATA_PATH` | `--train-data-path` | required |
+| `TRAIN_DATA_PATH` | `--train-data-path` | online mode |
+| `TRAIN_HIDDEN_STATES_PATH` | `--train-hidden-states-path` | offline mode |
 | `DLITE_VERSION` | `--dlite-version` | `dlite_v2` |
 | `BLOCK_SIZE` | `--block-size` | `8` |
 | `NUM_DRAFT_LAYERS` | `--num-draft-layers` | `5` |
@@ -23,6 +24,13 @@ CLI options:
 `sglang` remains available for target prefill and exposes the existing SGLang
 memory, tensor-parallel, and draft-sharding options. The draft model uses
 FlexAttention during training; inference may use FlashAttention 2 or SDPA.
+
+Set exactly one training-data variable. `TRAIN_DATA_PATH` tokenizes JSONL and
+runs target prefill online. `TRAIN_HIDDEN_STATES_PATH` reads a schema-v2
+`regen_full` cache and loads only the target embedding and LM head. Offline
+target logits are projected from cached final-norm hidden states at sampled
+anchor positions. Offline mode requires `TP_SIZE=1` and
+`SHARD_DRAFT_BY_TP=0`; torchrun workers then operate as data-parallel ranks.
 
 When `TARGET_LAYER_IDS` is non-empty, its unique, increasing, zero-based IDs
 are used directly and `CHS_NUM_LAYERS` is ignored. Set `TARGET_LAYER_IDS=` to
@@ -71,8 +79,8 @@ Run `scripts/run_training_dlite_two_stage.sh` and provide a trained teacher with
 - A new student backbone is always initialized from scratch.
 - Stage 1 uses only `STAGE1_KL_WEIGHT`; it has no auxiliary regression or
   true-label CE term.
-- Stage 1 and Stage 2 share one processed dataloader built from
-  `TRAIN_DATA_PATH`.
+- Stage 1 and Stage 2 share one dataloader built from the selected online JSONL
+  or offline `regen_full` cache.
 - The teacher sequential head is copied into the student, then frozen for
   Stage 1. The student backbone learns to match the teacher logits.
 - Stage 2 unfreezes the student and uses `STAGE2_FINAL_CE_WEIGHT`,

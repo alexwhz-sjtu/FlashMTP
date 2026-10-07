@@ -28,38 +28,43 @@ _configure_rank_cache("TRITON_CACHE_DIR", "TRITON_CACHE_ROOT", "triton")
 
 import torch
 import torch.distributed as dist
-from torch._inductor import config as inductor_config
 from accelerate.utils import set_seed
+from torch._inductor import config as inductor_config
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
+)
+from torch.distributed.fsdp import (
     MixedPrecision,
     ShardingStrategy,
 )
 from tqdm import tqdm
 
-from specforge.core.dlite import OnlineDLiteModel, gather_target_prefill_logits
-from specforge.distributed import destroy_distributed, init_distributed
-from specforge.modeling.draft.dlite import DLiteDraftModel
-from specforge.optimizer import BF16Optimizer
-from specforge.tracker import create_tracker, get_tracker_class
-from specforge.utils import print_on_rank0
 from scripts.dlite_training import (
     add_common_args,
     build_draft_model,
     build_target_and_components,
     build_train_dataloader,
     hidden_states_to_cuda,
+    load_cached_target_data,
     load_training_state,
     log_cuda_peak,
     normalize_accumulated_gradients,
+    required_hidden_layer_ids,
     resume_cursor,
     save_checkpoint,
     select_tp_rank_batch,
     stage_total_steps,
+    training_data_identity,
     validate_common_args,
     validate_tp_draft_sharding,
 )
+from specforge.core.dlite import OnlineDLiteModel, gather_target_prefill_logits
+from specforge.distributed import destroy_distributed, init_distributed
+from specforge.modeling.draft.dlite import DLiteDraftModel
+from specforge.optimizer import BF16Optimizer
+from specforge.tracker import create_tracker, get_tracker_class
+from specforge.utils import print_on_rank0
 
 inductor_config.triton.autotune_pointwise = (
     os.environ.get("DLITE_POINTWISE_AUTOTUNE", "0") == "1"
@@ -97,8 +102,6 @@ def parse_args():
     )
     args = parser.parse_args()
     validate_common_args(parser, args)
-    if not args.train_data_path:
-        parser.error("--train-data-path is required for teacher training")
     if args.resume_from and args.init_from:
         parser.error("--resume-from and --init-from are mutually exclusive")
     if args.num_epochs <= 0:
@@ -154,6 +157,16 @@ def main():
     tp_draft_rank = validate_tp_draft_sharding(args)
 
     resume_state = load_training_state(args.resume_from)
+    if resume_state is not None:
+        expected_identity = training_data_identity(args)
+        if (
+            resume_state.get("train_data_identity", expected_identity)
+            != expected_identity
+        ):
+            raise ValueError("Training dataset must match the resumed checkpoint.")
+        expected_mode = "regen_full" if args.train_hidden_states_path else "online"
+        if resume_state.get("train_data_mode", expected_mode) != expected_mode:
+            raise ValueError("Training data mode must match the resumed checkpoint.")
     if args.init_from:
         draft = DLiteDraftModel.from_pretrained(
             args.init_from,
@@ -177,7 +190,11 @@ def main():
     target, tokenizer, components, mask_token_id = build_target_and_components(
         args, [draft]
     )
-    dataloader = build_train_dataloader(args, tokenizer)
+    dataloader = build_train_dataloader(
+        args,
+        tokenizer,
+        required_layer_ids=required_hidden_layer_ids([draft]),
+    )
     online = OnlineDLiteModel(
         draft_model=draft,
         target_lm_head=components.lm_head,
@@ -243,9 +260,18 @@ def main():
             anchors, block_keep = online.sample_anchor_positions(
                 input_ids.size(1), loss_mask
             )
-            target_output = target.generate_dlite_data(
-                input_ids, attention_mask, loss_mask
-            )
+            if args.train_hidden_states_path:
+                hidden_states, target_logits = load_cached_target_data(
+                    data,
+                    anchors=anchors,
+                    block_size=draft.block_size,
+                    lm_head=components.lm_head,
+                    need_logits=True,
+                )
+            else:
+                target_output = target.generate_dlite_data(
+                    input_ids, attention_mask, loss_mask
+                )
             if global_step <= 3 and dist.get_rank() == 0:
                 torch.cuda.synchronize()
                 print(
@@ -256,7 +282,8 @@ def main():
                 print(
                     f"[rank {dist.get_rank()}] step1: target prefill done", flush=True
                 )
-            hidden_states = hidden_states_to_cuda(target_output.hidden_states)
+            if not args.train_hidden_states_path:
+                hidden_states = hidden_states_to_cuda(target_output.hidden_states)
             if tp_draft_rank is not None:
                 input_ids = select_tp_rank_batch(input_ids, tp_draft_rank)
                 loss_mask = select_tp_rank_batch(loss_mask, tp_draft_rank)
@@ -266,17 +293,19 @@ def main():
                 target_prefill_logits = select_tp_rank_batch(
                     target_output.logits.cuda(), tp_draft_rank
                 )
-            else:
+            elif not args.train_hidden_states_path:
                 target_prefill_logits = target_output.logits.cuda()
-            target_logits = gather_target_prefill_logits(
-                target_prefill_logits, anchors, draft.block_size
-            )
+            if not args.train_hidden_states_path:
+                target_logits = gather_target_prefill_logits(
+                    target_prefill_logits, anchors, draft.block_size
+                )
             if trace_first_step:
                 print(
                     f"[rank {dist.get_rank()}] step1: target logits gathered",
                     flush=True,
                 )
-            del target_output, target_prefill_logits
+            if not args.train_hidden_states_path:
+                del target_output, target_prefill_logits
             # Preparation uses trainable draft modules (for example
             # ``history_fuse``), so it must run inside FSDP.forward().  Calling
             # ``online.prepare_batch`` directly here observes empty local
@@ -394,6 +423,10 @@ def main():
                         "stage_step": stage_step,
                         "global_step": global_step,
                         "serial_head_inherited": False,
+                        "train_data_identity": training_data_identity(args),
+                        "train_data_mode": (
+                            "regen_full" if args.train_hidden_states_path else "online"
+                        ),
                     },
                 )
             if args.max_steps is not None and global_step >= args.max_steps:
@@ -424,6 +457,10 @@ def main():
                 "stage_step": stage_step,
                 "global_step": global_step,
                 "serial_head_inherited": False,
+                "train_data_identity": training_data_identity(args),
+                "train_data_mode": (
+                    "regen_full" if args.train_hidden_states_path else "online"
+                ),
             },
         )
     memory = log_cuda_peak("teacher")

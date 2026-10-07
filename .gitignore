@@ -128,6 +128,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -213,3 +215,27 @@ log/
 /log_aug
 /benchmark_results
 training_runs/
+
+# Local datasets and generated training caches
+/datasets/
+/checkpoints/
+/regen_token_only/
+/regen_full/
+*.arrow
+*.parquet
+*.tar
+*.tar.gz
+*.tgz
+
+# Model weights and tensor artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+pytorch_model*.bin
+
+# Local credentials and distributed-job output
+*.pem
+*.key
+credentials*.json
+slurm-*.out

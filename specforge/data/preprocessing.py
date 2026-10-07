@@ -30,7 +30,6 @@ from transformers import ImageProcessingMixin, PreTrainedTokenizer
 
 from datasets import Dataset as HFDataset
 
-
 try:
     from qwen_vl_utils import process_vision_info
 
@@ -299,6 +298,7 @@ def build_training_dataset(
     processor: Optional[ImageProcessingMixin] = None,
     is_preformatted: Optional[bool] = False,
     train_only_last_turn: Optional[bool] = False,
+    capture_errors: bool = False,
 ) -> HFDataset:
     """
     build training dataset
@@ -326,6 +326,10 @@ def build_training_dataset(
                         If False, expects "conversations" column with ShareGPT format.
         train_only_last_turn: If True, only the last assistant turn contributes to the loss.
                              Useful for thinking models where history may not contain thoughts.
+        capture_errors: If True, preserve one output row per input row, add
+                        ``source_index`` and ``preprocessing_error``, and replace
+                        failed tensor values with empty tensors. The default
+                        remains strict for training callers.
 
     Returns:
         The processed HF dataset.
@@ -343,7 +347,8 @@ def build_training_dataset(
 
     template: ChatTemplate = TEMPLATE_REGISTRY.get(chat_template)
 
-    dataset = dataset.shuffle(seed=shuffle_seed)
+    if shuffle_seed is not None:
+        dataset = dataset.shuffle(seed=shuffle_seed)
     original_cols = dataset.column_names
 
     def preprocess_function(examples):
@@ -417,8 +422,44 @@ def build_training_dataset(
         )
     else:
         batch_size = 1000  # default for conversations
+    map_function = preprocess_function
+    map_kwargs = {}
+    if capture_errors:
+
+        def preprocess_with_errors(examples, indices):
+            results = {
+                "input_ids": [],
+                "loss_mask": [],
+                "attention_mask": [],
+                "source_index": [],
+                "preprocessing_error": [],
+            }
+            for offset, source_index in enumerate(indices):
+                single = {key: [values[offset]] for key, values in examples.items()}
+                try:
+                    processed = preprocess_function(single)
+                    if len(processed["input_ids"]) != 1:
+                        raise ValueError(
+                            "preprocessing did not return exactly one sample"
+                        )
+                    for key in ("input_ids", "loss_mask", "attention_mask"):
+                        results[key].append(processed[key][0])
+                    results["preprocessing_error"].append("")
+                except Exception as exc:
+                    empty = torch.empty((1, 0), dtype=torch.long)
+                    for key in ("input_ids", "loss_mask", "attention_mask"):
+                        results[key].append(empty.clone())
+                    results["preprocessing_error"].append(
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                results["source_index"].append(source_index)
+            return results
+
+        map_function = preprocess_with_errors
+        map_kwargs["with_indices"] = True
+
     dataset = dataset.map(
-        preprocess_function,
+        map_function,
         batched=True,
         num_proc=num_proc,
         batch_size=batch_size,
@@ -426,6 +467,7 @@ def build_training_dataset(
         # keep_in_memory=True,
         load_from_cache_file=load_from_cache_file,
         cache_file_name=cache_file_name,
+        **map_kwargs,
     )
 
     dataset.set_format(type="torch")

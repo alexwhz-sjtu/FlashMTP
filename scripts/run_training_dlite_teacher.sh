@@ -43,7 +43,12 @@ PYTHON_EXECUTABLE="$(command -v "${PYTHON_BIN}" 2>/dev/null || printf '%s' "${PY
 export PATH="$(cd "$(dirname "${PYTHON_EXECUTABLE}")" && pwd):${PATH}"
 
 : "${TARGET_MODEL:?set TARGET_MODEL}"
-: "${TRAIN_DATA_PATH:?set TRAIN_DATA_PATH}"
+if [[ -n "${TRAIN_DATA_PATH:-}" && -n "${TRAIN_HIDDEN_STATES_PATH:-}" ]] || \
+   [[ -z "${TRAIN_DATA_PATH:-}" && -z "${TRAIN_HIDDEN_STATES_PATH:-}" ]]; then
+  echo "Set exactly one of TRAIN_DATA_PATH or TRAIN_HIDDEN_STATES_PATH" >&2
+  exit 2
+fi
+TRAIN_INPUT_PATH="${TRAIN_HIDDEN_STATES_PATH:-${TRAIN_DATA_PATH:-}}"
 
 NNODES="${PET_NNODES:-${NNODES:-1}}"
 NODE_RANK="${PET_NODE_RANK:-${NODE_RANK:-0}}"
@@ -87,6 +92,10 @@ NUM_ANCHORS="${NUM_ANCHORS:-512}"
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
 TP_SIZE="${TP_SIZE:-1}"
 SHARD_DRAFT_BY_TP="${SHARD_DRAFT_BY_TP:-0}"
+if [[ -n "${TRAIN_HIDDEN_STATES_PATH:-}" && ( "${TP_SIZE}" != "1" || "${SHARD_DRAFT_BY_TP}" != "0" ) ]]; then
+  echo "Offline regen_full training requires TP_SIZE=1 and SHARD_DRAFT_BY_TP=0" >&2
+  exit 2
+fi
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-20000}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.4}"
@@ -118,7 +127,7 @@ fi
 if [[ -n "${DATA_NUM_SAMPLES:-}" ]]; then
   DATA_TAG="$(slug "${DATA_NUM_SAMPLES}" 24)"
 else
-  DATA_BASENAME="${TRAIN_DATA_PATH%/}"
+  DATA_BASENAME="${TRAIN_INPUT_PATH%/}"
   DATA_BASENAME="${DATA_BASENAME##*/}"
   DATA_BASENAME="${DATA_BASENAME%.jsonl}"
   DATA_TAG="$(slug "${DATA_BASENAME}" 28)"
@@ -138,12 +147,19 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_DIR}/cache/models}"
 OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_TAG}}"
 
 OPTIONAL_ARGS=()
+if [[ -n "${TRAIN_HIDDEN_STATES_PATH:-}" ]]; then
+  OPTIONAL_ARGS+=(--train-hidden-states-path "${TRAIN_HIDDEN_STATES_PATH}")
+else
+  OPTIONAL_ARGS+=(--train-data-path "${TRAIN_DATA_PATH}")
+fi
 [[ -n "${LOSS_DECAY_GAMMA}" ]] && OPTIONAL_ARGS+=(--loss-decay-gamma "${LOSS_DECAY_GAMMA}")
 [[ -n "${BASE_LM_CE_DECAY_GAMMA}" ]] && OPTIONAL_ARGS+=(--base-lm-ce-decay-gamma "${BASE_LM_CE_DECAY_GAMMA}")
 [[ -n "${RESUME_FROM:-}" ]] && OPTIONAL_ARGS+=(--resume-from "${RESUME_FROM}")
 [[ -n "${INIT_FROM:-}" ]] && OPTIONAL_ARGS+=(--init-from "${INIT_FROM}")
 [[ -n "${CHAT_TEMPLATE:-}" ]] && OPTIONAL_ARGS+=(--chat-template "${CHAT_TEMPLATE}")
 [[ -n "${MASK_TOKEN_ID:-}" ]] && OPTIONAL_ARGS+=(--mask-token-id "${MASK_TOKEN_ID}")
+[[ -n "${EMBEDDING_KEY:-}" ]] && OPTIONAL_ARGS+=(--embedding-key "${EMBEDDING_KEY}")
+[[ -n "${LM_HEAD_KEY:-}" ]] && OPTIONAL_ARGS+=(--lm-head-key "${LM_HEAD_KEY}")
 [[ -n "${CACHE_DIR:-}" ]] && OPTIONAL_ARGS+=(--cache-dir "${CACHE_DIR}")
 [[ -n "${TARGET_LAYER_IDS}" ]] && OPTIONAL_ARGS+=(--target-layer-ids "${TARGET_LAYER_IDS}")
 [[ -n "${SGLANG_ATTENTION_BACKEND:-}" ]] && OPTIONAL_ARGS+=(--sglang-attention-backend "${SGLANG_ATTENTION_BACKEND}")
@@ -182,7 +198,6 @@ CMD=(
   --target-model-backend "${TARGET_MODEL_BACKEND}"
   --dlite-version "${DLITE_VERSION}"
   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
-  --train-data-path "${TRAIN_DATA_PATH}"
   --output-dir "${OUTPUT_DIR}"
   --block-size "${BLOCK_SIZE}"
   --num-draft-layers "${NUM_DRAFT_LAYERS}"

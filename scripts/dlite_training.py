@@ -11,7 +11,9 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import StateDictType
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 from transformers import AutoTokenizer
 
 from datasets import load_dataset
@@ -20,17 +22,23 @@ from specforge.checkpoint import (
     load_distributed_training_state,
     save_distributed_training_state,
 )
-from specforge.data import build_training_dataset, prepare_dp_dataloaders
+from specforge.data import (
+    RegenFullCollator,
+    RegenFullDataset,
+    build_training_dataset,
+    load_hidden_cache_manifest,
+    prepare_dp_dataloaders,
+)
 from specforge.distributed import get_dp_group, get_tp_group
+from specforge.modeling.config_utils import (
+    is_qwen35_model_type,
+    load_text_model_config,
+)
 from specforge.modeling.draft.dlite import (
     DLITE_ARCHITECTURE_VERSION,
     DLITE_ARCHITECTURE_VERSIONS,
     DLiteDraftModel,
     build_target_layer_ids,
-)
-from specforge.modeling.config_utils import (
-    is_qwen35_model_type,
-    load_text_model_config,
 )
 from specforge.modeling.target.dlite_target_model import get_dlite_target_model
 from specforge.modeling.target.target_utils import (
@@ -46,6 +54,16 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     model = parser.add_argument_group("model")
     model.add_argument("--target-model-path", required=True)
     model.add_argument("--target-model-backend", default="hf", choices=["hf", "sglang"])
+    model.add_argument(
+        "--embedding-key",
+        default="model.embed_tokens.weight",
+        help="Target checkpoint embedding key used by standalone/offline components.",
+    )
+    model.add_argument(
+        "--lm-head-key",
+        default="lm_head.weight",
+        help="Target checkpoint LM-head key used by standalone/offline components.",
+    )
     model.add_argument(
         "--dlite-version",
         default=DLITE_ARCHITECTURE_VERSION,
@@ -80,7 +98,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     data = parser.add_argument_group("dataset")
     data.add_argument(
         "--train-data-path",
-        help="Single-dataset path (teacher training or two-stage compatibility fallback).",
+        help="Online token-only JSONL. Mutually exclusive with --train-hidden-states-path.",
+    )
+    data.add_argument(
+        "--train-hidden-states-path",
+        help="Offline regen_full cache directory. Mutually exclusive with --train-data-path.",
     )
     data.add_argument("--chat-template", default="qwen")
     data.add_argument("--is-preformatted", action="store_true")
@@ -152,6 +174,17 @@ def validate_common_args(parser: argparse.ArgumentParser, args) -> None:
         parser.error("--max-grad-norm must be positive")
     if args.mask_token_id is not None and int(args.mask_token_id) < 0:
         parser.error("--mask-token-id must be non-negative")
+    if bool(args.train_data_path) == bool(args.train_hidden_states_path):
+        parser.error(
+            "exactly one of --train-data-path and --train-hidden-states-path is required"
+        )
+    if args.train_hidden_states_path:
+        if int(args.tp_size) != 1:
+            parser.error("offline regen_full training requires --tp-size 1")
+        if args.shard_draft_by_tp:
+            parser.error(
+                "offline regen_full training does not support --shard-draft-by-tp"
+            )
 
 
 def build_draft_config(args, *, model_role: str, source_config=None):
@@ -278,9 +311,13 @@ def build_target_model(args, draft_models: list[DLiteDraftModel]):
 
 def build_target_and_components(args, draft_models: list[DLiteDraftModel]):
     """Build one target and bind its tokenizer/embedding/head consistently."""
-    target = build_target_model(args, draft_models)
+    offline = bool(args.train_hidden_states_path)
+    target = None if offline else build_target_model(args, draft_models)
     tokenizer, components, mask_token_id = resolve_tokenizer_and_components(
-        args, draft_models, target=target
+        args,
+        draft_models,
+        target=target,
+        standalone_components=offline,
     )
     return target, tokenizer, components, mask_token_id
 
@@ -338,7 +375,9 @@ def _select_mask_token_id(
     return candidate, source
 
 
-def resolve_tokenizer_and_components(args, draft_models, target=None):
+def resolve_tokenizer_and_components(
+    args, draft_models, target=None, *, standalone_components: bool = False
+):
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
@@ -362,7 +401,7 @@ def resolve_tokenizer_and_components(args, draft_models, target=None):
         f"Resolved MASK token id {mask_token_id} from {mask_source}; "
         f"target vocab_size={int(target_config.vocab_size)}."
     )
-    if args.target_model_backend == "sglang":
+    if args.target_model_backend == "sglang" and not standalone_components:
         if target is None or not hasattr(target, "model_runner"):
             raise ValueError("SGLang target is required to reuse target components.")
         target_model = target.model_runner.model
@@ -380,8 +419,8 @@ def resolve_tokenizer_and_components(args, draft_models, target=None):
     else:
         components = TargetEmbeddingsAndHead.from_pretrained(
             args.target_model_path,
-            embed_key="model.embed_tokens.weight",
-            lm_head_key="lm_head.weight",
+            embed_key=args.embedding_key,
+            lm_head_key=args.lm_head_key,
             device="cuda",
             trust_remote_code=args.trust_remote_code,
         )
@@ -472,7 +511,16 @@ def build_train_dataloader(
     train_data_path: Optional[str] = None,
     cache_namespace: str = "single",
     num_proc: Optional[int] = None,
+    required_layer_ids: Optional[set[int]] = None,
 ):
+    if args.train_hidden_states_path:
+        if train_data_path is not None:
+            raise ValueError("online train_data_path cannot be used in offline mode")
+        return build_hidden_cache_dataloader(
+            args,
+            tokenizer,
+            required_layer_ids=set(required_layer_ids or ()),
+        )
     train_data_path = train_data_path or args.train_data_path
     if not train_data_path:
         raise ValueError("A training data path is required.")
@@ -497,10 +545,156 @@ def build_train_dataloader(
     return _prepare_dataloader(args, dataset, train_data_path=train_data_path)
 
 
+def build_hidden_cache_dataloader(args, tokenizer, *, required_layer_ids: set[int]):
+    target_config = load_text_model_config(
+        args.target_model_path, trust_remote_code=args.trust_remote_code
+    )
+    verify = not dist.is_initialized() or dist.get_rank() == 0
+    manifest = load_hidden_cache_manifest(
+        args.train_hidden_states_path,
+        target_model=args.target_model_path,
+        num_hidden_layers=int(target_config.num_hidden_layers),
+        hidden_size=int(target_config.hidden_size),
+        required_layer_ids=required_layer_ids,
+        max_length=int(args.max_length),
+        verify_checksums=verify,
+    )
+    if dist.is_initialized():
+        dist.barrier()
+        if not verify:
+            manifest = load_hidden_cache_manifest(
+                args.train_hidden_states_path,
+                target_model=args.target_model_path,
+                num_hidden_layers=int(target_config.num_hidden_layers),
+                hidden_size=int(target_config.hidden_size),
+                required_layer_ids=required_layer_ids,
+                max_length=int(args.max_length),
+                verify_checksums=False,
+            )
+    dataset = RegenFullDataset(
+        args.train_hidden_states_path,
+        manifest,
+        required_layer_ids=required_layer_ids,
+        max_length=args.max_length,
+    )
+    scan_here = not dist.is_initialized() or dist.get_rank() == 0
+    valid_indices = (
+        [
+            index
+            for index in range(len(dataset))
+            if _has_valid_anchor_supervision(dataset[index], block_size=args.block_size)
+        ]
+        if scan_here
+        else None
+    )
+    dataset.close()
+    if dist.is_initialized():
+        shared_indices = [valid_indices]
+        dist.broadcast_object_list(shared_indices, src=0)
+        valid_indices = shared_indices[0]
+    assert valid_indices is not None
+    dataset = Subset(dataset, valid_indices)
+    process_group = get_dp_group()
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=dist.get_world_size(process_group),
+        rank=dist.get_rank(process_group),
+        shuffle=True,
+    )
+    if args.dataloader_num_workers == 0:
+        prefetch_factor = None
+    else:
+        prefetch_factor = 2
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        num_workers=args.dataloader_num_workers,
+        prefetch_factor=prefetch_factor,
+        collate_fn=RegenFullCollator(
+            tokenizer.pad_token_id or 0,
+            args.max_length if args.pad_to_max_length else None,
+        ),
+        drop_last=True,
+    )
+    if len(dataloader) == 0:
+        raise ValueError(
+            f"Training cache {args.train_hidden_states_path!r} has no full batches "
+            "after filtering."
+        )
+    return dataloader
+
+
+def training_data_identity(args) -> str:
+    path = args.train_hidden_states_path or args.train_data_path
+    identity = os.path.realpath(path)
+    if args.train_hidden_states_path:
+        manifest_path = os.path.join(identity, "manifest.json")
+        digest = hashlib.sha256()
+        with open(manifest_path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        identity = f"{identity}#manifest_sha256={digest.hexdigest()}"
+    return identity
+
+
+def required_hidden_layer_ids(draft_models: list[DLiteDraftModel]) -> set[int]:
+    required: set[int] = set()
+    for draft in draft_models:
+        required.update(int(value) for value in draft.target_layer_ids)
+        if draft.is_teacher:
+            required.update(int(value) for value in draft.history_layer_ids)
+    return required
+
+
 def hidden_states_to_cuda(hidden_states):
     if isinstance(hidden_states, dict):
         return {key: value.cuda() for key, value in hidden_states.items()}
     return tuple(value.cuda() for value in hidden_states)
+
+
+def project_cached_target_logits(
+    final_hidden_state: torch.Tensor,
+    anchor_positions: torch.Tensor,
+    block_size: int,
+    lm_head: torch.nn.Module,
+) -> torch.Tensor:
+    """Project only cached positions needed by the DLite target loss."""
+    offsets = torch.arange(int(block_size) - 1, device=anchor_positions.device).view(
+        1, 1, -1
+    )
+    positions = anchor_positions.unsqueeze(-1) + offsets
+    if bool((positions >= final_hidden_state.size(1)).any()):
+        raise ValueError("Cached final hidden states do not cover target positions.")
+    expanded = final_hidden_state.unsqueeze(1).expand(
+        -1, anchor_positions.size(1), -1, -1
+    )
+    selected = torch.gather(
+        expanded,
+        2,
+        positions.unsqueeze(-1).expand(-1, -1, -1, final_hidden_state.size(-1)),
+    )
+    with torch.no_grad():
+        return lm_head(selected)
+
+
+def load_cached_target_data(
+    data,
+    *,
+    anchors: torch.Tensor,
+    block_size: int,
+    lm_head: torch.nn.Module,
+    need_logits: bool,
+):
+    hidden_states = hidden_states_to_cuda(data["hidden_states"])
+    target_logits = None
+    if need_logits:
+        final_layer_id = int(data["final_norm_layer_id"])
+        final_hidden = hidden_states[final_layer_id]
+        target_logits = project_cached_target_logits(
+            final_hidden, anchors, block_size, lm_head
+        )
+    return hidden_states, target_logits
 
 
 def validate_tp_draft_sharding(args) -> Optional[int]:

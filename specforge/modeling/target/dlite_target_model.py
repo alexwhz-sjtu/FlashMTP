@@ -456,45 +456,56 @@ class SGLangDLiteTargetModel(DLiteTargetModel):
         num_transformer_layers = getattr(
             self.model_runner.model_config, "num_hidden_layers", None
         )
-        if (
+        captured_ids = list(self.capture_layer_ids or [])
+        expected_aux_count = None
+        if num_transformer_layers is not None:
+            final_layer_id = num_transformer_layers - 1
+            expected_aux_count = sum(
+                layer_id < final_layer_id for layer_id in captured_ids
+            )
+        if expected_aux_count == 0 and batched_last is not None:
+            # When only the final layer is requested, SGLang mirrors its final
+            # state into aux_hidden_states as a fallback. It is not a second
+            # captured layer and must not be serialized twice.
+            num_aux_layers = 0
+            aux_layer_tensors = ()
+        elif (
             batched_aux.ndim == 3
             and batched_aux.shape[-1] % hidden_size == 0
-            and batched_aux.shape[-1] > hidden_size
+            and batched_aux.shape[-1] >= hidden_size
         ):
-            captured_ids = list(self.capture_layer_ids or [])
             num_aux_layers = batched_aux.shape[-1] // hidden_size
             aux_layer_tensors = self._aux_hidden_to_layer_tuple(
                 batched_aux,
                 last_hidden=None,
                 num_layers=num_aux_layers,
             )
-            aux_capture_ids, last_capture_ids = self._split_aux_and_last_capture_ids(
-                captured_ids,
-                num_aux_layers,
-                num_transformer_layers,
-                batched_last is not None,
-            )
-            if num_transformer_layers is not None and (
-                not captured_ids or len(captured_ids) < num_transformer_layers
-            ):
-                # Partial capture: map absolute layer id -> hidden tensor.
-                hidden_states = {
-                    layer_id: aux_layer_tensors[idx]
-                    for idx, layer_id in enumerate(aux_capture_ids)
-                }
-                for layer_id in last_capture_ids:
-                    hidden_states[layer_id] = batched_last
-            else:
-                layer_tensors = list(aux_layer_tensors)
-                if batched_last is not None:
-                    layer_tensors.append(batched_last)
-                hidden_states = tuple(layer_tensors)
         else:
             raise ValueError(
-                "SGLang returned single-layer hidden states; expected concatenated "
-                "aux_hidden_states from all captured layers. Ensure "
-                "wrap_eagle3_logits_processors_in_module is applied."
+                "SGLang returned invalid aux hidden states; expected one or more "
+                "captured layers aligned to hidden_size."
             )
+        aux_capture_ids, last_capture_ids = self._split_aux_and_last_capture_ids(
+            captured_ids,
+            num_aux_layers,
+            num_transformer_layers,
+            batched_last is not None,
+        )
+        if num_transformer_layers is not None and (
+            not captured_ids or len(captured_ids) < num_transformer_layers
+        ):
+            # Partial capture: map absolute layer id -> hidden tensor.
+            hidden_states = {
+                layer_id: aux_layer_tensors[idx]
+                for idx, layer_id in enumerate(aux_capture_ids)
+            }
+            for layer_id in last_capture_ids:
+                hidden_states[layer_id] = batched_last
+        else:
+            layer_tensors = list(aux_layer_tensors)
+            if batched_last is not None:
+                layer_tensors.append(batched_last)
+            hidden_states = tuple(layer_tensors)
         input_ids = torch.cat([d[0] for d in data_cache], dim=0)
         attention_mask = torch.cat([d[1] for d in data_cache], dim=0)
         loss_mask = torch.cat([d[2] for d in data_cache], dim=0)

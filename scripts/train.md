@@ -1,5 +1,10 @@
 ## DLite training recipe
 
+Use `TRAIN_DATA_PATH=/path/to/regen_token_only.jsonl` for online target-model
+prefill, or `TRAIN_HIDDEN_STATES_PATH=/path/to/regen_full/cache` for offline
+training. Set only one. Offline mode requires `TP_SIZE=1` and
+`SHARD_DRAFT_BY_TP=0`.
+
 ### single node
 
 ```bash
@@ -91,4 +96,3 @@ echo "训练已结束，退出码: $TRAIN_EXIT"
 exit "$TRAIN_EXIT"
 
 ```
-

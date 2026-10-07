@@ -97,11 +97,21 @@ if (( NNODES > 1 )) && [[ "${MASTER_ADDR}" == "127.0.0.1" || "${MASTER_ADDR}" ==
 fi
 
 : "${TARGET_MODEL:?set TARGET_MODEL}"
-: "${TRAIN_DATA_PATH:?set TRAIN_DATA_PATH}"
+if [[ -n "${TRAIN_DATA_PATH:-}" && -n "${TRAIN_HIDDEN_STATES_PATH:-}" ]] || \
+   [[ -z "${TRAIN_DATA_PATH:-}" && -z "${TRAIN_HIDDEN_STATES_PATH:-}" ]]; then
+  echo "Set exactly one of TRAIN_DATA_PATH or TRAIN_HIDDEN_STATES_PATH" >&2
+  exit 2
+fi
+TRAIN_INPUT_PATH="${TRAIN_HIDDEN_STATES_PATH:-${TRAIN_DATA_PATH:-}}"
 : "${STAGE1_EPOCHS:?set STAGE1_EPOCHS}"
 : "${STAGE2_EPOCHS:?set STAGE2_EPOCHS}"
 
 : "${LEARNING_RATE:?set LEARNING_RATE}"
+
+if [[ -n "${TRAIN_HIDDEN_STATES_PATH:-}" && ( "${TP_SIZE}" != "1" || "${SHARD_DRAFT_BY_TP}" != "0" ) ]]; then
+  echo "Offline regen_full training requires TP_SIZE=1 and SHARD_DRAFT_BY_TP=0" >&2
+  exit 2
+fi
 
 if [[ -z "${RESUME_FROM:-}" && -z "${TEACHER_DRAFT_PATH:-}" ]]; then
   echo "Fresh two-stage training requires TEACHER_DRAFT_PATH" >&2
@@ -152,7 +162,7 @@ slug() {
 TARGET_BASENAME="${TARGET_MODEL%/}"
 TARGET_BASENAME="${TARGET_BASENAME##*/}"
 TARGET_TAG="$(slug "${TARGET_BASENAME}" 14)"
-DATA_BASENAME="${TRAIN_DATA_PATH%/}"
+DATA_BASENAME="${TRAIN_INPUT_PATH%/}"
 DATA_BASENAME="${DATA_BASENAME##*/}"
 DATA_BASENAME="${DATA_BASENAME%.jsonl}"
 DATA_TAG="$(slug "${DATA_BASENAME}" 24)"
@@ -238,12 +248,19 @@ if [[ "${SHARD_DRAFT_BY_TP}" == "1" ]]; then
 fi
 
 OPTIONAL_ARGS=()
+if [[ -n "${TRAIN_HIDDEN_STATES_PATH:-}" ]]; then
+  OPTIONAL_ARGS+=(--train-hidden-states-path "${TRAIN_HIDDEN_STATES_PATH}")
+else
+  OPTIONAL_ARGS+=(--train-data-path "${TRAIN_DATA_PATH}")
+fi
 [[ -n "${TEACHER_DRAFT_PATH:-}" ]] && OPTIONAL_ARGS+=(--teacher-draft-path "${TEACHER_DRAFT_PATH}")
 [[ -n "${STAGE1_LOSS_DECAY_GAMMA:-}" ]] && OPTIONAL_ARGS+=(--stage1-loss-decay-gamma "${STAGE1_LOSS_DECAY_GAMMA}")
 [[ -n "${STAGE2_LOSS_DECAY_GAMMA:-}" ]] && OPTIONAL_ARGS+=(--stage2-loss-decay-gamma "${STAGE2_LOSS_DECAY_GAMMA}")
 [[ -n "${STAGE2_BASE_CE_DECAY_GAMMA:-}" ]] && OPTIONAL_ARGS+=(--stage2-base-ce-decay-gamma "${STAGE2_BASE_CE_DECAY_GAMMA}")
 [[ -n "${RESUME_FROM:-}" ]] && OPTIONAL_ARGS+=(--resume-from "${RESUME_FROM}")
 [[ -n "${MASK_TOKEN_ID:-}" ]] && OPTIONAL_ARGS+=(--mask-token-id "${MASK_TOKEN_ID}")
+[[ -n "${EMBEDDING_KEY:-}" ]] && OPTIONAL_ARGS+=(--embedding-key "${EMBEDDING_KEY}")
+[[ -n "${LM_HEAD_KEY:-}" ]] && OPTIONAL_ARGS+=(--lm-head-key "${LM_HEAD_KEY}")
 [[ -n "${CHAT_TEMPLATE:-}" ]] && OPTIONAL_ARGS+=(--chat-template "${CHAT_TEMPLATE}")
 [[ -n "${SGLANG_ATTENTION_BACKEND:-}" ]] && OPTIONAL_ARGS+=(--sglang-attention-backend "${SGLANG_ATTENTION_BACKEND}")
 [[ -n "${SGLANG_CONTEXT_LENGTH:-}" ]] && OPTIONAL_ARGS+=(--sglang-context-length "${SGLANG_CONTEXT_LENGTH}")
@@ -271,7 +288,6 @@ CMD=(
   --target-model-backend "${TARGET_MODEL_BACKEND}"
   --dlite-version "${DLITE_VERSION}"
   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-0.4}"
-  --train-data-path "${TRAIN_DATA_PATH}"
   --output-dir "${OUTPUT_DIR}"
   --stage1-epochs "${STAGE1_EPOCHS}"
   --learning-rate "${LEARNING_RATE}"
@@ -301,7 +317,7 @@ CMD=(
 printf 'DLite v2.3 two-stage config: dt=%s nodes=%s rank=%s gpus/node=%s world=%s tp=%s\n' \
   "${DT}" "${NNODES}" "${NODE_RANK}" "${NPROC_PER_NODE}" "${WORLD_SIZE}" "${TP_SIZE}"
 printf 'Output directory: %s\n' "${OUTPUT_DIR}"
-printf 'Training dataset: %s\n' "${TRAIN_DATA_PATH}"
+printf 'Training dataset: %s\n' "${TRAIN_INPUT_PATH}"
 printf 'Transition: 1 epoch on the shared dataset with cosine Stage1->Stage2 loss blending\n'
 printf 'Dataset cache: %s\n' "${CACHE_DIR}"
 printf 'MASK token id: %s\n' "${MASK_TOKEN_ID:-auto (model-adapted)}"
