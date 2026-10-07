@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="DLite logo" width="480">
+  <img src="assets/logo.svg" alt="DLite logo" width="720">
 </p>
 
 # DLite
