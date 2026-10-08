@@ -151,12 +151,48 @@ class TargetEmbeddingsAndHead(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        text_config = getattr(config, "text_config", config)
 
         self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
+            text_config.vocab_size,
+            text_config.hidden_size,
+            padding_idx=getattr(text_config, "pad_token_id", None),
         )
 
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(
+            text_config.hidden_size, text_config.vocab_size, bias=False
+        )
+
+    @staticmethod
+    def _infer_embed_key(model_path: str) -> str:
+        """Find the text embedding key without instantiating the target model."""
+        index_files = glob.glob(os.path.join(model_path, "*.index.json"))
+        if index_files:
+            with open(index_files[0], "r", encoding="utf-8") as handle:
+                keys = list(json.load(handle).get("weight_map", {}))
+        else:
+            keys = []
+            for filename in glob.glob(os.path.join(model_path, "*.safetensors")):
+                with safe_open(filename, framework="pt", device="cpu") as handle:
+                    keys.extend(handle.keys())
+
+        candidates = [key for key in keys if key.endswith("embed_tokens.weight")]
+        preferred = (
+            "model.language_model.embed_tokens.weight",
+            "model.embed_tokens.weight",
+        )
+        for key in preferred:
+            if key in candidates:
+                return key
+        if len(candidates) == 1:
+            return candidates[0]
+        if not candidates:
+            return "model.embed_tokens.weight"
+        raise ValueError(
+            "Could not choose a text embedding from checkpoint keys: "
+            + ", ".join(sorted(candidates))
+            + ". Pass --embedding-key explicitly."
+        )
 
     @classmethod
     def from_pretrained(
@@ -176,8 +212,6 @@ class TargetEmbeddingsAndHead(nn.Module):
         )
         instance = cls(config)
 
-        if embed_key is None:
-            embed_key = "model.embed_tokens.weight"
         if lm_head_key is None:
             lm_head_key = "lm_head.weight"
 
@@ -192,6 +226,9 @@ class TargetEmbeddingsAndHead(nn.Module):
                 )
             except Exception as e:
                 print(f"Warning: Snapshot download failed or path check failed: {e}")
+
+        if embed_key is None:
+            embed_key = cls._infer_embed_key(local_model_path)
 
         # 3. Handle Weight Tying
         tie_weights = getattr(config, "tie_word_embeddings", False)

@@ -28,6 +28,32 @@ python scripts/data/convert_dataset.py convert \
   --turn-mode multi
 ```
 
+Hugging Face Parquet inputs can be filtered while they are streamed. Repeating
+`--hf-filter` combines predicates with AND and lets the Parquet reader skip
+files or row groups when their metadata permits it:
+
+```bash
+.venv/bin/python scripts/data/convert_dataset.py convert \
+  --input allenai/WildChat-4.8M \
+  --input-format hf \
+  --split train \
+  --hf-filter language '==' Chinese \
+  --hf-filter model '==' gpt-4-0314 \
+  --adapter scripts/data/adapters/wildchat_4_8m.json \
+  --output cache/data/prompts/wildchat_chinese_gpt-4-0314.jsonl \
+  --turn-mode first \
+  --skip-invalid
+```
+
+This does not materialize the complete Hub dataset locally. Filtering is pushed
+into the Hugging Face Parquet loader; row groups that cannot be excluded from
+Parquet statistics may still be transferred and scanned. The WildChat adapter
+stores the conversation-level language in `category`. `--turn-mode first` keeps
+the first user request; use `multi` only when all user turns should be retained
+after the original assistant turns are removed.
+Empty messages inside a conversation are ignored. `--skip-invalid` skips the
+rare conversation that has no usable user message at all.
+
 The converter emits exactly this record contract:
 
 ```json
@@ -52,6 +78,10 @@ are not included in the successful output. Use `--resume` to continue by input
 `id`. This is the `regen_token_only` save mode: generated answer tokens are
 stored as decoded text without target-model hidden states. Its default location
 is `./cache/data/regen_token_only/`; `--output-file-path` overrides it.
+
+For regeneration input, `category` is optional. When it is absent,
+`regenerate_train_data.py` normalizes it to `null` in successful and error
+outputs so the downstream four-field contract remains stable.
 
 ## 3. Save tokens and hidden states
 
@@ -84,7 +114,7 @@ All DLite training entrypoints accept either online JSONL or an offline cache.
 Use exactly one of `--train-data-path` and `--train-hidden-states-path`:
 
 ```bash
-torchrun --nproc-per-node=8 -m scripts.train_dlite_sft \
+torchrun --nproc-per-node=8 -m scripts.dlite.train_dlite_sft \
   --target-model-path /path/to/model \
   --train-hidden-states-path ./cache/data/regen_full/dataset_model \
   --tp-size 1 \

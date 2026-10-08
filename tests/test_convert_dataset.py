@@ -32,6 +32,7 @@ def source_args(input_path: str, **overrides):
         "input_format": "auto",
         "records_path": None,
         "hf_config": None,
+        "hf_filter": None,
         "split": "train",
     }
     values.update(overrides)
@@ -281,8 +282,8 @@ def test_inspect_reports_fields_and_prompt_candidates(tmp_path, capsys):
 def test_hf_source_uses_streaming_and_dataset_id(tmp_path, monkeypatch):
     calls = []
 
-    def fake_load(dataset_id, hf_config, split):
-        calls.append((dataset_id, hf_config, split))
+    def fake_load(dataset_id, hf_config, split, hf_filters):
+        calls.append((dataset_id, hf_config, split, hf_filters))
         return iter([{"prompt": "from hf"}])
 
     monkeypatch.setattr(converter, "_load_hf_dataset", fake_load)
@@ -297,12 +298,44 @@ def test_hf_source_uses_streaming_and_dataset_id(tmp_path, monkeypatch):
         input_format="hf",
         hf_config="subset",
         split="validation",
+        hf_filter=[
+            ["language", "==", "Chinese"],
+            ["model", "==", "gpt-4-0314"],
+        ],
     )
 
     converter.convert_records(args)
 
-    assert calls == [("org/dataset", "subset", "validation")]
+    assert calls == [
+        (
+            "org/dataset",
+            "subset",
+            "validation",
+            [("language", "==", "Chinese"), ("model", "==", "gpt-4-0314")],
+        )
+    ]
     assert read_jsonl(output)[0]["source"] == "org/dataset"
+
+
+def test_hf_filter_parses_json_values_and_validates_operators():
+    assert converter.normalize_hf_filters(
+        [["score", ">=", "0.5"], ["language", "in", '["Chinese", "English"]']]
+    ) == [("score", ">=", 0.5), ("language", "in", ["Chinese", "English"])]
+
+    with pytest.raises(converter.ConversionError, match="unsupported"):
+        converter.normalize_hf_filters([["language", "contains", "Chinese"]])
+
+
+def test_hf_filter_is_rejected_for_local_input(tmp_path):
+    input_path = write_jsonl(tmp_path / "input.jsonl", [{"prompt": "hello"}])
+    filters = converter.normalize_hf_filters([["language", "==", "Chinese"]])
+
+    with pytest.raises(converter.ConversionError, match="only applies"):
+        list(
+            converter.iter_records(
+                str(input_path), "auto", None, None, "train", filters
+            )
+        )
 
 
 def test_parquet_is_read_in_batches(tmp_path):
@@ -335,4 +368,33 @@ def test_unmapped_role_and_multimodal_content_are_invalid(tmp_path):
             {"messages": [{"role": "user", "content": [{"type": "text"}]}]},
             "fallback",
             "multi",
+        )
+
+
+def test_empty_and_discarded_messages_do_not_reject_valid_prompt():
+    normalized = converter.normalize_extracted(
+        {
+            "messages": [
+                {"role": "user", "content": "first prompt"},
+                {"role": "assistant", "content": ""},
+                {"role": "user", "content": "   "},
+                {"role": "assistant", "content": [{"type": "image"}]},
+                {"role": "user", "content": "later prompt"},
+            ]
+        },
+        "fallback",
+        "first",
+    )
+
+    assert normalized["conversations"] == [
+        {"role": "user", "content": "first prompt"}
+    ]
+
+
+def test_messages_with_only_empty_users_are_invalid():
+    with pytest.raises(converter.ConversionError, match="no non-empty user turn"):
+        converter.normalize_extracted(
+            {"messages": [{"role": "user", "content": ""}]},
+            "fallback",
+            "first",
         )

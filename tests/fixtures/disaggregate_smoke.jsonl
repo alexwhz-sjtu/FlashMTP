@@ -1,0 +1,12 @@
+{"id":0,"conversations":[{"role":"user","content":"Count from one to ten."},{"role":"assistant","content":"One two three four five six seven eight nine ten."}],"source":"smoke","category":"test"}
+{"id":1,"conversations":[{"role":"user","content":"List ten colors."},{"role":"assistant","content":"Red orange yellow green blue indigo violet black white gray."}],"source":"smoke","category":"test"}
+{"id":2,"conversations":[{"role":"user","content":"Name ten animals."},{"role":"assistant","content":"Cat dog horse cow sheep goat tiger lion bear rabbit."}],"source":"smoke","category":"test"}
+{"id":3,"conversations":[{"role":"user","content":"Write a short sentence."},{"role":"assistant","content":"The quick brown fox jumps over the calm and sleepy dog."}],"source":"smoke","category":"test"}
+{"id":4,"conversations":[{"role":"user","content":"List ten fruits."},{"role":"assistant","content":"Apple banana orange grape peach pear mango melon plum kiwi."}],"source":"smoke","category":"test"}
+{"id":5,"conversations":[{"role":"user","content":"Name ten cities."},{"role":"assistant","content":"Paris London Tokyo Seoul Beijing Madrid Rome Berlin Cairo Lima."}],"source":"smoke","category":"test"}
+{"id":6,"conversations":[{"role":"user","content":"List ten tools."},{"role":"assistant","content":"Hammer saw drill wrench pliers chisel level file clamp screwdriver."}],"source":"smoke","category":"test"}
+{"id":7,"conversations":[{"role":"user","content":"Name ten shapes."},{"role":"assistant","content":"Circle square triangle rectangle oval star cube cone sphere hexagon."}],"source":"smoke","category":"test"}
+{"id":8,"conversations":[{"role":"user","content":"List ten materials."},{"role":"assistant","content":"Wood steel glass paper stone cotton leather copper clay rubber."}],"source":"smoke","category":"test"}
+{"id":9,"conversations":[{"role":"user","content":"Name ten jobs."},{"role":"assistant","content":"Teacher doctor engineer farmer artist writer chef pilot nurse builder."}],"source":"smoke","category":"test"}
+{"id":10,"conversations":[{"role":"user","content":"List ten sports."},{"role":"assistant","content":"Football tennis cricket hockey baseball rugby golf boxing skiing cycling."}],"source":"smoke","category":"test"}
+{"id":11,"conversations":[{"role":"user","content":"Name ten subjects."},{"role":"assistant","content":"Math physics chemistry biology history geography music art language computing."}],"source":"smoke","category":"test"}

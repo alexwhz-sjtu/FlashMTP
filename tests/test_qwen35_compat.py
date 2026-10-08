@@ -3,10 +3,14 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
-from scripts.dlite_training import build_draft_config
+import torch
+
+from scripts.dlite.dlite_training import build_draft_config
 from specforge.modeling.config_utils import load_text_model_config
 from specforge.modeling.draft.dlite import DLiteDraftModel
+from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
 
 def _write_qwen35_config(path: Path) -> None:
@@ -68,6 +72,56 @@ class Qwen35CompatibilityTest(unittest.TestCase):
             [0, 1, 3, 7, 11, 15, 19, 23, 27, 29, 30, 31],
         )
         self.assertEqual(model.chs_num_layers, 12)
+
+    def test_qwen35_moe_uses_shared_expert_width_for_dense_draft(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _write_qwen35_config(path)
+            config_path = path / "config.json"
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            text_config = raw["text_config"]
+            text_config["model_type"] = "qwen3_5_moe_text"
+            text_config.pop("intermediate_size")
+            text_config["shared_expert_intermediate_size"] = 24
+            text_config["moe_intermediate_size"] = 12
+            raw["model_type"] = "qwen3_5_moe"
+            raw["architectures"] = ["Qwen3_5MoeForConditionalGeneration"]
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+            config = load_text_model_config(tmpdir)
+
+        self.assertEqual(config.intermediate_size, 24)
+        self.assertEqual(config.dlite_source_model_type, "qwen3_5_moe")
+
+    def test_target_components_use_nested_text_dimensions(self):
+        config = SimpleNamespace(
+            text_config=SimpleNamespace(
+                vocab_size=64,
+                hidden_size=16,
+                pad_token_id=None,
+            )
+        )
+        components = TargetEmbeddingsAndHead(config)
+
+        self.assertEqual(components.embed_tokens.weight.shape, (64, 16))
+        self.assertEqual(components.lm_head.weight.shape, (64, 16))
+        self.assertIsInstance(components.embed_tokens.weight, torch.Tensor)
+
+    def test_qwen35_embedding_key_is_inferred_from_weight_index(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index = {
+                "weight_map": {
+                    "model.language_model.embed_tokens.weight": "model-1.safetensors",
+                    "lm_head.weight": "model-2.safetensors",
+                }
+            }
+            (Path(tmpdir) / "model.safetensors.index.json").write_text(
+                json.dumps(index), encoding="utf-8"
+            )
+
+            key = TargetEmbeddingsAndHead._infer_embed_key(tmpdir)
+
+        self.assertEqual(key, "model.language_model.embed_tokens.weight")
 
 
 if __name__ == "__main__":

@@ -37,7 +37,7 @@ BUILD_DATASET_NUM_PROC=128 \
 TRAIN_DATA_PATH='/data/wanghanzhen/projects/SpecDecoding/training_data/generated/qwen3-4b/open_perfectblend_80k_qwen3_4b.jsonl' \
 MODEL_TAG='Qwen3_4B' \
 TARGET_MODEL='/data/wanghanzhen/models/Qwen3-4B' \
-bash scripts/run_training_dlite_sft.sh --dt h100
+bash scripts/dlite/run_training_dlite_sft.sh --dt h100
 ```
 
 ```bash
@@ -77,7 +77,7 @@ TP_SIZE=1 \
 TRAIN_DATA_PATH='/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/qwen3_4b/mixed_2.3M_qwen3_4b_aug1_math_code_chat_temp1_chinese.jsonl' \
 MODEL_TAG='Qwen3_4B' \
 TARGET_MODEL='/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-4B' \
-bash scripts/run_training_dlite_sft.sh --dt qz > "whz_mtp_logs/train_dlite_$(date +%Y%m%d_%H%M%S).log" 2>&1 &
+bash scripts/dlite/run_training_dlite_sft.sh --dt qz > "whz_mtp_logs/train_dlite_$(date +%Y%m%d_%H%M%S).log" 2>&1 &
 
 # ========== 关键修改：等待训练完成 ==========
 TRAIN_PID=$!

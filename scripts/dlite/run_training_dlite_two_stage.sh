@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
+PROJECT_DIR="$(dirname "$(dirname "${SCRIPT_DIR}")")"
 cd "${PROJECT_DIR}"
 export PYTHONPATH="${PROJECT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -248,6 +248,27 @@ if [[ "${SHARD_DRAFT_BY_TP}" == "1" ]]; then
 fi
 
 OPTIONAL_ARGS=()
+DISAGGREGATE="${DISAGGREGATE:-0}"
+if [[ "${DISAGGREGATE}" == "1" ]]; then
+  : "${RANK_TARGET_PER_NODE:?set RANK_TARGET_PER_NODE for disaggregate mode}"
+  : "${RANK_DRAFT_PER_NODE:?set RANK_DRAFT_PER_NODE for disaggregate mode}"
+  : "${NODE_BATCH_SIZE:?set NODE_BATCH_SIZE for disaggregate mode}"
+  TARGET_TP_SIZE="${TARGET_TP_SIZE:-${TP_SIZE}}"
+  SGLANG_EP_SIZE="${SGLANG_EP_SIZE:-1}"
+  DRAFT_MICRO_BATCH_SIZE="${DRAFT_MICRO_BATCH_SIZE:-$((NODE_BATCH_SIZE / RANK_DRAFT_PER_NODE))}"
+  PIPELINE_DEPTH="${PIPELINE_DEPTH:-2}"
+  OPTIONAL_ARGS+=(
+    --disaggregate
+    --target-ranks-per-node "${RANK_TARGET_PER_NODE}"
+    --draft-ranks-per-node "${RANK_DRAFT_PER_NODE}"
+    --target-tp-size "${TARGET_TP_SIZE}"
+    --sglang-ep-size "${SGLANG_EP_SIZE}"
+    --node-batch-size "${NODE_BATCH_SIZE}"
+    --draft-micro-batch-size "${DRAFT_MICRO_BATCH_SIZE}"
+    --pipeline-depth "${PIPELINE_DEPTH}"
+  )
+  [[ "${PROFILE:-0}" == "1" ]] && OPTIONAL_ARGS+=(--profile)
+fi
 if [[ -n "${TRAIN_HIDDEN_STATES_PATH:-}" ]]; then
   OPTIONAL_ARGS+=(--train-hidden-states-path "${TRAIN_HIDDEN_STATES_PATH}")
 else
@@ -266,6 +287,9 @@ fi
 [[ -n "${SGLANG_CONTEXT_LENGTH:-}" ]] && OPTIONAL_ARGS+=(--sglang-context-length "${SGLANG_CONTEXT_LENGTH}")
 [[ -n "${SGLANG_MAX_RUNNING_REQUESTS:-}" ]] && OPTIONAL_ARGS+=(--sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}")
 [[ -n "${SGLANG_MAX_TOTAL_TOKENS:-}" ]] && OPTIONAL_ARGS+=(--sglang-max-total-tokens "${SGLANG_MAX_TOTAL_TOKENS}")
+if [[ "${DISAGGREGATE}" != "1" && -n "${SGLANG_EP_SIZE:-}" ]]; then
+  OPTIONAL_ARGS+=(--sglang-ep-size "${SGLANG_EP_SIZE}")
+fi
 [[ "${SHARD_DRAFT_BY_TP}" == "1" ]] && OPTIONAL_ARGS+=(--shard-draft-by-tp)
 [[ "${IS_PREFORMATTED:-0}" == "1" ]] && OPTIONAL_ARGS+=(--is-preformatted)
 [[ "${TRUST_REMOTE_CODE:-0}" == "1" ]] && OPTIONAL_ARGS+=(--trust-remote-code)
@@ -283,7 +307,7 @@ CMD=(
   --nnodes "${NNODES}" --node_rank "${NODE_RANK}"
   --nproc_per_node "${NPROC_PER_NODE}"
   --master_addr "${MASTER_ADDR}" --master_port "${MASTER_PORT}"
-  -m scripts.train_dlite_two_stage
+  -m scripts.dlite.train_dlite_two_stage
   --target-model-path "${TARGET_MODEL}"
   --target-model-backend "${TARGET_MODEL_BACKEND}"
   --dlite-version "${DLITE_VERSION}"

@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Optional
 
 import sglang.srt.distributed.parallel_state as parallel_state
@@ -15,9 +16,61 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
-from specforge.distributed import get_tp_group as get_specforge_tp_group
+from specforge.distributed import (
+    get_disaggregated_topology,
+)
+from specforge.distributed import (
+    get_tp_group as get_specforge_tp_group,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _coordinator_from_existing_group(
+    group, cpu_group, local_rank: int, name: str
+) -> GroupCoordinator:
+    """Wrap groups collectively created before target/draft role divergence."""
+    if group is None or cpu_group is None:
+        raise RuntimeError(f"missing pre-created SGLang {name} process group")
+    coordinator = object.__new__(GroupCoordinator)
+    coordinator.unique_name = parallel_state._get_unique_name(f"specforge_{name}")
+    parallel_state._register_group(coordinator)
+    coordinator.rank = dist.get_rank()
+    coordinator.local_rank = local_rank
+    coordinator.device_group = group
+    coordinator.cpu_group = cpu_group
+    coordinator.local_size = int(os.environ.get("LOCAL_SIZE", "0"))
+    coordinator.device = torch.device("cuda", local_rank)
+    coordinator.device_module = torch.cuda
+    coordinator.ranks = dist.get_process_group_ranks(group)
+    coordinator.world_size = dist.get_world_size(group)
+    coordinator.rank_in_group = dist.get_rank(group)
+    coordinator.active_ranks = torch.ones(
+        coordinator.world_size, dtype=torch.int32, device=coordinator.device
+    )
+    coordinator.active_ranks_cpu = torch.ones(coordinator.world_size, dtype=torch.int32)
+    coordinator.use_pynccl = False
+    coordinator.pynccl_use_current_stream = False
+    coordinator.use_pymscclpp = False
+    coordinator.use_custom_allreduce = False
+    coordinator.use_torch_symm_mem_all_reduce = False
+    coordinator.use_hpu_communicator = False
+    coordinator.use_xpu_communicator = False
+    coordinator.use_npu_communicator = False
+    coordinator.use_message_queue_broadcaster = False
+    coordinator.pynccl_comm = None
+    coordinator.pymscclpp_comm = None
+    coordinator.ca_comm = None
+    coordinator.qr_comm = None
+    coordinator.torch_symm_mem_comm = None
+    coordinator.hpu_communicator = None
+    coordinator.xpu_communicator = None
+    coordinator.npu_communicator = None
+    coordinator.mq_broadcaster = None
+    coordinator.is_symmetric_memory_enabled = lambda *args, **kwargs: False
+    coordinator.use_symmetric_memory = lambda *args, **kwargs: False
+    coordinator.is_allocation_symmetric = lambda *args, **kwargs: False
+    return coordinator
 
 
 def init_distributed_environment(
@@ -37,6 +90,17 @@ def init_distributed_environment(
     ), "distributed environment should be initialized first"
 
     tp_group = get_specforge_tp_group()
+    topology = get_disaggregated_topology()
+    if topology is not None:
+        if not topology.is_target:
+            raise RuntimeError("draft ranks must not initialize the SGLang target")
+        parallel_state._WORLD = _coordinator_from_existing_group(
+            topology.target_tp_group,
+            topology.target_tp_cpu_group,
+            local_rank,
+            "target_world",
+        )
+        return
     world_size = dist.get_world_size()
     tp_size = dist.get_world_size(tp_group)
     num_tp_groups = world_size // tp_size
@@ -104,6 +168,46 @@ def initialize_model_parallel(
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
     """
+    topology = get_disaggregated_topology()
+    if topology is not None:
+        if pipeline_model_parallel_size != 1:
+            raise ValueError("disaggregated SGLang requires pipeline parallel size 1")
+        if tensor_model_parallel_size != topology.target_tp_size:
+            raise ValueError(
+                "SGLang tensor parallel size does not match the pre-created target topology"
+            )
+        if expert_model_parallel_size != topology.target_ep_size:
+            raise ValueError(
+                "SGLang expert parallel size does not match the pre-created target topology"
+            )
+        local_rank = topology.local_rank
+        world = parallel_state._WORLD
+        parallel_state._TP = world
+        parallel_state._PP = _coordinator_from_existing_group(
+            topology.target_singleton_group,
+            topology.target_singleton_cpu_group,
+            local_rank,
+            "pp",
+        )
+        parallel_state._MOE_EP = _coordinator_from_existing_group(
+            topology.target_moe_ep_group,
+            topology.target_moe_ep_cpu_group,
+            local_rank,
+            "moe_ep",
+        )
+        parallel_state._MOE_TP = _coordinator_from_existing_group(
+            topology.target_moe_tp_group,
+            topology.target_moe_tp_cpu_group,
+            local_rank,
+            "moe_tp",
+        )
+        parallel_state._ATTN_CP = parallel_state._PP
+        parallel_state._ATTN_TP = world
+        parallel_state._MOE_DP = parallel_state._PP
+        if duplicate_tp_group:
+            parallel_state._PDMUX_PREFILL_TP_GROUP = world
+        return
+
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = parallel_state._WORLD.world_size

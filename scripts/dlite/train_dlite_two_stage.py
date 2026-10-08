@@ -20,7 +20,7 @@ from torch.distributed.fsdp import (
 )
 from tqdm import tqdm
 
-from scripts.dlite_training import (
+from scripts.dlite.dlite_training import (
     add_common_args,
     build_draft_model,
     build_target_and_components,
@@ -191,6 +191,11 @@ def main():
     logging.basicConfig(level=logging.INFO)
     args = parse_args()
     set_seed(args.seed)
+    if args.disaggregate:
+        from scripts.dlite.dlite_disaggregate import run_disaggregated
+
+        run_disaggregated(args, mode="two_stage")
+        return
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     tp_draft_rank = validate_tp_draft_sharding(args)
 

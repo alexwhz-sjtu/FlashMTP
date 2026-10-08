@@ -14,8 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts import dlite_training
-from scripts.dlite_training import (
+from scripts.dlite import dlite_training
+from scripts.dlite.dlite_training import (
     add_common_args,
     project_cached_target_logits,
     validate_common_args,

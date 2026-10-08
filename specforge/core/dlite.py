@@ -16,6 +16,7 @@ from specforge.modeling.draft.dlite import DLiteDraftModel
 
 try:
     from torch.nn.attention.flex_attention import create_block_mask
+
     from specforge.modeling.draft.flex_attention import (
         compile_friendly_create_block_mask,
     )
@@ -270,6 +271,7 @@ class OnlineDLiteModel(nn.Module):
         base_lm_ce_weight: float = 0.0,
         base_lm_ce_decay_gamma: Optional[float] = None,
         use_target_greedy_ce_labels: bool = False,
+        process_group=None,
     ) -> None:
         super().__init__()
         if attention_backend != "flex_attention":
@@ -300,6 +302,7 @@ class OnlineDLiteModel(nn.Module):
             raise ValueError("At least one DLite loss weight must be positive.")
         self.base_lm_ce_decay_gamma = base_lm_ce_decay_gamma
         self.use_target_greedy_ce_labels = bool(use_target_greedy_ce_labels)
+        self.process_group = process_group
 
     def sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor
@@ -381,32 +384,35 @@ class OnlineDLiteModel(nn.Module):
     def prepare_batch(
         self,
         input_ids: torch.Tensor,
-        hidden_states: HiddenStatesInput,
+        hidden_states: Optional[HiddenStatesInput],
         loss_mask: torch.Tensor,
         *,
         anchor_positions: Optional[torch.Tensor] = None,
         block_keep_mask: Optional[torch.Tensor] = None,
         shared_query_embeddings: Optional[torch.Tensor] = None,
+        target_hidden: Optional[torch.Tensor] = None,
+        raw_history_hidden: Optional[torch.Tensor] = None,
     ) -> PreparedDLiteBatch:
         if anchor_positions is None or block_keep_mask is None:
             anchor_positions, block_keep_mask = self.sample_anchor_positions(
                 input_ids.size(1), loss_mask
             )
-        target_hidden = prepare_target_hidden(
-            hidden_states,
-            anchor_positions,
-            self.draft_model.target_layer_ids,
-            self.draft_model.config.num_target_layers,
-        )
+        if target_hidden is None:
+            if hidden_states is None:
+                raise ValueError("hidden_states or prepared target_hidden is required")
+            target_hidden = prepare_target_hidden(
+                hidden_states,
+                anchor_positions,
+                self.draft_model.target_layer_ids,
+                self.draft_model.config.num_target_layers,
+            )
         prefix_count = self.draft_model.token_prefix_count
         prefix_offsets = torch.arange(
             1 - prefix_count,
             1,
             device=anchor_positions.device,
         ).view(1, 1, -1)
-        token_positions = (anchor_positions.unsqueeze(-1) + prefix_offsets).clamp(
-            min=0
-        )
+        token_positions = (anchor_positions.unsqueeze(-1) + prefix_offsets).clamp(min=0)
         token_ids = torch.gather(
             input_ids.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
             2,
@@ -431,11 +437,18 @@ class OnlineDLiteModel(nn.Module):
             query_embeddings = shared_query_embeddings
         shared_fused_history = None
         if self.draft_model.is_teacher:
-            raw_history = prepare_history_hidden_states(
-                hidden_states,
-                self.draft_model.history_layer_ids,
-                self.draft_model.config.num_target_layers,
-            )
+            if raw_history_hidden is None:
+                if hidden_states is None:
+                    raise ValueError(
+                        "teacher requires hidden_states or raw_history_hidden"
+                    )
+                raw_history = prepare_history_hidden_states(
+                    hidden_states,
+                    self.draft_model.history_layer_ids,
+                    self.draft_model.config.num_target_layers,
+                )
+            else:
+                raw_history = raw_history_hidden
             shared_fused_history = self.draft_model.fuse_history_hidden(raw_history)
         labels, prev_ids, weights, binary = self._build_labels_and_weights(
             input_ids, loss_mask, anchor_positions, block_keep_mask
@@ -630,7 +643,9 @@ class OnlineDLiteModel(nn.Module):
         )
         final_ce_numerator = (final_ce_values * active_final_weights).sum()
         final_denominator = active_final_weights.sum()
-        final_ce = fsdp_global_weighted_mean(final_ce_numerator, final_denominator)
+        final_ce = fsdp_global_weighted_mean(
+            final_ce_numerator, final_denominator, self.process_group
+        )
         if self.base_lm_ce_weight > 0:
             assert base_logits is not None
             base_ce_values = F.cross_entropy(
@@ -638,7 +653,9 @@ class OnlineDLiteModel(nn.Module):
             )
             base_ce_numerator = (base_ce_values * active_base_weights).sum()
             base_denominator = active_base_weights.sum()
-            base_ce = fsdp_global_weighted_mean(base_ce_numerator, base_denominator)
+            base_ce = fsdp_global_weighted_mean(
+                base_ce_numerator, base_denominator, self.process_group
+            )
         else:
             base_ce_numerator = prediction_hidden.new_zeros((), dtype=torch.float32)
             base_denominator = final_denominator
@@ -656,7 +673,9 @@ class OnlineDLiteModel(nn.Module):
             final_probs = F.softmax(final_logits.float(), dim=-1)
             tv_values = (final_probs - target_probs).abs().sum(dim=-1)
             tv_numerator = (tv_values * active_final_weights).sum()
-            tv_loss = fsdp_global_weighted_mean(tv_numerator, final_denominator)
+            tv_loss = fsdp_global_weighted_mean(
+                tv_numerator, final_denominator, self.process_group
+            )
         else:
             tv_numerator = prediction_hidden.new_zeros((), dtype=torch.float32)
             tv_loss = prediction_hidden.new_zeros((), dtype=torch.float32)
@@ -677,7 +696,9 @@ class OnlineDLiteModel(nn.Module):
             + self.tv_loss_weight * tv_numerator
             + self.base_lm_ce_weight * base_ce_numerator
         )
-        total = fsdp_global_weighted_mean(loss_numerator, loss_denominator)
+        total = fsdp_global_weighted_mean(
+            loss_numerator, loss_denominator, self.process_group
+        )
         with torch.no_grad():
             predictions = torch.zeros_like(batch.labels)
             predictions[active_positions] = final_logits.argmax(dim=-1)
@@ -685,13 +706,15 @@ class OnlineDLiteModel(nn.Module):
             ce_labels[active_positions] = active_ce_labels
             valid = batch.binary_eval_mask
             accuracy = fsdp_global_weighted_mean(
-                ((predictions == ce_labels) & valid).sum().float(), valid.sum()
+                ((predictions == ce_labels) & valid).sum().float(),
+                valid.sum(),
+                self.process_group,
             )
             correct = (predictions == ce_labels) & valid
             prefix = correct.cumprod(dim=-1).sum(dim=-1).float() + 1.0
             valid_blocks = batch.block_keep_mask & valid.any(dim=-1)
             prefix_acc = fsdp_global_weighted_mean(
-                prefix[valid_blocks].sum(), valid_blocks.sum()
+                prefix[valid_blocks].sum(), valid_blocks.sum(), self.process_group
             )
         return DLiteLossOutput(
             total,
@@ -744,6 +767,8 @@ class OnlineDLiteModel(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         loss_mask: Optional[torch.Tensor] = None,
         hidden_states: Optional[HiddenStatesInput] = None,
+        target_hidden: Optional[torch.Tensor] = None,
+        raw_history_hidden: Optional[torch.Tensor] = None,
         target_prefill_logits: Optional[torch.Tensor] = None,
         anchor_positions: Optional[torch.Tensor] = None,
         block_keep_mask: Optional[torch.Tensor] = None,
@@ -755,14 +780,16 @@ class OnlineDLiteModel(nn.Module):
         target_logits_are_gathered: bool = False,
     ):
         if prepared_batch is None:
-            if input_ids is None or loss_mask is None or hidden_states is None:
-                raise ValueError("input_ids, loss_mask and hidden_states are required")
+            if input_ids is None or loss_mask is None:
+                raise ValueError("input_ids and loss_mask are required")
             prepared_batch = self.prepare_batch(
                 input_ids,
                 hidden_states,
                 loss_mask,
                 anchor_positions=anchor_positions,
                 block_keep_mask=block_keep_mask,
+                target_hidden=target_hidden,
+                raw_history_hidden=raw_history_hidden,
             )
             seq_len = input_ids.size(1)
         if seq_len is None:
@@ -822,6 +849,7 @@ def compute_stage1_distillation_loss(
     raw_weight_mask: torch.Tensor,
     kl_weight: float,
     loss_decay_gamma: Optional[float],
+    process_group=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return Stage-1 metrics plus an additive numerator/denominator pair."""
     offsets = torch.arange(raw_weight_mask.size(-1), device=raw_weight_mask.device)
@@ -856,7 +884,7 @@ def compute_stage1_distillation_loss(
     student_log_probs = F.log_softmax(student_serial_logits.float(), dim=-1)
     kl_values = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)
     kl_numerator = (kl_values * active_weights).sum()
-    kl_loss = fsdp_global_weighted_mean(kl_numerator, denominator)
+    kl_loss = fsdp_global_weighted_mean(kl_numerator, denominator, process_group)
     loss_numerator = float(kl_weight) * kl_numerator
     return float(kl_weight) * kl_loss, kl_loss, loss_numerator, denominator.detach()
 

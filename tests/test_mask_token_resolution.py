@@ -1,6 +1,6 @@
 import unittest
 
-from scripts.dlite_training import _select_mask_token_id
+from scripts.dlite.dlite_training import _select_mask_token_id
 
 
 class MaskTokenResolutionTest(unittest.TestCase):

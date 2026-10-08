@@ -1,0 +1,45 @@
+algorithm: dflash2
+
+launcher:
+  target_model: /data/wanghanzhen/models/Qwen3-4B
+  train_data: /data/wanghanzhen/projects/SpecDecoding/FlashMTP_v2.3/cache/data/regen_token_only/wildchat_chinese_turns_le2_qwen3_4b_temp0.7_topk15_max4096.jsonl
+  output_dir: /data/wanghanzhen/projects/SpecDecoding/FlashMTP_v2.3/cache/models/dflash2_qwen3_4b_wildchat_le2
+  nproc_per_node: 8
+  master_port: 29501
+
+arguments:
+  target_model_backend: sglang
+  sglang_attention_backend: fa3
+  sglang_mem_fraction_static: 0.30
+  chat_template: qwen
+  max_length: 4096
+  batch_size: 1
+  accumulation_steps: 1
+  tp_size: 1
+  dist_timeout: 1200
+  # false: every rank runs target + draft; true: split target and draft ranks.
+  disaggregate: false
+  target_ranks_per_node: 4
+  draft_ranks_per_node: 4
+  target_tp_size: 1
+  node_batch_size: 4
+  draft_micro_batch_size: 1
+  pipeline_depth: 2
+  num_epochs: 6
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  block_size: 16
+  num_draft_layers: 5
+  num_anchors: 512
+  attention_backend: flex_attention
+  attention_mode: gqa
+  conv_kernel_size: 2
+  conv_group_size: 16
+  selector_rank: 256
+  selector_top_k: 16
+  selector_loss_alpha: 1.0
+  build_dataset_num_proc: 32
+  dataloader_num_workers: 8
+  log_interval: 10
+  save_interval: 500
+  report_to: none

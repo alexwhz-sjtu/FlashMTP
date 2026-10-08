@@ -4,6 +4,11 @@
 
 # DLite
 
+The repository also trains and benchmarks the DFlash family (`dflash`,
+`dflash2`, and `dspark`) through independent launchers under `scripts/` and
+`evaluation/`. See [the training guide](docs/TRAINING.md#dflash-family-training)
+for online, offline, and disaggregated examples.
+
 DLite is a Qwen3 speculative-decoding project with teacher training, two-stage
 student training, and standalone evaluation. The student predicts a block in
 parallel and uses a lightweight `rnn` sequential head to restore token-to-token
@@ -51,7 +56,7 @@ Teacher training:
 TARGET_MODEL=/path/to/Qwen3-8B \
 TRAIN_DATA_PATH=/path/to/train.jsonl \
 OUTPUT_DIR=/path/to/teacher \
-bash scripts/run_training_dlite_teacher.sh --dt h100
+bash scripts/dlite/run_training_dlite_teacher.sh --dt h100
 ```
 
 For Qwen3.5-4B, the launcher automatically selects the SGLang target backend
@@ -62,7 +67,7 @@ TARGET_MODEL=/path/to/Qwen3.5-4B \
 TRAIN_DATA_PATH=/path/to/train.jsonl \
 CHAT_TEMPLATE=qwen3.5 \
 TARGET_LAYER_IDS="0,1,3,7,11,15,19,23,27,29,30,31" \
-bash scripts/run_training_dlite_teacher.sh --dt h100
+bash scripts/dlite/run_training_dlite_teacher.sh --dt h100
 ```
 
 Two-stage student training:
@@ -74,7 +79,7 @@ TRAIN_DATA_PATH=/path/to/train.jsonl \
 OUTPUT_DIR=/path/to/student \
 STAGE1_EPOCHS=1 STAGE2_EPOCHS=5 \
 LEARNING_RATE=5e-4 STAGE1_KL_WEIGHT=1.0 \
-bash scripts/run_training_dlite_two_stage.sh --dt h100
+bash scripts/dlite/run_training_dlite_two_stage.sh --dt h100
 ```
 
 Both stages consume the same `TRAIN_DATA_PATH`. The student backbone always
@@ -87,6 +92,26 @@ All three launchers also support offline `regen_full` training. Replace
 and set `TP_SIZE=1` plus `SHARD_DRAFT_BY_TP=0`. The two data variables are
 mutually exclusive. Offline mode skips target-transformer prefill and computes
 target logits from cached final-norm hidden states with the frozen LM head.
+
+Online training can instead disaggregate target prefill from draft training.
+For the 8-GPU TP2/EP2 topology (three target replicas and two draft ranks):
+
+```bash
+DISAGGREGATE=1 NPROC_PER_NODE=8 \
+RANK_TARGET_PER_NODE=6 RANK_DRAFT_PER_NODE=2 \
+TARGET_TP_SIZE=2 SGLANG_EP_SIZE=2 \
+NODE_BATCH_SIZE=6 DRAFT_MICRO_BATCH_SIZE=3 PIPELINE_DEPTH=2 \
+TARGET_MODEL_BACKEND=sglang TARGET_MODEL=/path/to/target \
+TRAIN_DATA_PATH=/path/to/train.jsonl OUTPUT_DIR=/path/to/output \
+bash scripts/dlite/run_training_dlite_teacher.sh --dt h100
+```
+
+The same variables work with the SFT and two-stage launchers. Target ranks run
+the TP/EP-sharded SGLang transformer and send selected hidden states only.
+Draft ranks run draft FSDP and hold a frozen full target embedding/LM head, so
+vocabulary logits never cross the target-to-draft bridge. Disaggregation is
+online-only and cannot be combined with `TRAIN_HIDDEN_STATES_PATH` or
+`SHARD_DRAFT_BY_TP=1`.
 
 See [docs/TRAINING.md](docs/TRAINING.md) for configuration details.
 

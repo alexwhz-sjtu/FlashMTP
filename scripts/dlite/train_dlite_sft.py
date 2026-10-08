@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Train the standalone global-position SWA draft teacher."""
+"""Train a DLite student directly with supervised target-model objectives."""
 
 import argparse
 import logging
 import os
-import time
 
-# SGLang and FlexAttention lazily compile CUDA kernels. Give every torchrun
-# worker separate persistent caches so concurrent multi-node builds and
-# autotuning cannot corrupt or reuse another rank's intermediate artifacts.
-_project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# SGLang and FlexAttention compile lazily. Keep worker caches separate so
+# concurrent torchrun ranks cannot corrupt one another's artifacts.
+_project_dir = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 _global_rank = os.environ.get("RANK", "0")
 
 
@@ -29,7 +29,6 @@ _configure_rank_cache("TRITON_CACHE_DIR", "TRITON_CACHE_ROOT", "triton")
 import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
-from torch._inductor import config as inductor_config
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -40,7 +39,7 @@ from torch.distributed.fsdp import (
 )
 from tqdm import tqdm
 
-from scripts.dlite_training import (
+from scripts.dlite.dlite_training import (
     add_common_args,
     build_draft_model,
     build_target_and_components,
@@ -66,44 +65,40 @@ from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker, get_tracker_class
 from specforge.utils import print_on_rank0
 
-inductor_config.triton.autotune_pointwise = (
-    os.environ.get("DLITE_POINTWISE_AUTOTUNE", "0") == "1"
-)
-
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train DLite SWA teacher")
+    parser = argparse.ArgumentParser(
+        description="Direct supervised DLite student training"
+    )
     add_common_args(parser)
+    parser.add_argument(
+        "--local-position",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the pivot_q_student local-position layout (required).",
+    )
     parser.add_argument(
         "--init-from",
         help=(
-            "Initialize draft weights/config from a checkpoint but start a fresh "
-            "optimizer, data cursor, and global step."
+            "Initialize student weights/config from a checkpoint while starting "
+            "a fresh optimizer, scheduler, and data cursor."
         ),
     )
-    parser.add_argument("--num-epochs", type=int, default=6)
-    parser.add_argument("--learning-rate", type=float, default=5e-4)
+    parser.add_argument("--num-epochs", type=int, default=10)
+    parser.add_argument("--learning-rate", type=float, default=4e-4)
     parser.add_argument("--warmup-ratio", type=float, default=0.04)
-    parser.add_argument("--final-ce-weight", type=float, default=1.0)
+    parser.add_argument("--final-ce-weight", type=float, default=0.1)
     parser.add_argument("--tv-loss-weight", type=float, default=1.0)
     parser.add_argument("--base-lm-ce-weight", type=float, default=0.0)
     parser.add_argument("--loss-decay-gamma", type=float)
     parser.add_argument("--base-lm-ce-decay-gamma", type=float)
-    parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=None,
-        help="Optional short-run limit, primarily for reproducible benchmarks.",
-    )
-    parser.add_argument(
-        "--no-final-save",
-        action="store_true",
-        help="Skip the final checkpoint (useful for throughput benchmarks).",
-    )
     args = parser.parse_args()
+
     validate_common_args(parser, args)
     if args.resume_from and args.init_from:
         parser.error("--resume-from and --init-from are mutually exclusive")
+    if not args.local_position:
+        parser.error("Direct DLite student training requires --local-position")
     if args.num_epochs <= 0:
         parser.error("--num-epochs must be positive")
     if args.learning_rate <= 0:
@@ -116,28 +111,87 @@ def parse_args():
         args.base_lm_ce_weight,
     )
     if any(weight < 0 for weight in loss_weights):
-        parser.error("Teacher loss weights must be non-negative")
+        parser.error("Loss weights must be non-negative")
     if sum(loss_weights) == 0:
-        parser.error("At least one teacher loss weight must be positive")
+        parser.error("At least one loss weight must be positive")
     get_tracker_class(args.report_to).validate_args(parser, args)
     return args
 
 
 def _sync_args_from_checkpoint(args, draft: DLiteDraftModel) -> None:
-    if not draft.is_teacher:
-        raise ValueError("Teacher training can only resume an swa_teacher checkpoint.")
+    if not draft.is_student:
+        raise ValueError("SFT requires a pivot_q_student checkpoint.")
     args.block_size = draft.block_size
     args.dlite_version = draft.architecture_version
     args.num_draft_layers = draft.config.num_hidden_layers
-    args.swa_window_size = draft.swa_window_size
     args.chs_num_layers = draft.chs_num_layers
     args.target_layer_ids = ",".join(str(value) for value in draft.target_layer_ids)
     args.sequential_head = draft.sequential_head_type
     args.sequential_rank = draft.sequential_rank
-    # Transformers does not serialize the private attention implementation
-    # selector and defaults a reloaded checkpoint to SDPA.  Teacher training
-    # supplies a torch BlockMask, which is supported by FlexAttention only.
     draft.config._attn_implementation = "flex_attention"
+
+
+def _validate_resume_state(args, state: dict, total_steps: int) -> None:
+    if state.get("training_stage") != "sft":
+        raise ValueError(
+            "SFT can only resume an SFT checkpoint; got "
+            f"{state.get('training_stage')!r}. Use --init-from to import weights only."
+        )
+    expected_data = training_data_identity(args)
+    saved_data = state.get("train_data_identity")
+    if saved_data is not None and saved_data != expected_data:
+        raise ValueError(
+            "Training dataset must match the resumed checkpoint: "
+            f"saved={saved_data!r}, provided={expected_data!r}."
+        )
+    expected_mode = "regen_full" if args.train_hidden_states_path else "online"
+    if state.get("train_data_mode", expected_mode) != expected_mode:
+        raise ValueError("Training data mode must match the resumed checkpoint.")
+    for key, requested in (
+        ("tp_size", int(args.tp_size)),
+        ("scheduler_total_steps", int(total_steps)),
+        ("scheduler_learning_rate", float(args.learning_rate)),
+        ("scheduler_warmup_ratio", float(args.warmup_ratio)),
+    ):
+        if state.get(key) is not None and state[key] != requested:
+            raise ValueError(
+                f"{key} must match the resumed checkpoint: "
+                f"saved={state[key]!r}, requested={requested!r}."
+            )
+    if state.get("shard_draft_by_tp") is not None and bool(
+        state["shard_draft_by_tp"]
+    ) != bool(args.shard_draft_by_tp):
+        raise ValueError("--shard-draft-by-tp must match the resumed checkpoint.")
+
+
+def _checkpoint_metadata(
+    args,
+    *,
+    epoch: int,
+    next_batch: int,
+    train_step: int,
+    global_step: int,
+    optimizer_step: int,
+    scheduler_total_steps: int,
+) -> dict:
+    return {
+        "training_stage": "sft",
+        "stage_epoch": int(epoch),
+        "next_batch_in_epoch": int(next_batch),
+        "stage_step": int(train_step),
+        "global_step": int(global_step),
+        "optimizer_step": int(optimizer_step),
+        "scheduler_total_steps": int(scheduler_total_steps),
+        "scheduler_learning_rate": float(args.learning_rate),
+        "scheduler_warmup_ratio": float(args.warmup_ratio),
+        "shard_draft_by_tp": bool(args.shard_draft_by_tp),
+        "tp_size": int(args.tp_size),
+        "train_data_identity": training_data_identity(args),
+        "train_data_mode": (
+            "regen_full" if args.train_hidden_states_path else "online"
+        ),
+        "local_position": True,
+    }
 
 
 @record
@@ -145,62 +199,61 @@ def main():
     logging.basicConfig(level=logging.INFO)
     args = parse_args()
     set_seed(args.seed)
+    if args.disaggregate:
+        from scripts.dlite.dlite_disaggregate import run_disaggregated
+
+        run_disaggregated(args, mode="sft")
+        return
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
-    print(
-        f"[rank {dist.get_rank()}] JIT caches: "
-        f"tvm={os.environ['TVM_FFI_CACHE_DIR']}, "
-        f"inductor={os.environ['TORCHINDUCTOR_CACHE_DIR']}, "
-        f"triton={os.environ['TRITON_CACHE_DIR']}; "
-        f"pointwise_autotune={inductor_config.triton.autotune_pointwise}",
-        flush=True,
-    )
     tp_draft_rank = validate_tp_draft_sharding(args)
 
     resume_state = load_training_state(args.resume_from)
-    if resume_state is not None:
-        expected_identity = training_data_identity(args)
-        if (
-            resume_state.get("train_data_identity", expected_identity)
-            != expected_identity
-        ):
-            raise ValueError("Training dataset must match the resumed checkpoint.")
-        expected_mode = "regen_full" if args.train_hidden_states_path else "online"
-        if resume_state.get("train_data_mode", expected_mode) != expected_mode:
-            raise ValueError("Training data mode must match the resumed checkpoint.")
     if args.init_from:
-        draft = DLiteDraftModel.from_pretrained(
+        student = DLiteDraftModel.from_pretrained(
             args.init_from,
             torch_dtype=torch.bfloat16,
             attn_implementation="flex_attention",
         ).cuda()
-        _sync_args_from_checkpoint(args, draft)
+        _sync_args_from_checkpoint(args, student)
         print_on_rank0(
-            f"Initialized teacher weights from {args.init_from}; "
+            f"Initialized student weights from {args.init_from}; "
             "optimizer and training cursor start fresh."
         )
-    elif resume_state is None:
-        draft = build_draft_model(args, model_role="swa_teacher")
-    else:
-        draft = DLiteDraftModel.from_pretrained(
+    elif resume_state is not None:
+        student = DLiteDraftModel.from_pretrained(
             args.resume_from,
             torch_dtype=torch.bfloat16,
             attn_implementation="flex_attention",
         ).cuda()
-        _sync_args_from_checkpoint(args, draft)
+        _sync_args_from_checkpoint(args, student)
+    else:
+        student = build_draft_model(args, model_role="pivot_q_student")
+        print_on_rank0("Initialized pivot_q_student from the target config.")
+
+    student.requires_grad_(True)
     target, tokenizer, components, mask_token_id = build_target_and_components(
-        args, [draft]
+        args, [student]
     )
     dataloader = build_train_dataloader(
         args,
         tokenizer,
-        required_layer_ids=required_hidden_layer_ids([draft]),
+        train_data_path=args.train_data_path,
+        cache_namespace="sft",
+        num_proc=args.build_dataset_num_proc,
+        required_layer_ids=required_hidden_layer_ids([student]),
     )
+    scheduler_total_steps = stage_total_steps(
+        dataloader, args.num_epochs, args.accumulation_steps
+    )
+    if resume_state is not None:
+        _validate_resume_state(args, resume_state, scheduler_total_steps)
+
     online = OnlineDLiteModel(
-        draft_model=draft,
+        draft_model=student,
         target_lm_head=components.lm_head,
         target_embed_tokens=components.embed_tokens,
         mask_token_id=mask_token_id,
-        block_size=draft.block_size,
+        block_size=student.block_size,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
         final_ce_weight=args.final_ce_weight,
@@ -219,19 +272,20 @@ def main():
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
     )
     optimizer = BF16Optimizer(
-        draft,
+        student,
         lr=args.learning_rate,
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.warmup_ratio,
-        total_steps=stage_total_steps(
-            dataloader, args.num_epochs, args.accumulation_steps
-        ),
+        total_steps=scheduler_total_steps,
     )
+    optimizer_step = 0
     if resume_state is not None:
         optimizer.load_state_dict(resume_state)
+        optimizer_step = int(resume_state.get("optimizer_step", 0))
+
     tracker = create_tracker(args, args.output_dir)
-    start_epoch, start_batch, stage_step, global_step = resume_cursor(
-        resume_state, "teacher"
+    start_epoch, start_batch, train_step, global_step = resume_cursor(
+        resume_state, "sft"
     )
     micro_steps = 0
     loss_denominator_sum = None
@@ -239,9 +293,9 @@ def main():
 
     for epoch in range(start_epoch, args.num_epochs):
         dataloader.sampler.set_epoch(epoch)
-        draft.train()
+        student.train()
         iterator = (
-            tqdm(dataloader, desc=f"Teacher epoch {epoch}")
+            tqdm(dataloader, desc=f"SFT epoch {epoch}")
             if dist.get_rank() == 0
             else dataloader
         )
@@ -249,11 +303,7 @@ def main():
             if epoch == start_epoch and batch_idx < start_batch:
                 continue
             global_step += 1
-            stage_step += 1
-            debug_t0 = time.perf_counter()
-            trace_first_step = global_step == 1
-            if trace_first_step:
-                print(f"[rank {dist.get_rank()}] step1: batch loaded", flush=True)
+            train_step += 1
             input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
@@ -264,7 +314,7 @@ def main():
                 hidden_states, target_logits = load_cached_target_data(
                     data,
                     anchors=anchors,
-                    block_size=draft.block_size,
+                    block_size=student.block_size,
                     lm_head=components.lm_head,
                     need_logits=True,
                 )
@@ -272,18 +322,8 @@ def main():
                 target_output = target.generate_dlite_data(
                     input_ids, attention_mask, loss_mask
                 )
-            if global_step <= 3 and dist.get_rank() == 0:
-                torch.cuda.synchronize()
-                print(
-                    f"[timing] step={global_step} target={time.perf_counter() - debug_t0:.2f}s",
-                    flush=True,
-                )
-            if trace_first_step:
-                print(
-                    f"[rank {dist.get_rank()}] step1: target prefill done", flush=True
-                )
-            if not args.train_hidden_states_path:
                 hidden_states = hidden_states_to_cuda(target_output.hidden_states)
+                target_prefill_logits = target_output.logits.cuda()
             if tp_draft_rank is not None:
                 input_ids = select_tp_rank_batch(input_ids, tp_draft_rank)
                 loss_mask = select_tp_rank_batch(loss_mask, tp_draft_rank)
@@ -291,25 +331,13 @@ def main():
                 block_keep = select_tp_rank_batch(block_keep, tp_draft_rank)
                 hidden_states = select_tp_rank_batch(hidden_states, tp_draft_rank)
                 target_prefill_logits = select_tp_rank_batch(
-                    target_output.logits.cuda(), tp_draft_rank
+                    target_prefill_logits, tp_draft_rank
                 )
-            elif not args.train_hidden_states_path:
-                target_prefill_logits = target_output.logits.cuda()
             if not args.train_hidden_states_path:
                 target_logits = gather_target_prefill_logits(
-                    target_prefill_logits, anchors, draft.block_size
+                    target_prefill_logits, anchors, student.block_size
                 )
-            if trace_first_step:
-                print(
-                    f"[rank {dist.get_rank()}] step1: target logits gathered",
-                    flush=True,
-                )
-            if not args.train_hidden_states_path:
                 del target_output, target_prefill_logits
-            # Preparation uses trainable draft modules (for example
-            # ``history_fuse``), so it must run inside FSDP.forward().  Calling
-            # ``online.prepare_batch`` directly here observes empty local
-            # parameter shards on non-owning ranks.
             (
                 loss,
                 accuracy,
@@ -328,14 +356,6 @@ def main():
                 target_prefill_logits=target_logits,
                 target_logits_are_gathered=True,
             )
-            if global_step <= 3 and dist.get_rank() == 0:
-                torch.cuda.synchronize()
-                print(
-                    f"[timing] step={global_step} forward={time.perf_counter() - debug_t0:.2f}s",
-                    flush=True,
-                )
-            if trace_first_step:
-                print(f"[rank {dist.get_rank()}] step1: draft forward done", flush=True)
             del hidden_states, target_logits
             (loss_numerator / args.accumulation_steps).backward()
             loss_denominator_sum = (
@@ -343,15 +363,8 @@ def main():
                 if loss_denominator_sum is None
                 else loss_denominator_sum + loss_denominator.detach()
             )
-            if global_step <= 3 and dist.get_rank() == 0:
-                torch.cuda.synchronize()
-                print(
-                    f"[timing] step={global_step} backward={time.perf_counter() - debug_t0:.2f}s",
-                    flush=True,
-                )
-            if trace_first_step:
-                print(f"[rank {dist.get_rank()}] step1: backward done", flush=True)
             micro_steps += 1
+            grad_norm = None
             if micro_steps == args.accumulation_steps:
                 normalize_accumulated_gradients(
                     optimizer,
@@ -360,26 +373,9 @@ def main():
                     group=fsdp.process_group,
                 )
                 grad_norm = optimizer.step()
+                optimizer_step += 1
                 micro_steps = 0
                 loss_denominator_sum = None
-            else:
-                grad_norm = None
-            if global_step <= 3 and dist.get_rank() == 0:
-                torch.cuda.synchronize()
-                print(
-                    f"[timing] step={global_step} complete={time.perf_counter() - debug_t0:.2f}s",
-                    flush=True,
-                )
-
-            if args.max_steps is not None:
-                torch.cuda.synchronize()
-                if dist.get_rank() == 0:
-                    print(
-                        f"[benchmark] step={global_step} dt={time.perf_counter() - debug_t0:.4f}s "
-                        f"seq={input_ids.size(1)} "
-                        f"peak_alloc_gib={torch.cuda.max_memory_allocated() / 1024**3:.3f}",
-                        flush=True,
-                    )
 
             if global_step % args.log_interval == 0:
                 metrics = torch.stack(
@@ -395,45 +391,39 @@ def main():
                 dist.all_reduce(metrics)
                 metrics /= dist.get_world_size()
                 payload = {
-                    "teacher/loss": metrics[0].item(),
-                    "teacher/accuracy": metrics[1].item(),
-                    "teacher/prefix_acc": metrics[2].item(),
-                    "teacher/final_ce": metrics[3].item(),
-                    "teacher/base_ce": metrics[4].item(),
-                    "teacher/tv": metrics[5].item(),
-                    "teacher/lr": optimizer.get_learning_rate(),
+                    "train/loss": metrics[0].item(),
+                    "train/accuracy": metrics[1].item(),
+                    "train/prefix_acc": metrics[2].item(),
+                    "train/final_ce": metrics[3].item(),
+                    "train/base_ce": metrics[4].item(),
+                    "train/tv": metrics[5].item(),
+                    "train/lr": optimizer.get_learning_rate(),
                 }
                 if grad_norm is not None:
-                    payload["teacher/grad_norm"] = grad_norm
+                    payload["train/grad_norm"] = grad_norm
                 tracker.log(payload, step=global_step)
                 print_on_rank0(
-                    f"teacher step={global_step} loss={metrics[0]:.4f} acc={metrics[1]:.4f}"
+                    f"sft step={global_step} loss={metrics[0]:.4f} "
+                    f"acc={metrics[1]:.4f}"
                 )
             if global_step % args.save_interval == 0 and micro_steps == 0:
                 save_checkpoint(
                     output_dir=args.output_dir,
-                    name=f"epoch_{epoch}_step_{global_step}",
+                    name=f"epoch_{epoch}_step_{train_step}",
                     fsdp_model=fsdp,
-                    draft_model=draft,
+                    draft_model=student,
                     optimizer=optimizer,
-                    metadata={
-                        "training_stage": "teacher",
-                        "stage_epoch": epoch,
-                        "next_batch_in_epoch": batch_idx + 1,
-                        "stage_step": stage_step,
-                        "global_step": global_step,
-                        "serial_head_inherited": False,
-                        "train_data_identity": training_data_identity(args),
-                        "train_data_mode": (
-                            "regen_full" if args.train_hidden_states_path else "online"
-                        ),
-                    },
+                    metadata=_checkpoint_metadata(
+                        args,
+                        epoch=epoch,
+                        next_batch=batch_idx + 1,
+                        train_step=train_step,
+                        global_step=global_step,
+                        optimizer_step=optimizer_step,
+                        scheduler_total_steps=scheduler_total_steps,
+                    ),
                 )
-            if args.max_steps is not None and global_step >= args.max_steps:
-                break
         start_batch = 0
-        if args.max_steps is not None and global_step >= args.max_steps:
-            break
 
     if micro_steps:
         normalize_accumulated_gradients(
@@ -443,31 +433,29 @@ def main():
             group=fsdp.process_group,
         )
         optimizer.step()
-    if not args.no_final_save:
-        save_checkpoint(
-            output_dir=args.output_dir,
-            name="final",
-            fsdp_model=fsdp,
-            draft_model=draft,
-            optimizer=optimizer,
-            metadata={
-                "training_stage": "teacher",
-                "stage_epoch": args.num_epochs,
-                "next_batch_in_epoch": 0,
-                "stage_step": stage_step,
-                "global_step": global_step,
-                "serial_head_inherited": False,
-                "train_data_identity": training_data_identity(args),
-                "train_data_mode": (
-                    "regen_full" if args.train_hidden_states_path else "online"
-                ),
-            },
-        )
-    memory = log_cuda_peak("teacher")
+        optimizer_step += 1
+
+    save_checkpoint(
+        output_dir=args.output_dir,
+        name="final",
+        fsdp_model=fsdp,
+        draft_model=student,
+        optimizer=optimizer,
+        metadata=_checkpoint_metadata(
+            args,
+            epoch=args.num_epochs,
+            next_batch=0,
+            train_step=train_step,
+            global_step=global_step,
+            optimizer_step=optimizer_step,
+            scheduler_total_steps=scheduler_total_steps,
+        ),
+    )
+    memory = log_cuda_peak("sft")
     tracker.log(
         {
-            "teacher/cuda_peak_allocated_gib": memory["allocated_gib"],
-            "teacher/cuda_peak_reserved_gib": memory["reserved_gib"],
+            "train/cuda_peak_allocated_gib": memory["allocated_gib"],
+            "train/cuda_peak_reserved_gib": memory["reserved_gib"],
         },
         step=global_step,
     )

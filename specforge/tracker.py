@@ -37,6 +37,7 @@ def _clip_wandb_identifier(value: Optional[str], field: str) -> Optional[str]:
     )
     return clipped
 
+
 # --- Lazy Imports ---
 # These libraries are imported only when their respective trackers are used.
 try:
@@ -76,6 +77,8 @@ class Tracker(abc.ABC):
         self.args = args
         self.output_dir = output_dir
         self.rank = dist.get_rank()
+        self.coordinator_rank = int(getattr(args, "tracker_global_rank", 0))
+        self.is_coordinator = self.rank == self.coordinator_rank
         self.is_initialized = False
 
     @classmethod
@@ -160,7 +163,7 @@ class WandbTracker(Tracker):
 
     def __init__(self, args, output_dir: str):
         super().__init__(args, output_dir)
-        if self.rank == 0:
+        if self.is_coordinator:
             if _wandb_requires_login():
                 wandb.login(key=args.wandb_key)
             # wandb_run_id: optional stable id from launch scripts; resume="allow" continues an
@@ -178,11 +181,11 @@ class WandbTracker(Tracker):
             self.is_initialized = True
 
     def log(self, log_dict: Dict[str, Any], step: Optional[int] = None):
-        if self.rank == 0 and self.is_initialized:
+        if self.is_coordinator and self.is_initialized:
             wandb.log(log_dict, step=step)
 
     def close(self):
-        if self.rank == 0 and self.is_initialized and wandb.run:
+        if self.is_coordinator and self.is_initialized and wandb.run:
             wandb.finish()
             self.is_initialized = False
 
@@ -217,7 +220,7 @@ class SwanlabTracker(Tracker):
 
     def __init__(self, args, output_dir: str):
         super().__init__(args, output_dir)
-        if self.rank == 0:
+        if self.is_coordinator:
             if args.swanlab_key:
                 swanlab.login(api_key=args.swanlab_key)
 
@@ -232,11 +235,15 @@ class SwanlabTracker(Tracker):
             self.is_initialized = True
 
     def log(self, log_dict: Dict[str, Any], step: Optional[int] = None):
-        if self.rank == 0 and self.is_initialized:
+        if self.is_coordinator and self.is_initialized:
             swanlab.log(log_dict, step=step)
 
     def close(self):
-        if self.rank == 0 and self.is_initialized and swanlab.get_run() is not None:
+        if (
+            self.is_coordinator
+            and self.is_initialized
+            and swanlab.get_run() is not None
+        ):
             swanlab.finish()
             self.is_initialized = False
 
@@ -253,19 +260,19 @@ class TensorboardTracker(Tracker):
 
     def __init__(self, args, output_dir: str):
         super().__init__(args, output_dir)
-        if self.rank == 0:
+        if self.is_coordinator:
             log_dir = os.path.join(output_dir, "runs")
             self.writer = SummaryWriter(log_dir=log_dir)
             self.is_initialized = True
 
     def log(self, log_dict: Dict[str, Any], step: Optional[int] = None):
-        if self.rank == 0 and self.is_initialized:
+        if self.is_coordinator and self.is_initialized:
             for key, value in log_dict.items():
                 if isinstance(value, (int, float)):
                     self.writer.add_scalar(key, value, global_step=step)
 
     def close(self):
-        if self.rank == 0 and self.is_initialized:
+        if self.is_coordinator and self.is_initialized:
             self.writer.close()
             self.is_initialized = False
 
@@ -296,7 +303,7 @@ class MLflowTracker(Tracker):
 
     def __init__(self, args, output_dir: str):
         super().__init__(args, output_dir)
-        if self.rank == 0:
+        if self.is_coordinator:
             if args.mlflow_tracking_uri:
                 mlflow.set_tracking_uri(args.mlflow_tracking_uri)
 
@@ -307,12 +314,12 @@ class MLflowTracker(Tracker):
             self.is_initialized = True
 
     def log(self, log_dict: Dict[str, Any], step: Optional[int] = None):
-        if self.rank == 0 and self.is_initialized:
+        if self.is_coordinator and self.is_initialized:
             # MLflow's log_metrics takes a dictionary directly
             mlflow.log_metrics(log_dict, step=step)
 
     def close(self):
-        if self.rank == 0 and self.is_initialized:
+        if self.is_coordinator and self.is_initialized:
             mlflow.end_run()
             self.is_initialized = False
 

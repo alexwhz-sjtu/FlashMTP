@@ -61,6 +61,18 @@ def standard_record(record_id):
     }
 
 
+def test_regen_accepts_missing_category_and_normalizes_to_none():
+    record = {
+        "id": "no-category",
+        "conversations": [{"role": "user", "content": "prompt"}],
+        "source": "unit",
+    }
+
+    validated = regen.validate_record(record, 1)
+
+    assert validated["category"] is None
+
+
 def test_default_save_mode_paths():
     regen_path = regen.default_output_path(
         SimpleNamespace(

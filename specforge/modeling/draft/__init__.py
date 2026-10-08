@@ -6,6 +6,10 @@ from .dlite import (
     gather_pivot_multilayer_inference,
 )
 from .sequential_head import DLiteSequentialHead
+from .dflash import DFlashDraftModel
+from .dflash2 import DFlash2DraftModel
+from .dspark import DSparkDraftModel
+from .registry import DRAFT_REGISTRY, available_drafts, register_draft, resolve_draft
 
 __all__ = [
     "DLiteDraftModel",
@@ -14,4 +18,11 @@ __all__ = [
     "DLiteSequentialHead",
     "build_dlite_target_layer_ids",
     "gather_pivot_multilayer_inference",
+    "DFlashDraftModel",
+    "DFlash2DraftModel",
+    "DSparkDraftModel",
+    "DRAFT_REGISTRY",
+    "available_drafts",
+    "register_draft",
+    "resolve_draft",
 ]

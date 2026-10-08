@@ -9,6 +9,7 @@ in a declarative JSON adapter or in a trusted Python adapter exposing
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib.util
 import json
 import os
@@ -21,6 +22,7 @@ from typing import Any, Callable
 
 INPUT_FORMATS = ("auto", "json", "jsonl", "parquet", "hf")
 TURN_MODES = ("multi", "first")
+HF_FILTER_OPERATORS = {"=", "==", "!=", ">", ">=", "<", "<=", "in", "not in"}
 DEFAULT_ROLE_MAP = {
     "system": "system",
     "user": "user",
@@ -287,8 +289,45 @@ def iter_parquet(path: Path) -> Iterator[Mapping[str, Any]]:
         raise ConversionError(f"failed to read Parquet input {path}: {exc}") from exc
 
 
+def _parse_hf_filter_value(raw_value: str) -> Any:
+    """Parse JSON scalars/arrays while leaving ordinary CLI strings unchanged."""
+    try:
+        return json.loads(raw_value)
+    except json.JSONDecodeError:
+        return raw_value
+
+
+def normalize_hf_filters(
+    raw_filters: list[list[str]] | None,
+) -> list[tuple[str, str, Any]] | None:
+    if not raw_filters:
+        return None
+    filters = []
+    for column, operator, raw_value in raw_filters:
+        column = column.strip()
+        operator = operator.strip().lower()
+        if not column:
+            raise ConversionError("--hf-filter column must be non-empty")
+        if operator not in HF_FILTER_OPERATORS:
+            supported = ", ".join(sorted(HF_FILTER_OPERATORS))
+            raise ConversionError(
+                f"unsupported Hugging Face filter operator {operator!r}; "
+                f"choose one of: {supported}"
+            )
+        value = _parse_hf_filter_value(raw_value)
+        if operator in {"in", "not in"} and not isinstance(value, list):
+            raise ConversionError(
+                f"--hf-filter with operator {operator!r} requires a JSON array value"
+            )
+        filters.append((column, operator, value))
+    return filters
+
+
 def _load_hf_dataset(
-    dataset_id: str, hf_config: str | None, split: str
+    dataset_id: str,
+    hf_config: str | None,
+    split: str,
+    hf_filters: list[tuple[str, str, Any]] | None = None,
 ) -> Iterable[Any]:
     try:
         from datasets import load_dataset
@@ -299,6 +338,8 @@ def _load_hf_dataset(
     kwargs: dict[str, Any] = {"split": split, "streaming": True}
     if hf_config is not None:
         kwargs["name"] = hf_config
+    if hf_filters is not None:
+        kwargs["filters"] = hf_filters
     try:
         return load_dataset(dataset_id, **kwargs)
     except Exception as exc:
@@ -313,12 +354,15 @@ def iter_records(
     records_path: str | None,
     hf_config: str | None,
     split: str,
+    hf_filters: list[tuple[str, str, Any]] | None = None,
 ) -> Iterator[Mapping[str, Any]]:
     resolved_format = infer_input_format(input_value, input_format)
     if resolved_format != "json" and records_path is not None:
         raise ConversionError("--records-path only applies to JSON input")
     if resolved_format != "hf" and hf_config is not None:
         raise ConversionError("--hf-config only applies to Hugging Face input")
+    if resolved_format != "hf" and hf_filters is not None:
+        raise ConversionError("--hf-filter only applies to Hugging Face input")
 
     if resolved_format == "jsonl":
         yield from iter_jsonl(_require_local_file(input_value, resolved_format))
@@ -329,7 +373,9 @@ def iter_records(
     elif resolved_format == "parquet":
         yield from iter_parquet(_require_local_file(input_value, resolved_format))
     elif resolved_format == "hf":
-        for index, row in enumerate(_load_hf_dataset(input_value, hf_config, split)):
+        for index, row in enumerate(
+            _load_hf_dataset(input_value, hf_config, split, hf_filters)
+        ):
             if not isinstance(row, Mapping):
                 raise ConversionError(f"Hugging Face record {index} is not an object")
             yield row
@@ -388,9 +434,13 @@ def normalize_extracted(
                 raise ConversionError(
                     f"message {index} has unsupported normalized role {role!r}"
                 )
-            content = _normalize_content(message.get("content"), f"message {index}")
-            if role in {"system", "user"}:
-                messages.append({"role": role, "content": content})
+            if role not in {"system", "user"}:
+                continue
+            raw_content = message.get("content")
+            if isinstance(raw_content, str) and not raw_content.strip():
+                continue
+            content = _normalize_content(raw_content, f"message {index}")
+            messages.append({"role": role, "content": content})
 
     if turn_mode == "first":
         first_user = next(
@@ -464,7 +514,12 @@ def inspect_records(args: argparse.Namespace) -> dict[str, Any]:
     candidate_paths: dict[str, int] = {}
     for index, row in enumerate(
         iter_records(
-            args.input, args.input_format, args.records_path, args.hf_config, args.split
+            args.input,
+            args.input_format,
+            args.records_path,
+            args.hf_config,
+            args.split,
+            normalize_hf_filters(args.hf_filter),
         )
     ):
         if index >= args.rows:
@@ -523,6 +578,7 @@ def convert_records(args: argparse.Namespace) -> dict[str, Any]:
                 args.records_path,
                 args.hf_config,
                 args.split,
+                normalize_hf_filters(args.hf_filter),
             )
             for row_index, row in enumerate(records):
                 if args.limit is not None and processed >= args.limit:
@@ -583,6 +639,16 @@ def add_source_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--hf-config", help="Hugging Face dataset configuration name")
     parser.add_argument(
+        "--hf-filter",
+        action="append",
+        nargs=3,
+        metavar=("COLUMN", "OPERATOR", "VALUE"),
+        help=(
+            "Hugging Face Parquet filter; repeat for AND conditions. "
+            "Values are parsed as JSON when possible."
+        ),
+    )
+    parser.add_argument(
         "--split", default="train", help="Hugging Face split (default: train)"
     )
 
@@ -634,6 +700,11 @@ def main(argv: list[str] | None = None) -> int:
     except ConversionError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        # Streaming Parquet readers can retain cyclic references to background
+        # scanner resources until interpreter shutdown. Collect them while the
+        # Python runtime is still fully initialized, especially after --limit.
+        gc.collect()
     return 0
 
 

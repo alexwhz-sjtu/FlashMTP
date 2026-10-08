@@ -10,11 +10,11 @@ class TrainingSurfaceTest(unittest.TestCase):
         sources = "\n".join(
             (ROOT / path).read_text(encoding="utf-8")
             for path in (
-                "scripts/dlite_training.py",
-                "scripts/train_dlite_teacher.py",
-                "scripts/run_training_dlite_teacher.sh",
-                "scripts/train_dlite_two_stage.py",
-                "scripts/run_training_dlite_two_stage.sh",
+                "scripts/dlite/dlite_training.py",
+                "scripts/dlite/train_dlite_teacher.py",
+                "scripts/dlite/run_training_dlite_teacher.sh",
+                "scripts/dlite/train_dlite_two_stage.py",
+                "scripts/dlite/run_training_dlite_two_stage.sh",
                 "specforge/core/dlite.py",
                 "specforge/modeling/draft/sequential_head.py",
             )

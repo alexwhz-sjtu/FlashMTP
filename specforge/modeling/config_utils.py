@@ -6,7 +6,6 @@ from typing import Any
 
 from transformers import AutoConfig, PretrainedConfig, Qwen3Config
 
-
 QWEN35_MODEL_TYPES = {"qwen3_5", "qwen3_5_moe"}
 
 
@@ -37,16 +36,30 @@ def _qwen35_text_dict_to_qwen3_config(
     if not isinstance(text_config, dict):
         raise ValueError("Qwen3.5 config is missing the required text_config object.")
 
+    # Dense Qwen3.5 checkpoints expose ``intermediate_size``.  MoE variants do
+    # not have a single dense FFN width, so use the shared expert width for the
+    # dense DLite draft (and fall back to an individual routed expert width).
+    # This choice affects only the trainable draft backbone; the target keeps
+    # its native MoE configuration inside SGLang.
+    intermediate_size = text_config.get("intermediate_size")
+    if intermediate_size is None:
+        intermediate_size = text_config.get("shared_expert_intermediate_size")
+    if intermediate_size is None:
+        intermediate_size = text_config.get("moe_intermediate_size")
+
     required = (
         "vocab_size",
         "hidden_size",
-        "intermediate_size",
         "num_hidden_layers",
         "num_attention_heads",
         "num_key_value_heads",
         "head_dim",
     )
     missing = [name for name in required if text_config.get(name) is None]
+    if intermediate_size is None:
+        missing.append(
+            "intermediate_size/shared_expert_intermediate_size/" "moe_intermediate_size"
+        )
     if missing:
         raise ValueError(
             "Qwen3.5 text_config is missing required DLite fields: "
@@ -58,7 +71,7 @@ def _qwen35_text_dict_to_qwen3_config(
     kwargs: dict[str, Any] = {
         "vocab_size": int(text_config["vocab_size"]),
         "hidden_size": int(text_config["hidden_size"]),
-        "intermediate_size": int(text_config["intermediate_size"]),
+        "intermediate_size": int(intermediate_size),
         "num_hidden_layers": num_hidden_layers,
         "num_attention_heads": int(text_config["num_attention_heads"]),
         "num_key_value_heads": int(text_config["num_key_value_heads"]),

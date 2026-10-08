@@ -56,8 +56,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     model.add_argument("--target-model-backend", default="hf", choices=["hf", "sglang"])
     model.add_argument(
         "--embedding-key",
-        default="model.embed_tokens.weight",
-        help="Target checkpoint embedding key used by standalone/offline components.",
+        default=None,
+        help=(
+            "Target checkpoint embedding key used by standalone/offline components. "
+            "By default it is inferred from the checkpoint index."
+        ),
     )
     model.add_argument(
         "--lm-head-key",
@@ -133,6 +136,15 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     )
     train.add_argument("--dist-timeout", type=int, default=1200)
     train.add_argument("--resume-from")
+    disagg = parser.add_argument_group("disaggregated target/draft execution")
+    disagg.add_argument("--disaggregate", action="store_true")
+    disagg.add_argument("--target-ranks-per-node", type=int)
+    disagg.add_argument("--draft-ranks-per-node", type=int)
+    disagg.add_argument("--target-tp-size", type=int)
+    disagg.add_argument("--node-batch-size", type=int)
+    disagg.add_argument("--draft-micro-batch-size", type=int)
+    disagg.add_argument("--pipeline-depth", type=int, default=2)
+    disagg.add_argument("--profile", action="store_true")
     sglang = parser.add_argument_group("sglang target backend")
     SGLangBackendArgs.add_args(sglang)
 
@@ -185,6 +197,61 @@ def validate_common_args(parser: argparse.ArgumentParser, args) -> None:
             parser.error(
                 "offline regen_full training does not support --shard-draft-by-tp"
             )
+    if args.disaggregate:
+        required = (
+            "target_ranks_per_node",
+            "draft_ranks_per_node",
+            "node_batch_size",
+        )
+        missing = [name for name in required if getattr(args, name) is None]
+        if missing:
+            parser.error(
+                "--disaggregate requires "
+                + ", ".join(f"--{name.replace('_', '-')}" for name in missing)
+            )
+        if args.train_hidden_states_path:
+            parser.error("--disaggregate supports --train-data-path only")
+        if args.shard_draft_by_tp:
+            parser.error("--disaggregate is incompatible with --shard-draft-by-tp")
+        args.target_tp_size = args.target_tp_size or args.tp_size
+        for name in (
+            "target_ranks_per_node",
+            "draft_ranks_per_node",
+            "target_tp_size",
+            "node_batch_size",
+            "pipeline_depth",
+        ):
+            if int(getattr(args, name)) <= 0:
+                parser.error(f"--{name.replace('_', '-')} must be positive")
+        if int(args.pipeline_depth) < 2:
+            parser.error("--pipeline-depth must be at least 2")
+        if int(args.target_ranks_per_node) % int(args.target_tp_size):
+            parser.error(
+                "--target-ranks-per-node must be divisible by --target-tp-size"
+            )
+        producers = int(args.target_ranks_per_node) // int(args.target_tp_size)
+        if int(args.node_batch_size) % producers:
+            parser.error("--node-batch-size must be divisible by target producers")
+        if int(args.node_batch_size) % int(args.draft_ranks_per_node):
+            parser.error("--node-batch-size must be divisible by draft ranks")
+        if int(args.target_tp_size) % int(args.sglang_ep_size):
+            parser.error("--target-tp-size must be divisible by --sglang-ep-size")
+        if (
+            int(args.target_tp_size) > 1 or int(args.sglang_ep_size) > 1
+        ) and args.target_model_backend != "sglang":
+            parser.error(
+                "disaggregated TP/EP > 1 requires --target-model-backend sglang"
+            )
+        local_draft_batch = int(args.node_batch_size) // int(args.draft_ranks_per_node)
+        if args.draft_micro_batch_size is None:
+            args.draft_micro_batch_size = local_draft_batch
+        if int(args.draft_micro_batch_size) <= 0 or (
+            local_draft_batch % int(args.draft_micro_batch_size)
+        ):
+            parser.error(
+                "--draft-micro-batch-size must divide the per-rank draft batch"
+            )
+        args.target_batch_size = int(args.node_batch_size) // producers
 
 
 def build_draft_config(args, *, model_role: str, source_config=None):
@@ -263,7 +330,7 @@ def build_draft_model(args, *, model_role: str, source_config=None):
     return DLiteDraftModel(config).cuda().to(torch.bfloat16)
 
 
-def build_target_model(args, draft_models: list[DLiteDraftModel]):
+def build_target_model(args, draft_models):
     target_config = load_text_model_config(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
@@ -303,8 +370,10 @@ def build_target_model(args, draft_models: list[DLiteDraftModel]):
     capture = set()
     for draft in draft_models:
         capture.update(draft.target_layer_ids)
-        if draft.is_teacher:
+        if getattr(draft, "is_teacher", False):
             capture.update(draft.history_layer_ids)
+    if getattr(args, "require_target_last_hidden", False):
+        capture.add(int(target_config.num_hidden_layers) - 1)
     target.set_capture_layers(sorted(capture))
     return target
 
@@ -384,11 +453,13 @@ def resolve_tokenizer_and_components(
     target_config = load_text_model_config(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
-    configured_mask_ids = [
-        draft.config.dlite_config.get("mask_token_id")
-        for draft in draft_models
-        if getattr(draft.config, "dlite_config", None)
-    ]
+    configured_mask_ids = []
+    for draft in draft_models:
+        method_config = getattr(draft.config, "dlite_config", None)
+        if method_config is None:
+            method_config = getattr(draft.config, "dflash_config", None)
+        if method_config:
+            configured_mask_ids.append(method_config.get("mask_token_id"))
     mask_token_id, mask_source = _select_mask_token_id(
         explicit_id=args.mask_token_id,
         configured_ids=configured_mask_ids,
@@ -434,7 +505,12 @@ def resolve_tokenizer_and_components(
     for draft in draft_models:
         draft.mask_token_id = mask_token_id
         draft.mask_embedding_mode = "vocab_row"
-        draft.config.dlite_config["mask_token_id"] = mask_token_id
+        if getattr(draft.config, "dlite_config", None) is not None:
+            draft.config.dlite_config["mask_token_id"] = mask_token_id
+        else:
+            method_config = dict(getattr(draft.config, "dflash_config", None) or {})
+            method_config["mask_token_id"] = mask_token_id
+            draft.config.dflash_config = method_config
     return tokenizer, components, mask_token_id
 
 
@@ -638,11 +714,11 @@ def training_data_identity(args) -> str:
     return identity
 
 
-def required_hidden_layer_ids(draft_models: list[DLiteDraftModel]) -> set[int]:
+def required_hidden_layer_ids(draft_models) -> set[int]:
     required: set[int] = set()
     for draft in draft_models:
         required.update(int(value) for value in draft.target_layer_ids)
-        if draft.is_teacher:
+        if getattr(draft, "is_teacher", False):
             required.update(int(value) for value in draft.history_layer_ids)
     return required
 
@@ -746,14 +822,17 @@ def save_checkpoint(
     output_dir: str,
     name: str,
     fsdp_model: FSDP,
-    draft_model: DLiteDraftModel,
+    draft_model,
     optimizer,
     metadata: dict,
+    process_group=None,
+    coordinator_global_rank: int = 0,
 ) -> str:
     save_dir = os.path.join(output_dir, name)
-    if dist.get_rank() == 0:
+    group_rank = dist.get_rank(process_group)
+    if group_rank == 0:
         os.makedirs(save_dir, exist_ok=True)
-    dist.barrier()
+    dist.barrier(group=process_group)
     with FSDP.state_dict_type(fsdp_model, StateDictType.FULL_STATE_DICT):
         full_state = fsdp_model.state_dict()
         draft_state = {
@@ -762,23 +841,51 @@ def save_checkpoint(
             if "draft_model." in key
         }
         model_metadata = {
-            "architecture_version": draft_model.architecture_version,
-            "model_role": draft_model.model_role,
-            "swa_window_size": draft_model.swa_window_size,
-            "chs_num_layers": draft_model.chs_num_layers,
-            "block_size": draft_model.block_size,
-            "num_draft_layers": draft_model.config.num_hidden_layers,
-            "sequential_head": draft_model.sequential_head_type,
-            "sequential_rank": draft_model.sequential_rank,
+            "architecture": draft_model.__class__.__name__,
+            "block_size": int(draft_model.block_size),
+            "num_draft_layers": int(draft_model.config.num_hidden_layers),
+            "target_layer_ids": [int(value) for value in draft_model.target_layer_ids],
+            "num_target_layers": int(draft_model.config.num_target_layers),
+            "target_hidden_size": int(draft_model.config.hidden_size),
         }
+        if isinstance(draft_model, DLiteDraftModel):
+            model_metadata.update(
+                {
+                    "architecture_version": draft_model.architecture_version,
+                    "model_role": draft_model.model_role,
+                    "swa_window_size": draft_model.swa_window_size,
+                    "chs_num_layers": draft_model.chs_num_layers,
+                    "sequential_head": draft_model.sequential_head_type,
+                    "sequential_rank": draft_model.sequential_rank,
+                }
+            )
+        else:
+            model_metadata["dflash_config"] = dict(
+                getattr(draft_model.config, "dflash_config", None) or {}
+            )
         save_distributed_training_state(
-            save_dir, {**model_metadata, **metadata, **optimizer.state_dict()}
+            save_dir,
+            {**model_metadata, **metadata, **optimizer.state_dict()},
+            process_group=process_group,
         )
-        if dist.get_rank() == 0:
+        if group_rank == 0:
             draft_model.save_pretrained(save_dir, state_dict=draft_state)
-            for filename in ("dlite.py", "sequential_head.py"):
+            source_files = (
+                ("dlite.py", "sequential_head.py")
+                if isinstance(draft_model, DLiteDraftModel)
+                else (
+                    "dflash.py",
+                    "dflash2.py",
+                    "dspark.py",
+                    "dflash_kernels.py",
+                    "flex_attention_backend.py",
+                    "registry.py",
+                )
+            )
+            for filename in source_files:
                 source = os.path.join(
                     os.path.dirname(__file__),
+                    "..",
                     "..",
                     "specforge",
                     "modeling",
@@ -787,8 +894,9 @@ def save_checkpoint(
                 )
                 if os.path.exists(source):
                     shutil.copy(source, os.path.join(save_dir, filename))
-    dist.barrier()
-    print_on_rank0(f"Saved checkpoint to {save_dir}")
+    dist.barrier(group=process_group)
+    if dist.get_rank() == coordinator_global_rank:
+        print(f"Saved checkpoint to {save_dir}", flush=True)
     return save_dir
 
 

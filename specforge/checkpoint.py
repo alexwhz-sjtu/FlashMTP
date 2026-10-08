@@ -26,12 +26,14 @@ def distributed_training_state_exists(checkpoint_dir: str) -> bool:
 
 
 def _rank_and_world_size(
-    rank: Optional[int] = None, world_size: Optional[int] = None
+    rank: Optional[int] = None,
+    world_size: Optional[int] = None,
+    process_group: Optional[dist.ProcessGroup] = None,
 ) -> tuple[int, int]:
     if rank is None:
-        rank = dist.get_rank() if dist.is_initialized() else 0
+        rank = dist.get_rank(process_group) if dist.is_initialized() else 0
     if world_size is None:
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        world_size = dist.get_world_size(process_group) if dist.is_initialized() else 1
     return rank, world_size
 
 
@@ -51,6 +53,7 @@ def save_distributed_training_state(
     *,
     rank: Optional[int] = None,
     world_size: Optional[int] = None,
+    process_group: Optional[dist.ProcessGroup] = None,
 ) -> None:
     """Save rank-local optimizer state and a rank-0 compatibility file.
 
@@ -58,7 +61,7 @@ def save_distributed_training_state(
     writes its local optimizer shard.  Only after every shard is durable does
     rank 0 publish ``training_state.pt``.
     """
-    rank, world_size = _rank_and_world_size(rank, world_size)
+    rank, world_size = _rank_and_world_size(rank, world_size, process_group)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     state_to_save = dict(state)
@@ -74,7 +77,7 @@ def save_distributed_training_state(
         )
 
     if dist.is_initialized():
-        dist.barrier()
+        dist.barrier(group=process_group)
 
     if rank == 0:
         _atomic_torch_save(
@@ -82,7 +85,7 @@ def save_distributed_training_state(
         )
 
     if dist.is_initialized():
-        dist.barrier()
+        dist.barrier(group=process_group)
 
 
 def load_distributed_training_state(
@@ -91,9 +94,10 @@ def load_distributed_training_state(
     map_location: Any = "cpu",
     rank: Optional[int] = None,
     world_size: Optional[int] = None,
+    process_group: Optional[dist.ProcessGroup] = None,
 ) -> Optional[dict[str, Any]]:
     """Load this rank's optimizer shard, with legacy checkpoint fallback."""
-    rank, world_size = _rank_and_world_size(rank, world_size)
+    rank, world_size = _rank_and_world_size(rank, world_size, process_group)
     ranked_path = ranked_training_state_path(checkpoint_dir, rank)
     common_path = os.path.join(checkpoint_dir, "training_state.pt")
     if not os.path.isfile(common_path):

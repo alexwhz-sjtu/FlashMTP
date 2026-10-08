@@ -1,0 +1,20 @@
+{"id": 0, "conversations": [{"role": "user", "content": "如何在sd上无错误进行模型训练"}, {"role": "user", "content": "作为一名室内设计师该如何在网上快速找到客户"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 1, "conversations": [{"role": "user", "content": "如何做好人力资源工作"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 2, "conversations": [{"role": "user", "content": "倉頡規則"}, {"role": "user", "content": "\"一\" 字倉頡碼是甚麼"}, {"role": "user", "content": "\"好\"字呢？"}, {"role": "user", "content": "不對"}, {"role": "user", "content": "全錯"}, {"role": "user", "content": "你不懂，我放棄了"}, {"role": "user", "content": "子字的代碼是\"n d \",  那麼\"好\"字應是？"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 3, "conversations": [{"role": "user", "content": "选取图片某一片区域，如左下角，横坐标小于300，纵坐标大于400，进行中值滤波操作，用python如何实现"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 4, "conversations": [{"role": "user", "content": "iPhone在待机状态下耗电量为多少"}, {"role": "user", "content": "iPhone的主板会漏电吗？什么原因导致的？"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 5, "conversations": [{"role": "user", "content": "选取图片左下角，如横坐标小于300，纵坐标大于400，用opencv进行中值滤波操作，如何用python实现"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 6, "conversations": [{"role": "user", "content": "你好"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 7, "conversations": [{"role": "user", "content": "小孩不想学习，怎办？"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 8, "conversations": [{"role": "user", "content": "孕检需要做什么准备"}, {"role": "user", "content": "朝阳区妇幼保健院孕检材料"}, {"role": "user", "content": "孕检材料呢"}, {"role": "user", "content": "这个医院的孕检流程"}, {"role": "user", "content": "北京市朝阳区妇幼保健院的孕检流程"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 9, "conversations": [{"role": "user", "content": "4.水中声速测量实验中，能否使用超声波探测的距离数据代替标尺数据？为什么？（10分）"}, {"role": "user", "content": "不能，超声波探测的距离数据是仪器使用某一温度下的声速计算而得，并不一定是实际实验时的水中声速，用该数据计算出的声速是仪器使用的声速，因而不能用超声波探测的距离数据代替标尺数据"}, {"role": "user", "content": "超声成像实验中，对比扫描图与有机玻璃实物是否完全一致？请分析原因"}, {"role": "user", "content": "总结一下"}, {"role": "user", "content": "写一小段超声定位和形貌成像物理实验的小结、建议与体会"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 10, "conversations": [{"role": "user", "content": "一份简历包括什么内容"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 11, "conversations": [{"role": "user", "content": "一份简历包括什么内容"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 12, "conversations": [{"role": "user", "content": "完成一个数字虚拟人的项目，输入一张人物图片和 一段文本，生成人物说这一段文本的视频，利用现有的模型直接加载使用并生成数字虚拟人的视频，要求用python实现，代码可以运行生成。"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 13, "conversations": [{"role": "user", "content": "企业销售dashboard设计"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 14, "conversations": [{"role": "user", "content": "心绞痛的原因和解决办法"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 15, "conversations": [{"role": "user", "content": "中国天然气化工的龙头企业"}, {"role": "user", "content": "想了解天然气化工路线的未来前景，较煤、石油路线有没有竞争优势，以及怎么样选择产品定位找什么公司的专家"}, {"role": "user", "content": "以天然气为原料来生产化工产品的公司有哪些"}, {"role": "user", "content": "中国以天然气为原料来生产化工产品的公司有哪些"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 16, "conversations": [{"role": "user", "content": "你是什么版本AI"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 17, "conversations": [{"role": "user", "content": "设计一个计算机科学与技术2班的班徽，要科幻的，艺术的"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 18, "conversations": [{"role": "user", "content": "用python实现，输入表格图片，然后根据表格填空的位置自动填写表格内容，输出特定位置上的文字信息"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}
+{"id": 19, "conversations": [{"role": "user", "content": "你好"}, {"role": "user", "content": "帮我基于html+vue+elementui写一个页面，内容是类似微信那种聊天页面，要求能兼容pc端和移动端，背景风格等你自己看着办最好炫酷一些"}], "source": "allenai/WildChat-4.8M", "category": "Chinese"}

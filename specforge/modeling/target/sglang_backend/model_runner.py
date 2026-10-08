@@ -1,5 +1,6 @@
 import logging
 import os
+import shutil
 
 import torch
 from sglang.srt.distributed import (
@@ -46,6 +47,23 @@ class SGLangRunner(ModelRunner):
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
+
+        # SGLang 0.5.9 JIT-compiles RoPE and norm kernels with the ninja
+        # executable.  Invoking ``.venv/bin/torchrun`` directly does not
+        # necessarily prepend that directory to PATH even though the Python
+        # package is installed in the venv.
+        if shutil.which("ninja") is None:
+            try:
+                import ninja
+
+                os.environ["PATH"] = (
+                    ninja.BIN_DIR + os.pathsep + os.environ.get("PATH", "")
+                )
+            except ImportError as error:
+                raise RuntimeError(
+                    "SGLang requires ninja for runtime kernel compilation; "
+                    "install the project dependencies in the active environment"
+                ) from error
 
         try:
             torch.get_device_module(self.device).set_device(self.gpu_id)
@@ -115,12 +133,15 @@ class SGLangRunner(ModelRunner):
             # - Removed torch_compile parameter (no longer supported)
             # - Added new parameters: attention_data_parallel_size, attention_context_model_parallel_size, moe_data_model_parallel_size
 
-            # Debug: Print the values
             dp_size = getattr(self.server_args, "dp_size", 1)
             attn_cp_size = getattr(self.server_args, "attn_cp_size", 1)
             moe_dp_size = getattr(self.server_args, "moe_dp_size", 1)
-            print(
-                f"[DEBUG] tp_size={self.tp_size}, dp_size={dp_size}, attn_cp_size={attn_cp_size}, moe_dp_size={moe_dp_size}"
+            logger.debug(
+                "tp_size=%s dp_size=%s attn_cp_size=%s moe_dp_size=%s",
+                self.tp_size,
+                dp_size,
+                attn_cp_size,
+                moe_dp_size,
             )
 
             initialize_model_parallel(
